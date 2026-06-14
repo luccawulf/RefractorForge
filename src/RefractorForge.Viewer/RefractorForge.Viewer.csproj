@@ -1,0 +1,84 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- WinExe = no background CMD window on launch (the GUI subsystem). Diagnostics now live in the in-app
+         Log/Errors box (ConsoleLog); the headless relay mode re-attaches the parent terminal's console. -->
+    <OutputType>WinExe</OutputType>
+    <!-- App/taskbar icon (Win32 resource). Regenerate from code with Assets\make_icon.ps1. -->
+    <ApplicationIcon>Assets\RefractorForge.ico</ApplicationIcon>
+    <!-- net8.0-windows + WinForms is used ONLY for the native folder/file picker dialogs; the 3D
+         window is still Silk.NET/OpenGL. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Texture-heavy maps allocate large arrays (whole texture*.rfa in memory + many decoded tiles). Server GC
+         gives per-core heaps with far better throughput on big allocations; concurrent GC keeps pauses low so a
+         large load doesn't stall the window. Explicit 64-bit so the process is never the 2 GB-capped 32-bit host. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <PlatformTarget>x64</PlatformTarget>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Silk.NET 2.23.0 (Winter 2025). Restored normally on your machine. -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Silk.NET.Windowing" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.OpenGL" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.Input" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.Maths" Version="2.23.0" />
+    <!-- Dear ImGui editor UI, rendered into the same GL context/window. Pulls ImGuiNET transitively.
+         (If a build ever can't find the ImGuiNET namespace, add: ImGui.NET as a package reference.) -->
+    <PackageReference Include="Silk.NET.OpenGL.Extensions.ImGui" Version="2.23.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Object Library catalog (14 categories, real BFV template names) shown in the left panel. -->
+    <EmbeddedResource Include="objcatalog.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Battlecraft brush-shape masks (Round/Square/Noise/Splatter/Cross/Tracks), copied next to the exe
+         as brushes\*.bmp and loaded into the terrain brush "Shape" selector. -->
+    <Content Include="Assets\brushes\*.bmp" CopyToOutputDirectory="PreserveNewest">
+      <Link>brushes\%(Filename)%(Extension)</Link>
+    </Content>
+    <!-- Battlecraft per-material surface textures (mat_*.bmp), copied next to the exe as textures\*.bmp and
+         used as the palette for the terrain Texture paint tool. -->
+    <Content Include="Assets\textures\*.bmp" CopyToOutputDirectory="PreserveNewest">
+      <Link>textures\%(Filename)%(Extension)</Link>
+    </Content>
+    <!-- The app icon, copied beside the exe so the GL window can load it at runtime for the taskbar / title bar /
+         Alt-Tab. Silk's GLFW window does NOT inherit the exe's <ApplicationIcon> PE resource, so we set it in code
+         (SetAppIcon in Program.cs) from this copy. -->
+    <Content Include="Assets\RefractorForge.ico" CopyToOutputDirectory="PreserveNewest">
+      <Link>RefractorForge.ico</Link>
+    </Content>
+    <!-- Launch splash image (shown briefly at startup with the RefractorForge name + author credit). -->
+    <Content Include="Assets\refractorforgesplash.png" CopyToOutputDirectory="PreserveNewest">
+      <Link>refractorforgesplash.png</Link>
+    </Content>
+    <!-- Bundled user Texture Library (Editor42-style): tileable terrain textures shipped beside the exe as
+         TerrainTextures\<Category>\*. Users drop their own .bmp/.dds/.tga/.png/.jpg in here (the editor's
+         "Texture Library" browser reads it recursively + Import copies new files in). Folder structure +
+         %(RecursiveDir) preserve the category subfolders. -->
+    <Content Include="Assets\TerrainTextures\**\*.*" CopyToOutputDirectory="PreserveNewest">
+      <Link>TerrainTextures\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+    <!-- Bundled FFmpeg (ffmpeg.exe + its runtime DLLs), shipped beside the exe as ffmpeg\* so Bink (.bik)
+         video playback works out of the box with no separate download. FindFfmpeg() prefers ffmpeg\ffmpeg.exe.
+         ~49 MB; GPL build (links libx264) — see Assets\ffmpeg\FFMPEG_NOTICE.txt for attribution + source. -->
+    <Content Include="Assets\ffmpeg\**\*.*" CopyToOutputDirectory="PreserveNewest">
+      <Link>ffmpeg\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
+    <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
+    <ProjectReference Include="..\RefractorForge.Collab\RefractorForge.Collab.csproj" />
+  </ItemGroup>
+
+</Project>

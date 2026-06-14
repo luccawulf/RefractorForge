@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RefractorForge.Collab</RootNamespace>
+    <!-- Multi-user editing. Depends ONLY on the format spine + the BCL
+         (System.Net.Sockets for the optional TCP transport). No third-party
+         packages, so it builds and runs anywhere the spine does. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
+  </ItemGroup>
+
+</Project>

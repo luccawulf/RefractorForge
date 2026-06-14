@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RefractorForge.Formats</RootNamespace>
+    <!-- The spine has ZERO external dependencies on purpose: it stays portable
+         to any UI shell (WPF, Avalonia, Silk.NET, a CLI, tests) and never drags
+         engine assumptions into the data model. -->
+  </PropertyGroup>
+
+</Project>

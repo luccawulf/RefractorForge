@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- No NuGet deps: mesh + camera + a software rasterizer on System.Numerics (in-box).
+         The GPU viewer reuses TerrainMesh and Camera; the rasterizer is a headless
+         preview/verification path. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
+  </ItemGroup>
+
+</Project>

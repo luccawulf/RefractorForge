@@ -1,0 +1,39 @@
+# Build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Demo / test scratch output directories (each holds a generated Heightmap.raw + preview dumps)
+/out/
+/edit/
+/rfals/
+/waterinfo/
+/savelevel/
+/vehcollision/
+/smrender/
+/repackcheck/
+/gameplayedit/
+/lsbroundtrip/
+
+# Local editor / tooling config (per-machine, not part of the source)
+.claude/
+imgui.ini
+refractorforge.json
+sound_debug.log
+sound_capture.wav
+
+# Bundled FFmpeg binaries (third-party, ~47 MB, GPL/LGPL) — users supply their own; keep only the NOTICE
+src/RefractorForge.Viewer/Assets/ffmpeg/*.dll
+src/RefractorForge.Viewer/Assets/ffmpeg/*.exe
+
+# Stray game assets / large binaries should never be committed (engine content is copyrighted)
+*.rfa
+*.dds
+*.raw
+*.bik
+*.zip
+
+# Claude Code project instructions (AI tooling notes, kept local; not part of the public source)
+CLAUDE.md

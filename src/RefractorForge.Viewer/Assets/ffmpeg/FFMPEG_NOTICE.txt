@@ -1,0 +1,19 @@
+RefractorForge bundles FFmpeg to decode Bink (.bik) videos for in-editor playback.
+
+FFmpeg is a separate work, the property of its authors, and is NOT part of
+RefractorForge. It is used here only as an external command-line program
+(ffmpeg.exe is launched as a child process; RefractorForge does not link against
+the FFmpeg libraries).
+
+This build links libx264 and is therefore distributed under the terms of the
+GNU General Public License, version 2 or later (GPL v2+). The FFmpeg / libx264
+source code is available from:
+
+    https://ffmpeg.org/          (FFmpeg)
+    https://www.videolan.org/developers/x264.html   (x264)
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+
+Files in this folder (ffmpeg.exe + its required runtime DLLs) are an unmodified
+redistribution of an FFmpeg build. To use a different FFmpeg, replace ffmpeg.exe
+(and its DLLs) here, or drop an ffmpeg.exe on your PATH.
