@@ -33,7 +33,7 @@ public sealed class MeshLibrary
 
     /// <summary>One material's triangles, its shader-derived color (fallback/tint), and its decoded
     /// texture if the texture archive is available.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest);
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -674,7 +674,7 @@ public sealed class MeshLibrary
             {
                 var idx = new int[mp.Indices.Length];
                 for (int k = 0; k < idx.Length; k++) idx[k] = mp.Indices[k] + baseV;
-                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest));
+                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend));
             }
         }
         return mats.Count > 0
@@ -1233,8 +1233,11 @@ public sealed class MeshLibrary
             var tex = _textures?.Resolve(sh?.Texture);
             // Foliage/cutout sheets and explicit fade materials are alpha-tested so the transparent
             // parts of the atlas don't render as opaque rectangles.
-            bool alphaTest = sh?.TextureFade == true || IsCutout(sh?.Texture);
-            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, alphaTest));
+            // Glass/canopy (explicit `transparent`) blends softly with NORMAL lighting; foliage/fences/cutout sheets
+            // (fade flag, foliage names, or genuine cutout alpha) are HARD alpha-tested with flat foliage lighting.
+            bool blend = sh?.Transparent == true;
+            bool cutout = !blend && (sh?.TextureFade == true || IsCutout(sh?.Texture) || HasTransparency(tex));
+            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())
@@ -1249,7 +1252,11 @@ public sealed class MeshLibrary
         string t = tex.ToLowerInvariant();
         return t.Contains("leaf") || t.Contains("palm") || t.Contains("tree") || t.Contains("fern")
             || t.Contains("bush") || t.Contains("vine") || t.Contains("plant") || t.Contains("grass")
-            || t.Contains("frond") || t.Contains("foliage") || t.Contains("portal");
+            || t.Contains("frond") || t.Contains("foliage") || t.Contains("portal")
+            // cutout/transparent hard-surface names common on vehicles + structures
+            || t.Contains("fence") || t.Contains("wire") || t.Contains("chain") || t.Contains("net")
+            || t.Contains("grate") || t.Contains("window") || t.Contains("glass") || t.Contains("railing")
+            || t.Contains("canopy") || t.Contains("cockpit") || t.Contains("windscreen") || t.Contains("windsh");
     }
 
     // True when a decoded texture actually contains transparency (a leaf/cutout atlas): a meaningful fraction of texels
@@ -1259,9 +1266,15 @@ public sealed class MeshLibrary
     {
         if (tex?.Rgba is not { Length: > 0 } d) return false;
         int n = d.Length / 4; if (n == 0) return false;
-        int step = Math.Max(1, n / 4096), sampled = 0, transp = 0;
-        for (int i = 0; i < n; i += step) { sampled++; if (d[i * 4 + 3] < 250) transp++; }
-        return sampled > 0 && transp > sampled * 0.03;   // >3% non-opaque -> cutout
+        // Real transparency (glass / cutout / fences / window holes) is BIMODAL: a meaningful transparent region AND
+        // a meaningful solid region. We reject two false positives that hurt: (1) only a trickle of sub-opaque alpha,
+        // which is usually a gloss/spec mask on metal panels -- not transparency; (2) a near-FULLY-transparent channel,
+        // which is an unused/garbage alpha that would otherwise make the WHOLE mesh vanish (this was hiding vehicles).
+        int step = Math.Max(1, n / 8192), sampled = 0, trans = 0, solid = 0;
+        for (int i = 0; i < n; i += step) { int a = d[i * 4 + 3]; sampled++; if (a < 128) trans++; else if (a >= 240) solid++; }
+        if (sampled == 0) return false;
+        float tf = (float)trans / sampled, sf = (float)solid / sampled;
+        return tf > 0.02f && tf < 0.85f && sf > 0.05f;   // some transparent + some solid -> genuine glass/cutout
     }
 
     /// <summary>Find and parse the .rs shader set for a mesh entry (basename match; level override first).</summary>

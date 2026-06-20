@@ -52,7 +52,8 @@ public sealed record GameplayObjects(
         public string Name = "";
         public Vec3 Position;
         public Vec3 Rotation;
-        public int OsId = 1;
+        public int OsId = 0;   // 0 = no setOSId on the spawn -> OwningControlPointIndex falls back to the NEAREST control
+                               // point (NOT a hard-coded id 1, which wrongly bound every unlinked spawn to objectSpawnerId 1).
         public int Team = 0;
     }
 

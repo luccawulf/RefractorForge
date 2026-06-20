@@ -12,7 +12,7 @@ namespace RefractorForge.Render;
 /// </summary>
 public sealed class RsShaderSet
 {
-    public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade);
+    public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade, bool Transparent = false);
 
     private readonly Dictionary<string, MaterialShader> _byName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -22,7 +22,7 @@ public sealed class RsShaderSet
     {
         var set = new RsShaderSet();
         string? curName = null, curTex = null;
-        Vector3 diffuse = Vector3.One; bool fade = false; bool inBlock = false;
+        Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
 
         foreach (var rawLine in text.Split('\n'))
         {
@@ -32,13 +32,13 @@ public sealed class RsShaderSet
                 // subshader "Name" "StandardMesh/Default"
                 var q = SplitQuoted(line);
                 curName = q.Count > 0 ? q[0] : null;
-                curTex = null; diffuse = Vector3.One; fade = false;
+                curTex = null; diffuse = Vector3.One; fade = false; transp = false;
             }
             else if (line.StartsWith("{")) inBlock = true;
             else if (line.StartsWith("}"))
             {
                 if (curName is not null)
-                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade);
+                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp);
                 inBlock = false; curName = null;
             }
             else if (inBlock && curName is not null)
@@ -59,6 +59,8 @@ public sealed class RsShaderSet
                 }
                 else if (line.StartsWith("textureFade", StringComparison.OrdinalIgnoreCase))
                     fade = line.Contains("true", StringComparison.OrdinalIgnoreCase);
+                else if (line.StartsWith("transparent", StringComparison.OrdinalIgnoreCase))
+                    transp = line.Contains("true", StringComparison.OrdinalIgnoreCase);   // BF1942 glass/canopy: alpha-blended material
             }
         }
         return set;

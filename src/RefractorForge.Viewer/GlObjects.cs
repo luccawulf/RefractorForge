@@ -13,7 +13,7 @@ namespace RefractorForge.Viewer;
 /// </summary>
 sealed class GlObjects
 {
-    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; }
+    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; }
     private sealed class Template { public uint Vao; public Part[] Parts = Array.Empty<Part>(); public Vector3 BbMin; public Vector3 BbMax; }
 
     private readonly Dictionary<string, Template> _templates = new(StringComparer.OrdinalIgnoreCase);
@@ -228,7 +228,7 @@ sealed class GlObjects
                 {
                     gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                     gl.Uniform1(uUseTex, 1);
-                    gl.Uniform1(uAlphaTest, part.AlphaTest ? 1 : 0);
+                    gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
                 }
                 else
                 {
@@ -293,7 +293,7 @@ sealed class GlObjects
                     {
                         gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                         gl.Uniform1(uUseTex, 1);
-                        gl.Uniform1(uAlphaTest, part.AlphaTest ? 1 : 0);
+                        gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
                     }
                     else
                     {
@@ -344,7 +344,7 @@ sealed class GlObjects
             int off = allIdx.Count;
             foreach (var ix in part.Indices) allIdx.Add((uint)ix);
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
-            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest });
+            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend });
         }
         Bounds(pos, out var bbMin, out var bbMax);
         var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = parts.ToArray(), BbMin = bbMin, BbMax = bbMax };
@@ -372,7 +372,7 @@ sealed class GlObjects
             {
                 gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                 gl.Uniform1(uUseTex, 1);
-                gl.Uniform1(uAlphaTest, part.AlphaTest ? 1 : 0);
+                gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
             }
             else
             {

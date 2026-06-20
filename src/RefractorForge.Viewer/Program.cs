@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using RefractorForge.Formats.Con;
@@ -36,7 +36,7 @@ using ImGui = ImGuiNET.ImGui;   // disambiguate from the Silk.NET.OpenGL.Extensi
 // ============================================================================
 
 // Headless CENTRAL relay mode: `--relay <port> [seedLevelFolder | StaticObjects.con | level.rfa] [--save <file>]`.
-// Runs ONLY the collaboration relay Ã¢â‚¬â€ no GL window Ã¢â‚¬â€ so a group can all JOIN one always-on server instead of one
+// Runs ONLY the collaboration relay - no GL window - so a group can all JOIN one always-on server instead of one
 // person hosting (whose local document would otherwise overwrite everyone else's on connect). With --save the
 // canonical document is persisted to <file> and RESUMED from it next start, so edits survive a server restart.
 // Console diagnostics include non-ASCII (em-dashes etc.); render them as UTF-8 instead of the default code page,
@@ -159,7 +159,7 @@ uniform vec3 uColor; out vec4 frag;
 void main(){ frag = vec4(uColor,1.0); }";
 
 // Collision wireframe: like the marker line shader but distance-faded so it only draws as far as the user can
-// see â€” it dissolves across the fog band (uFogStart..uFogEnd) instead of rendering into / beyond the fog.
+// see - it dissolves across the fog band (uFogStart..uFogEnd) instead of rendering into / beyond the fog.
 const string CollisionVert = @"#version 330 core
 layout(location=0) in vec3 aPos; uniform mat4 uMVP; uniform vec3 uCamPos; out float vDist;
 void main(){ gl_Position = uMVP * vec4(aPos,1.0); vDist = distance(aPos, uCamPos); }";
@@ -235,7 +235,7 @@ const string SkyFrag = @"#version 330 core
 in vec3 vDir; out vec4 frag;
 uniform vec3 uSunDir;      // world direction toward the sun (normalized)
 uniform vec3 uFogColor;
-uniform float uRot;        // skybox rotation (radians) Ã¢â‚¬â€ Sky.setRotAngle
+uniform float uRot;        // skybox rotation (radians) - Sky.setRotAngle
 uniform int uHasCube;
 uniform samplerCube uCube;
 uniform int uHasCloud;     // animated cloud layer overlay
@@ -332,7 +332,7 @@ void main(){
     vec4 t = texture(uTex, vUv);
     float a = t.a * vAlpha;
     if (uFogEnable == 1) {
-        // effects must stay WITHIN the view distance â€” dissolve to nothing across the fog band instead of rendering
+        // effects must stay WITHIN the view distance - dissolve to nothing across the fog band instead of rendering
         // into / past the fog (alpha-fade to 0, not tint-to-fog: additive particles tinted to fog would BRIGHTEN it).
         float d = length(vWorld - uCamPos);
         a *= 1.0 - clamp((d - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
@@ -354,7 +354,7 @@ void main(){ gl_Position = uMVP * vec4(aPos,1.0); vN = mat3(uModel) * aNormal; v
 const string ObjFrag = @"#version 330 core
 in vec3 vN; in vec2 vUv; in vec2 vLmUv; in vec3 vWorld;
 uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
-uniform int uUseTex; uniform int uAlphaTest; uniform sampler2D uTex;
+uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
@@ -376,7 +376,7 @@ void main(){
     vec4 tc = texture(uTex, vUv);
     vec3 base = (uUseTex==1) ? tc.rgb : uColor;
     float a   = (uUseTex==1) ? tc.a   : 1.0;
-    if (uAlphaTest==1 && a < 0.33) discard;   // lower ref keeps thin leaf-card coverage (foliage atlases are mostly transparent); opaque parts have a=1.0 so unaffected
+    if (uAlphaTest==1 && uAlphaEnable==1 && a < 0.33) discard;   // cutout discard only while transparency is enabled (toggle off -> solid)
     vec3 c;
     if (uHasLightmap==1) {
         vec3 lm = texture(uLightmap, vLmUv).rgb;          // baked lighting already has shadows baked in -> no shadow map
@@ -395,7 +395,7 @@ void main(){
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
         c = mix(c, uFogColor, fog);
     }
-    frag = vec4(c, 1.0);
+    frag = vec4(c, (uAlphaTest!=0 && uAlphaEnable==1) ? a : 1.0);   // cutout(1)+glass(2) carry real alpha when enabled; else fully opaque
 }";
 
 // Depth-only shader for the sun shadow-map pass: render terrain + objects from the sun's POV into a depth texture.
@@ -410,10 +410,10 @@ void main(){}";
 // Resolve the level folder + mesh archives, in priority order:
 //   1. explicit command-line paths (back-compat with scripts);
 //   2. saved selections from a previous run (refractorforge.json beside the exe);
-//   3. native folder/file pickers (GUI) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â first run, or whenever --pick is passed.
+//   3. native folder/file pickers (GUI) - first run, or whenever --pick is passed.
 string? levelDir = null;
 string[] levelArchives = Array.Empty<string>();   // all level .rfa (base + patches); empty when the level is a FOLDER
-string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa + patches Ã¢â‚¬â€ no limit
+string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa + patches - no limit
 string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (their folders are also scanned for siblings)
 {
     var pathArgs = args.Where(a => !a.StartsWith("-", StringComparison.Ordinal)).ToArray();
@@ -439,26 +439,13 @@ string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (th
         }
         else
         {
-            // First run / no saved level: show the splash by itself for ~3s, then close it and open the level picker.
+            // First run / no saved level: show the splash by itself for ~3s, then use the Open Mod flow (pick the mod
+            // folder, then the map .rfa; the mesh + texture archives are auto-collected from the mod's chain).
             SplashScreen.WaitVisibleFor(3000);
             SplashScreen.Close();
-            // Level: a folder, or one-or-MORE packed .rfa (base + patch archives, merged).
-            var folder = Picker.Folder("Select the level FOLDER (Cancel to choose packed .rfa instead)", saved?.Level);
-            if (folder is not null) levelDir = folder;
-            else
+            if (GatherModPaths(out var lvlRfas0, out var meshList0, out var texList0))
             {
-                var rfas = Picker.Files("Select the level .rfa  (pick the base + ANY patch .rfa together Ã¢â‚¬â€ Ctrl/Shift-click)",
-                                        "RFA archives|*.rfa|All files|*.*", saved?.Level);
-                if (rfas.Length > 0) { levelArchives = rfas; levelDir = rfas[0]; }
-            }
-            if (levelDir is not null)
-            {
-                meshArchives = Picker.Files("Select ALL mesh/object archives Ã¢â‚¬â€ standardMesh.rfa, objects.rfa, and any patches (Ctrl/Shift-click). Cancel to skip.",
-                                            "RFA archives|*.rfa|All files|*.*", (saved?.MeshArchives is { Length: > 0 } sm0 ? sm0[0] : saved?.StdMesh) ?? levelDir)
-                               .Where(File.Exists).ToArray();
-                texPicks = Picker.Files("Select ALL texture archives Ã¢â‚¬â€ texture.rfa, texture_001.rfa, and any patches (Ctrl/Shift-click). Cancel to skip.",
-                                        "RFA archives|*.rfa|All files|*.*", (saved?.Textures is { Length: > 0 } st ? st[0] : null) ?? levelDir)
-                               .Where(File.Exists).ToArray();
+                levelArchives = lvlRfas0; levelDir = lvlRfas0[0]; meshArchives = meshList0; texPicks = texList0;
                 Settings.Save(new LevelPaths(levelDir, null, null, texPicks, meshArchives, levelArchives.Length > 0 ? levelArchives : null));
             }
         }
@@ -481,7 +468,7 @@ string? texturesDir = null;          // the level's Textures/ dir (where txCxR.d
 Heightmap? heightmap = null;         // kept so the ground-pick can sample terrain height for placement
 TerrainPick? terrainPick = null;
 
-// Loaded-level state assigned straight-line by the load block below ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â declared here (before it) so the
+// Loaded-level state assigned straight-line by the load block below - declared here (before it) so the
 // top-level code can assign them; the editor's local functions capture these same variables by reference.
 GameplayObjects gameplay = GameplayObjects.Empty;
 EditableGameplay gameplayEdit = new(GameplayObjects.Empty);   // mutable editing view of the gameplay layer
@@ -504,7 +491,7 @@ string[] rfaList = levelArchives.Length > 0 ? levelArchives
                  : (levelDir is not null && LevelArchive.IsRfa(levelDir) ? new[] { levelDir } : Array.Empty<string>());
 // AUTO-MOUNT PATCH ARCHIVES: the engine layers <Level>_NNN.rfa over the base (Dystopia_City_001.rfa overrides
 // 3 StaticObjects.con + 1400 entries). Users usually pick just the base, so add numeric-suffix siblings of every
-// picked archive automatically â€” appended AFTER their base (LevelArchive is last-wins) and numerically ordered.
+// picked archive automatically - appended AFTER their base (LevelArchive is last-wins) and numerically ordered.
 if (rfaList.Length > 0)
 {
     var expanded = new List<string>(rfaList);
@@ -525,7 +512,7 @@ if (rfaList.Length > 0)
     rfaList = expanded.ToArray();
 }
 // TERRAIN-REUSE add-on maps: many mod maps (FHSW/FH/DC/bf1918 Aberdeen, Bocage, Battleaxe, Adak_Island...) ship
-// Heightmap.raw + StaticObjects but NO Terrain.con â€” they LAYER over the base game's same-named map, which the engine
+// Heightmap.raw + StaticObjects but NO Terrain.con - they LAYER over the base game's same-named map, which the engine
 // mounts to supply the terrain config. The editor only loaded the mod's rfa -> "Terrain.con not found" -> total load
 // failure (23 such maps across 13 mods in the multi-mod audit). If no picked rfa carries terrain, find the SAME-NAMED
 // level .rfa elsewhere in the mod chain (init.con deps + base game) and layer it UNDERNEATH (lowest priority, so the
@@ -616,7 +603,7 @@ if (rfaList.Length > 0)
     env = lvl.Environment;
     sounds = lvl.Sounds ?? SoundLibrary.Empty;   // .rfa levels edit sounds too (saved back into the repack/patch)
     loadedShadowBits = lvl.Shadow;               // the level's baked terrain sun-shadow (display via the Shadows toggle)
-    // NOTE: object lightmaps are loaded LAZILY (EnsureObjectLightmaps) on first enable â€” decoding them here re-opens
+    // NOTE: object lightmaps are loaded LAZILY (EnsureObjectLightmaps) on first enable - decoding them here re-opens
     // the level .rfa and was a big chunk of the load time.
     // Can't write back into the .rfa yet, so F5 saves a loose StaticObjects.con beside the archive.
     soPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(levelDir)) ?? ".",
@@ -650,7 +637,7 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     env = EnvironmentSettings.LoadFolder(levelDir);
     sounds = SoundLibrary.LoadFolder(levelDir);   // recognise + edit placed sound emitters (.ssc)
     loadedShadowBits = LightmapShadowBits.TryLoadFolder(levelDir);   // the level's baked terrain sun-shadow, if present
-    // object lightmaps loaded lazily (EnsureObjectLightmaps) â€” see the .rfa branch note above.
+    // object lightmaps loaded lazily (EnsureObjectLightmaps) - see the .rfa branch note above.
     SyncMarkers();
     var terrainTexDir = Directory.EnumerateDirectories(levelDir, "Textures", SearchOption.AllDirectories).FirstOrDefault();
     texturesDir = terrainTexDir;   // where txCxR.dds tiles live, so the Texture paint tool can re-emit them on save
@@ -663,7 +650,7 @@ else
     cfg = new TerrainConfig { MaterialSize = 1024, WorldSize = 4096, YScale = 0.5f, WaterLevel = 30 };
     heightmap = HeightmapGenerator.DiamondSquare(cfg.MaterialSize, 2026, 0.55f);
     mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1);
-    Console.WriteLine("No level selected ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â generated 4 km demo terrain (not savable).");
+    Console.WriteLine("No level selected - generated 4 km demo terrain (not savable).");
 }
 }
 catch (Exception loadEx)
@@ -704,7 +691,7 @@ string? scanDir = levelDir is null ? null
     : (LevelArchive.IsRfa(levelDir) ? Path.GetDirectoryName(Path.GetFullPath(levelDir)) : levelDir);
 
 // Open the chosen mesh archives so placed objects render as their real geometry. The level's OWN .rfa(s) are
-// added too â€” a map .rfa can embed its own .sm meshes / object .con / .dds (mod + custom maps), which were
+// added too - a map .rfa can embed its own .sm meshes / object .con / .dds (mod + custom maps), which were
 // invisible before. The user's global archives come first (MeshLibrary/TextureLibrary are first-wins), so the
 // map only supplies meshes/textures it uniquely carries.
 if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaList.Length > 0))
@@ -732,11 +719,11 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
         }
     }
     // AUTO-DISCOVER THE GAME'S BASE ARCHIVES the way the engine mounts the whole Archives folder. BF1942 spreads
-    // its meshes across MANY top-level archives â€” Bocage's church/windmill/lumbermill/farm/hospital/barack live in
+    // its meshes across MANY top-level archives - Bocage's church/windmill/lumbermill/farm/hospital/barack live in
     // aiMeshes.rfa, its suburbhouses/ruins in StandardMesh_001.rfa, only a few in standardMesh.rfa. Picking just
     // standardMesh.rfa (or relying on the _NNN sibling) left whole buildings missing. Walk up from each level .rfa to
     // its "Archives" ancestor and pull in every top-level *.rfa there (texture* go to the texture lib; the bulky
-    // audio/menu/font archives are skipped â€” they carry no meshes). Self-contained levels just find their own folder;
+    // audio/menu/font archives are skipped - they carry no meshes). Self-contained levels just find their own folder;
     // a level that isn't under an Archives dir discovers nothing and falls back to the picked archives.
     static bool IsTexArc(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
     static bool IsNonMeshArc(string p)
@@ -765,7 +752,7 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
             // 2) the MOD DEPENDENCY CHAIN: a custom map (e.g. interstate's Dystopia_City) embeds most of its meshes but
             //    still references BASE-game archives (trees in treeMesh.rfa, suburbhouses in StandardMesh_001.rfa) that
             //    live in Mods\bf1942\Archives, NOT the mod's folder. Parse the mod's init.con `game.addModPath` chain
-            //    (relative to gameRoot) + ALWAYS the base game mod, and glob each one's Archives â€” exactly how OpenMod
+            //    (relative to gameRoot) + ALWAYS the base game mod, and glob each one's Archives - exactly how OpenMod
             //    + the engine mount the chain. So opening a mod LEVEL directly resolves 100%, no manual archive picks.
             var modDir = arc.Parent;
             DirectoryInfo? gameRoot = null;
@@ -844,7 +831,7 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
         }
         else
         {
-            Console.WriteLine("No texture*.rfa found ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â objects render untextured. " +
+            Console.WriteLine("No texture*.rfa found - objects render untextured. " +
                               "Pick texture.rfa and texture_001.rfa at startup (multi-select), or run with --pick.");
         }
     }
@@ -889,6 +876,9 @@ string gpVehBuf = "";                                         // inspector vehic
 // Common BFV vehicle templates for the vehicle-spawn picker (the current value is appended if it's not listed).
 string[] vehicleCatalog = { "Sheridan", "M48Patton", "M113", "Mutt", "t54", "M46", "vespa", "uh1Assault",
                             "UH1Transport", "Chinook", "Mi8Cargo", "F4Phantom", "Corsair", "PBR", "Sampan", "ZSU", "bm21sam" };
+string[]? vehCacheList = null; MeshLibrary? vehCacheFor = null;   // mod-aware vehicle dropdown cache (rebuilt per loaded mesh library)
+(Vector3 pos, float yaw, float pitch)?[] camBookmarks = new (Vector3 pos, float yaw, float pitch)?[9];   // camera bookmarks: Ctrl+1..9 save, 1..9 recall
+bool autoBackup = true;                 // copy the level to a timestamped Backups\ folder before each save (File menu toggle)
 GpKind? gpPlaceKind = null;                                   // armed gameplay placement (null = place static object)
 // Edit Control Point dialog (Battlecraft-style): a working copy of the selected control point's fields.
 bool editCpRequest = false; int ecpIndex = -1;
@@ -950,7 +940,7 @@ System.Random weatherRng = new(12345);
 uint weatherProg = 0;                                        // textured point-sprite shader for the preview
 int uWMvp = -1, uWTex = -1, uWColor = -1, uWSize = -1;       // weatherProg uniforms
 // Particle EFFECTS (the level's FX/*.con: waterfalls, lava, fire, smoke, steam...) shown as animated billboards.
-EffectsLibrary? effectsLib = null;                           // parsed effect bundles (lazy â€” built on first enable)
+EffectsLibrary? effectsLib = null;                           // parsed effect bundles (lazy - built on first enable)
 bool effectsLoaded = false;                                  // the (heavy) effect-con parse is deferred off the load path
 bool showEffects = false;                                    // Layers toggle: animated particle effects
 uint effectProg = 0, effectVao = 0, effectVbo = 0;          // billboard shader + dynamic per-frame buffer
@@ -1019,7 +1009,7 @@ string layerPresetName = "myLayer";
 bool surfUseAlpha = false;                       // Surface brush: honor the source texture's alpha as a decal/splat mask
 bool detailImported = false;                     // user imported a tiling detail texture -> ship Textures/detail.dds on save
 float detailRepeatM = 8f;                        // world metres per detail-texture repeat (DetailRepeatMeters)
-// foliage (undergrowth/overgrowth) painting ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â reuses the material-map painting stack on the two
+// foliage (undergrowth/overgrowth) painting - reuses the material-map painting stack on the two
 // Growth/ index maps. Each layer has its own resolution (often != materialSize), so each painter
 // gets a TerrainConfig whose MaterialSize is that layer's side (correct world<->grid spacing).
 int paintLayer = 0;            // active paint target: 0 = Material, 1 = Undergrowth, 2 = Overgrowth
@@ -1059,6 +1049,10 @@ float flattenTarget = 30f;              // explicit Flatten/Set target height (m
 string[] sculptModeLabels = { "Raise", "Lower", "Flatten", "Set" };
 string[] falloffLabels = { "Smooth", "Linear", "Constant", "Gaussian" };
 BrushMode[] sculptModes = { BrushMode.Raise, BrushMode.Lower, BrushMode.Flatten, BrushMode.Set };
+bool lrSculpt = false;                  // Sculpt option: LEFT mouse raises, RIGHT mouse lowers (instead of picking a Mode)
+int activeStrokeDir = 0;                // +1 raise / -1 lower while an L/R-button sculpt stroke is live (0 = use the Mode)
+bool alphaTransparency = true;          // render object/foliage texture alpha as transparency (cutout + soft blend)
+bool showMinimapObjects = true;         // draw static-object dots on the mini-map (click one to select it)
 // Battlecraft bitmap brush shapes (brushes\*.bmp beside the exe) + a procedural "Radial" default at index 0.
 List<(string Name, BrushMask? Mask)> brushShapes = new() { ("Radial", null) };
 int brushShapeIdx = 0;
@@ -1129,7 +1123,7 @@ float skyRotDeg = 0f;                   // user yaw offset added to the level's 
 double appClock = 0;                    // seconds since launch, drives the water ripple animation
 bool showWater = true, showSky = true;  // Layers-panel toggles
 uint shadowTexId = 0;                   // (legacy) baked sun-shadow buffer for the TerrainShadow.dds export only
-bool showShadows = false;              // real-time sun shadow map toggle (OFF by default â€” no dark-by-default ground)
+bool showShadows = false;              // real-time sun shadow map toggle (OFF by default - no dark-by-default ground)
 // Real-time sun shadow map: a depth render of terrain + objects from the sun's POV, sampled by the terrain/object
 // shaders for live cast shadows that follow the controllable sun. Replaces the old baked .lsb display.
 uint shadowMapFbo = 0, shadowMapDepthTex = 0;
@@ -1155,7 +1149,7 @@ bool showMinimap = true;
 uint terrainTexId = 0;   // baked GPU terrain atlas (0 = none ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ height-ramp shading)
 
 uint objProg = 0;
-int uMvpO = -1, uModelO = -1, uColorO = -1, uLightO = -1, uUseTexO = -1, uAlphaTestO = -1, uTintO = -1;
+int uMvpO = -1, uModelO = -1, uColorO = -1, uLightO = -1, uUseTexO = -1, uAlphaTestO = -1, uAlphaEnableO = -1, uTintO = -1;
 GlObjects? glObjects = null;
 // Editable fog state (seeded from the level's Init.con; tweaked live in the Environment panel).
 bool fogEnabled = false; Vector3 fogColor = new(0.72f, 0.83f, 0.83f); float fogStart = 100f, fogEnd = 450f;
@@ -1164,7 +1158,7 @@ Vector3 waterColor = new(0.10f, 0.22f, 0.30f); float waterAlpha = 0.6f;   // wat
 Vector3 deepColor = new(0.16f, 0.35f, 0.55f);   // submerged-terrain tint (from the level's water.deepcolor)
 
 Camera cam = Camera.FrameAerial(cfg.WorldSize, (minH + maxH) * 0.5f, opts.Size.X / (float)opts.Size.Y);
-cam.MirrorX = true;   // no view reflection ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the native orientation already matches the game (left stays left)
+cam.MirrorX = true;   // no view reflection - the native orientation already matches the game (left stays left)
 // Movement speed and zoom step both scale with how high the camera is above the lowest terrain, so
 // navigation is fast at map-overview height and fine when zoomed in next to an object.
 float Altitude() => MathF.Max(8f, cam.Position.Y - minH);
@@ -1266,11 +1260,11 @@ const int mvSize = 512;                                // preview resolution
 string? dragTemplate = null;                          // template being drag-dropped from the library onto the map
 List<(string label, string[] items)> catalog = new();  // categories -> template names
 List<string> treeMeshNames = new();   // imported BF1942 treeMesh.rfa tree templates (render via the object pipeline)
-// Sentinel "templates" for the draggable Gameplay category Ã¢â‚¬â€ a drop with one of these creates a
+// Sentinel "templates" for the draggable Gameplay category - a drop with one of these creates a
 // gameplay spawn (control point / vehicle / soldier) instead of a static object.
-const string GpDragControlPoint = "Control Point";
-const string GpDragVehicle = "Vehicle Spawn";
-const string GpDragSoldier = "Soldier Spawn";
+const string GpDragControlPoint = "Control Point";
+const string GpDragVehicle = "Vehicle Spawn";
+const string GpDragSoldier = "Soldier Spawn";
 GpKind? GpKindForDrag(string t) => t == GpDragControlPoint ? GpKind.ControlPoint
                                  : t == GpDragVehicle ? GpKind.Vehicle
                                  : t == GpDragSoldier ? GpKind.Soldier : (GpKind?)null;
@@ -1474,7 +1468,8 @@ void OnLoad()
                 return;
             }
             // Active terrain stroke: keep stamping the brush under the cursor as it drags.
-            if (stroke is not null && terrainPick is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            if (stroke is not null && terrainPick is not null
+                && (mouse!.IsButtonPressed(MouseButton.Left) || (activeStrokeDir < 0 && mouse!.IsButtonPressed(MouseButton.Right))))
             {
                 var fb = window.FramebufferSize;
                 var ray = Picking.ScreenToRay(cam, pos.X, pos.Y, fb.X, fb.Y);
@@ -1532,6 +1527,18 @@ void OnLoad()
         };
         mouse.MouseUp += (_, btn) =>
         {
+            // L/R sculpt: a RIGHT-button lower stroke commits on right-up (mirrors the left terrain-stroke commit below).
+            if (btn == MouseButton.Right && stroke is not null && activeStrokeDir < 0)
+            {
+                var redit = stroke.Finish(); stroke = null; activeStrokeDir = 0;
+                if (redit is not null && heightmap is not null)
+                {
+                    if (hist is not null) hist.Do(new TerrainStrokeCommand(redit, heightmap, RebuildTerrain));
+                    else RebuildTerrain();
+                }
+                terrainDirty = false;
+                return;
+            }
             if (btn != MouseButton.Left) return;
             // Release a road-point drag (the points are pre-stamp scratch state; Stamp is the undoable act).
             if (roadDragIdx >= 0) { roadDragIdx = -1; return; }
@@ -1565,7 +1572,7 @@ void OnLoad()
             // Finish a terrain stroke: coalesce into one edit and push it onto the shared undo stack.
             if (stroke is not null)
             {
-                var edit = stroke.Finish(); stroke = null;
+                var edit = stroke.Finish(); stroke = null; activeStrokeDir = 0;
                 if (edit is not null && heightmap is not null)
                 {
                     if (hist is not null) hist.Do(new TerrainStrokeCommand(edit, heightmap, RebuildTerrain));
@@ -1673,9 +1680,19 @@ void OnLoad()
         mouse.MouseDown += (_, btn) =>
         {
             if (UiWantsMouse()) return;                 // clicking a panel shouldn't select in the viewport
-            if (btn != MouseButton.Left) return;
             var fb = window.FramebufferSize;
             var ray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fb.X, fb.Y);
+            // L/R sculpt option: the RIGHT button begins a LOWER stroke in Sculpt mode (otherwise right = camera orbit).
+            if (lrSculpt && btn == MouseButton.Right && toolNames[tool] == "Sculpt"
+                && terrainEd is not null && terrainPick is not null && terrainPick.Raycast(ray, out var rLowHit))
+            {
+                activeStrokeDir = -1;
+                stroke = terrainEd.BeginStroke();
+                stroke.Dab(rLowHit.X, rLowHit.Z, MakeBrush());
+                terrainDirty = true;
+                return;
+            }
+            if (btn != MouseButton.Left) return;
 
             // Measure tool: each left-click drops a terrain point (Esc clears / exits).
             if (measureMode && terrainPick is not null && terrainPick.Raycast(ray, out var mpt))
@@ -1747,6 +1764,7 @@ void OnLoad()
                 && terrainEd is not null && terrainPick is not null && terrainPick.Raycast(ray, out var thit))
             {
                 stroke = terrainEd.BeginStroke();
+                activeStrokeDir = (lrSculpt && toolNames[tool] == "Sculpt") ? 1 : 0;   // left = raise when the L/R option is on
                 stroke.Dab(thit.X, thit.Z, MakeBrush());
                 terrainDirty = true;
                 return;
@@ -1877,7 +1895,7 @@ void OnLoad()
             // Otherwise: select. Shift toggles membership; a plain click replaces the selection.
             gpIndex = -1;                                   // leaving gameplay selection
             if (markers.Length == 0) return;
-            // Pick on the object's actual geometry (ray vs each mesh's transformed bounding box) Ã¢â‚¬â€ clicks
+            // Pick on the object's actual geometry (ray vs each mesh's transformed bounding box) - clicks
             // land on what you see. Fall back to a screen-space marker pick, then a world-space ray sphere.
             int hit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
             if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, 18f);
@@ -1905,7 +1923,7 @@ void OnLoad()
     }
     if (kb is not null) kb.KeyDown += OnKeyDown;
 
-    // Dear ImGui editor UI ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â renders into this same GL context/window each frame.
+    // Dear ImGui editor UI - renders into this same GL context/window each frame.
     imgui = new ImGuiController(gl, window, input);
     try { ClipboardBridge.Install(); } catch { }   // Ctrl+C/V in text boxes -> OS clipboard (e.g. paste a collab IP)
     ApplyTheme();
@@ -1925,7 +1943,7 @@ void OnLoad()
     RebuildCatalog();
 
     // One-time diagnostic: list placed objects that can't resolve a mesh (they render as amber diamonds), and
-    // WHY Ã¢â‚¬â€ distinguishes a genuinely missing asset (load the right .rfa) from a .sm we can't parse.
+    // WHY - distinguishes a genuinely missing asset (load the right .rfa) from a .sm we can't parse.
     if (meshLib is not null && so is not null)
     {
         var unresolved = so.Objects
@@ -2100,7 +2118,7 @@ void OnLoad()
         gl.EnableVertexAttribArray(0);
     }
 
-    // Indicator diamond (octahedron) for mesh-less objects Ã¢â‚¬â€ drawn lit via objProg so it reads as a real
+    // Indicator diamond (octahedron) for mesh-less objects - drawn lit via objProg so it reads as a real
     // 3D marker. Unit shape; scaled to a few metres at draw time. 6 verts, 8 triangular faces.
     {
         var diaV = new (float x, float y, float z)[]
@@ -2234,6 +2252,7 @@ void OnLoad()
         uLightO = gl.GetUniformLocation(objProg, "uLightDir");
         uUseTexO = gl.GetUniformLocation(objProg, "uUseTex");
         uAlphaTestO = gl.GetUniformLocation(objProg, "uAlphaTest");
+        uAlphaEnableO = gl.GetUniformLocation(objProg, "uAlphaEnable");
         uTintO = gl.GetUniformLocation(objProg, "uTint");
         uUseShadowMapO = gl.GetUniformLocation(objProg, "uUseShadowMap");
         uLightSpaceO = gl.GetUniformLocation(objProg, "uLightSpace");
@@ -2242,14 +2261,14 @@ void OnLoad()
         gl.Uniform1(gl.GetUniformLocation(objProg, "uLightmap"), 1);     // object lightmap -> texture unit 1
         gl.Uniform1(gl.GetUniformLocation(objProg, "uShadowMap"), 2);    // sun shadow map -> texture unit 2
         glObjects = GlObjects.Build(gl, so, meshLib);
-        // Object lightmaps are matched lazily (EnsureObjectLightmaps) the first time the layer is enabled â€” keeps load fast.
+        // Object lightmaps are matched lazily (EnsureObjectLightmaps) the first time the layer is enabled - keeps load fast.
         SyncMarkers(); // recompute mesh-less markers now that the library is known
         Console.WriteLine($"Object meshes: {glObjects.TemplateCount} templates, {glObjects.InstanceCount} instances, {glObjects.TextureCount} textures; {pointMarkers.Length} mesh-less markers.");
     }
     LoadOvergrowthSettings();   // restore the per-map overgrowth overlay config (spacing + on/off), if saved
     RefreshTextureLibrary();    // scan the bundled/user Texture Library folder for the Surface painter + Layer Tool
     // Seed the sun azimuth/elevation from the level's SkyAndSun.con so manual sun control starts where the level is,
-    // and flag the real-time shadow map for a first render. (No baked .lsb auto-load â€” that darkened the whole ground.)
+    // and flag the real-time shadow map for a first render. (No baked .lsb auto-load - that darkened the whole ground.)
     { var s0 = EffectiveSun(); sunElevationDeg = MathF.Asin(Math.Clamp(s0.Y, -1f, 1f)) * 180f / MathF.PI; sunAzimuthDeg = MathF.Atan2(s0.X, s0.Z) * 180f / MathF.PI; }
     shadowMapDirty = true;
     UploadMarkers();
@@ -2314,6 +2333,15 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.F6: SetMapper(5); return;
         case Key.S: if (ctrl) { DoSave(); return; } break;
         case Key.L: if (ctrl) { DoTestLevel(); return; } break;
+    }
+    // Camera bookmarks: Ctrl+1..9 saves the current view to a slot; 1..9 (no Ctrl) flies back to it. Works any time.
+    int bmSlot = key switch { Key.Number1 => 0, Key.Number2 => 1, Key.Number3 => 2, Key.Number4 => 3, Key.Number5 => 4,
+                              Key.Number6 => 5, Key.Number7 => 6, Key.Number8 => 7, Key.Number9 => 8, _ => -1 };
+    if (bmSlot >= 0)
+    {
+        if (ctrl) { camBookmarks[bmSlot] = (cam.Position, cam.Yaw, cam.Pitch); Toast($"Saved camera bookmark {bmSlot + 1}"); }
+        else if (camBookmarks[bmSlot] is { } bm) { cam.Position = bm.pos; cam.Yaw = bm.yaw; cam.Pitch = bm.pitch; Toast($"Camera bookmark {bmSlot + 1}"); }
+        return;
     }
     if (hist is null || so is null) return;
     // Arrow keys nudge the selected object(s): FINE by default (0.5 m / 3°), COARSE with Shift (one terrain sample / 15°).
@@ -2420,7 +2448,7 @@ void BuildGrid()
     float seg = MathF.Max(cfg.HorizontalSpacing, ws / 512f);   // drape step; caps each line at ~512 samples
     // Lift the lines just off the surface -- enough to beat z-fighting, small enough to read as ON the ground
     // (was ~0.6 m on Irving, which floated). Scales a touch with cell size so coarse big-map grids still clear.
-    float bias = MathF.Max(0.04f, gridStep * 0.01f);
+    float bias = MathF.Max(0.15f, gridStep * 0.02f);
     int est = (int)((ws / gridStep + 1) * (ws / seg + 1) * 12) + 64;   // pre-size to avoid repeated List growth
     var verts = new List<float>(Math.Clamp(est, 8192, 24_000_000));
     void Drape(bool alongX, float fixedC)
@@ -2707,7 +2735,7 @@ void DrawGridLabels()
 }
 
 // True when a world point sits past the fog's far plane, so its marker / ring / link / label should be skipped
-// (matches the terrain + water fade â€” distant overlays shouldn't float in the haze). Fog off => nothing culled.
+// (matches the terrain + water fade - distant overlays shouldn't float in the haze). Fog off => nothing culled.
 bool FogCulled(Vector3 w) => fogEnabled && Vector3.Distance(cam.Position, w) > fogEnd;
 
 // The team that actually owns a vehicle spawner (1 = Axis/NVA, 2 = Allies/US), from its owning control point (matched by
@@ -2801,7 +2829,7 @@ void DrawGameplay()
         gl.DrawArrays(PrimitiveType.Points, 0, (uint)pts.Count);
     }
 
-    // Draw a batch of line segments (pairs of endpoints) in one colour â€” used for the spawn->control-point links.
+    // Draw a batch of line segments (pairs of endpoints) in one colour - used for the spawn->control-point links.
     void Links(System.Collections.Generic.List<Vector3> segs, float r, float g, float b)
     {
         if (segs.Count < 2) return;
@@ -3099,7 +3127,7 @@ void WeatherRespawn(int i, float camX, float camZ, float vtop, float vbot, bool 
     float R() => (float)(weatherRng.NextDouble() * 2.0 - 1.0);
     if (k == RefractorForge.Formats.Con.WeatherType.DustStorm)
     {
-        // Ground-hugging sheets blowing sideways (no real fall) â€” sit just above the terrain under the cursor box.
+        // Ground-hugging sheets blowing sideways (no real fall) - sit just above the terrain under the cursor box.
         float x = camX + R() * half, z = camZ + R() * half;
         float g = terrainPick is not null ? terrainPick.HeightAt(x, z) : cam.Position.Y - 30f;
         weatherPos[i] = new Vector3(x, g + 0.5f + (float)weatherRng.NextDouble() * 6f, z);
@@ -3251,7 +3279,7 @@ unsafe void DrawEffects()
     gl.DepthMask(false);
     gl.BindVertexArray(effectVao);
     gl.BindBuffer(BufferTargetARB.ArrayBuffer, effectVbo);
-    // beyond the fog end nothing is visible (the shader fades to 0 there) â€” skip those instances entirely.
+    // beyond the fog end nothing is visible (the shader fades to 0 there) - skip those instances entirely.
     float fogCull = fogEnabled ? fogEnd : float.MaxValue;
     var camp = cam.Position;
     // 6 verts/particle * 8 floats (center3 + corner2 + size + alpha + rot). Reused scratch grows as needed.
@@ -3382,7 +3410,7 @@ void DrawGizmos()
         gl.Uniform3(uColor, act == 1 ? 1f : 0.80f, act == 1 ? 0.95f : 0.25f, act == 1 ? 0.35f : 0.25f); gl.DrawArrays(PrimitiveType.LineLoop, 1 * N, (uint)N);  // pitch(X)
         gl.Uniform3(uColor, act == 2 ? 0.50f : 0.28f, act == 2 ? 0.75f : 0.42f, act == 2 ? 1f : 0.92f); gl.DrawArrays(PrimitiveType.LineLoop, 2 * N, (uint)N);  // roll (Z)
     }
-    else // Scale ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â single uniform handle at the object (grab near it on screen, drag radially)
+    else // Scale - single uniform handle at the object (grab near it on screen, drag radially)
     {
         float[] one = { gp.X, gp.Y, gp.Z };
         gl.BindVertexArray(gizmoVao);
@@ -3415,7 +3443,7 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? BakeShadowLsb()
     return TerrainShadow.BakeToLsb(heightmap, cfg, sun, gridDim, flipX: shadowLsbFlipX, flipY: shadowLsbFlipY);
 }
 
-// The painted terrain atlas as in-memory txCxR.dds tile bytes (uncompressed BGRA DDS â€” the engine form).
+// The painted terrain atlas as in-memory txCxR.dds tile bytes (uncompressed BGRA DDS - the engine form).
 // Used to inject painted surfaces into an .rfa save via extraFiles (folder saves write the same tiles straight
 // to disk in SaveTextureTiles). Names are the bare leaf (tx{col}x{row}.dds); LevelSaver.FindEntry matches them
 // to the archive's existing Textures/ entries. SplitToTiles only re-emits tiles that already exist, so every
@@ -3449,7 +3477,7 @@ void DoTestLevel()
         }
     }
     catch { }
-    if (gameRoot is null) { Toast("Couldn't find the game install (no Mods\\ ancestor) â€” launch the game yourself."); return; }
+    if (gameRoot is null) { Toast("Couldn't find the game install (no Mods\\ ancestor) - launch the game yourself."); return; }
     string exe = Path.Combine(gameRoot, gameIsBf1942 ? "BF1942.exe" : "BfVietnam.exe");
     if (!File.Exists(exe)) { Toast($"Game exe not found: {Path.GetFileName(exe)} in {gameRoot}."); return; }
     try
@@ -3462,12 +3490,52 @@ void DoTestLevel()
     catch (Exception ex) { Toast("Launch failed: " + ex.Message); }
 }
 
+// Auto-backup: before a save overwrites the level, copy the editable level files (or the whole .rfa) to a
+// timestamped Backups\ folder next to the level. Folder levels skip bulky textures (.dds). Best-effort; a
+// backup failure never blocks the save.
+void AutoBackup()
+{
+    if (!autoBackup || string.IsNullOrEmpty(levelDir)) return;
+    try
+    {
+        string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        if (LevelArchive.IsRfa(levelDir))
+        {
+            var dir = Path.GetDirectoryName(levelDir) ?? ".";
+            var bdir = Path.Combine(dir, "Backups"); Directory.CreateDirectory(bdir);
+            var dst = Path.Combine(bdir, $"{Path.GetFileNameWithoutExtension(levelDir)}_{stamp}{Path.GetExtension(levelDir)}");
+            if (!File.Exists(dst)) File.Copy(levelDir, dst);
+            Console.WriteLine($"Auto-backup -> {dst}");
+            Toast($"Backed up {Path.GetFileName(levelDir)}");
+        }
+        else if (Directory.Exists(levelDir))
+        {
+            var root = levelDir.TrimEnd('\\', '/');
+            var name = new DirectoryInfo(root).Name;
+            var bdir = Path.Combine(Path.GetDirectoryName(root) ?? root, "Backups", $"{name}_{stamp}");
+            int n = 0;
+            foreach (var src in Directory.EnumerateFiles(levelDir, "*.*", SearchOption.AllDirectories))
+            {
+                var ext = Path.GetExtension(src).ToLowerInvariant();
+                if (ext is not (".con" or ".raw" or ".wst" or ".lsb" or ".ssc" or ".pal")) continue;   // editable level data only
+                var rel = Path.GetRelativePath(levelDir, src);
+                var dst = Path.Combine(bdir, rel);
+                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                File.Copy(src, dst, true); n++;
+            }
+            if (n > 0) { Console.WriteLine($"Auto-backup: {n} level file(s) -> {bdir}"); Toast($"Backed up {n} level file(s)"); }
+        }
+    }
+    catch (Exception ex) { Console.WriteLine($"Auto-backup skipped: {ex.Message}"); }
+}
+
 void DoSave()
 {
     if (so is null) return;
+    AutoBackup();
 
     // Re-emit the painted terrain texture as txCxR.dds tiles (split the atlas back into the level's tile grid,
-    // uncompressed DDS â€” the form the engine reads, same as the generated minimap). Folder levels only for now.
+    // uncompressed DDS - the form the engine reads, same as the generated minimap). Folder levels only for now.
     void SaveTextureTiles()
     {
         if (!atlasPainted || atlasCpu is null || terrainTex is null) return;
@@ -3507,7 +3575,7 @@ void DoSave()
         if (DetailDdsBytes() is { } detd) { try { var tdir = texturesDir ?? System.IO.Path.Combine(levelDir, "Textures"); System.IO.Directory.CreateDirectory(tdir); System.IO.File.WriteAllBytes(System.IO.Path.Combine(tdir, detd.Name), detd.Bytes); Console.WriteLine("   Wrote Textures/detail.dds (imported detail texture)."); } catch (Exception ex) { Console.WriteLine($"   detail.dds save failed: {ex.Message}"); } }
         ApplyWeatherToLevel();   // write Effects/RF_Weather.con + texture + Init run-include if weather is enabled
         SaveCloudsFolder();      // patch the animated-cloud block into SkyAndSun.con if clouds were edited
-        // Write every vehicle whose navmap was painted (each buffer is held independently in aiNavBufs â€” no
+        // Write every vehicle whose navmap was painted (each buffer is held independently in aiNavBufs - no
         // save-first / no reseed loss). Each buffer carries its own side, robust to a mid-session map resize.
         int navVeh = 0, navFiles = 0;
         for (int v = 0; v < aiNavBufs.Length; v++)
@@ -3671,7 +3739,7 @@ void DoGenerateMinimap()
 // carved out + brush clearance; passable=0x00/black, blocked=0xFF/white; land=levels 0-2, water=2-5). Folder
 // levels: written into Pathfinding/. Packed .rfa: written to a loose <name>_Pathfinding folder beside the archive.
 // NOTE: the per-vehicle companions <Veh>.raw (128^2 region map) + <Veh>Info.raw (SAI region graph) are NOT yet
-// written (see pathfinding-re-map memory) â€” pathfinding A* uses the Level maps; companions are SAI-only.
+// written (see pathfinding-re-map memory) - pathfinding A* uses the Level maps; companions are SAI-only.
 void DoGenerateNavmaps()
 {
     if (heightmap is null) return;
@@ -3719,7 +3787,7 @@ void DoGenerateSurfaceMaps()
     Toast("Baked surface atlas from the material map + set. Ctrl+S writes the tiles.");
 }
 
-// Convert a single TGA to an uncompressed BGRA DDS the game reads â€” a built-in modern TGA->DDS converter (BF texture
+// Convert a single TGA to an uncompressed BGRA DDS the game reads - a built-in modern TGA->DDS converter (BF texture
 // work historically needed an external tool). Reuses the proven TgaTexture decoder + DdsTexture uncompressed writer.
 void DoConvertTgaToDds()
 {
@@ -3834,7 +3902,7 @@ Matrix4x4 ComputeLightSpace(Vector3 sun, Vector3 focus, float radius)
 }
 
 // Render the terrain + nearby objects into the shadow map from the sun's POV (depth only), centred on `focus` with
-// half-extent `radius`. Re-run only when the sun, geometry, or the focus/zoom changed â€” not every frame.
+// half-extent `radius`. Re-run only when the sun, geometry, or the focus/zoom changed - not every frame.
 unsafe void RenderShadowMap(Vector3 sun, Vector3 focus, float radius)
 {
     if (heightmap is null || terrainVao == 0 || depthProg == 0) return;
@@ -3851,7 +3919,7 @@ unsafe void RenderShadowMap(Vector3 sun, Vector3 focus, float radius)
     gl.BindVertexArray(terrainVao);
     gl.DrawElements(PrimitiveType.Triangles, (uint)terrainIndexCount, DrawElementsType.UnsignedInt, (void*)0);
     // Objects: record BACK-face depth only (cull front faces). A solid building's lit FRONT faces then sit in front of
-    // the stored shadow depth, so they stop shadowing themselves â€” this kills the "shadows on top of the building" acne
+    // the stored shadow depth, so they stop shadowing themselves - this kills the "shadows on top of the building" acne
     // without the heavy bias that would detach shadows. (Terrain keeps both faces above; it's a single-sided surface.)
     gl.Enable(EnableCap.CullFace);
     gl.CullFace(TriangleFace.Front);
@@ -3981,7 +4049,7 @@ void Toast(string msg) { toastText = msg; toastT = 4.5f; Console.WriteLine(msg);
 
 // Import a Heightmap.raw (headerless 16-bit LE square grid) over the current terrain. Bilinearly resampled to the
 // level's materialSize if it differs, then copied IN PLACE so the existing TerrainPick / TerrainEditor keep working.
-// Not part of object undo Ã¢â‚¬â€ it's a fresh terrain baseline (re-import the original .raw to revert).
+// Not part of object undo - it's a fresh terrain baseline (re-import the original .raw to revert).
 // The side length of a headerless 16-bit square .raw (sqrt of its sample count), or null if the file isn't a
 // perfect square of 16-bit samples. Used by the New Map import to auto-match the grid size and validate the pick.
 int? RawSquareSide(string path)
@@ -4561,7 +4629,7 @@ void LayerToolWindow()
 }
 
 // ---- Detail texture (BF detailTexName): a fine tiling overlay multiplied over the base atlas up close. There was
-// no import path before â€” only levels that already shipped Textures/detail.dds got one. ----
+// no import path before - only levels that already shipped Textures/detail.dds got one. ----
 void ImportDetailTexture()
 {
     if (terrainTex is null) { Toast("No terrain texture in this level to attach detail to."); return; }
@@ -4579,21 +4647,21 @@ void ImportDetailTexture()
     detailImported = true;
     Toast($"Detail texture <- {Path.GetFileName(f)} ({tx.Width}x{tx.Height})");
 }
-// Let the user supply the scrolling water textures manually â€” for maps that REFERENCE water.texLayer1/2 but don't ship
+// Let the user supply the scrolling water textures manually - for maps that REFERENCE water.texLayer1/2 but don't ship
 // the files (most stock BF1942 maps use engine-built-in water07/08 absent from the .rfa). Picks diffuse layer 1, then
 // optional layer 2 + normal map, uploads them tiled, and flips the water plane to the textured path.
 void ImportWaterTextures()
 {
     // The water draw only takes the textured path when env is non-null (it reads scroll/tile from env). env is null only
-    // on the demo-terrain fallback (no level loaded), where imported water textures would silently never render â€” guard it.
+    // on the demo-terrain fallback (no level loaded), where imported water textures would silently never render - guard it.
     if (env is null) { Toast("Load a level first, then import water textures."); return; }
     var f1 = Picker.File("Water DIFFUSE layer 1 (.dds / .tga / .png / .bmp)", "Images|*.dds;*.tga;*.bmp;*.png;*.jpg|All files|*.*", null);
     if (f1 is null) return;
     var t1 = LoadImageAsTexture(f1);
     if (t1 is null) { Toast($"Couldn't load {Path.GetFileName(f1)}."); return; }
-    var f2 = Picker.File("Water DIFFUSE layer 2 (optional â€” Cancel to reuse layer 1)", "Images|*.dds;*.tga;*.bmp;*.png;*.jpg|All files|*.*", null);
+    var f2 = Picker.File("Water DIFFUSE layer 2 (optional - Cancel to reuse layer 1)", "Images|*.dds;*.tga;*.bmp;*.png;*.jpg|All files|*.*", null);
     var t2 = f2 is not null ? LoadImageAsTexture(f2) : null;
-    var fn = Picker.File("Water NORMAL map (optional â€” Cancel for none)", "Images|*.dds;*.tga;*.bmp;*.png;*.jpg|All files|*.*", null);
+    var fn = Picker.File("Water NORMAL map (optional - Cancel for none)", "Images|*.dds;*.tga;*.bmp;*.png;*.jpg|All files|*.*", null);
     var tn = fn is not null ? LoadImageAsTexture(fn) : null;
     if (waterTex1 != 0) { gl.DeleteTexture(waterTex1); waterTex1 = 0; }
     if (waterTex2 != 0) { gl.DeleteTexture(waterTex2); waterTex2 = 0; }
@@ -4663,6 +4731,8 @@ string SanitizeTemplate(string raw)
 BrushMode CurBrushMode()
 {
     if (toolNames[tool] == "Smooth") return BrushMode.Smooth;
+    if (activeStrokeDir > 0) return BrushMode.Raise;     // L/R-button sculpt stroke overrides the Mode combo
+    if (activeStrokeDir < 0) return BrushMode.Lower;
     var m = sculptModes[Math.Clamp(sculptModeIdx, 0, sculptModes.Length - 1)];
     bool shift = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
     if (shift) { if (m == BrushMode.Raise) m = BrushMode.Lower; else if (m == BrushMode.Lower) m = BrushMode.Raise; }
@@ -4686,6 +4756,20 @@ MaterialBrush MakeMatBrush()
 {
     var shape = brushShapes[Math.Clamp(brushShapeIdx, 0, brushShapes.Count - 1)].Mask;
     return new MaterialBrush(ActivePaintValue(), brushRadius, matHardness, BrushFalloff.Smooth, shape, squareBrush && shape is null);
+}
+
+// Mod-aware vehicle list for the spawn dropdown: the vehicles actually present in the loaded mod (meshLib's assembled
+// vehicle folders), cached per mesh library; falls back to the built-in catalog when nothing's loaded.
+string[] VehicleChoices()
+{
+    if (meshLib is null) return vehicleCatalog;
+    if (!ReferenceEquals(vehCacheFor, meshLib))
+    {
+        vehCacheFor = meshLib;
+        try { var v = meshLib.AssembledTemplateNames.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToArray(); vehCacheList = v.Length > 0 ? v : vehicleCatalog; }
+        catch { vehCacheList = vehicleCatalog; }
+    }
+    return vehCacheList ?? vehicleCatalog;
 }
 
 // Geometry is unchanged by a move, so just recompute the placement matrices (cheap, no re-upload).
@@ -4757,7 +4841,7 @@ void DropSelectedToGround()
 }
 
 // Add/delete shifts object indices, so the per-template instance lists are re-resolved. First time = a full Build;
-// thereafter rebuild IN PLACE (reusing cached GPU templates) so an edit doesn't re-upload every mesh â€” this is what
+// thereafter rebuild IN PLACE (reusing cached GPU templates) so an edit doesn't re-upload every mesh - this is what
 // kept collaborative edits (and their local echo through the relay) from stalling the editor for seconds.
 void RebuildObjects()
 {
@@ -4770,9 +4854,9 @@ void RebuildObjects()
 }
 
 // Bake a per-object lightmap for every placed object that carries lightmap UVs, from the CURRENT editor sun: ambient +
-// sun NÂ·L Ã— terrain cast-shadow, rendered into each object's lightmap-UV atlas (ObjectLightmapBaker). Shows the result
+// sun N-L Ã— terrain cast-shadow, rendered into each object's lightmap-UV atlas (ObjectLightmapBaker). Shows the result
 // immediately AND queues the .tga files so a Save writes them into the level (the engine then reads them). This is the
-// object half of "bake lighting to the game"; the terrain half is the .lsb (File â–¸ Write LightmapShadowBits on Save).
+// object half of "bake lighting to the game"; the terrain half is the .lsb (File > Write LightmapShadowBits on Save).
 void BakeObjectLightmaps()
 {
     if (so is null || meshLib is null || heightmap is null) { Toast("Load a level with terrain first."); return; }
@@ -4964,6 +5048,11 @@ void OnRender(double dt)
 
     DrawGrid();   // draped world-grid overlay (depth-tested, on the ground), if enabled
 
+    // Texture transparency: blend object + foliage alpha (the shader's alpha-test discard does the hard cutout,
+    // blending softens the edges). Opaque parts output alpha=1.0 so they're unaffected.
+    if (alphaTransparency) { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
+    gl.UseProgram(objProg); gl.Uniform1(uAlphaEnableO, alphaTransparency ? 1 : 0);   // toggle off -> no discard + opaque output (objects revert to solid)
+
     // Real object geometry (GPU). Selected object is tinted via the highlight colour.
     if (glObjects is not null && showObjects && !painting)
     {
@@ -4973,7 +5062,7 @@ void OnRender(double dt)
         gl.Uniform1(uUseShadowMapO, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
         unsafe { var lso = lightSpace; gl.UniformMatrix4(uLightSpaceO, 1, false, (float*)&lso); }
         if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
-        // Baked object lighting unless you're driving the sun manually â€” then objects light DYNAMICALLY (NÂ·L + the
+        // Baked object lighting unless you're driving the sun manually - then objects light DYNAMICALLY (N-L + the
         // real-time shadow map) so they respond to the sun in real time (a static baked lightmap can't move with it).
         bool wantLm = showObjectLightmaps && !sunOverride;
         if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
@@ -5074,7 +5163,8 @@ void OnRender(double dt)
                             foreach (var p in fpos0) { flo = Vector3.Min(flo, p); fhi = Vector3.Max(fhi, p); }
                             const float hoistInset = 0.4f;    // forward: pull the hoist edge toward the pole so the cloth touches it
                             const float flagLateral = 0.4f;   // "right": shift the flag laterally (Z) to line up with the pole (flip sign if it goes the wrong way)
-                            var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset, cp.Position.Y + poleTopY + flo.Y, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
+                            const float flagRise = 0.8f;      // lift the cloth ~2.5 ft up the pole (user request)
+                            var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
                             DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f));
                         }
                     }
@@ -5099,6 +5189,8 @@ void OnRender(double dt)
                                   cam.ViewProjection, cam.Position, cull);
         }
     }
+
+    if (alphaTransparency) gl.Disable(EnableCap.Blend);   // restore opaque state; water sets its own blend below
 
     // Water surface: translucent plane at the level's water height, blended over terrain + objects
     // (depth-test on so submerged terrain still occludes it, depth-write off so it doesn't occlude).
@@ -5195,7 +5287,7 @@ void OnRender(double dt)
         {
             var col = peerColors[pidx++ % peerColors.Length];
             gl.Uniform3(uColorO, col.X, col.Y, col.Z);
-            // The diamond is yaw-rotated so its long (forward) axis aims along the peer's heading â€” paired with the
+            // The diamond is yaw-rotated so its long (forward) axis aims along the peer's heading - paired with the
             // pointer line below this makes the look direction obvious to everyone collaborating.
             void PeerDiamond(Vector3 at, float scale, float heading)
             {
@@ -5205,12 +5297,12 @@ void OnRender(double dt)
                 var mvpM = world * cam.ViewProjection; var modelM = world;
                 unsafe { gl.UniformMatrix4(uMvpO, 1, false, (float*)&mvpM); gl.UniformMatrix4(uModelO, 1, false, (float*)&modelM); gl.DrawElements(PrimitiveType.Triangles, (uint)indicatorCount, DrawElementsType.UnsignedInt, (void*)0); }
             }
-            // The "person" diamond floating at the peer's camera Ã¢â‚¬â€ screen-constant size (this one's the keeper).
+            // The "person" diamond floating at the peer's camera - screen-constant size (this one's the keeper).
             var cur = new Vector3(peer.Cursor.X, peer.Cursor.Y, peer.Cursor.Z);
             float ds = Math.Clamp(Vector3.Distance(cam.Position, cur) * 0.012f, 1.5f, 14f);
             PeerDiamond(cur, ds, peer.Heading);
             pointers.Add((cur, peer.Heading, col, ds));
-            // The marker over the object they have selected Ã¢â‚¬â€ same screen-constant sizing as the person, 20% bigger.
+            // The marker over the object they have selected - same screen-constant sizing as the person, 20% bigger.
             if (peer.SelectionId != "-" && so is not null && so.FindById(peer.SelectionId) is { } po)
             {
                 var pp = new Vector3(po.Position.X, po.Position.Y + 4f, po.Position.Z);
@@ -5445,13 +5537,13 @@ List<(string label, string[] items)> LoadCatalog()
         var present = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // normKey -> display name
         void Add(string name) { var k = Stem(name).ToLowerInvariant(); if (!present.ContainsKey(k)) present[k] = Stem(name); }
         foreach (var bn in meshLib.MeshBaseNames) Add(bn);
-        // Vehicles/weapons by their real name (folder). List them ALL â€” some BFV stationary weapons (Browning,
+        // Vehicles/weapons by their real name (folder). List them ALL - some BFV stationary weapons (Browning,
         // Coaxial_Browning, StationaryFreePosition) have no standalone body mesh in the archives and render as a
         // marker, but the user still wants them in the list. (AI/ sub-folder phantoms are excluded upstream in
         // AssembledTemplateNames.)
         foreach (var v in meshLib.AssembledTemplateNames) present[v.ToLowerInvariant()] = v;
 
-        // BFV objcatalog reverse map Ã¢â‚¬â€ fallback for objects with no archive-folder category.
+        // BFV objcatalog reverse map - fallback for objects with no archive-folder category.
         var labelOf = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (dict is not null)
             foreach (var (key, label) in order)
@@ -5465,7 +5557,7 @@ List<(string label, string[] items)> LoadCatalog()
         foreach (var kv in present)
         {
             // Assembled names keep their LOD suffix in the present-key, but the category maps are keyed by the
-            // STEMMED name â€” so try the stem too, else e.g. "Stationary_M60" misses its "Stationary Weapons" slot.
+            // STEMMED name - so try the stem too, else e.g. "Stationary_M60" misses its "Stationary Weapons" slot.
             var lk = Stem(kv.Value).ToLowerInvariant();
             string label = cats.TryGetValue(kv.Key, out var c) ? c
                          : cats.TryGetValue(lk, out var c2) ? c2
@@ -5788,7 +5880,7 @@ void Inspector()
                 ImGui.SameLine(); if (ImGui.Button("Layer Tool...")) { showLayerTool = true; RefreshTextureLibrary(); }
                 if (ImGui.Button("Fill terrain with this texture") && SurfPaintTex() is Texture2D ftx) FillTerrainWith(ftx, SurfPaintTile());
                 ImGui.Checkbox("Respect texture alpha (decal/splat)", ref surfUseAlpha);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Paint only where the source texture is opaque â€” for cut-out decals/splats.");
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Paint only where the source texture is opaque - for cut-out decals/splats.");
                 // ---- Detail texture (close-up tiling overlay, BF detailTexName) ----
                 ImGui.Separator();
                 if (ImGui.Button("Import detail texture...")) ImportDetailTexture();
@@ -5821,7 +5913,7 @@ void Inspector()
                 if (matPainter is null) { ImGui.TextWrapped("No material map in this level."); return; }
                 // Each material INDEX maps to a surface (matToSurf -> texPalette). Show the swatch as the ACTUAL
                 // surface colour + the surface name (in the editor's surfNames order) so the grid matches the ground
-                // and the on-map labels â€” the old matNames order was wrong (it mislabelled jungle grass as Wet Sand).
+                // and the on-map labels - the old matNames order was wrong (it mislabelled jungle grass as Wet Sand).
                 int hSlot = activeMaterial < matToSurf.Length ? (matToSurf[activeMaterial] & 15) : (activeMaterial & 15);
                 ImGui.Text($"Material #{activeMaterial}  {(hSlot < surfNames.Length ? surfNames[hSlot] : "")}");
                 // 16-swatch material palette (8 per row); click selects the active material index.
@@ -5850,7 +5942,7 @@ void Inspector()
             // Foliage layer (undergrowth/overgrowth): paint a discrete foliage value (0 clears).
             var pal = paintLayer == 1 ? growth?.UnderPalette : growth?.OverPalette;
             int gside = paintLayer == 1 ? (growth?.UnderSide ?? 0) : (growth?.OverSide ?? 0);
-            ImGui.TextColored(new Vector4(0.49f, 0.86f, 0.55f, 1f), $"{(paintLayer == 1 ? "Undergrowth" : "Overgrowth")} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {gside}x{gside}");
+            ImGui.TextColored(new Vector4(0.49f, 0.86f, 0.55f, 1f), $"{(paintLayer == 1 ? "Undergrowth" : "Overgrowth")} - {gside}x{gside}");
             ImGui.Text($"Foliage value #{activeFoliage}{(activeFoliage == 0 ? "  (clear)" : "")}");
             for (int i = 0; i < 16; i++)
             {
@@ -5880,6 +5972,7 @@ void Inspector()
         }
         if (terrainEd is null) { ImGui.TextDisabled("No terrain loaded."); return; }
         if (tn == "Sculpt") ImGui.Combo("Mode", ref sculptModeIdx, sculptModeLabels, sculptModeLabels.Length);
+        if (tn == "Sculpt") { ImGui.Checkbox("L/R mouse = raise / lower", ref lrSculpt); if (ImGui.IsItemHovered()) ImGui.SetTooltip("Left-drag raises, right-drag lowers the terrain (overrides the Mode above).\nWhile sculpting, right-drag won't orbit the camera."); }
         if (brushShapeNames.Length > 1) ImGui.Combo("Shape", ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
         // Falloff + the procedural square only apply to the radial brush; bitmap shapes carry their own edge.
         if (brushShapeIdx == 0) ImGui.Combo("Falloff", ref falloffIdx, falloffLabels, falloffLabels.Length);
@@ -5992,8 +6085,9 @@ void Inspector()
         {
             // Pick the vehicle from the catalog (current value appended if it's a custom/unlisted template),
             // or type a custom name in the field below.
-            var choices = vehicleCatalog.Contains(gpVehBuf) || string.IsNullOrEmpty(gpVehBuf)
-                ? vehicleCatalog : vehicleCatalog.Append(gpVehBuf).ToArray();
+            var cat = VehicleChoices();
+            var choices = cat.Contains(gpVehBuf) || string.IsNullOrEmpty(gpVehBuf)
+                ? cat : cat.Append(gpVehBuf).ToArray();
             int sel = Array.IndexOf(choices, gpVehBuf);
             if (ImGui.Combo("Vehicle", ref sel, choices, choices.Length) && sel >= 0 && hist is not null)
             {
@@ -6153,7 +6247,7 @@ void Inspector()
     }
 }
 
-// Layer visibility toggles ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â always shown at the bottom of the Inspector panel.
+// Layer visibility toggles - always shown at the bottom of the Inspector panel.
 // The resolved overgrowth scatter: the .wst geometry scattered per cell (OvergrowthFoliage.Scatter), each dropped
 // to ground height (skipping underwater) and kept only if its mesh resolves in the loaded library. SHARED by the
 // GL overlay AND the bake-to-.con export so they're identical. Empty if no overgrowth / mesh lib / terrain.
@@ -6171,7 +6265,7 @@ List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterOv
     return outp;
 }
 
-// Rebuild the overgrowth foliage overlay (a VIEW only â€” never saved as part of the level). Builds GL instances
+// Rebuild the overgrowth foliage overlay (a VIEW only - never saved as part of the level). Builds GL instances
 // from the shared resolved scatter and hands them to GlObjects.
 void BuildOvergrowthFoliage()
 {
@@ -6281,6 +6375,8 @@ void LayersPanel()
     ImGui.TextDisabled("LAYERS");
     ImGui.Checkbox("Terrain", ref showTerrain);
     ImGui.Checkbox("Static Objects", ref showObjects);
+    ImGui.Checkbox("Texture transparency", ref alphaTransparency);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque.");
     if (ImGui.Checkbox("Collision (wireframe)", ref showCollision) && showCollision) collisionDirty = true;
     ImGui.Checkbox($"Vehicles ({gameplayEdit.VehicleSpawns.Count})###vehLayer", ref showVehicles);
     ImGui.Checkbox($"Control Points ({gameplayEdit.ControlPoints.Count})###cpLayer", ref showControlPoints);
@@ -6324,13 +6420,13 @@ void LayersPanel()
     if (ImGui.Checkbox("Object Lightmaps", ref showObjectLightmaps) && showObjectLightmaps)
     {
         // Enabling it: decode now so we can tell the user when a level simply HAS no baked object lightmaps (e.g. the
-        // FHSW Tigerpass ships none â€” the base BF1942 Tigerpass has 80; the FHSW mapper just didn't bake them). Without
+        // FHSW Tigerpass ships none - the base BF1942 Tigerpass has 80; the FHSW mapper just didn't bake them). Without
         // this, the toggle silently does nothing and reads as broken. Point them at the bake tool.
         EnsureObjectLightmaps();
         if ((objectLightmaps?.Count ?? 0) == 0)
             Toast("This level has no baked object lightmaps. Use Tools > \"Bake Object Lightmaps (from sun)\" to generate them.");
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show the level's BAKED per-object lighting (ObjectLightMaps/*.tga or *.dds). Loaded on first\nenable (kept off the load path). If the level ships none (some custom/FHSW maps don't), bake them\nwith Tools > Bake Object Lightmaps. Ignored while you control the sun manually (objects then light\ndynamically: real-time NÂ·L + sun shadows, following the sun).");
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show the level's BAKED per-object lighting (ObjectLightMaps/*.tga or *.dds). Loaded on first\nenable (kept off the load path). If the level ships none (some custom/FHSW maps don't), bake them\nwith Tools > Bake Object Lightmaps. Ignored while you control the sun manually (objects then light\ndynamically: real-time N-L + sun shadows, following the sun).");
 
     // Weather (rain/snow/dust): a preview overlay + PLACEABLE emitters generated into the level on save.
     if (ImGui.Checkbox("Effects", ref showEffects) && showEffects)
@@ -6350,7 +6446,7 @@ void LayersPanel()
         SldI("Intensity/s", ref weatherIntensity, 20, 600);
         ImGui.SetNextItemWidth(150f);
         SldF("Wind", ref weatherWind, -10f, 10f, "%.1f");
-        // Place a weather emitter on the map (the normal Refractor way) â€” arms the Place tool with the bundle.
+        // Place a weather emitter on the map (the normal Refractor way) - arms the Place tool with the bundle.
         if (ImGui.Button("Place emitter")) ArmWeatherPlace();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Arms the Place tool with this weather emitter - click the map to drop it (shows as a marker; saves into StaticObjects.con).");
         ImGui.SameLine();
@@ -6485,7 +6581,7 @@ void SaveCloudsFolder()
             System.IO.File.WriteAllLines(skyPath, env.PatchSkyAndSunConLines(System.IO.File.ReadAllLines(skyPath)));
         else
         {
-            // No SkyAndSun.con to patch â€” write a fresh one under Init/.
+            // No SkyAndSun.con to patch - write a fresh one under Init/.
             var initDir = System.IO.Path.Combine(levelDir, "Init"); System.IO.Directory.CreateDirectory(initDir);
             System.IO.File.WriteAllLines(System.IO.Path.Combine(initDir, "SkyAndSun.con"), env.ToSkyAndSunConLines());
         }
@@ -6582,7 +6678,7 @@ void EnvironmentPanel()
     if (ImGui.DragFloat("Water level (m)", ref wl, 0.25f, -5000f, 5000f, "%.1f")) { cfg.WaterLevel = wl; waterLevelEdited = true; BroadcastWater(); }
     ImGui.SameLine();
     if (ImGui.SmallButton("Reset##wl") && env is not null) { cfg.WaterLevel = waterLevelLoaded; waterLevelEdited = false; BroadcastWater(); }
-    // Water surface colour + transparency, and the submerged-terrain (deep) tint Ã¢â‚¬â€ seeded from the level's
+    // Water surface colour + transparency, and the submerged-terrain (deep) tint - seeded from the level's
     // water.color / water.deepcolor / waterShallowAlpha.
     ImGui.ColorEdit3("Water colour", ref waterColor);
     ImGui.ColorEdit3("Deep colour", ref deepColor);
@@ -6655,7 +6751,7 @@ void EnvironmentPanel()
     }
     else if (skyMeshOk)
         ImGui.TextDisabled($"Skybox: {env?.SkyBoxMesh} (level mesh)");
-    else ImGui.TextDisabled("no cubemap faces found Ã¢â‚¬â€ procedural sun-sky");
+    else ImGui.TextDisabled("no cubemap faces found - procedural sun-sky");
     ImGui.SetNextItemWidth(150f);
     SldF("Sky rotation (deg)", ref skyRotDeg, -180f, 180f, "%.0f");
     if (ImGui.Button("Import skybox...")) ImportSkybox();
@@ -6710,7 +6806,7 @@ void OpenNewMap()
 }
 
 // Build the level folder from the dialog's settings, point Settings at it, and relaunch into the
-// normal startup load path (no in-process GL teardown Ã¢â‚¬â€ far simpler and can't half-initialise state).
+// normal startup load path (no in-process GL teardown - far simpler and can't half-initialise state).
 void DoCreateNewMap()
 {
     nmError = "";
@@ -6728,7 +6824,7 @@ void DoCreateNewMap()
         { nmError = $"'{name}' already exists and isn't empty."; return; }
 
         // Auto-fit yScale so the requested peak height is actually representable. A 16-bit sample caps at
-        // ~yScale*256 m, so with the default yScale 0.5 anything above ~128 m was silently clamped Ã¢â‚¬â€ which is
+        // ~yScale*256 m, so with the default yScale 0.5 anything above ~128 m was silently clamped - which is
         // why cranking the height range still looked flat. The user's yScale is kept as a floor.
         // Validate the heightmap pick up front (type 4) so we fail with a clear message before creating anything.
         if (nmTerrainType == 4 && (nmHeightmapPath.Trim().Length == 0 || !File.Exists(nmHeightmapPath.Trim())))
@@ -6796,14 +6892,14 @@ void OpenLevel()
         if (folder is not null) lvl = folder;
         else
         {
-            var rfas = Picker.Files("Select the level .rfa  (base + ANY patch .rfa together Ã¢â‚¬â€ Ctrl/Shift-click)", "RFA archives|*.rfa|All files|*.*", saved?.Level);
+            var rfas = Picker.Files("Select the level .rfa  (base + ANY patch .rfa together - Ctrl/Shift-click)", "RFA archives|*.rfa|All files|*.*", saved?.Level);
             if (rfas.Length == 0) return;   // cancelled - keep the current level
             lvlArchives = rfas; lvl = rfas[0];
         }
 
-        var mesh = Picker.Files("Select ALL mesh/object archives Ã¢â‚¬â€ standardMesh.rfa, objects.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
+        var mesh = Picker.Files("Select ALL mesh/object archives - standardMesh.rfa, objects.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
                                 "RFA archives|*.rfa|All files|*.*", (saved?.MeshArchives is { Length: > 0 } sm0 ? sm0[0] : saved?.StdMesh) ?? lvl);
-        var tex = Picker.Files("Select ALL texture archives Ã¢â‚¬â€ texture.rfa, texture_001.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
+        var tex = Picker.Files("Select ALL texture archives - texture.rfa, texture_001.rfa, patches (Ctrl/Shift-click). Cancel to skip.",
                                "RFA archives|*.rfa|All files|*.*", (saved?.Textures is { Length: > 0 } st ? st[0] : null) ?? lvl);
         Settings.Save(new LevelPaths(lvl, null, null,
             tex.Length > 0 ? tex : saved?.Textures,
@@ -6815,71 +6911,77 @@ void OpenLevel()
     catch (Exception ex) { Console.WriteLine($"Open level failed: {ex.Message}"); }
 }
 
-// Open a MOD: pick the mod folder (<Game>\Mods\<Mod>), then auto-collect the mod's Archives\*.rfa PLUS the base
-// game's Mods\bf1942|BfVietnam\Archives\*.rfa into the mesh + texture lists (mod archives FIRST so the mod wins â€”
-// MeshLibrary/TextureLibrary are first-wins), let the user pick a level from the mod, and relaunch into the
-// standard load path. Self-contained mods load fine; sub-mods inherit the base game's stock assets.
+// Pick a MOD folder (<Game>\Mods\<Mod>), then auto-collect the mod's Archives\*.rfa PLUS the base game's
+// Mods\bf1942|BfVietnam\Archives\*.rfa into the mesh + texture lists (mod archives FIRST so the mod wins -
+// MeshLibrary/TextureLibrary are first-wins), parse the init.con mount chain, and pick a level .rfa from the mod.
+// Shared by File > Open Mod (which then relaunches) and the first-run startup (which loads in place). Pure
+// path-gathering (no window/UI state) so it is safe to call before the GL window exists. Returns false if cancelled.
+bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] texList)
+{
+    lvlRfas = Array.Empty<string>(); meshList = Array.Empty<string>(); texList = Array.Empty<string>();
+    var saved = Settings.Load();
+    var modDir = Picker.Folder("Select the MOD folder  (e.g. ...\\Battlefield 1942\\Mods\\DesertCombat)", saved?.Level);
+    if (modDir is null) return false;
+    // gameRoot = the install dir (the parent of the Mods\ folder the mod lives under).
+    string? gameRoot = null;
+    for (var d = new DirectoryInfo(modDir.TrimEnd('\\', '/')); d?.Parent is not null; d = d.Parent)
+        if (d.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { gameRoot = d.Parent.FullName; break; }
+    if (gameRoot is null) { Console.WriteLine("Open mod: that folder isn't under a Battlefield Mods\\ directory."); return false; }
+
+    // The MOUNT CHAIN: a Refractor mod's init.con lists `game.addModPath Mods/<X>/` lines in precedence order
+    // (mod first, its dependency mods next, the base game LAST). Parse them (relative to gameRoot); fall back to
+    // [mod, base] if there's no init.con.
+    var modPaths = new List<string>();
+    var initCon = Path.Combine(modDir, "init.con");
+    if (File.Exists(initCon))
+        foreach (var raw in File.ReadAllLines(initCon))
+        {
+            var line = raw.Trim();
+            int sp = line.IndexOf(' ');
+            if (sp < 0 || !line[..sp].Equals("game.addModPath", StringComparison.OrdinalIgnoreCase)) continue;
+            var rel = line[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
+            if (rel.Length == 0) continue;
+            var abs = Path.GetFullPath(Path.Combine(gameRoot, rel));
+            if (Directory.Exists(abs) && !modPaths.Any(p => p.Equals(abs, StringComparison.OrdinalIgnoreCase))) modPaths.Add(abs);
+        }
+    if (modPaths.Count == 0) modPaths.Add(modDir);   // no init.con chain -> at least the mod itself
+    // ALWAYS ensure the base game mod is in the chain (many mods only addModPath themselves). Appended LAST
+    // (lowest precedence, first-wins) so it just fills gaps; harmless for a self-contained mod.
+    var baseGuess = new[] { "BfVietnam", "bf1942", "bfvietnam" }.Select(b => Path.Combine(gameRoot, "Mods", b)).FirstOrDefault(Directory.Exists);
+    if (baseGuess is not null && !modPaths.Any(p => p.Equals(baseGuess, StringComparison.OrdinalIgnoreCase))) modPaths.Add(baseGuess);
+
+    // Collect each mod-path's Archives\**\*.rfa in chain order (first listed = highest precedence). Skip ~$ leftovers.
+    string[] AllRfa(string dir) => Directory.Exists(dir)
+        ? Directory.EnumerateFiles(dir, "*.rfa", SearchOption.AllDirectories).Where(f => !Path.GetFileName(f).StartsWith("~")).ToArray()
+        : Array.Empty<string>();
+    bool IsLevelRfa(string p) => p.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
+    bool IsTex(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
+    var allRfas = new List<string>();
+    foreach (var mp in modPaths)
+        allRfas.AddRange(AllRfa(Directory.Exists(Path.Combine(mp, "Archives")) ? Path.Combine(mp, "Archives") : mp));
+    meshList = allRfas.Where(p => !IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    texList = allRfas.Where(p => IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+    bool isBfv = gameRoot.ToLowerInvariant().Contains("vietnam") || modPaths.Any(p => Path.GetFileName(p).Equals("BfVietnam", StringComparison.OrdinalIgnoreCase));
+    string baseSub = isBfv ? "BfVietnam" : "bf1942";
+    var modArc = Directory.Exists(Path.Combine(modDir, "Archives")) ? Path.Combine(modDir, "Archives") : modDir;
+    var levelsHint = Path.Combine(modArc, baseSub, "levels");
+    if (!Directory.Exists(levelsHint)) levelsHint = modArc;
+    lvlRfas = Picker.Files("Select the map .rfa to open from this mod  (base + any patch, Ctrl/Shift-click)",
+                           "RFA archives|*.rfa|All files|*.*", levelsHint);
+    if (lvlRfas.Length == 0) { Console.WriteLine("Open mod: no level chosen."); return false; }
+    Console.WriteLine($"Open mod {Path.GetFileName(modDir)}: chain [{string.Join(" -> ", modPaths.Select(p => Path.GetFileName(p)))}], {meshList.Length} mesh + {texList.Length} texture archive(s), level {Path.GetFileName(lvlRfas[0])}.");
+    return true;
+}
+
+// File > Open Mod: gather the mod's paths, remember them, and relaunch into the standard load path.
 void OpenMod()
 {
     try
     {
-        var saved = Settings.Load();
-        var modDir = Picker.Folder("Select the MOD folder  (e.g. ...\\Battlefield 1942\\Mods\\DesertCombat)", saved?.Level);
-        if (modDir is null) return;
-        // gameRoot = the install dir (the parent of the Mods\ folder the mod lives under).
-        string? gameRoot = null;
-        for (var d = new DirectoryInfo(modDir.TrimEnd('\\', '/')); d?.Parent is not null; d = d.Parent)
-            if (d.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { gameRoot = d.Parent.FullName; break; }
-        if (gameRoot is null) { Toast("That folder isn't under a Battlefield Mods\\ directory."); return; }
-
-        // The MOUNT CHAIN: a Refractor mod's init.con lists `game.addModPath Mods/<X>/` lines in precedence order
-        // (mod first, its dependency mods next, the base game LAST) â€” e.g. DC_Final_EOD -> DC_Final -> DesertCombat
-        // -> EOD -> BF1942. Parse them (relative to gameRoot); fall back to [mod, base] if there's no init.con.
-        var modPaths = new List<string>();
-        var initCon = Path.Combine(modDir, "init.con");
-        if (File.Exists(initCon))
-            foreach (var raw in File.ReadAllLines(initCon))
-            {
-                var line = raw.Trim();
-                int sp = line.IndexOf(' ');
-                if (sp < 0 || !line[..sp].Equals("game.addModPath", StringComparison.OrdinalIgnoreCase)) continue;
-                var rel = line[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
-                if (rel.Length == 0) continue;
-                var abs = Path.GetFullPath(Path.Combine(gameRoot, rel));
-                if (Directory.Exists(abs) && !modPaths.Any(p => p.Equals(abs, StringComparison.OrdinalIgnoreCase))) modPaths.Add(abs);
-            }
-        if (modPaths.Count == 0) modPaths.Add(modDir);   // no init.con chain -> at least the mod itself
-        // ALWAYS ensure the base game mod is in the chain, even if the mod's init.con doesn't list it (many mods â€”
-        // e.g. Op_Remembrance â€” only `addModPath` themselves). Appended LAST (lowest precedence, first-wins) so it
-        // just fills gaps; harmless for a self-contained mod.
-        var baseGuess = new[] { "BfVietnam", "bf1942", "bfvietnam" }.Select(b => Path.Combine(gameRoot, "Mods", b)).FirstOrDefault(Directory.Exists);
-        if (baseGuess is not null && !modPaths.Any(p => p.Equals(baseGuess, StringComparison.OrdinalIgnoreCase))) modPaths.Add(baseGuess);
-
-        // Collect each mod-path's Archives\**\*.rfa in chain order (first listed = highest precedence; the mesh +
-        // texture libraries are first-wins, so the mod's assets shadow its dependencies' shadow the base's). Skip
-        // ~$â€¦ temp/lock leftovers (a stray ~$andardMesh.rfa crashed the load).
-        string[] AllRfa(string dir) => Directory.Exists(dir)
-            ? Directory.EnumerateFiles(dir, "*.rfa", SearchOption.AllDirectories).Where(f => !Path.GetFileName(f).StartsWith("~")).ToArray()
-            : Array.Empty<string>();
-        bool IsLevelRfa(string p) => p.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
-        bool IsTex(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
-        var allRfas = new List<string>();
-        foreach (var mp in modPaths)
-            allRfas.AddRange(AllRfa(Directory.Exists(Path.Combine(mp, "Archives")) ? Path.Combine(mp, "Archives") : mp));
-        var meshList = allRfas.Where(p => !IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        var texList = allRfas.Where(p => IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-
-        bool isBfv = gameRoot.ToLowerInvariant().Contains("vietnam") || modPaths.Any(p => Path.GetFileName(p).Equals("BfVietnam", StringComparison.OrdinalIgnoreCase));
-        string baseSub = isBfv ? "BfVietnam" : "bf1942";
-        var modArc = Directory.Exists(Path.Combine(modDir, "Archives")) ? Path.Combine(modDir, "Archives") : modDir;
-        var levelsHint = Path.Combine(modArc, baseSub, "levels");
-        if (!Directory.Exists(levelsHint)) levelsHint = modArc;
-        var lvlRfas = Picker.Files("Select the level .rfa to open from this mod  (base + any patch, Ctrl/Shift-click)",
-                                   "RFA archives|*.rfa|All files|*.*", levelsHint);
-        if (lvlRfas.Length == 0) { Toast("No level chosen - mod not opened."); return; }
-
+        if (!GatherModPaths(out var lvlRfas, out var meshList, out var texList)) return;
         Settings.Save(new LevelPaths(lvlRfas[0], null, null, texList, meshList, lvlRfas));
-        Console.WriteLine($"Opening mod {Path.GetFileName(modDir)}: chain [{string.Join(" -> ", modPaths.Select(p => Path.GetFileName(p)))}], {meshList.Length} mesh + {texList.Length} texture archive(s), level {Path.GetFileName(lvlRfas[0])} - restarting...");
+        Console.WriteLine("Opening mod - restarting...");
         RelaunchAndExit();
     }
     catch (Exception ex) { Console.WriteLine($"Open mod failed: {ex.Message}"); Toast("Open mod failed: " + ex.Message); }
@@ -7209,7 +7311,7 @@ void OnLocalEdit(IEditCommand cmd)
     if (verb == "TERRAIN") { collab.SendOp(EncTerrain(wire)); return; }
     if (verb == "MATERIAL") { collab.SendOp(EncMaterial(wire)); return; }
     // Gameplay (control points / vehicle spawns / soldier spawns) is index-addressed, so ship the WHOLE
-    // layer as a full-state snapshot Ã¢â‚¬â€ the receiver replaces theirs. Small + can't desync.
+    // layer as a full-state snapshot - the receiver replaces theirs. Small + can't desync.
     if (verb.StartsWith("GP")) { collab.SendOp("GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gameplayEdit)))); return; }
     foreach (var part in wire.Split(" ; "))   // object ops (incl. composites: prefab stamp / multi-move)
     {
@@ -7220,7 +7322,7 @@ void OnLocalEdit(IEditCommand cmd)
 }
 
 // Collaborative undo/redo: after a local undo/redo reverses an edit, broadcast the RESULTING (now-current)
-// state so peers converge â€” otherwise the undo would only happen on this machine. The command's forward wire
+// state so peers converge - otherwise the undo would only happen on this machine. The command's forward wire
 // is the wrong direction, so instead we re-broadcast live state: terrain/material/gameplay reuse the same
 // live-reading encoders as a normal edit (they read the post-undo maps), and object ops re-send each affected
 // object's current transform (or a DEL if it's now gone). All ops are absolute/idempotent, so the echo back
@@ -7472,7 +7574,7 @@ void CollabDrain()
             case MsgType.SyncEnd: changed = true; break;
             case MsgType.SeedRequest:
                 // We're the first client on a fresh central relay: upload our WHOLE level so the server (and every
-                // later joiner) starts from our document â€” objects + terrain + material/foliage + gameplay + water +
+                // later joiner) starts from our document - objects + terrain + material/foliage + gameplay + water +
                 // overgrowth settings + any imported .obj meshes.
                 if (so is not null && collab is not null)
                 {
@@ -7519,7 +7621,7 @@ void DoCollabHost()
 }
 
 // Snapshot the host's full NON-object world (CLONES, so the relay's background threads never touch the live maps the
-// GL thread renders) so late joiners to a HOST get terrain/material/foliage/gameplay/water/overgrowth/imports too â€”
+// GL thread renders) so late joiners to a HOST get terrain/material/foliage/gameplay/water/overgrowth/imports too -
 // the relay keeps it current by replaying every streamed op onto these clones.
 CollabWorldState BuildHostWorld()
 {
@@ -7636,7 +7738,7 @@ unsafe void RenderMeshPreview()
     gl.Viewport(0, 0, (uint)mvSize, (uint)mvSize);
     gl.Enable(EnableCap.DepthTest);
     gl.Disable(EnableCap.Blend);
-    gl.Disable(EnableCap.CullFace);             // show both faces â€” mesh winding varies
+    gl.Disable(EnableCap.CullFace);             // show both faces - mesh winding varies
     gl.ClearColor(0.13f, 0.14f, 0.16f, 1f);
     gl.Clear((uint)(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit));
     gl.UseProgram(objProg);
@@ -7705,7 +7807,7 @@ void DoPlayMapBik()
     }
     if (biks.Count == 0) { Toast("No .bik videos embedded in this map's .rfa."); return; }
     if (biks.Count == 1) { PlayBikFile(biks[0]); return; }
-    var pick = Picker.File($"{biks.Count} video(s) in this map â€” choose one", "Bink video (*.bik)|*.bik", tmp);
+    var pick = Picker.File($"{biks.Count} video(s) in this map - choose one", "Bink video (*.bik)|*.bik", tmp);
     if (pick is not null) PlayBikFile(pick);
 }
 
@@ -7738,7 +7840,7 @@ void PlayBikFile(string bik)
     }
     catch (Exception ex) { Toast("Decode failed: " + ex.Message); return; }
     var frames = Directory.Exists(dir) ? Directory.GetFiles(dir, "f_*.png").OrderBy(f => f, StringComparer.Ordinal).ToArray() : Array.Empty<string>();
-    if (frames.Length == 0) { Toast("No frames decoded â€” is this a valid .bik?"); return; }
+    if (frames.Length == 0) { Toast("No frames decoded - is this a valid .bik?"); return; }
     bikFrames = frames; bikFps = fps; bikFrameIdx = 0; bikClock = 0; bikLoadedFrame = -1;
     bikPlaying = true; bikLoop = true; bikOpen = true; bikName = Path.GetFileName(bik);
     Console.WriteLine($"Decoded {frames.Length} frame(s) @ {bikFps:0.#} fps from {bikName}.");
@@ -7830,7 +7932,7 @@ void MeshViewerWindow()
                     {
                         float wheel = ImGui.GetIO().MouseWheel;   // scroll over the model to zoom in/out
                         if (wheel != 0f) meshViewerZoom = Math.Clamp(meshViewerZoom * (1f + wheel * 0.12f), 0.25f, 6f);
-                        ImGui.SetTooltip("Drag to orbit Â· scroll / +- to zoom");
+                        ImGui.SetTooltip("Drag to orbit - scroll / +- to zoom");
                     }
                 }
                 else ImGui.TextDisabled("(rendering...)");
@@ -7857,8 +7959,16 @@ void MinimapPanel()
         // north-up V flip as the camera marker. Click anywhere on the map flies the camera there (handler below).
         Vector2 MmPt(float wx, float wz) => p0 + new Vector2(Math.Clamp(wx / ws, 0f, 1f) * side, (1f - Math.Clamp(wz / ws, 0f, 1f)) * side);
         // Bigger, black-outlined markers so the gameplay (incl. the spread-out SEA flags / carriers far from the
-        // island) stand out against the open water â€” the island is small on big naval maps like Midway.
+        // island) stand out against the open water - the island is small on big naval maps like Midway.
         uint black = 0xFF000000;
+        // Static-object dots (dim) so you can spot and click them; the selected one is highlighted.
+        if (showMinimapObjects && so is not null)
+        {
+            uint odim = ImGui.GetColorU32(new Vector4(0.85f, 0.85f, 0.9f, 0.5f));
+            foreach (var o in so.Objects) { var od = MmPt(o.Position.X, o.Position.Z); dl.AddCircleFilled(od, 1.2f, odim); }
+            if (selected >= 0 && selected < so.Objects.Count)
+            { var sd = MmPt(so.Objects[selected].Position.X, so.Objects[selected].Position.Z); dl.AddCircleFilled(sd, 3.2f, ImGui.GetColorU32(new Vector4(1f, 0.4f, 0.4f, 1f))); dl.AddCircle(sd, 3.2f, black, 0, 1.4f); }
+        }
         if (showSpawns)
             foreach (var ss in gameplayEdit.SoldierSpawns)
             { var d = MmPt(ss.Position.X, ss.Position.Z); dl.AddCircleFilled(d, 2.6f, ImGui.GetColorU32(new Vector4(0.4f, 1f, 0.45f, 1f))); dl.AddCircle(d, 2.6f, black, 0, 1f); }
@@ -7888,8 +7998,17 @@ void MinimapPanel()
                 cam.Position = new Vector3(nx, terrainPick.HeightAt(nx, nz) + MathF.Max(above, 15f), nz);
             }
             else cam.Position = new Vector3(nx, cam.Position.Y, nz);
+            // Also select the nearest static object to the click (within a few px) so you can edit it from here.
+            if (so is not null && so.Objects.Count > 0)
+            {
+                float pickR = (8f / side) * ws, bestD2 = pickR * pickR; int best = -1;
+                for (int i = 0; i < so.Objects.Count; i++)
+                { var op = so.Objects[i].Position; float dx = op.X - nx, dz = op.Z - nz, d2 = dx * dx + dz * dz; if (d2 < bestD2) { bestD2 = d2; best = i; } }
+                if (best >= 0) { selected = best; multi.Clear(); multi.Add(best); }
+            }
         }
         if (ImGui.SmallButton("Refresh")) BuildMinimap();
+        ImGui.SameLine(); ImGui.Checkbox("Objects", ref showMinimapObjects);
     }
     ImGui.End();
 }
@@ -7913,6 +8032,7 @@ void BuildUi()
             if (ImGui.MenuItem("Test This Level (in-game)", "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads.");
             if (ImGui.MenuItem("Save as Patch .rfa...", null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
+            if (ImGui.MenuItem("Auto-backup on save", null, autoBackup)) autoBackup = !autoBackup;
             if (ImGui.MenuItem("Import .obj...", null, false, meshLib is not null && so is not null)) DoImportObj();
             if (ImGui.MenuItem("Import treeMesh.rfa...", null, false, meshLib is not null && so is not null)) DoImportTreeMesh();
             if (ImGui.MenuItem("Play .bik video...")) DoPlayBik();
@@ -7966,7 +8086,7 @@ void BuildUi()
             if (ImGui.MenuItem("Generate Surface Maps (bake from set)", null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.Separator();
             if (ImGui.MenuItem("Bake Object Lightmaps (from sun)", null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Bake each building/object's lighting (sun + terrain shadow) into its lightmap from the\ncurrent sun, then Save to ship them to the game. Pair with File â–¸ 'Write LightmapShadowBits.lsb'\nfor the terrain shadow. Set the sun first in the Environment â–¸ Sun panel.");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Bake each building/object's lighting (sun + terrain shadow) into its lightmap from the\ncurrent sun, then Save to ship them to the game. Pair with File > 'Write LightmapShadowBits.lsb'\nfor the terrain shadow. Set the sun first in the Environment > Sun panel.");
             ImGui.Separator();
             if (ImGui.MenuItem("Convert TGA -> DDS...")) DoConvertTgaToDds();
             if (ImGui.MenuItem("Batch TGA -> DDS (folder)...")) DoBatchTgaToDds();
@@ -8127,7 +8247,7 @@ void BuildUi()
     ImGui.End();
 
     // Complete a drag-and-drop from the Object Library: when the dragged item is released over the 3D
-    // viewport (not over a panel), place it on the terrain under the cursor Ã¢â‚¬â€ same as the Place tool.
+    // viewport (not over a panel), place it on the terrain under the cursor - same as the Place tool.
     if (dragTemplate is not null && ImGui.IsMouseReleased(ImGuiMouseButton.Left))
     {
         var mp = ImGui.GetMousePos();
@@ -8210,7 +8330,7 @@ void BuildUi()
 }
 
 // In-app Log / Errors window: shows captured console output (errors highlighted). Auto-pops after a level load that
-// produced warnings (missing meshes etc.) â€” the equivalent of Battlecraft's "Load Errors" box â€” and is reopenable
+// produced warnings (missing meshes etc.) - the equivalent of Battlecraft's "Load Errors" box - and is reopenable
 // from View -> Log / Errors. Replaces hunting through the background CMD window.
 void LogWindow()
 {
@@ -8475,7 +8595,7 @@ uint MakeMesh(float[] verts, uint[] indices, out uint vbo)
 
 // Load the level's real skybox cubemap from the Sky_<map>_0N.dds faces (skybox mesh Sky_OI_m1 -> textures
 // Sky_OI_0N), falling back to the generic env_default cubemap. Best-effort face order (06 = the low-res down
-// face); verify in-editor Ã¢â‚¬â€ the Sky inspector has a rotation slider + a toggle to the procedural sun-sky. Leaves
+// face); verify in-editor - the Sky inspector has a rotation slider + a toggle to the procedural sun-sky. Leaves
 // skyCubeTex 0 (procedural sky) when no faces resolve.
 // Build a pos(3)+uv(2) GL mesh from a resolved StandardMesh + upload each part's EMBEDDED texture; returns the VAO and
 // a per-part (offset, count, texId) table. Used for the real skybox + cloud meshes. Textures upload at NATIVE size (no
@@ -8627,7 +8747,7 @@ unsafe void LoadSkyCubemap()
     if (faces.Any(f => f is null)) return;
 
     // A cubemap is INCOMPLETE (every sample returns black) unless all 6 faces share one size. BFV's down face is
-    // often tiny Ã¢â‚¬â€ Sky_OI_06 is 32x32 vs 512 for the rest Ã¢â‚¬â€ so upscale every face to the largest before upload.
+    // often tiny - Sky_OI_06 is 32x32 vs 512 for the rest - so upscale every face to the largest before upload.
     BuildSkyCubemapFromFaces(faces, $"{baseName}_0N");
 }
 
@@ -8709,7 +8829,7 @@ unsafe uint UploadTexture(Texture2D t)
     return id;
 }
 
-// Same upload but REPEAT-wrapped + mipmapped â€” for tiling water layers / normal maps.
+// Same upload but REPEAT-wrapped + mipmapped - for tiling water layers / normal maps.
 unsafe uint UploadTiledTexture(Texture2D t)
 {
     uint id = gl.GenTexture();
@@ -8835,7 +8955,7 @@ unsafe void UploadAtlasRect(int x, int y, int w, int h)
     gl.PixelStore(PixelStoreParameter.UnpackSkipRows, 0);
 }
 
-// Same, plus a full mip regen â€” for discrete events (stroke finish / undo / redo) where distant mips must refresh.
+// Same, plus a full mip regen - for discrete events (stroke finish / undo / redo) where distant mips must refresh.
 void UploadAtlasRectMips(int x, int y, int w, int h)
 {
     UploadAtlasRect(x, y, w, h);
@@ -8986,7 +9106,7 @@ unsafe uint UploadDetailTexture(Texture2D t)
 
 // (Re)upload an index map as a single-channel R8 texture, sampled NEAREST so each cell reads its
 // exact index. Called on load and after every paint stroke (cheap). The same texture slot serves the
-// material map and either growth layer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â whichever is the active paint target.
+// material map and either growth layer - whichever is the active paint target.
 unsafe void UploadPaintTexture(MaterialMap? m)
 {
     if (m is null) return;
@@ -9005,7 +9125,7 @@ unsafe void UploadPaintTexture(MaterialMap? m)
     gl.ActiveTexture(TextureUnit.Texture0);
 }
 
-// Active paint target (Material / Undergrowth / Overgrowth) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â painter, map, brush value, and overlay.
+// Active paint target (Material / Undergrowth / Overgrowth) - painter, map, brush value, and overlay.
 MaterialPainter? ActivePainter() => paintLayer == 1 ? underPainter : paintLayer == 2 ? overPainter : matPainter;
 MaterialMap? ActivePaintMap() => paintLayer == 1 ? growth?.Under : paintLayer == 2 ? growth?.Over : materialMap;
 byte ActivePaintValue() => paintLayer == 0 ? activeMaterial : activeFoliage;

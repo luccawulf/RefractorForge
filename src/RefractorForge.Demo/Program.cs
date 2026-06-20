@@ -2693,6 +2693,30 @@ if (arg == "gameplay" && args.Length >= 2)
     return 0;
 }
 
+if (arg == "vehteams" && args.Length >= 2)
+{
+    // vehteams <a.rfa,b.rfa,...> — load the level EXACTLY like the editor (FromRfa, last-wins merge of base + patches)
+    // and print, per vehicle spawn, the owning control point + resolved team + vehicle (mirrors the Viewer's SpawnTeam).
+    var rfas = args[1].Split(',', StringSplitOptions.RemoveEmptyEntries);
+    var lvl = LevelArchive.FromRfa(rfas);
+    var gp = lvl.Gameplay;
+    var cps = gp.ControlPoints;
+    Console.WriteLine($"control points ({cps.Count}):");
+    for (int i = 0; i < cps.Count; i++)
+        Console.WriteLine($"  [{i}] {cps[i].Name,-34} team={cps[i].Team} osId={cps[i].ObjectSpawnerId} sg={cps[i].SpawnGroupId} pos {cps[i].Position.X:0}/{cps[i].Position.Z:0}");
+    Console.WriteLine($"vehicle spawns ({gp.VehicleSpawns.Count}):");
+    foreach (var v in gp.VehicleSpawns)
+    {
+        int ci = GameplayObjects.OwningControlPointIndex(cps, v.Position, v.OsId, true);
+        int team = ci >= 0 ? cps[ci].Team : 2;
+        string s = team == 1 ? v.Vehicle1 : v.Vehicle2;
+        if (string.IsNullOrEmpty(s)) s = v.Vehicle;
+        string owner = ci >= 0 ? cps[ci].Name : "(none)";
+        Console.WriteLine($"  {v.Name,-18} pos {v.Position.X,5:0}/{v.Position.Z,5:0} osId={v.OsId,-3} -> CP[{ci}] {owner,-30} team={team} => {s}   (v1={v.Vehicle1} v2={v.Vehicle2})");
+    }
+    return 0;
+}
+
 if (arg == "minimap" && args.Length >= 2)
 {
     // minimap <levelDir> [outDir] [size] — generate ingamemap.dds + Thumbnail.dds (top-down terrain).
@@ -3068,6 +3092,23 @@ if (arg == "catdump" && args.Length >= 3)
         if (e.Name.Replace('\\', '/').ToLowerInvariant().Contains(sub))
         { Console.WriteLine($"--- {e.Name} ---"); Console.WriteLine(System.Text.Encoding.Latin1.GetString(a.Read(e))); return 0; }
     Console.WriteLine($"no entry matching '{sub}'"); return 1;
+}
+
+if (arg == "rsdump" && args.Length >= 3)
+{
+    // rsdump <archive.rfa> <entry-substring> — parse the first matching .rs shader set and print each material's flags.
+    var a = RefractorForge.Formats.Rfa.RfaArchive.Open(args[1]);
+    var sub = args[2].ToLowerInvariant();
+    foreach (var e in a.Entries)
+        if (e.Name.Replace('\\', '/').ToLowerInvariant().Contains(sub) && e.Name.ToLowerInvariant().EndsWith(".rs"))
+        {
+            var ss = RefractorForge.Render.RsShaderSet.Parse(System.Text.Encoding.Latin1.GetString(a.Read(e)));
+            Console.WriteLine($"--- {e.Name} ({ss.Materials.Count} materials) ---");
+            foreach (var m in ss.Materials.Values)
+                Console.WriteLine($"  {m.Name,-34} tex={m.Texture,-22} fade={m.TextureFade} transparent={m.Transparent}");
+            return 0;
+        }
+    Console.WriteLine($"no .rs matching '{sub}'"); return 1;
 }
 
 if (arg == "meshresolve" && args.Length >= 3)
