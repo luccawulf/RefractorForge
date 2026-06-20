@@ -355,7 +355,7 @@ sealed class GlObjects
     /// <summary>Draw a single resolved mesh at a world matrix (e.g. a vehicle body at its spawn).
     /// Builds + caches the GPU template on first use under <paramref name="key"/>.</summary>
     public unsafe void DrawMesh(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
-                                Matrix4x4 viewProj, string key, MeshLibrary.Mesh mesh, Matrix4x4 world, Vector3 tint)
+                                Matrix4x4 viewProj, string key, MeshLibrary.Mesh mesh, Matrix4x4 world, Vector3 tint, Vector3? solidColor = null)
     {
         var t = UploadMesh(gl, key, mesh);
         gl.UseProgram(prog);
@@ -368,7 +368,13 @@ sealed class GlObjects
         gl.BindVertexArray(t.Vao);
         foreach (var part in t.Parts)
         {
-            if (part.Tex != 0)
+            if (solidColor is Vector3 sc)   // flat untextured colour for every part (e.g. a neutral white flag cloth)
+            {
+                gl.Uniform1(uUseTex, 0);
+                gl.Uniform1(uAlphaTest, 0);
+                gl.Uniform3(uColor, sc.X, sc.Y, sc.Z);
+            }
+            else if (part.Tex != 0)
             {
                 gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                 gl.Uniform1(uUseTex, 1);

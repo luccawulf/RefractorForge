@@ -1925,6 +1925,7 @@ void OnLoad()
 
     // Dear ImGui editor UI - renders into this same GL context/window each frame.
     imgui = new ImGuiController(gl, window, input);
+    ImGui.GetIO().ConfigWindowsMoveFromTitleBarOnly = true;   // body-drags (model-viewer orbit, minimap click) don't move the window; the title bar still does
     try { ClipboardBridge.Install(); } catch { }   // Ctrl+C/V in text boxes -> OS clipboard (e.g. paste a collab IP)
     ApplyTheme();
     LoadPrefabs();
@@ -2310,6 +2311,7 @@ void OnUpdate(double dt)
     }
 
     if (kb is null) return;
+    if (imgui is not null && ImGui.GetIO().WantCaptureKeyboard) return;   // don't fly the camera with WASD/Q-E while typing in an inspector field
     float amt = Altitude() * 1.2f * camSpeedMult * (float)dt * (kb.IsKeyPressed(Key.ShiftLeft) ? 4f : 1f);
     float fwd = (kb.IsKeyPressed(Key.W) ? 1 : 0) - (kb.IsKeyPressed(Key.S) ? 1 : 0);
     float str = (kb.IsKeyPressed(Key.D) ? 1 : 0) - (kb.IsKeyPressed(Key.A) ? 1 : 0);
@@ -5124,12 +5126,12 @@ void OnRender(double dt)
             gl.UseProgram(objProg);
             gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
             SetFogUniforms(objProg);
-            void DrawGp(string key, MeshLibrary.Mesh mesh, Vec3 pos, Vec3 rot)
+            void DrawGp(string key, MeshLibrary.Mesh mesh, Vec3 pos, Vec3 rot, Vector3? solidColor = null)
             {
                 var w = Matrix4x4.CreateFromYawPitchRoll(rot.X * MathF.PI / 180f, rot.Y * MathF.PI / 180f, rot.Z * MathF.PI / 180f)
                       * Matrix4x4.CreateTranslation(pos.X, pos.Y, pos.Z);
                 glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                   cam.ViewProjection, key, mesh, w, Vector3.One);
+                                   cam.ViewProjection, key, mesh, w, Vector3.One, solidColor);
             }
             // Soldier spawn marker: a simple soldier-sized box (NOT the engine's 3-arrow spawn mesh), oriented to yaw.
             if (showSpawns)
@@ -5144,7 +5146,7 @@ void OnRender(double dt)
                     var poleName = string.IsNullOrEmpty(cp.PoleGeometry) ? "flagbase_m1" : cp.PoleGeometry;
                     if (meshLib.TryGet(poleName, out var pole) && pole is not null)
                         DrawGp($"gp::cp::{poleName}", pole, cp.Position, Vec3.Zero);
-                    var flagName = cp.Team == 1 ? cp.FlagGeometry1 : cp.FlagGeometry2;   // neutral(0) shows the team-2 flag
+                    var flagName = cp.Team == 1 ? cp.FlagGeometry1 : cp.FlagGeometry2;   // team1=axis, team2=allied cloth; neutral(0) uses this shape but rendered WHITE (below)
                     if (!string.IsNullOrEmpty(flagName) && meshLib.TryGet(flagName, out var flag) && flag is not null)
                     {
                         float fy = cp.FlagHeight > 0 ? cp.FlagHeight : 8.2f;
@@ -5161,11 +5163,11 @@ void OnRender(double dt)
                         {
                             Vector3 flo = fpos0[0], fhi = fpos0[0];
                             foreach (var p in fpos0) { flo = Vector3.Min(flo, p); fhi = Vector3.Max(fhi, p); }
-                            const float hoistInset = 0.4f;    // forward: pull the hoist edge toward the pole so the cloth touches it
+                            const float hoistInset = 0.05f;   // forward: hoist edge sits just in front of the pole
                             const float flagLateral = 0.4f;   // "right": shift the flag laterally (Z) to line up with the pole (flip sign if it goes the wrong way)
                             const float flagRise = 0.8f;      // lift the cloth ~2.5 ft up the pole (user request)
                             var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
-                            DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f));
+                            DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f), cp.Team == 0 ? new Vector3(0.9f, 0.9f, 0.9f) : (Vector3?)null);   // neutral CP -> white flag
                         }
                     }
                 }
