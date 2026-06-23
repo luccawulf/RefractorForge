@@ -36,7 +36,7 @@ public class RefractorFlatArchiveTests
     public void Build_Load_MultiBlockEntry_RoundTrips()
     {
         // > 32 KiB forces multiple blocks
-        var big = Lzo1xTests.RandomBytes(90_000, seed: 42);
+        var big = RandomBytes(90_000, seed: 42);
         var entries = new List<(string Name, byte[] Data)> { ("big.bin", big) };
         using var tmp = BuildTempArchive(entries);
         Assert.Equal(big, tmp.Archive.Read(tmp.Archive.Entries[0]));
@@ -239,5 +239,12 @@ public class RefractorFlatArchiveTests
         Span<byte> b = stackalloc byte[4];
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(b, v);
         s.Write(b);
+    }
+
+    internal static byte[] RandomBytes(int length, int seed)
+    {
+        var data = new byte[length];
+        new Random(seed).NextBytes(data);
+        return data;
     }
 }

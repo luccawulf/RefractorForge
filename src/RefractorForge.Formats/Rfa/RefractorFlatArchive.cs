@@ -166,8 +166,13 @@ public sealed class RefractorFlatArchive
             if (unc == 0) continue;
             var src = region.Slice(dataStart + cum, comp);
             var dst = result.AsSpan(written, unc);
-            if (comp == unc) src.CopyTo(dst);
-            else Lzo1x.Decompress(src, dst, unc);
+            if (comp == unc)
+                src.CopyTo(dst);
+            else
+            {
+                var dstArray = MiniLZO.MiniLZO.Decompress(src.ToArray(), unc);
+                dstArray.CopyTo(dst);
+            }
             written += unc;
         }
         if (written != uncompressedSize)
@@ -202,7 +207,7 @@ public sealed class RefractorFlatArchive
             int start = i * ChunkSize;
             int len = Math.Min(ChunkSize, n - start);
             var chunk = data.AsSpan(start, len);
-            var lzo = Lzo1x.Compress(chunk);
+            var lzo = MiniLZO.MiniLZO.Compress(chunk.ToArray());
             // If LZO grows the block (incompressible data), store the raw chunk instead.
             comps.Add(lzo.Length < len ? lzo : chunk.ToArray());
             uncs[i] = len;

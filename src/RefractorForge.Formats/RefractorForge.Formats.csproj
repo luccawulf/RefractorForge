@@ -14,5 +14,8 @@
       <_Parameter1>RefractorForge.Tests</_Parameter1>
     </AssemblyAttribute>
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="MiniLZO" Version="1.0.1" />
+  </ItemGroup>
 
 </Project>
