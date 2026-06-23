@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using RefractorForge.Formats.Con;
 using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Sound;
@@ -25,18 +25,18 @@ public static class LevelArchive
     /// LATER archives overriding earlier ones for same-named files (this is how Refractor patch .rfa work).</summary>
     public static Loaded FromRfa(params string[] rfaPaths)
     {
-        var arcs = new List<RfaArchive>();
+        var arcs = new List<RefractorFlatArchive>();
         foreach (var p in rfaPaths.Where(File.Exists))
         {
             if (Path.GetFileName(p).StartsWith("~")) continue;   // ~$… temp/lock leftovers
-            try { arcs.Add(RfaArchive.Open(p)); }
+            try { arcs.Add(new RefractorFlatArchive(p)); }
             catch (Exception ex) { System.Console.WriteLine($"LevelArchive: skipping unreadable '{Path.GetFileName(p)}' ({ex.GetType().Name})"); }
         }
         if (arcs.Count == 0) throw new FileNotFoundException("No readable .rfa archive supplied.");
         string label = arcs.Count == 1 ? Path.GetFileName(rfaPaths[0]) : $"{arcs.Count} archives";
 
         // Find an entry by trailing file name; LATER archives (patches) win over earlier ones.
-        (RfaArchive Arc, RfaEntry Entry)? Find(string fileName)
+        (RefractorFlatArchive Arc, RefractorFlatArchiveEntry Entry)? Find(string fileName)
         {
             // Prefer the GLOBALLY SHALLOWEST match across ALL archives: heavily-scripted maps carry per-game-mode
             // copies in sub-folders (Dystopia_City has BattleMode/StaticObjects.con AND ChallengeMode/StaticObjects.con
@@ -45,7 +45,7 @@ public static class LevelArchive
             // whichever (last) archive happens to contain the name — otherwise a _NNN patch that ships only a deeper
             // Menu/init.con shadows the base's root Init.con and silently drops its fog/render settings. Among EQUAL
             // depths a later archive (the patch) wins.
-            (RfaArchive Arc, RfaEntry Entry)? best = null; int bestDepth = int.MaxValue;
+            (RefractorFlatArchive Arc, RefractorFlatArchiveEntry Entry)? best = null; int bestDepth = int.MaxValue;
             for (int i = 0; i < arcs.Count; i++)
                 foreach (var e in arcs[i].Entries)
                 {
@@ -74,7 +74,7 @@ public static class LevelArchive
         var so = StaticObjectsFile.Parse(Lines(Need("StaticObjects.con")));
 
         // Terrain tiles: gather txNNxNN from ALL archives (later archives override same-named tiles).
-        var tileMap = new Dictionary<string, (RfaArchive Arc, RfaEntry Entry)>(StringComparer.OrdinalIgnoreCase);
+        var tileMap = new Dictionary<string, (RefractorFlatArchive Arc, RefractorFlatArchiveEntry Entry)>(StringComparer.OrdinalIgnoreCase);
         foreach (var a in arcs)
             foreach (var e in a.Entries)
                 if (System.Text.RegularExpressions.Regex.IsMatch(

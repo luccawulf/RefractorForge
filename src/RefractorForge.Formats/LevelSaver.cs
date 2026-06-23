@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -191,11 +191,11 @@ public static class LevelSaver
             var rel = Path.GetRelativePath(folderDir, f).Replace('\\', '/');
             entries.Add((prefix + rel, File.ReadAllBytes(f)));
         }
-        RfaWriter.WriteFile(outRfaPath, entries);
+        RefractorFlatArchive.WriteFile(outRfaPath, entries);
         return entries.Count;
     }
 
-    private static string? FindEntry(RfaArchive a, string suffix, bool preferConquest)
+    private static string? FindEntry(RefractorFlatArchive a, string suffix, bool preferConquest)
     {
         string? first = null;
         foreach (var e in a.Entries)
@@ -213,7 +213,7 @@ public static class LevelSaver
     /// (standalone patch).</summary>
     /// <summary>The archive's level-folder entry prefix (e.g. "bfvietnam/levels/Foo/"), derived from where
     /// StaticObjects.con (or Init.con / Heightmap.raw) lives, so brand-new files can be added under the same path.</summary>
-    private static string ArchivePrefix(RfaArchive arch)
+    private static string ArchivePrefix(RefractorFlatArchive arch)
     {
         foreach (var anchor in new[] { "StaticObjects.con", "Init.con", "Heightmap.raw" })
         {
@@ -229,7 +229,7 @@ public static class LevelSaver
     }
 
     private static (Dictionary<string, byte[]> Repl, List<string> Names) BuildReplacements(
-        RfaArchive arch, StaticObjectsFile? so, Heightmap? heightmap, MaterialMap? material,
+        RefractorFlatArchive arch, StaticObjectsFile? so, Heightmap? heightmap, MaterialMap? material,
         EditableGameplay? gameplay, GrowthMaps? growth, LightmapShadowBits? shadow, TerrainConfig? terrainConfig,
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles,
         IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
@@ -316,9 +316,9 @@ public static class LevelSaver
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles = null,
         IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
     {
-        var arch = RfaArchive.Open(originalRfaPath);
+        var arch = new RefractorFlatArchive(originalRfaPath);
         var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries);
-        RfaWriter.RepackToFile(outRfaPath, arch, repl);   // stream: a huge base archive won't fit in one byte[]
+        RefractorFlatArchive.RepackToFile(outRfaPath, arch, repl);   // stream: a huge base archive won't fit in one byte[]
         return names;
     }
 
@@ -334,12 +334,12 @@ public static class LevelSaver
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles = null,
         IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
     {
-        var arch = RfaArchive.Open(baseRfaPath);
+        var arch = new RefractorFlatArchive(baseRfaPath);
         var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries);
         // Deterministic order; entries are addressed by name so order doesn't affect mounting.
         var entries = repl.OrderBy(kv => kv.Key, System.StringComparer.OrdinalIgnoreCase)
                           .Select(kv => (kv.Key, kv.Value)).ToList();
-        RfaWriter.WriteFile(outPatchPath, entries);
+        RefractorFlatArchive.WriteFile(outPatchPath, entries);
         return names;
     }
 }

@@ -153,6 +153,34 @@ public static class Lzo1x
         return dst;
     }
 
+    // ---- Literal-only block -------------------------------------------------
+
+    /// <summary>Encode one ≤32 KiB chunk as a literal-only LZO1X v0 stream (no match-finding). The
+    /// output is a fully valid LZO1X stream — <see cref="Decompress(ReadOnlySpan{byte},int)"/> accepts
+    /// it — but it does not shrink the data (output ≈ input + 4 bytes overhead). Use this when you
+    /// need a technically-valid LZO stream without running the compressor (e.g., for test vectors or
+    /// when the caller has already decided the block should be stored verbatim as an LZO stream rather
+    /// than as a raw comp==unc region).</summary>
+    internal static byte[] EncodeLiteralBlock(ReadOnlySpan<byte> block)
+    {
+        int n = block.Length;
+        var o = new List<byte>(n + 8);
+        if (n <= 3)
+            o.Add((byte)(n + 17));          // initial-run form: first byte ≥18 → copy (b-17) literals
+        else if (n <= 18)
+            o.Add((byte)(n - 3));           // t in [1..15], state==0 → copy (t+3) literals
+        else
+        {
+            o.Add(0);                       // t==0 → extended literal run
+            int m = n - 18;
+            while (m > 255) { o.Add(0); m -= 255; }
+            o.Add((byte)m);
+        }
+        for (int i = 0; i < n; i++) o.Add(block[i]);
+        o.Add(0x11); o.Add(0x00); o.Add(0x00);  // end-of-stream marker
+        return o.ToArray();
+    }
+
     // ---- Compression --------------------------------------------------------
     // Greedy LZO1X-1-style compressor producing the exact v0 bitstream the decoder above accepts
     // (the documented inverse of each instruction). Clean-room from the format description; the

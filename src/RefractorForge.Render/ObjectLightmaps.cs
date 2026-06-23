@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
@@ -63,7 +63,7 @@ public sealed class ObjectLightmaps
     }
 
     /// <summary>Load every ObjectLightMaps/*.tga straight out of the level .rfa archives.</summary>
-    public static ObjectLightmaps FromArchives(IEnumerable<RfaArchive> archives)
+    public static ObjectLightmaps FromArchives(IEnumerable<RefractorFlatArchive> archives)
     {
         var olm = new ObjectLightmaps();
         foreach (var a in archives)
@@ -91,11 +91,11 @@ public sealed class ObjectLightmaps
     /// <summary>Open the given level .rfa paths and load their ObjectLightMaps/*.tga (skips missing/unreadable).</summary>
     public static ObjectLightmaps FromRfaPaths(IEnumerable<string> paths)
     {
-        var arcs = new List<RfaArchive>();
+        var arcs = new List<RefractorFlatArchive>();
         foreach (var p in paths)
         {
             if (!File.Exists(p) || Path.GetFileName(p).StartsWith("~")) continue;
-            try { arcs.Add(RfaArchive.Open(p)); } catch { }
+            try { arcs.Add(new RefractorFlatArchive(p)); } catch { }
         }
         return FromArchives(arcs);
     }

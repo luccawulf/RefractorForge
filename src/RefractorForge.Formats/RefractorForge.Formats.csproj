@@ -9,5 +9,10 @@
          to any UI shell (WPF, Avalonia, Silk.NET, a CLI, tests) and never drags
          engine assumptions into the data model. -->
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>RefractorForge.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 
 </Project>

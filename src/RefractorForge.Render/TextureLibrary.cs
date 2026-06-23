@@ -1,4 +1,4 @@
-using RefractorForge.Formats.Rfa;
+﻿using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
 
@@ -10,13 +10,13 @@ namespace RefractorForge.Render;
 /// </summary>
 public sealed class TextureLibrary
 {
-    private readonly List<RfaArchive> _archives = new();
-    private readonly Dictionary<string, RfaEntry> _byName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<RefractorFlatArchive> _archives = new();
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _byName = new(StringComparer.OrdinalIgnoreCase);
     // Texture/AltTex/<leaf> entries: a map's explicit alternate-texture OVERRIDES. Resolved BEFORE _byName so they win
     // even when an object's .rs references the texture by a FULL base path (the engine's AltTex behaviour). First-wins,
     // and level archives are opened first, so the level's AltTex beats any base AltTex.
-    private readonly Dictionary<string, RfaEntry> _override = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<RfaEntry, RfaArchive> _owner = new();   // entry -> its archive, O(1) (was an O(n) scan)
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _override = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<RefractorFlatArchiveEntry, RefractorFlatArchive> _owner = new();   // entry -> its archive, O(1) (was an O(n) scan)
     private readonly Dictionary<string, Texture2D?> _cache = new(StringComparer.OrdinalIgnoreCase);
 
     public static TextureLibrary Open(params string[] archivePaths)
@@ -26,8 +26,8 @@ public sealed class TextureLibrary
         {
             if (!File.Exists(path)) continue;
             if (Path.GetFileName(path).StartsWith("~")) continue;   // ~$… temp/lock leftovers
-            RfaArchive arc;
-            try { arc = RfaArchive.Open(path); }
+            RefractorFlatArchive arc;
+            try { arc = new RefractorFlatArchive(path); }
             catch (Exception ex) { System.Console.WriteLine($"TextureLibrary: skipping unreadable archive '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
             lib._archives.Add(arc);
             foreach (var e in arc.Entries)
@@ -75,7 +75,7 @@ public sealed class TextureLibrary
         return tex;
     }
 
-    private RfaEntry? Find(string name)
+    private RefractorFlatArchiveEntry? Find(string name)
     {
         string n = name.Replace('\\', '/').Trim();
         // strip an existing extension so we can try BOTH .dds and .tga (a shader ref like "texture/water07" has none).
@@ -90,5 +90,5 @@ public sealed class TextureLibrary
         return null;
     }
 
-    private RfaArchive Owner(RfaEntry e) => _owner.TryGetValue(e, out var a) ? a : _archives[0];
+    private RefractorFlatArchive Owner(RefractorFlatArchiveEntry e) => _owner.TryGetValue(e, out var a) ? a : _archives[0];
 }
