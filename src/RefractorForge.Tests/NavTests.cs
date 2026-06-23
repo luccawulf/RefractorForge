@@ -149,7 +149,7 @@ public class NavTests
             var baseNav = SearchMapGenerator.EncodeVehicleLevels(tank, SearchMapGenerator.GenerateGrid(cfg, hm, tank, 0), finest);
             const string navPrefix = "BfVietnam/levels/RFNav/Pathfinding/";
             var baseEntries = baseNav.Select(f => (navPrefix + f.FileName, f.Data)).ToList();
-            RefractorFlatArchive.WriteFile(navBase, baseEntries);
+            RefractorFlatArchive.WriteFile(navBase, baseEntries, compress: true, xPackId: XPackId.Default);
             var editedNav = SearchMapGenerator.EncodeVehicleLevels(tank, grid, finest);
             var navNames = LevelSaver.WritePatchRfa(navBase, navPatch, null, null, null, null, extraFiles: editedNav);
             Assert.True(navNames.Count == editedNav.Count, $"every edited navmap matched a base Pathfinding entry ({navNames.Count}/{editedNav.Count})");

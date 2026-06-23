@@ -229,9 +229,13 @@ public sealed class RefractorFlatArchive
 
     /// <summary>Streaming archive core. Writes header, entry regions, then the TOC, patching the
     /// header's <c>tocOffset</c> placeholder at the end. Requires a seekable stream.</summary>
-    private static void StreamArchive(Stream output, int count,
-        Func<int, string> name, Func<int, (byte[] Region, int Unc)> getRegion,
-        WriteOptions options)
+    private static void StreamArchive(
+        Stream output,
+        int count,
+        Func<int, string> name,
+        Func<int, (byte[] Region, int Unc)> getRegion,
+        bool compress,
+        XPackId xPackId)
     {
         if (!output.CanSeek)
             throw new ArgumentException("Writing an RFA requires a seekable stream (tocOffset is back-patched).", nameof(output));
@@ -240,7 +244,7 @@ public sealed class RefractorFlatArchive
 
         // ── Header ───────────────────────────────────────────────────────────
         WriteU32(output, 0);                              // tocOffset placeholder — patched below
-        WriteU32(output, options.Compress ? 1u : 0u);
+        WriteU32(output, compress ? 1u : 0u);
 
         // 143-byte descriptor: any bytes work for the engine's checksum.
         byte[] descriptor = new byte[143];
@@ -251,7 +255,7 @@ public sealed class RefractorFlatArchive
         // Encrypted XPack ID: stored as (actual_id + Σ descriptor_bytes) mod 2^32.
         uint descriptorSum = 0;
         foreach (var b in descriptor) descriptorSum += b;
-        WriteU32(output, (uint)options.XPackId + descriptorSum);
+        WriteU32(output, (uint)xPackId + descriptorSum);
 
         // ── Entry regions ────────────────────────────────────────────────────
         var offsets    = new long[count];
@@ -295,24 +299,27 @@ public sealed class RefractorFlatArchive
     // ── Public write API ─────────────────────────────────────────────────────
 
     /// <summary>Stream an archive of ordered <c>(name, bytes)</c> entries directly to a file.</summary>
-    public static void WriteFile(string path, IReadOnlyList<(string Name, byte[] Data)> entries,
-        WriteOptions? options = null)
+    public static void WriteFile(
+        string path,
+        IReadOnlyList<(string Name, byte[] Data)> entries,
+        bool compress,
+        XPackId xPackId)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-        options ??= WriteOptions.Default;
         StreamArchive(fs, entries.Count,
             i => entries[i].Name,
-            i => { var d = entries[i].Data; return (BuildRegion(d, options.Compress), d.Length); },
-            options);
+            i => { var d = entries[i].Data; return (BuildRegion(d, compress), d.Length); },
+            compress, xPackId);
     }
 
     /// <summary>Stream a repack straight to a file (low memory, no array-size ceiling).
     /// Writes to a sibling temp file first so the original is never locked while being read,
     /// then atomically replaces <paramref name="path"/>.</summary>
-    public static void RepackToFile(string path, RefractorFlatArchive original,
-        IReadOnlyDictionary<string, byte[]> replacements, WriteOptions? options = null)
+    public static void RepackToFile(
+        string path,
+        RefractorFlatArchive original,
+        IReadOnlyDictionary<string, byte[]> replacements)
     {
-        options ??= new WriteOptions { Compress = original.IsCompressed, XPackId = original.XPackId };
         var ci = new Dictionary<string, byte[]>(replacements, StringComparer.OrdinalIgnoreCase);
         var ents = original.Entries;
 
@@ -322,9 +329,9 @@ public sealed class RefractorFlatArchive
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
                 StreamArchive(fs, ents.Count, i => ents[i].Name,
                     i => ci.TryGetValue(ents[i].Name, out var rep)
-                        ? (BuildRegion(rep, options.Compress), rep.Length)
+                        ? (BuildRegion(rep, original.IsCompressed), rep.Length)
                         : (original.RawRegion(ents[i]), ents[i].UncompressedSize),
-                    options);
+                    original.IsCompressed, original.XPackId);
             File.Move(tmp, path, overwrite: true);
         }
         catch

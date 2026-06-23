@@ -11,7 +11,7 @@ public class RefractorFlatArchiveTests
     [Fact]
     public void Build_Load_EntryCountPreserved()
     {
-        using var tmp = BuildTempArchive(SyntheticEntries());
+        using var tmp = BuildTempArchive(SyntheticEntries(), compress: true, xPackId: XPackId.Default);
         Assert.Equal(SyntheticEntries().Count, tmp.Archive.Entries.Count);
     }
 
@@ -19,7 +19,7 @@ public class RefractorFlatArchiveTests
     public void Build_Load_ContentIdentical()
     {
         var entries = SyntheticEntries();
-        using var tmp = BuildTempArchive(entries);
+        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
         for (int i = 0; i < entries.Count; i++)
             Assert.Equal(entries[i].Data, tmp.Archive.Read(tmp.Archive.Entries[i]));
     }
@@ -28,7 +28,7 @@ public class RefractorFlatArchiveTests
     public void Build_Load_EmptyEntry_RoundTrips()
     {
         var entries = new List<(string Name, byte[] Data)> { ("empty.txt", Array.Empty<byte>()) };
-        using var tmp = BuildTempArchive(entries);
+        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
         Assert.Equal(Array.Empty<byte>(), tmp.Archive.Read(tmp.Archive.Entries[0]));
     }
 
@@ -38,7 +38,7 @@ public class RefractorFlatArchiveTests
         // > 32 KiB forces multiple blocks
         var big = RandomBytes(90_000, seed: 42);
         var entries = new List<(string Name, byte[] Data)> { ("big.bin", big) };
-        using var tmp = BuildTempArchive(entries);
+        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
         Assert.Equal(big, tmp.Archive.Read(tmp.Archive.Entries[0]));
     }
 
@@ -48,7 +48,7 @@ public class RefractorFlatArchiveTests
     public void Build_Uncompressed_ContentIdentical()
     {
         var entries = SyntheticEntries();
-        using var tmp = BuildTempArchive(entries, WriteOptions.Uncompressed);
+        using var tmp = BuildTempArchive(entries, compress: false, xPackId: XPackId.Default);
         Assert.False(tmp.Archive.IsCompressed);
         for (int i = 0; i < entries.Count; i++)
             Assert.Equal(entries[i].Data, tmp.Archive.Read(tmp.Archive.Entries[i]));
@@ -63,7 +63,7 @@ public class RefractorFlatArchiveTests
     [InlineData(XPackId.None)]
     public void Build_XPackId_RoundTrips(XPackId id)
     {
-        using var tmp = BuildTempArchive(SyntheticEntries(), new WriteOptions { XPackId = id });
+        using var tmp = BuildTempArchive(SyntheticEntries(), compress: true, xPackId: id);
         Assert.Equal(id, tmp.Archive.XPackId);
     }
 
@@ -72,7 +72,7 @@ public class RefractorFlatArchiveTests
     [Fact]
     public void Build_Uncompressed_SetsIsCompressedFalse()
     {
-        using var tmp = BuildTempArchive(SyntheticEntries(), WriteOptions.Uncompressed);
+        using var tmp = BuildTempArchive(SyntheticEntries(), compress: false, xPackId: XPackId.Default);
         Assert.False(tmp.Archive.IsCompressed);
     }
 
@@ -113,7 +113,7 @@ public class RefractorFlatArchiveTests
     public void Entry_lookup_case_insensitive()
     {
         var entries = new List<(string, byte[])> { ("Folder/File.txt", new byte[] { 1 }) };
-        using var tmp = BuildTempArchive(entries);
+        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
         Assert.NotNull(tmp.Archive.Entries.FirstOrDefault(e => e.Name.Equals("folder/file.txt", StringComparison.OrdinalIgnoreCase)));
         Assert.Null(tmp.Archive.Entries.FirstOrDefault(e => e.Name.Equals("does/not/exist.txt", StringComparison.OrdinalIgnoreCase)));
     }
@@ -124,7 +124,7 @@ public class RefractorFlatArchiveTests
     public void WriteTo_ReadToc_EntryCountMatches()
     {
         var entries = SyntheticEntries();
-        using var tmp = BuildTempArchive(entries);
+        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
         var toc = RefractorFlatArchive.ReadToc(tmp.Path);
         Assert.Equal(entries.Count, toc.Count);
     }
@@ -171,7 +171,7 @@ public class RefractorFlatArchiveTests
     [Fact]
     public void Repack_PreservesXPackId()
     {
-        using var tmp = BuildTempArchive(SyntheticEntries(), new WriteOptions { XPackId = XPackId.RoadToRome });
+        using var tmp = BuildTempArchive(SyntheticEntries(), compress: true, xPackId: XPackId.RoadToRome);
         string repacked = Path.GetTempFileName();
         try
         {
@@ -202,14 +202,14 @@ public class RefractorFlatArchiveTests
 
     /// <summary>Writes entries to a temp file and opens it. Dispose to delete the file.</summary>
     private static TempArchive BuildTempArchive(
-        IReadOnlyList<(string Name, byte[] Data)> entries, WriteOptions? options = null)
+        IReadOnlyList<(string Name, byte[] Data)> entries, bool compress, XPackId xPackId)
     {
         string path = Path.GetTempFileName();
-        RefractorFlatArchive.WriteFile(path, entries, options);
+        RefractorFlatArchive.WriteFile(path, entries, compress, xPackId);
         return new TempArchive(path, new RefractorFlatArchive(path));
     }
 
-    private static TempArchive BuildTestArchive() => BuildTempArchive(SyntheticEntries());
+    private static TempArchive BuildTestArchive() => BuildTempArchive(SyntheticEntries(), compress: true, xPackId: XPackId.Default);
 
     private sealed class TempArchive(string path, RefractorFlatArchive archive) : IDisposable
     {

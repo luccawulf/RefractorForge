@@ -191,7 +191,7 @@ public static class LevelSaver
             var rel = Path.GetRelativePath(folderDir, f).Replace('\\', '/');
             entries.Add((prefix + rel, File.ReadAllBytes(f)));
         }
-        RefractorFlatArchive.WriteFile(outRfaPath, entries);
+        RefractorFlatArchive.WriteFile(outRfaPath, entries, compress: true, xPackId: XPackId.Default);
         return entries.Count;
     }
 
@@ -339,7 +339,7 @@ public static class LevelSaver
         // Deterministic order; entries are addressed by name so order doesn't affect mounting.
         var entries = repl.OrderBy(kv => kv.Key, System.StringComparer.OrdinalIgnoreCase)
                           .Select(kv => (kv.Key, kv.Value)).ToList();
-        RefractorFlatArchive.WriteFile(outPatchPath, entries);
+        RefractorFlatArchive.WriteFile(outPatchPath, entries, compress: true, xPackId: XPackId.Default);
         return names;
     }
 }
