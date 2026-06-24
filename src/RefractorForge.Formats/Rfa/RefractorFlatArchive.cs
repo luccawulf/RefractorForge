@@ -41,7 +41,6 @@ public sealed class RefractorFlatArchive
 
     // ── State ────────────────────────────────────────────────────────────────
 
-    private readonly byte[]? _data;   // set when constructed via Load(byte[])
     private readonly string? _path;   // set when constructed via Open(string)
 
     public IReadOnlyList<RefractorFlatArchiveEntry> Entries { get; }
@@ -61,7 +60,6 @@ public sealed class RefractorFlatArchive
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         var (isV11, isCompressed, xpackId, entries) = ReadFrom(fs);
-        _data = null;
         _path = path;
         Entries = entries;
         IsCompressed = isCompressed;
@@ -71,8 +69,7 @@ public sealed class RefractorFlatArchive
 
     // ── Shared header + TOC reader ────────────────────────────────────────────
 
-    private static (bool IsV11, bool Compressed, XPackId XPackId, List<RefractorFlatArchiveEntry> Entries)
-        ReadFrom(Stream s)
+    private static (bool IsV11, bool Compressed, XPackId XPackId, List<RefractorFlatArchiveEntry> Entries) ReadFrom(Stream s)
     {
         Span<byte> u4 = stackalloc byte[4];
         Span<byte> sig = stackalloc byte[28];
@@ -109,10 +106,10 @@ public sealed class RefractorFlatArchive
             s.ReadExactly(nameBytes);
             s.ReadExactly(rec);
             list.Add(new RefractorFlatArchiveEntry(
-                Name:             Encoding.Latin1.GetString(nameBytes),
-                BlockSize:        (int)BinaryPrimitives.ReadUInt32LittleEndian(rec),
+                Name: Encoding.Latin1.GetString(nameBytes),
+                BlockSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec),
                 UncompressedSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(4)),
-                Offset:                BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(8))));
+                Offset: BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(8))));
         }
 
         return (isV11, compressed, xpackId, list);
@@ -123,15 +120,11 @@ public sealed class RefractorFlatArchive
     /// <summary>Decompress an entry to its full uncompressed bytes.</summary>
     public byte[] Read(RefractorFlatArchiveEntry e)
     {
-        if (_data is not null)
-            return DecodeRegion(_data.AsSpan((int)e.Offset, e.BlockSize), e.UncompressedSize, e.Name);
         return DecodeRegion(ReadRegionFromFile(e), e.UncompressedSize, e.Name);
     }
 
     private byte[] RawRegion(RefractorFlatArchiveEntry e)
     {
-        if (_data is not null)
-            return _data.AsSpan((int)e.Offset, e.BlockSize).ToArray();
         return ReadRegionFromFile(e);
     }
 
@@ -159,11 +152,12 @@ public sealed class RefractorFlatArchive
         {
             int b = descBase + i * 12;
             int comp = (int)ReadU32(region, b);
-            int unc  = (int)ReadU32(region, b + 4);
-            int cum  = (int)ReadU32(region, b + 8);
-            // Skip trailing 0-length terminator blocks some writers append (e.g. Dambuster/materialmap.raw:
-            // 8 real blocks + a 9th comp=4/unc=0 marker). Feeding unc==0 to the decoder caused crashes.
-            if (unc == 0) continue;
+            int unc = (int)ReadU32(region, b + 4);
+            int cum = (int)ReadU32(region, b + 8);
+
+            if (unc == 0)
+                continue;
+
             var src = region.Slice(dataStart + cum, comp);
             var dst = result.AsSpan(written, unc);
             if (comp == unc)
@@ -180,16 +174,6 @@ public sealed class RefractorFlatArchive
         return result;
     }
 
-    // ── TOC-only streaming read ───────────────────────────────────────────────
-
-    /// <summary>Read just an archive's directory table without loading the whole file — the only viable
-    /// approach for archives too large to fit in a single managed <c>byte[]</c>.</summary>
-    public static IReadOnlyList<RefractorFlatArchiveEntry> ReadToc(string path)
-    {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        return ReadFrom(fs).Entries;
-    }
-
     // ── Writing ───────────────────────────────────────────────────────────────
 
     private static byte[] BuildRegion(byte[] data, bool compress)
@@ -201,7 +185,7 @@ public sealed class RefractorFlatArchive
         int numBlocks = n == 0 ? 0 : (n + ChunkSize - 1) / ChunkSize;
 
         var comps = new List<byte[]>(numBlocks);
-        var uncs  = new int[numBlocks];
+        var uncs = new int[numBlocks];
         for (int i = 0; i < numBlocks; i++)
         {
             int start = i * ChunkSize;
@@ -258,18 +242,18 @@ public sealed class RefractorFlatArchive
         WriteU32(output, (uint)xPackId + descriptorSum);
 
         // ── Entry regions ────────────────────────────────────────────────────
-        var offsets    = new long[count];
+        var offsets = new long[count];
         var blockSizes = new int[count];
-        var names      = new byte[count][];
-        var uncs       = new int[count];
+        var names = new byte[count][];
+        var uncs = new int[count];
         for (int i = 0; i < count; i++)
         {
             offsets[i] = output.Position - start;
             var (region, unc) = getRegion(i);
             output.Write(region, 0, region.Length);
             blockSizes[i] = region.Length;
-            names[i]      = Encoding.Latin1.GetBytes(name(i));
-            uncs[i]       = unc;
+            names[i] = Encoding.Latin1.GetBytes(name(i));
+            uncs[i] = unc;
         }
 
         // ── TOC ──────────────────────────────────────────────────────────────
@@ -327,11 +311,16 @@ public sealed class RefractorFlatArchive
         try
         {
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
-                StreamArchive(fs, ents.Count, i => ents[i].Name,
+                StreamArchive(
+                    fs,
+                    ents.Count,
+                    i => ents[i].Name,
                     i => ci.TryGetValue(ents[i].Name, out var rep)
                         ? (BuildRegion(rep, original.IsCompressed), rep.Length)
                         : (original.RawRegion(ents[i]), ents[i].UncompressedSize),
-                    original.IsCompressed, original.XPackId);
+                    original.IsCompressed,
+                    original.XPackId
+                );
             File.Move(tmp, path, overwrite: true);
         }
         catch
@@ -353,7 +342,7 @@ public sealed class RefractorFlatArchive
     /// and should be excluded from a dedicated-server archive.</summary>
     public static bool IsClientOnlyEntry(string entryName)
     {
-        string ext  = Path.GetExtension(entryName);
+        string ext = Path.GetExtension(entryName);
         string file = Path.GetFileName(entryName);
         return ClientOnlyExtensions.Contains(ext) || ClientOnlyFileNames.Contains(file);
     }

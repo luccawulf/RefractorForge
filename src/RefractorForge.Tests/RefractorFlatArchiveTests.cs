@@ -118,17 +118,6 @@ public class RefractorFlatArchiveTests
         Assert.Null(tmp.Archive.Entries.FirstOrDefault(e => e.Name.Equals("does/not/exist.txt", StringComparison.OrdinalIgnoreCase)));
     }
 
-    // ── StreamingWrite / ReadToc ──────────────────────────────────────────────
-
-    [Fact]
-    public void WriteTo_ReadToc_EntryCountMatches()
-    {
-        var entries = SyntheticEntries();
-        using var tmp = BuildTempArchive(entries, compress: true, xPackId: XPackId.Default);
-        var toc = RefractorFlatArchive.ReadToc(tmp.Path);
-        Assert.Equal(entries.Count, toc.Count);
-    }
-
     // ── Repack ────────────────────────────────────────────────────────────────
 
     [Fact]

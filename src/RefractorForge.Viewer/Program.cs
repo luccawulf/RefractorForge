@@ -526,7 +526,8 @@ if (rfaList.Length > 0)
         try
         {
             bool t = false, h = false;
-            foreach (var toc in RefractorForge.Formats.Rfa.RefractorFlatArchive.ReadToc(rfa))
+            var rfaFile = new RefractorFlatArchive(rfa);
+            foreach (var toc in rfaFile.Entries)
             {
                 var e = toc.Name.Replace('\\', '/');
                 if (e.EndsWith("/Terrain.con", OIC) || e.Equals("Terrain.con", OIC)) t = true;
