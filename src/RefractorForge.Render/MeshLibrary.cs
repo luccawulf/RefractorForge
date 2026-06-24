@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
@@ -15,14 +15,14 @@ namespace RefractorForge.Render;
 /// </summary>
 public sealed class MeshLibrary
 {
-    private readonly List<RfaArchive> _archives = new();
-    private readonly Dictionary<string, RfaEntry> _byName = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, RfaEntry> _treeByName = new(StringComparer.OrdinalIgnoreCase);   // BF1942 .tm tree meshes (basename, no ext)
-    private readonly Dictionary<string, RfaEntry> _rsByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<RefractorFlatArchive> _archives = new();
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _byName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _treeByName = new(StringComparer.OrdinalIgnoreCase);   // BF1942 .tm tree meshes (basename, no ext)
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _rsOverrideFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Mesh?> _cache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<RfaEntry> _vehicleCons = new();                  // .con files under .../Vehicles/
-    private readonly List<RfaEntry> _conEntries = new();                   // ALL .con files (for object-template geometry)
+    private readonly List<RefractorFlatArchiveEntry> _vehicleCons = new();                  // .con files under .../Vehicles/
+    private readonly List<RefractorFlatArchiveEntry> _conEntries = new();                   // ALL .con files (for object-template geometry)
     private Dictionary<string, string>? _objGeom;                          // ObjectTemplate name -> geometry name (lazy)
     private Dictionary<string, string>? _geomFile;                         // GeometryTemplate alias -> .sm file (lazy)
     private Dictionary<string, ConTemplate>? _allTemplates;               // ALL ObjectTemplates by name, across archives (lazy)
@@ -178,8 +178,8 @@ public sealed class MeshLibrary
 
     // Decode a resolved .sm entry's first usable collision section. Cached per entry so a vehicle that reuses the same
     // wheel/tread .sm across parts decodes it once.
-    private readonly Dictionary<RfaEntry, CollisionMesh?> _colEntryCache = new();
-    private CollisionMesh? BuildCollisionFromEntry(RfaEntry entry)
+    private readonly Dictionary<RefractorFlatArchiveEntry, CollisionMesh?> _colEntryCache = new();
+    private CollisionMesh? BuildCollisionFromEntry(RefractorFlatArchiveEntry entry)
     {
         if (_colEntryCache.TryGetValue(entry, out var hit)) return hit;
         CollisionMesh? result = null;
@@ -209,10 +209,10 @@ public sealed class MeshLibrary
         {
             if (!File.Exists(path)) continue;
             if (Path.GetFileName(path).StartsWith("~")) continue;   // ~$… temp/lock leftovers (e.g. a stray ~$andardMesh.rfa)
-            RfaArchive arc;
+            RefractorFlatArchive arc;
             // A corrupt / partial / non-RFA file must NOT crash the whole editor (it's loaded straight-line, outside
             // the level-load try/catch) — skip it and keep going.
-            try { arc = RfaArchive.Open(path); }
+            try { arc = new RefractorFlatArchive(path); }
             catch (Exception ex) { System.Console.WriteLine($"MeshLibrary: skipping unreadable archive '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
             lib._archives.Add(arc);
             foreach (var e in arc.Entries)
@@ -413,7 +413,7 @@ public sealed class MeshLibrary
     private bool TryLoadVehicleHierarchy(string vehicle, out List<ConTemplate> templates, out Dictionary<string, string> geoFiles, out string rootName)
     {
         templates = new(); geoFiles = new(StringComparer.OrdinalIgnoreCase); rootName = vehicle;
-        RfaEntry? conEntry = null;
+        RefractorFlatArchiveEntry? conEntry = null;
         string vlow = vehicle.ToLowerInvariant();
         foreach (var e in _vehicleCons)
         {
@@ -772,7 +772,7 @@ public sealed class MeshLibrary
     }
 
     /// <summary>The first ObjectTemplate.create name in a single .con entry (the main Objects.con's root), or null.</summary>
-    private string? FirstTemplateName(RfaEntry conEntry)
+    private string? FirstTemplateName(RefractorFlatArchiveEntry conEntry)
     {
         try
         {
@@ -961,7 +961,7 @@ public sealed class MeshLibrary
         // Prefer the high-detail _m1 over _L1 (low) so the editor shows the better silhouette.
         string[] suffixes = { "_main_m1", "_body_m1", "_fus_m1", "_main", "_body", "_fus", "_hull_m1", "_hull" };
         string vlow = vehicle.ToLowerInvariant();
-        RfaEntry? bestEntry = null; int bestRank = int.MaxValue;
+        RefractorFlatArchiveEntry? bestEntry = null; int bestRank = int.MaxValue;
         foreach (var kv in _byName)
         {
             string n = kv.Key.ToLowerInvariant();
@@ -1014,7 +1014,7 @@ public sealed class MeshLibrary
         return "NO_TEMPLATE: no ObjectTemplate.create in any opened archive and no mesh matches the name";
     }
 
-    private RfaEntry? Resolve(string template)
+    private RefractorFlatArchiveEntry? Resolve(string template)
     {
         var e = ResolveByName(template);
         if (e is not null) return e;
@@ -1039,7 +1039,7 @@ public sealed class MeshLibrary
 
     /// <summary>Resolve a NAME directly to a .sm entry: exact + LOD-suffixed + "_off" variants + a shortest-prefix
     /// fallback. (The object-template indirection lives in <see cref="Resolve"/>.)</summary>
-    private RfaEntry? ResolveByName(string t)
+    private RefractorFlatArchiveEntry? ResolveByName(string t)
     {
         // GeometryTemplate.file values are often PATHS (e.g. "\DesertCombat\STRYKER\STRYKER_Hull"); the .sm index is
         // keyed by bare basename, so strip any folder prefix first or the lookup + LOD/prefix fallbacks all miss.
@@ -1054,7 +1054,7 @@ public sealed class MeshLibrary
                 if (_byName.TryGetValue(cand, out var e)) return e;
         }
 
-        RfaEntry? best = null; int bestLen = int.MaxValue;
+        RefractorFlatArchiveEntry? best = null; int bestLen = int.MaxValue;
         foreach (var kv in _byName)
             if (kv.Key.StartsWith(t, StringComparison.OrdinalIgnoreCase) && kv.Key.Length < bestLen)
             { best = kv.Value; bestLen = kv.Key.Length; }
@@ -1161,7 +1161,7 @@ public sealed class MeshLibrary
 
     /// <summary>Resolve a template to a BF1942 .tm tree mesh: by its own name, or via ObjectTemplate.geometry ->
     /// GeometryTemplate.file -> the .tm basename (the same indirection the .sm path uses).</summary>
-    private RfaEntry? ResolveTree(string template)
+    private RefractorFlatArchiveEntry? ResolveTree(string template)
     {
         static string Norm(string s)
         {
@@ -1184,7 +1184,7 @@ public sealed class MeshLibrary
     private (Vector3 Color, Texture2D? Tex) ResolveTreeMaterial(string texName)
         => (new Vector3(0.36f, 0.55f, 0.30f), _textures?.Resolve(texName));
 
-    private Mesh? BuildFromEntry(RfaEntry entry)
+    private Mesh? BuildFromEntry(RefractorFlatArchiveEntry entry)
     {
         byte[] bytes;
         try { bytes = OwningArchive(entry).Read(entry); }
@@ -1278,7 +1278,7 @@ public sealed class MeshLibrary
     }
 
     /// <summary>Find and parse the .rs shader set for a mesh entry (basename match; level override first).</summary>
-    private RsShaderSet? LoadShaders(RfaEntry smEntry)
+    private RsShaderSet? LoadShaders(RefractorFlatArchiveEntry smEntry)
     {
         string baseName = smEntry.Name.Replace('\\', '/');
         baseName = baseName[(baseName.LastIndexOf('/') + 1)..];
@@ -1294,7 +1294,7 @@ public sealed class MeshLibrary
         return null;
     }
 
-    private RfaArchive OwningArchive(RfaEntry e)
+    private RefractorFlatArchive OwningArchive(RefractorFlatArchiveEntry e)
     {
         foreach (var arc in _archives)
             if (arc.Entries.Contains(e)) return arc;

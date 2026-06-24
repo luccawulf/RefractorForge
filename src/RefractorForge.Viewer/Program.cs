@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using RefractorForge.Formats.Con;
@@ -17,7 +17,8 @@ using Silk.NET.OpenGL;
 using Silk.NET.OpenGL.Extensions.ImGui;
 using Silk.NET.Windowing;
 using ImGuiNET;
-using ImGui = ImGuiNET.ImGui;   // disambiguate from the Silk.NET.OpenGL.Extensions.ImGui namespace
+using ImGui = ImGuiNET.ImGui;
+using RefractorForge.Formats.Rfa;   // disambiguate from the Silk.NET.OpenGL.Extensions.ImGui namespace
 
 // ============================================================================
 // RefractorForge interactive viewer/editor.
@@ -525,7 +526,8 @@ if (rfaList.Length > 0)
         try
         {
             bool t = false, h = false;
-            foreach (var toc in RefractorForge.Formats.Rfa.RfaArchive.ReadToc(rfa))
+            var rfaFile = new RefractorFlatArchive(rfa);
+            foreach (var toc in rfaFile.Entries)
             {
                 var e = toc.Name.Replace('\\', '/');
                 if (e.EndsWith("/Terrain.con", OIC) || e.Equals("Terrain.con", OIC)) t = true;
@@ -2784,8 +2786,8 @@ byte[]? ResolveSoundWav(SoundEmitter em)
     byte[]? best = null; int bestScore = -1;
     foreach (var ap in soundWavArchives)
     {
-        RefractorForge.Formats.Rfa.RfaArchive arc;
-        try { arc = RefractorForge.Formats.Rfa.RfaArchive.Open(ap); } catch { continue; }
+        RefractorForge.Formats.Rfa.RefractorFlatArchive arc;
+        try { arc = new RefractorFlatArchive(ap); } catch { continue; }
         foreach (var e in arc.Entries)
         {
             var en = e.Name.Replace('\\', '/').ToLowerInvariant();
@@ -3535,6 +3537,10 @@ void DoSave()
 {
     if (so is null) return;
     AutoBackup();
+    try { DoSaveCore(); } catch (Exception ex) { Console.Error.WriteLine($"Save failed: {ex.Message}"); showLog = true; }
+}
+void DoSaveCore()
+{
 
     // Re-emit the painted terrain texture as txCxR.dds tiles (split the atlas back into the level's tile grid,
     // uncompressed DDS - the form the engine reads, same as the generated minimap). Folder levels only for now.
@@ -4154,7 +4160,7 @@ void DoImportTreeMesh()
     if (path is null) return;
     try
     {
-        var arc = RefractorForge.Formats.Rfa.RfaArchive.Open(path);
+        var arc = new RefractorFlatArchive(path);
         (Vector3, Texture2D?) Resolve(string texName)
         {
             Texture2D? tex = meshLib.Textures?.Resolve(Path.GetFileNameWithoutExtension(texName));
@@ -6554,7 +6560,7 @@ void ApplyWeatherToLevel()
     (string, byte[])? initEdit = null;
     try
     {
-        var arch = RefractorForge.Formats.Rfa.RfaArchive.Open(baseRfaForInit);
+        var arch = new RefractorFlatArchive(baseRfaForInit);
         var e = arch.Entries
             .Where(x => x.Name.EndsWith("Init.con", StringComparison.OrdinalIgnoreCase)
                      && !x.Name.Replace('\\', '/').ToLowerInvariant().Contains("/menu/"))
@@ -6649,7 +6655,7 @@ void ImportCloudMesh()
     SaveCloudsToEnv();
     try
     {
-        var arch = RefractorForge.Formats.Rfa.RfaArchive.Open(baseRfa);
+        var arch = new RefractorFlatArchive(baseRfa);
         var e = arch.Entries.FirstOrDefault(x => x.Name.EndsWith("SkyAndSun.con", StringComparison.OrdinalIgnoreCase));
         if (e is null) return null;
         var lines = System.Text.Encoding.Latin1.GetString(arch.Read(e)).Replace("\r\n", "\n").Split('\n');
@@ -7799,7 +7805,7 @@ void DoPlayMapBik()
     foreach (var rfa in rfaList)
     {
         if (!File.Exists(rfa)) continue;
-        RefractorForge.Formats.Rfa.RfaArchive a; try { a = RefractorForge.Formats.Rfa.RfaArchive.Open(rfa); } catch { continue; }
+        RefractorForge.Formats.Rfa.RefractorFlatArchive a; try { a = new RefractorFlatArchive(rfa); } catch { continue; }
         foreach (var e in a.Entries)
         {
             if (!e.Name.EndsWith(".bik", StringComparison.OrdinalIgnoreCase)) continue;

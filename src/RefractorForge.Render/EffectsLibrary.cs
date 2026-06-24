@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
@@ -41,7 +41,7 @@ public sealed class EffectsLibrary
     public int BundleCount => _bundles.Count;
 
     /// <summary>Load every Effects.con (and object .con that attaches effects) from the given RFA archives.</summary>
-    public static EffectsLibrary FromArchives(IEnumerable<RfaArchive> archives)
+    public static EffectsLibrary FromArchives(IEnumerable<RefractorFlatArchive> archives)
     {
         var lib = new EffectsLibrary();
         foreach (var a in archives)
@@ -64,11 +64,11 @@ public sealed class EffectsLibrary
 
     public static EffectsLibrary FromRfaPaths(IEnumerable<string> paths)
     {
-        var arcs = new List<RfaArchive>();
+        var arcs = new List<RefractorFlatArchive>();
         foreach (var p in paths)
         {
             if (!File.Exists(p) || Path.GetFileName(p).StartsWith("~")) continue;
-            try { arcs.Add(RfaArchive.Open(p)); } catch { }
+            try { arcs.Add(new RefractorFlatArchive(p)); } catch { }
         }
         return FromArchives(arcs);
     }

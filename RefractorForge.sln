@@ -1,35 +1,21 @@
-
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.0.31903.59
+# Visual Studio Version 18
+VisualStudioVersion = 18.6.11819.183
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{D7C03832-DD16-4762-A0D7-0A065F40B7E0}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Formats", "src\RefractorForge.Formats\RefractorForge.Formats.csproj", "{86C661D4-8466-4A4A-867C-1FFE6BF3323A}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Render", "src\RefractorForge.Render\RefractorForge.Render.csproj", "{77B37E1A-D586-46F2-8C0F-D2071BFF5237}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Demo", "src\RefractorForge.Demo\RefractorForge.Demo.csproj", "{B5E4C0BE-197F-46F8-A36C-89E9E866DC96}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Viewer", "src\RefractorForge.Viewer\RefractorForge.Viewer.csproj", "{826E3223-C537-4298-AB06-4FA95C3DF677}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Collab", "src\RefractorForge.Collab\RefractorForge.Collab.csproj", "{7498AB75-59AE-4175-AA68-B270C5E77C90}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.CollabTests", "src\RefractorForge.CollabTests\RefractorForge.CollabTests.csproj", "{574C078D-A4EE-4565-942F-5005D9F6E683}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.RfaTool", "src\RefractorForge.RfaTool\RefractorForge.RfaTool.csproj", "{775A0C2A-60A7-414B-A6E6-041720381D8E}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Studio", "src\RefractorForge.Studio\RefractorForge.Studio.csproj", "{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.TerrainTests", "src\RefractorForge.TerrainTests\RefractorForge.TerrainTests.csproj", "{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Tests", "src\RefractorForge.Tests\RefractorForge.Tests.csproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{86C661D4-8466-4A4A-867C-1FFE6BF3323A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
@@ -40,10 +26,6 @@ Global
 		{77B37E1A-D586-46F2-8C0F-D2071BFF5237}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{77B37E1A-D586-46F2-8C0F-D2071BFF5237}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{77B37E1A-D586-46F2-8C0F-D2071BFF5237}.Release|Any CPU.Build.0 = Release|Any CPU
-		{B5E4C0BE-197F-46F8-A36C-89E9E866DC96}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{B5E4C0BE-197F-46F8-A36C-89E9E866DC96}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{B5E4C0BE-197F-46F8-A36C-89E9E866DC96}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{B5E4C0BE-197F-46F8-A36C-89E9E866DC96}.Release|Any CPU.Build.0 = Release|Any CPU
 		{826E3223-C537-4298-AB06-4FA95C3DF677}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{826E3223-C537-4298-AB06-4FA95C3DF677}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{826E3223-C537-4298-AB06-4FA95C3DF677}.Release|Any CPU.ActiveCfg = Release|Any CPU
@@ -52,32 +34,15 @@ Global
 		{7498AB75-59AE-4175-AA68-B270C5E77C90}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7498AB75-59AE-4175-AA68-B270C5E77C90}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{7498AB75-59AE-4175-AA68-B270C5E77C90}.Release|Any CPU.Build.0 = Release|Any CPU
-		{574C078D-A4EE-4565-942F-5005D9F6E683}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{574C078D-A4EE-4565-942F-5005D9F6E683}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{574C078D-A4EE-4565-942F-5005D9F6E683}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{574C078D-A4EE-4565-942F-5005D9F6E683}.Release|Any CPU.Build.0 = Release|Any CPU
-		{775A0C2A-60A7-414B-A6E6-041720381D8E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{775A0C2A-60A7-414B-A6E6-041720381D8E}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{775A0C2A-60A7-414B-A6E6-041720381D8E}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{775A0C2A-60A7-414B-A6E6-041720381D8E}.Release|Any CPU.Build.0 = Release|Any CPU
-		{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55}.Release|Any CPU.Build.0 = Release|Any CPU
-		{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
-	GlobalSection(NestedProjects) = preSolution
-		{86C661D4-8466-4A4A-867C-1FFE6BF3323A} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{77B37E1A-D586-46F2-8C0F-D2071BFF5237} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{B5E4C0BE-197F-46F8-A36C-89E9E866DC96} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{826E3223-C537-4298-AB06-4FA95C3DF677} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{7498AB75-59AE-4175-AA68-B270C5E77C90} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{574C078D-A4EE-4565-942F-5005D9F6E683} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{775A0C2A-60A7-414B-A6E6-041720381D8E} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{3F9A1C77-5B2E-4D8A-9E14-7C2B6A0D1E55} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
-		{4A2B8E91-7C3D-4F56-A1B8-9D0E2F3C4B5A} = {D7C03832-DD16-4762-A0D7-0A065F40B7E0}
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {E87B8850-6D0E-47D7-A280-8D12A5388C92}
 	EndGlobalSection
 EndGlobal
