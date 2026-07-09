@@ -165,4 +165,26 @@ public class NavTests
             try { Directory.Delete(tmpDir, true); } catch { }
         }
     }
+
+    [Fact]
+    public void Pathmap_raw_loads_both_forms_and_unrotates()
+    {
+        // A synthetic painted world-grid map (vertical blocked stripes). Encode to BOTH on-disk forms, load them
+        // back via PathmapRaw + UnemitNav, and confirm the world grid is recovered exactly. Guards the native
+        // pathmap viewer (Open .raw + post-save preview) against an orientation/format regression.
+        int side = 128;
+        var world = new byte[side * side];
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+                world[y * side + x] = (x / 16 % 2 == 0) ? (byte)0x00 : (byte)0xFF;
+
+        var nav = SearchMapGenerator.EmitNav(world, side);   // on-disk 8Bit (nav-oriented)
+
+        var eight = PathmapRaw.Load(nav, "Tank0Level0Map8Bit.raw", out int s8);
+        Assert.True(s8 == side && SearchMapGenerator.UnemitNav(eight, s8).SequenceEqual(world), "8Bit .raw round-trips to the world grid");
+
+        var comp = CompressedSearchMap.Encode(nav, side, 0);
+        var dec = PathmapRaw.Load(comp, "Tank0Level0Map.raw", out int sc);
+        Assert.True(sc == side && SearchMapGenerator.UnemitNav(dec, sc).SequenceEqual(world), "compressed .raw round-trips to the world grid");
+    }
 }

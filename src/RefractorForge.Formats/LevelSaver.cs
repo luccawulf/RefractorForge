@@ -342,4 +342,51 @@ public static class LevelSaver
         RefractorFlatArchive.WriteFile(outPatchPath, entries, compress: true, xPackId: XPackId.Default);
         return names;
     }
+
+    /// <summary>Extract level <c>.rfa</c>(s) (base + patches, later archives win) into <paramref name="destDir"/>,
+    /// stripping the shared leading folders (e.g. <c>bf1942/levels/Bocage/</c>) so the files land directly in the
+    /// folder (<c>Heightmap.raw</c>, <c>Init/Terrain.con</c>, …). This is the project workflow's "open RFA → unpack
+    /// to a working folder" step; the folder is then edited + saved like any folder level, and export re-packs only
+    /// the modified files. Shared mesh/texture archives are NOT passed here — only the level's own <c>.rfa</c>.
+    /// Returns the number of files written.</summary>
+    public static int ExtractToFolder(IEnumerable<string> rfaPaths, string destDir)
+    {
+        // Merge entries by name across archives so a patch overrides the base (later wins), matching the loader.
+        var merged = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in rfaPaths)
+        {
+            if (string.IsNullOrEmpty(p) || !File.Exists(p) || Path.GetFileName(p).StartsWith("~")) continue;
+            var arc = new RefractorFlatArchive(p);
+            foreach (var e in arc.Entries) merged[e.Name.Replace('\\', '/')] = arc.Read(e);
+        }
+        string prefix = CommonDirPrefix(merged.Keys);
+        Directory.CreateDirectory(destDir);
+        int n = 0;
+        foreach (var (name, bytes) in merged)
+        {
+            var rel = name.Length > prefix.Length ? name[prefix.Length..] : Path.GetFileName(name);
+            var dst = Path.Combine(destDir, rel.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+            File.WriteAllBytes(dst, bytes);
+            n++;
+        }
+        return n;
+    }
+
+    /// <summary>The longest common leading DIRECTORY prefix (forward-slashed, trailing '/') shared by all entry
+    /// names; "" if none. A level archive's entries all sit under one folder, so this recovers it.</summary>
+    private static string CommonDirPrefix(IEnumerable<string> names)
+    {
+        string[]? common = null;
+        foreach (var n in names)
+        {
+            var parts = n.Split('/');
+            var dirs = parts.Take(parts.Length - 1).ToArray();   // drop the filename
+            if (common is null) { common = dirs; continue; }
+            int k = 0;
+            while (k < common.Length && k < dirs.Length && common[k].Equals(dirs[k], StringComparison.OrdinalIgnoreCase)) k++;
+            common = common.Take(k).ToArray();
+        }
+        return common is { Length: > 0 } ? string.Join('/', common) + "/" : "";
+    }
 }

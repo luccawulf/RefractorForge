@@ -416,6 +416,7 @@ string? levelDir = null;
 string[] levelArchives = Array.Empty<string>();   // all level .rfa (base + patches); empty when the level is a FOLDER
 string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa + patches - no limit
 string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (their folders are also scanned for siblings)
+RefractorForge.Formats.RfProject? activeRfProject = null;   // the loaded .rfproj (project workflow); Ctrl+S updates it
 {
     var pathArgs = args.Where(a => !a.StartsWith("-", StringComparison.Ordinal)).ToArray();
     bool forcePick = args.Any(a => a is "--pick" or "-p");
@@ -427,8 +428,23 @@ string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (th
     else
     {
         var saved = Settings.Load();
-        // Reuse the remembered level whether it's an extracted FOLDER or one-or-more packed .rfa FILEs.
-        if (!forcePick && saved is { Level: string sl } && (Directory.Exists(sl) || File.Exists(sl)))
+        var activeProj = ActiveProject.Get();
+        // 1) An active project (.rfproj) -> load it. Folder-based: the level data lives in the project folder, with
+        //    mesh/texture libraries referenced (Custom) or derived from the mod chain (Default).
+        if (!forcePick && activeProj is not null && File.Exists(activeProj))
+        {
+            try
+            {
+                var proj = RefractorForge.Formats.RfProject.Load(activeProj);
+                var (pld, pma, pta) = proj.Resolve();
+                levelDir = pld; meshArchives = pma; texPicks = pta; levelArchives = Array.Empty<string>();
+                RecentProjects.Touch(proj);
+                activeRfProject = proj;
+            }
+            catch { ActiveProject.Clear(); }   // corrupt/missing -> fall through to the startup screen
+        }
+        // 2) Back-compat: a remembered plain level from before the project system (FOLDER or one-or-more .rfa).
+        if (levelDir is null && !forcePick && saved is { Level: string sl } && (Directory.Exists(sl) || File.Exists(sl)))
         {
             levelDir = sl;
             levelArchives = (saved.LevelArchives is { Length: > 0 } la ? la
@@ -438,17 +454,15 @@ string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (th
                 .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).Select(p => p!).ToArray();
             texPicks = (saved.Textures ?? Array.Empty<string>()).Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).ToArray();
         }
-        else
+        // 3) No project + no remembered level -> the interactive startup screen (Recent Projects + Open/New).
+        if (levelDir is null)
         {
-            // First run / no saved level: show the splash by itself for ~3s, then use the Open Mod flow (pick the mod
-            // folder, then the map .rfa; the mesh + texture archives are auto-collected from the mod's chain).
-            SplashScreen.WaitVisibleFor(3000);
-            SplashScreen.Close();
-            if (GatherModPaths(out var lvlRfas0, out var meshList0, out var texList0))
-            {
-                levelArchives = lvlRfas0; levelDir = lvlRfas0[0]; meshArchives = meshList0; texPicks = texList0;
-                Settings.Save(new LevelPaths(levelDir, null, null, texPicks, meshArchives, levelArchives.Length > 0 ? levelArchives : null));
-            }
+            SplashScreen.Close();   // dismiss the splash so the startup window is visible
+            var proj = ProjectFlows.RunStartup();
+            if (proj is null) Environment.Exit(0);   // user cancelled -> exit before opening the GL window
+            var (pld, pma, pta) = proj!.Resolve();
+            levelDir = pld; meshArchives = pma; texPicks = pta; levelArchives = Array.Empty<string>();
+            activeRfProject = proj;
         }
     }
 }
@@ -862,6 +876,7 @@ uint collisionProg = 0; int uCMvp = -1, uCCam = -1, uCColor = -1, uCFogStart = -
 uint ringVao = 0, ringVbo = 0;         // 3 rotation rings (drawn as GL_LINE_LOOP)
 uint brushRingVao = 0, brushRingVbo = 0;  // terrain-brush radius ring (XZ circle at the cursor)
 uint brushSquareVao = 0, brushSquareVbo = 0;  // square-brush radius outline (XZ square at the cursor)
+uint brushDrapeVao = 0, brushDrapeVbo = 0;    // dynamic brush-cursor outline that drapes on the terrain
 uint gridVao = 0, gridVbo = 0; int gridVertCount = 0; float gridStep = 0f; bool gridDirty = true;  // draped world-grid overlay
 uint indicatorVao = 0; int indicatorCount = 0;  // small 3D diamond drawn at mesh-less objects so they're visible
 uint gpVao = 0, gpVbo = 0;             // gameplay markers (control points / vehicle spawns / soldier spawns)
@@ -1214,7 +1229,7 @@ bool sliderEditStart = false; // focus the input on the first frame of editing
 bool showLog = false;         // in-app Log / Errors window (captures console output; auto-pops on load warnings)
 bool logErrorsOnly = false;   // filter the Log window to just error/warning lines
 Vector2D<int> appliedFbSize = default;   // last framebuffer size the GL viewport/aspect were synced to (initial maximize fix)
-bool squareBrush = false;     // square (box) footprint for the terrain + material brushes
+bool squareBrush = true;      // square (box) footprint for the terrain + material brushes (default, per user request)
 // UI layout metrics, hoisted so the 3D overlay (DrawGameplay labels) can clip world-space labels to the
 // central viewport instead of painting them over the side/menu/status panels. uiMenuH is refreshed by BuildUi.
 float uiMenuH = 0f;
@@ -1256,6 +1271,12 @@ bool meshViewerOpen = false;
 string? meshViewerTemplate = null;
 bool meshViewerAutoRotate = true;
 float meshViewerYaw = 0f, meshViewerPitch = 0.3f;     // orbit angles (drag to change; auto-rotate spins yaw)
+// AI Pathmap preview: decode a saved/opened Pathfinding .raw and show it as an image (to verify saves natively).
+uint pathmapTex = 0;                                  // RGBA preview texture
+bool pathmapPreviewOpen = false;
+float pathmapPreviewT = 0f;                           // >0 = auto-close countdown (post-save); 0 while open = manual/persistent
+string pathmapPreviewLabel = "";
+int pathmapPreviewSide = 0;
 float meshViewerZoom = 1f;                            // scroll/+/- zoom (1 = framed to fit; >1 closer, <1 farther)
 uint mvFbo = 0, mvColorTex = 0, mvDepthRbo = 0;       // the preview render target (lazy, reused)
 const int mvSize = 512;                                // preview resolution
@@ -2111,6 +2132,16 @@ void OnLoad()
         gl.EnableVertexAttribArray(0);
     }
 
+    // Draped brush-cursor outline (dynamic; refilled per-frame to follow the terrain like the grid).
+    {
+        brushDrapeVao = gl.GenVertexArray();
+        gl.BindVertexArray(brushDrapeVao);
+        brushDrapeVbo = gl.GenBuffer();
+        gl.BindBuffer(BufferTargetARB.ArrayBuffer, brushDrapeVbo);
+        unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0); }
+        gl.EnableVertexAttribArray(0);
+    }
+
     // Draped world-grid overlay (dynamic; filled by BuildGrid() from the terrain heights).
     {
         gridVao = gl.GenVertexArray();
@@ -2472,6 +2503,38 @@ void BuildGrid()
     gl.BindVertexArray(gridVao);
     gl.BindBuffer(BufferTargetARB.ArrayBuffer, gridVbo);
     gl.BufferData<float>(BufferTargetARB.ArrayBuffer, arr, BufferUsageARB.DynamicDraw);
+}
+
+// A brush-radius cursor outline that DRAPES on the terrain (samples height per point + a small hover bias) so it
+// hugs slopes like the grid instead of a flat ring/square punching through the ground. World-space; draw with the
+// plain view-projection. square=true -> a box outline (edges tessellated so they follow the terrain too).
+void DrawDrapedBrushOutline(float cx, float cz, float radius, bool square)
+{
+    if (terrainPick is null) return;
+    const int n = 64; const float bias = 0.2f;
+    var pts = new float[n * 3];
+    for (int i = 0; i < n; i++)
+    {
+        float ox, oz;
+        if (square)
+        {
+            float t = i / (float)n * 4f; int edge = (int)t; float f = t - edge;   // walk the [-r,r] perimeter
+            (ox, oz) = edge switch
+            {
+                0 => (-radius + 2f * radius * f, -radius),
+                1 => (radius, -radius + 2f * radius * f),
+                2 => (radius - 2f * radius * f, radius),
+                _ => (-radius, radius - 2f * radius * f),
+            };
+        }
+        else { float a = i / (float)n * MathF.PI * 2f; ox = MathF.Cos(a) * radius; oz = MathF.Sin(a) * radius; }
+        float wx = cx + ox, wz = cz + oz;
+        pts[i * 3] = wx; pts[i * 3 + 1] = terrainPick.HeightAt(wx, wz) + bias; pts[i * 3 + 2] = wz;
+    }
+    gl.BindVertexArray(brushDrapeVao);
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, brushDrapeVbo);
+    gl.BufferData<float>(BufferTargetARB.ArrayBuffer, pts, BufferUsageARB.DynamicDraw);
+    gl.DrawArrays(PrimitiveType.LineLoop, 0, (uint)n);
 }
 
 // Draw the draped grid as depth-tested lines (occluded by hills/objects in front), in a subtle cool grey.
@@ -3469,54 +3532,80 @@ void DoTestLevel()
     if (so is null || levelDir is null) { Toast("Load a level first."); return; }
     DoSave();   // write the edits back so the game reads them
     string? gameRoot = null, modName = null;
-    try
+    bool isBf1942 = gameIsBf1942;
+    if (activeRfProject is { } proj)
     {
-        var start = LevelArchive.IsRfa(levelDir) ? Path.GetDirectoryName(Path.GetFullPath(levelDir)) : Path.GetFullPath(levelDir);
-        var d = start is null ? null : new DirectoryInfo(start);
-        for (int i = 0; i < 12 && d is not null; i++)
+        // Project workflow: pack the extracted folder into a patch .rfa in the mod (or the project's GameTestDir),
+        // then launch that game. The base .rfa (if any) stays as-is; the packed <Map>(_Patch).rfa mounts over it.
+        gameRoot = !string.IsNullOrEmpty(proj.GameTestDir) ? proj.GameTestDir : proj.GameRoot;
+        modName = proj.Mod;
+        isBf1942 = !proj.Game.Equals("BFVietnam", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(gameRoot)) { Toast("Set the project's game install (Default) or GameTestDir (Custom) to test in-game."); return; }
+        try
         {
-            if (d.Parent is not null && d.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase))
-            { modName = d.Name; gameRoot = d.Parent.Parent?.FullName; break; }
-            d = d.Parent;
+            string baseSub = isBf1942 ? "bf1942" : "BfVietnam";
+            string map = proj.EffectiveMapName;
+            string rfaName = map + (string.IsNullOrEmpty(proj.PatchNumber) ? "" : "_" + proj.PatchNumber) + ".rfa";
+            string destDir = Path.Combine(gameRoot, "Mods", modName, "Archives", baseSub, "levels");
+            Directory.CreateDirectory(destDir);
+            string outRfa = Path.Combine(destDir, rfaName);
+            int n = RefractorForge.Formats.LevelSaver.PackFolder(levelDir, outRfa, $"{baseSub}/levels/{map}/");
+            Console.WriteLine($"Test This Level: packed {n} file(s) -> {outRfa}");
         }
+        catch (Exception ex) { Toast("Pack for test failed: " + ex.Message); return; }
     }
-    catch { }
+    else
+    {
+        // Classic (non-project): derive the game install by walking up for a Mods\ ancestor.
+        try
+        {
+            var start = LevelArchive.IsRfa(levelDir) ? Path.GetDirectoryName(Path.GetFullPath(levelDir)) : Path.GetFullPath(levelDir);
+            var d = start is null ? null : new DirectoryInfo(start);
+            for (int i = 0; i < 12 && d is not null; i++)
+            {
+                if (d.Parent is not null && d.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase))
+                { modName = d.Name; gameRoot = d.Parent.Parent?.FullName; break; }
+                d = d.Parent;
+            }
+        }
+        catch { }
+    }
     if (gameRoot is null) { Toast("Couldn't find the game install (no Mods\\ ancestor) - launch the game yourself."); return; }
-    string exe = Path.Combine(gameRoot, gameIsBf1942 ? "BF1942.exe" : "BfVietnam.exe");
+    string exe = Path.Combine(gameRoot, isBf1942 ? "BF1942.exe" : "BfVietnam.exe");
     if (!File.Exists(exe)) { Toast($"Game exe not found: {Path.GetFileName(exe)} in {gameRoot}."); return; }
     try
     {
-        string args = modName is not null ? $"+restart 1 +game mods/{modName}" : "+restart 1";
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, args) { WorkingDirectory = gameRoot, UseShellExecute = true });
+        string launchArgs = modName is not null ? $"+restart 1 +game mods/{modName}" : "+restart 1";
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, launchArgs) { WorkingDirectory = gameRoot, UseShellExecute = true });
         Toast($"Saved + launched {Path.GetFileName(exe)} (mod: {modName ?? "base"}). Pick this map in-game.");
-        Console.WriteLine($"Test This Level: launched {exe} {args}");
+        Console.WriteLine($"Test This Level: launched {exe} {launchArgs}");
     }
     catch (Exception ex) { Toast("Launch failed: " + ex.Message); }
 }
 
 // Auto-backup: before a save overwrites the level, copy the editable level files (or the whole .rfa) to a
-// timestamped Backups\ folder next to the level. Folder levels skip bulky textures (.dds). Best-effort; a
-// backup failure never blocks the save.
+// timestamped folder under %APPDATA%\RefractorForge\Backups. CRITICAL: backups must NOT live inside the game's
+// levels folder -- the game would try to mount the Backups dir as a level and fail to start. Folder levels skip
+// bulky textures (.dds). Best-effort; a backup failure never blocks the save.
 void AutoBackup()
 {
     if (!autoBackup || string.IsNullOrEmpty(levelDir)) return;
     try
     {
         string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string backupRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge", "Backups");
         if (LevelArchive.IsRfa(levelDir))
         {
-            var dir = Path.GetDirectoryName(levelDir) ?? ".";
-            var bdir = Path.Combine(dir, "Backups"); Directory.CreateDirectory(bdir);
-            var dst = Path.Combine(bdir, $"{Path.GetFileNameWithoutExtension(levelDir)}_{stamp}{Path.GetExtension(levelDir)}");
+            Directory.CreateDirectory(backupRoot);
+            var dst = Path.Combine(backupRoot, $"{Path.GetFileNameWithoutExtension(levelDir)}_{stamp}{Path.GetExtension(levelDir)}");
             if (!File.Exists(dst)) File.Copy(levelDir, dst);
             Console.WriteLine($"Auto-backup -> {dst}");
             Toast($"Backed up {Path.GetFileName(levelDir)}");
         }
         else if (Directory.Exists(levelDir))
         {
-            var root = levelDir.TrimEnd('\\', '/');
-            var name = new DirectoryInfo(root).Name;
-            var bdir = Path.Combine(Path.GetDirectoryName(root) ?? root, "Backups", $"{name}_{stamp}");
+            var name = new DirectoryInfo(levelDir.TrimEnd('\\', '/')).Name;
+            var bdir = Path.Combine(backupRoot, $"{name}_{stamp}");
             int n = 0;
             foreach (var src in Directory.EnumerateFiles(levelDir, "*.*", SearchOption.AllDirectories))
             {
@@ -3538,6 +3627,9 @@ void DoSave()
     if (so is null) return;
     AutoBackup();
     try { DoSaveCore(); } catch (Exception ex) { Console.Error.WriteLine($"Save failed: {ex.Message}"); showLog = true; }
+    // Project workflow: keep the .rfproj manifest + Recent Projects list current on every save.
+    if (activeRfProject is not null)
+        try { activeRfProject.Save(); RecentProjects.Touch(activeRfProject); } catch { }
 }
 void DoSaveCore()
 {
@@ -3585,13 +3677,17 @@ void DoSaveCore()
         SaveCloudsFolder();      // patch the animated-cloud block into SkyAndSun.con if clouds were edited
         // Write every vehicle whose navmap was painted (each buffer is held independently in aiNavBufs - no
         // save-first / no reseed loss). Each buffer carries its own side, robust to a mid-session map resize.
+        // Target the level's REAL Pathfinding dir (it may sit in a sub-folder) so the edits land where the engine
+        // loads them, not in a stray top-level Pathfinding/.
+        string navParent = System.IO.Directory.EnumerateDirectories(levelDir, "Pathfinding", System.IO.SearchOption.AllDirectories).FirstOrDefault() is string pfDir
+            ? (System.IO.Path.GetDirectoryName(pfDir) ?? levelDir) : levelDir;
         int navVeh = 0, navFiles = 0;
         for (int v = 0; v < aiNavBufs.Length; v++)
             if (aiNavBufDirty[v] && aiNavBufs[v] is not null)
             {
                 var vp = RefractorForge.Formats.Terrain.SearchMapParams.Standard[Math.Clamp(v, 0, RefractorForge.Formats.Terrain.SearchMapParams.Standard.Count - 1)];
                 int side = (int)Math.Round(Math.Sqrt(aiNavBufs[v]!.Length));
-                navFiles += RefractorForge.Formats.Terrain.SearchMapGenerator.WriteVehicleEditedFolder(levelDir, vp, aiNavBufs[v]!, side);
+                navFiles += RefractorForge.Formats.Terrain.SearchMapGenerator.WriteVehicleEditedFolder(navParent, vp, aiNavBufs[v]!, side);
                 aiNavBufDirty[v] = false; navVeh++;
             }
         if (navVeh > 0)
@@ -3599,6 +3695,7 @@ void DoSaveCore()
             Console.WriteLine($"   Wrote {navFiles} edited AI navmap file(s) for {navVeh} vehicle(s) -> Pathfinding/");
             Toast($"Saved AI navmaps: {navVeh} vehicle(s), {navFiles} files.");
             aiNavDirty = false;
+            PreviewSavedNav();   // re-read + show the saved map for a few seconds (verify)
         }
         var sw = sounds.SaveDirty();
         if (sw.Count > 0) Console.WriteLine($"   Saved {sw.Count} sound script(s) (.ssc).");
@@ -3633,7 +3730,7 @@ void DoSaveCore()
         if (tileOk > 0) { atlasPainted = false; Console.WriteLine($"   Baked {tileOk} terrain texture tile(s) into the archive."); }
         else if (tiles.Count > 0) Console.WriteLine("   (painted surface tiles NOT saved: this .rfa has no Textures/ tiles to override -- save to a folder level)");
         int navOk = navFiles.Count > 0 ? navFiles.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase))) : 0;
-        if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Baked {navOk} AI navmap file(s) into the archive."); }
+        if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Baked {navOk} AI navmap file(s) into the archive."); PreviewSavedNav(); }
         else if (navFiles.Count > 0) Console.WriteLine("   (painted AI navmaps NOT saved: this .rfa has no Pathfinding/ entries to override -- save to a folder level)");
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
         return;
@@ -3741,11 +3838,13 @@ void DoGenerateMinimap()
     }
 }
 
-// Generate the level's AI navmaps from the current terrain + placed objects. Writes BOTH forms per vehicle:
-// the engine-form compressed <Veh>Level<L>Map.raw (what ai.loadMaps reads, via CompressedSearchMap.Encode) AND
-// the editor 8Bit <Veh>Level<L>Map8Bit.raw. createSearchMaps-STYLE (per-vehicle water/slope + object footprints
-// carved out + brush clearance; passable=0x00/black, blocked=0xFF/white; land=levels 0-2, water=2-5). Folder
-// levels: written into Pathfinding/. Packed .rfa: written to a loose <name>_Pathfinding folder beside the archive.
+// Save the level's AI navmaps to where the ENGINE actually loads them. The user's PAINTED maps (aiNavBufs) win:
+// every painted vehicle is written; if nothing is painted yet, every vehicle is generated from terrain+objects
+// (the fresh-map case). Writes BOTH forms (engine compressed <Veh>Level<L>Map.raw + editor 8Bit
+// <Veh>Level<L>Map8Bit.raw). Folder levels -> the level's real Pathfinding/ dir; packed .rfa -> INTO the archive
+// (overriding the base navmaps the engine reads). PREVIOUSLY this always regenerated from terrain (discarding
+// hand-painted edits) and, for an .rfa, wrote a loose <name>_Pathfinding folder the game never reads -- so
+// painted AI paths never reached the game. That is the bug this fixes.
 // NOTE: the per-vehicle companions <Veh>.raw (128^2 region map) + <Veh>Info.raw (SAI region graph) are NOT yet
 // written (see pathfinding-re-map memory) - pathfinding A* uses the Level maps; companions are SAI-only.
 void DoGenerateNavmaps()
@@ -3754,22 +3853,164 @@ void DoGenerateNavmaps()
     var foots = meshLib is not null && so is not null
         ? RefractorForge.Render.SearchMapBuilder.Footprints(so.Objects, meshLib)
         : null;
-    string? navDir = null;
-    if (levelDir is not null && System.IO.Directory.Exists(levelDir))
-        navDir = System.IO.Directory.EnumerateDirectories(levelDir, "Pathfinding", System.IO.SearchOption.AllDirectories).FirstOrDefault()
-                 ?? System.IO.Path.Combine(levelDir, "Pathfinding");
-    else if (levelDir is not null)
+    var std = RefractorForge.Formats.Terrain.SearchMapParams.Standard;
+
+    // Painted vehicles win; un-painted vehicles are left to the base unless NOTHING is painted (then generate all).
+    var files = new List<(string Name, byte[] Bytes)>();
+    int painted = 0;
+    for (int v = 0; v < std.Count && v < aiNavBufs.Length; v++)
+        if (aiNavBufDirty[v] && aiNavBufs[v] is not null)
+        {
+            int side = (int)Math.Round(Math.Sqrt(aiNavBufs[v]!.Length));
+            foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.EncodeVehicleLevels(std[v], aiNavBufs[v]!, side))
+                files.Add((f.FileName, f.Data));
+            painted++;
+        }
+    bool generatedAll = files.Count == 0;
+    if (generatedAll)
+        foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.GenerateAll(cfg, heightmap, foots))
+            files.Add((f.FileName, f.Data));
+    if (files.Count == 0) return;
+    string what = generatedAll ? "generated from terrain" : $"{painted} painted vehicle(s)";
+
+    // Packed .rfa: write the navmaps INTO the archive (override the base entries the engine loads), exactly like
+    // Ctrl+S. extraFiles silently drops names the base doesn't ship, so a map without Pathfinding/ entries needs
+    // a folder save -- report that honestly instead of claiming success.
+    if (levelDir is not null && LevelArchive.IsRfa(levelDir))
     {
-        var d = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(levelDir)) ?? ".";
-        navDir = System.IO.Path.Combine(d, System.IO.Path.GetFileNameWithoutExtension(levelDir) + "_Pathfinding");
+        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, null, null, null, null, extraFiles: files);
+        int navOk = files.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase)));
+        if (navOk > 0)
+        {
+            for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false;
+            Console.WriteLine($"Saved {navOk} AI navmap file(s) into {levelDir} ({what}).");
+            Toast($"Saved AI navmaps into the .rfa: {navOk} files ({what}).");
+            PreviewSavedNav();
+        }
+        else
+        {
+            Console.WriteLine("   (AI navmaps NOT saved: this .rfa ships no Pathfinding/ entries to override -- save to a folder level).");
+            Toast("AI navmaps NOT saved: this .rfa has no Pathfinding entries. Extract to a folder level and save there.");
+        }
+        return;
     }
-    if (navDir is null) return;
+
+    // Folder level: write into the level's REAL Pathfinding/ dir (it may be in a sub-folder).
+    string? navDir = (levelDir is not null && System.IO.Directory.Exists(levelDir))
+        ? (System.IO.Directory.EnumerateDirectories(levelDir, "Pathfinding", System.IO.SearchOption.AllDirectories).FirstOrDefault()
+           ?? System.IO.Path.Combine(levelDir, "Pathfinding"))
+        : null;
+    if (navDir is null) { Toast("Open a level first."); return; }
     System.IO.Directory.CreateDirectory(navDir);
-    int n = 0;
-    foreach (var (file, data) in RefractorForge.Formats.Terrain.SearchMapGenerator.GenerateAll(cfg, heightmap, foots))
-    { System.IO.File.WriteAllBytes(System.IO.Path.Combine(navDir, file), data); n++; }
-    Console.WriteLine($"Generated {n} AI navmaps (compressed + 8Bit) -> {navDir}" + (foots is not null ? $" ({foots.Count} object footprints)" : " (terrain-only)"));
-    Toast($"Generated {n} AI navmaps (compressed + 8Bit){(foots is not null ? $", {foots.Count} object footprints" : "")}.");
+    foreach (var (file, data) in files) System.IO.File.WriteAllBytes(System.IO.Path.Combine(navDir, file), data);
+    for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false;
+    Console.WriteLine($"Saved {files.Count} AI navmap file(s) -> {navDir} ({what}).");
+    Toast($"Saved {files.Count} AI navmaps ({what}).");
+    PreviewSavedNav();
+}
+
+// ---- AI Pathmap preview: decode a saved/opened Pathfinding .raw to an image so a save can be verified natively. ----
+
+// Upload a WORLD-GRID map (0x00 pass / 0xFF block) as a grayscale RGBA texture (black=passable, white=blocked,
+// matching the AI Path painter + raw2tga) and open the preview window. seconds>0 auto-closes after that many.
+unsafe void ShowPathmap(byte[] worldGrid, int side, string label, float seconds)
+{
+    if (side <= 0 || worldGrid.Length != side * side) return;
+    byte[] g = worldGrid; int ts = side;   // downsample big maps (up to 4096 sq) so the preview texture stays modest
+    while (ts > 1024 && ts % 2 == 0) { g = RefractorForge.Formats.Terrain.SearchMapGenerator.DownsampleBlocked(g, ts, ts / 2); ts /= 2; }
+    var rgba = new byte[ts * ts * 4];
+    for (int i = 0; i < ts * ts; i++) { byte v = g[i] == 0xFF ? (byte)230 : (byte)32; rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255; }
+    if (pathmapTex == 0) pathmapTex = gl.GenTexture();
+    gl.BindTexture(TextureTarget.Texture2D, pathmapTex);
+    gl.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+    fixed (byte* p = rgba)
+        gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)ts, (uint)ts, 0, PixelFormat.Rgba, PixelType.UnsignedByte, p);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+    gl.BindTexture(TextureTarget.Texture2D, 0);
+    pathmapPreviewSide = side; pathmapPreviewLabel = label; pathmapPreviewOpen = true; pathmapPreviewT = seconds;
+}
+
+// Decode a pathmap .raw's bytes (compressed engine form or 8Bit form) to a WORLD-GRID map for display (un-rotating
+// the on-disk nav orientation back to the painter's map orientation). Null if unrecognizable.
+byte[]? DecodePathmapToWorld(byte[] data, string nameHint, out int side)
+{
+    side = 0;
+    try
+    {
+        var navOriented = RefractorForge.Formats.Terrain.PathmapRaw.Load(data, nameHint, out side);
+        return RefractorForge.Formats.Terrain.SearchMapGenerator.UnemitNav(navOriented, side);
+    }
+    catch { return null; }
+}
+
+// File > Open AI Pathmap: pick a Pathfinding .raw (compressed or 8Bit) and show it natively -- the native
+// equivalent of the community Import_Pathfind + raw2tga tools.
+void OpenPathmapFile()
+{
+    var path = Picker.File("Open AI Pathmap (.raw)", "AI pathmaps (*.raw)|*.raw|All files (*.*)|*.*", levelDir);
+    if (path is null) return;
+    try
+    {
+        var world = DecodePathmapToWorld(System.IO.File.ReadAllBytes(path), System.IO.Path.GetFileName(path), out int side);
+        if (world is null) { Toast("Not a recognizable AI pathmap .raw."); return; }
+        ShowPathmap(world, side, System.IO.Path.GetFileName(path), 0f);
+    }
+    catch (Exception ex) { Toast("Open pathmap failed: " + ex.Message); }
+}
+
+// After a nav save, RE-READ the active vehicle's just-saved map (from the .rfa or the Pathfinding folder) and show
+// it for a few seconds so the save can be verified against what was painted. Best-effort (never throws into save).
+void PreviewSavedNav()
+{
+    try
+    {
+        if (levelDir is null) return;
+        int vi = Math.Clamp(aiPathVeh, 0, RefractorForge.Formats.Terrain.SearchMapParams.Standard.Count - 1);
+        var vp = RefractorForge.Formats.Terrain.SearchMapParams.Standard[vi];
+        int finest = vp.LevelSet.Min();
+        string comp = $"{vp.Name}Level{finest}Map.raw", eight = $"{vp.Name}Level{finest}Map8Bit.raw";
+        byte[]? data = null; string used = comp;
+
+        if (LevelArchive.IsRfa(levelDir))
+        {
+            var a = new RefractorForge.Formats.Rfa.RefractorFlatArchive(levelDir);
+            var ce = a.Entries.FirstOrDefault(x => x.Name.EndsWith(comp, StringComparison.OrdinalIgnoreCase) && !x.Name.EndsWith("8Bit.raw", StringComparison.OrdinalIgnoreCase));
+            if (ce is not null) { data = a.Read(ce); used = comp; }
+            else { var ee = a.Entries.FirstOrDefault(x => x.Name.EndsWith(eight, StringComparison.OrdinalIgnoreCase)); if (ee is not null) { data = a.Read(ee); used = eight; } }
+        }
+        else if (System.IO.Directory.Exists(levelDir))
+        {
+            var navDir = System.IO.Directory.EnumerateDirectories(levelDir, "Pathfinding", System.IO.SearchOption.AllDirectories).FirstOrDefault()
+                         ?? System.IO.Path.Combine(levelDir, "Pathfinding");
+            var pe = System.IO.Path.Combine(navDir, eight); var pc = System.IO.Path.Combine(navDir, comp);
+            if (System.IO.File.Exists(pe)) { data = System.IO.File.ReadAllBytes(pe); used = eight; }
+            else if (System.IO.File.Exists(pc)) { data = System.IO.File.ReadAllBytes(pc); used = comp; }
+        }
+        if (data is null) return;
+        var world = DecodePathmapToWorld(data, used, out int side);
+        if (world is not null) ShowPathmap(world, side, $"{vp.Name} L{finest}  -  saved & re-read from disk", 6f);
+    }
+    catch { }
+}
+
+// The preview window itself (drawn each frame from BuildUi while open).
+void PathmapPreviewWindow()
+{
+    if (!pathmapPreviewOpen || pathmapTex == 0) return;
+    ImGui.SetNextWindowSize(new Vector2(560, 640), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin("AI Pathmap Preview", ref pathmapPreviewOpen, ImGuiWindowFlags.NoScrollbar))
+    {
+        ImGui.TextColored(new Vector4(0.86f, 0.55f, 0.55f, 1f), pathmapPreviewLabel);
+        ImGui.Text($"{pathmapPreviewSide} x {pathmapPreviewSide} cells   black = passable, white = blocked");
+        if (pathmapPreviewT > 0f) { ImGui.SameLine(); ImGui.TextDisabled($"(auto-close {pathmapPreviewT:0.#}s)"); }
+        float sz = MathF.Min(ImGui.GetContentRegionAvail().X, 512f);
+        // North (+Z = high world-grid row) at the TOP, matching the minimap + the in-game map (V-flip the texture).
+        ImGui.Image((IntPtr)pathmapTex, new Vector2(sz, sz), new Vector2(0f, 1f), new Vector2(1f, 0f));
+    }
+    ImGui.End();
 }
 
 // Auto material map from terrain (water line / slope / altitude) - the editor's "Generate Material Map".
@@ -4947,6 +5188,7 @@ void OnRender(double dt)
     }
     lastFps = dt > 0 ? 1.0 / dt : lastFps;
     if (toastT > 0f) toastT -= (float)dt;   // fade out the transient status-bar confirmation
+    if (pathmapPreviewT > 0f) { pathmapPreviewT -= (float)dt; if (pathmapPreviewT <= 0f) pathmapPreviewOpen = false; }   // auto-close the post-save pathmap preview
     appClock += dt;              // advance the water-ripple animation
     if (meshViewerOpen && meshViewerAutoRotate) meshViewerYaw += (float)dt * 0.6f;   // spin the model viewer
     imgui.Update((float)dt);     // begin a new ImGui frame
@@ -5365,9 +5607,8 @@ void OnRender(double dt)
         var bray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbb.X, fbb.Y);
         if (terrainPick.Raycast(bray, out var bp))
         {
-            var m = Matrix4x4.CreateScale(brushRadius) * Matrix4x4.CreateTranslation(bp.X, bp.Y, bp.Z);
             gl.UseProgram(markerProg);
-            gl.UniformMatrix4(uMvpM, 1, false, ToFloats(m * cam.ViewProjection));
+            gl.UniformMatrix4(uMvpM, 1, false, ToFloats(cam.ViewProjection));   // the draped outline is built in world space
             bool lower = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
             if (toolNames[tool] == "Paint") { var pc = paintLayer == 3 ? texSwatch[activeTexture & 15] : matPalette[activeMaterial & 15]; gl.Uniform3(uColor, pc.X, pc.Y, pc.Z); }
             else if (toolNames[tool] == "Smooth") gl.Uniform3(uColor, 0.4f, 0.8f, 1f);
@@ -5389,8 +5630,7 @@ void OnRender(double dt)
             bool squareBitmap = !surfacePaint && !aiPath && brushShapeIdx > 0 && brushShapeIdx < brushShapeNames.Length
                                 && brushShapeNames[brushShapeIdx].IndexOf("square", StringComparison.OrdinalIgnoreCase) >= 0;
             bool sqPrev = squareBitmap || (squareBrush && (surfacePaint || aiPath || brushShapeIdx == 0));
-            if (sqPrev) { gl.BindVertexArray(brushSquareVao); gl.DrawArrays(PrimitiveType.LineLoop, 0, 4); }
-            else { gl.BindVertexArray(brushRingVao); gl.DrawArrays(PrimitiveType.LineLoop, 0, 64); }
+            DrawDrapedBrushOutline(bp.X, bp.Z, brushRadius, sqPrev);   // follows the terrain + hovers above it, like the grid
             gl.Enable(EnableCap.DepthTest);
 
             // Identify the active material/foliage as a floating label on the ground at the brush cursor.
@@ -6869,6 +7109,7 @@ void DoCreateNewMap()
 
         var saved = Settings.Load();   // keep the current mesh/texture archives so the new map has a library
         Settings.Save(new LevelPaths(dir, saved?.StdMesh, saved?.Objects, saved?.Textures));
+        ActiveProject.Clear();   // classic in-editor New Map is Settings-based, not a project
         Console.WriteLine($"Created new level '{name}' ({matSize}^2, world {worldSize} m) at {dir}");
         RelaunchAndExit();
     }
@@ -6885,6 +7126,45 @@ void RelaunchAndExit()
     }
     catch (Exception ex) { Console.WriteLine($"Relaunch failed: {ex.Message}"); }
     window.Close();
+}
+
+// Relaunch straight to the startup screen: clear the active project + force the picker (--pick skips the active-
+// project + remembered-level auto-load), so the user lands on Recent Projects + Open/New.
+void RelaunchToStartup()
+{
+    ActiveProject.Clear();
+    try
+    {
+        var exe = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(exe))
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false };
+            psi.ArgumentList.Add("--pick");
+            System.Diagnostics.Process.Start(psi);
+        }
+    }
+    catch (Exception ex) { Console.WriteLine($"Relaunch to startup failed: {ex.Message}"); }
+    window.Close();
+}
+
+// Run a project flow from the File ▸ Project menu (native pickers + extract/create), then relaunch to load the new
+// active project. ProjectFlows already saved the .rfproj + set it active + added it to recents.
+void OpenProjectMenu(Func<RefractorForge.Formats.RfProject?> flow)
+{
+    RefractorForge.Formats.RfProject? proj;
+    try { proj = flow(); } catch (Exception ex) { Toast("Project action failed: " + ex.Message); return; }
+    if (proj is null) return;   // cancelled
+    Console.WriteLine("Opening project - restarting...");
+    RelaunchAndExit();
+}
+
+// Edit the current project's manifest fields (name/game/mod/patch/mode/paths), then save it.
+void OpenProjectSettings()
+{
+    if (activeRfProject is null) { Toast("No active project."); return; }
+    if (ProjectSettingsDialog.Show(activeRfProject))
+        try { activeRfProject.Save(); RecentProjects.Touch(activeRfProject); Toast("Project settings saved."); }
+        catch (Exception ex) { Toast("Save failed: " + ex.Message); }
 }
 
 // Open a different level: run the same native pickers the first-run flow uses, remember the choice, and
@@ -6913,6 +7193,7 @@ void OpenLevel()
             tex.Length > 0 ? tex : saved?.Textures,
             mesh.Length > 0 ? mesh : saved?.MeshArchives,
             lvlArchives.Length > 0 ? lvlArchives : null));
+        ActiveProject.Clear();   // the classic Open-Level path is Settings-based, not a project
         Console.WriteLine($"Opening {lvl} - restarting...");
         RelaunchAndExit();
     }
@@ -6989,6 +7270,7 @@ void OpenMod()
     {
         if (!GatherModPaths(out var lvlRfas, out var meshList, out var texList)) return;
         Settings.Save(new LevelPaths(lvlRfas[0], null, null, texList, meshList, lvlRfas));
+        ActiveProject.Clear();   // classic Open-Mod path is Settings-based, not a project
         Console.WriteLine("Opening mod - restarting...");
         RelaunchAndExit();
     }
@@ -8033,6 +8315,18 @@ void BuildUi()
         menuH = ImGui.GetWindowSize().Y;
         if (ImGui.BeginMenu("File"))
         {
+            if (ImGui.BeginMenu("Project"))
+            {
+                if (ImGui.MenuItem("New Project (map)...")) OpenProjectMenu(() => ProjectFlows.NewMapFlow());
+                if (ImGui.MenuItem("Open Project (.rfproj)...")) OpenProjectMenu(() => ProjectFlows.OpenProjectFlow());
+                if (ImGui.MenuItem("Open Level RFA (extract to folder)...")) OpenProjectMenu(() => ProjectFlows.OpenRfaFlow());
+                if (ImGui.MenuItem("Open Level Folder...")) OpenProjectMenu(() => ProjectFlows.OpenFolderFlow());
+                ImGui.Separator();
+                if (ImGui.MenuItem("Project Settings...", null, false, activeRfProject is not null)) OpenProjectSettings();
+                if (ImGui.MenuItem("Startup Screen (Close Project)")) RelaunchToStartup();
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
             if (ImGui.MenuItem("New Map...")) OpenNewMap();
             if (ImGui.MenuItem("Open Level / .rfa...", "Ctrl+O")) OpenLevel();
             if (ImGui.MenuItem("Open Mod...")) OpenMod();
@@ -8050,7 +8344,8 @@ void BuildUi()
             if (ImGui.MenuItem("Generate Minimap", null, false, heightmap is not null)) DoGenerateMinimap();
             if (ImGui.MenuItem("Bake Sun Shadows", null, false, heightmap is not null)) DoBakeShadows();
             if (ImGui.MenuItem("Reload Level Lightmap (display)", null, false, heightmap is not null)) InitTerrainShadowOnLoad();
-            if (ImGui.MenuItem("Generate AI Navmaps", null, false, heightmap is not null)) DoGenerateNavmaps();
+            if (ImGui.MenuItem("Save / Generate AI Navmaps", null, false, heightmap is not null)) DoGenerateNavmaps();
+            if (ImGui.MenuItem("Open AI Pathmap (.raw)...")) OpenPathmapFile();
             if (ImGui.MenuItem("Scatter Objects...", null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
             if (ImGui.MenuItem("Write LightmapShadowBits.lsb on Save", null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
             // Flips correct a mirrored shadow for BOTH the on-screen lightmap display AND the .lsb write-back; toggling
@@ -8335,6 +8630,7 @@ void BuildUi()
     LayerToolWindow();
     MeshViewerWindow();
     BikWindow();
+    PathmapPreviewWindow();
 }
 
 // In-app Log / Errors window: shows captured console output (errors highlighted). Auto-pops after a level load that

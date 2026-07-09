@@ -54,9 +54,11 @@ public sealed record SearchMapParams(
 public static class SearchMapGenerator
 {
 
-    /// <summary>nav(x,y) -> world-grid mapping code. rot90 best-matched retail; one switch point so an
-    /// in-game test can flip it without touching the algorithm. 1=yx 5=rot90 6=rot270 7=yx+rot180.</summary>
-    public static int NavOrientation { get; set; } = 5;
+    /// <summary>nav(x,y) -> world-grid mapping code. **0 = IDENTITY, the validated default**: the engine stores
+    /// navmaps in direct world order (row = Z, col = X). Retail BOAT maps correlate ~95% underwater→passable ONLY
+    /// under identity, consistently across BF1942 + BFV (the old rot90 guess wrote saved navmaps rotated 90°).
+    /// Kept as one switch point should a future in-game test ever need a flip. 0=identity 1=yx 5=rot90 6=rot270 7=yx+rot180.</summary>
+    public static int NavOrientation { get; set; } = 0;
 
     /// <summary>Upper bound on a navmap level's side. Without it, a large map (e.g. 32 km / materialSize 2048)
     /// would make an 8192² L0 navmap (~67 MB/file, ~1 GB for the set) and take tens of seconds to generate —
@@ -171,6 +173,20 @@ public static class SearchMapGenerator
         return outp;
     }
 
+    /// <summary>Inverse of <see cref="EmitNav"/>: recover the WORLD-GRID map from an on-disk nav-oriented 8Bit map,
+    /// so a saved/loaded pathmap can be shown in the same orientation the AI Path painter uses.</summary>
+    public static byte[] UnemitNav(byte[] navOriented, int side)
+    {
+        var grid = new byte[side * side];
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                var (gx, gy) = NavToGrid(NavOrientation, x, y, side);
+                grid[gy * side + gx] = navOriented[y * side + x];
+            }
+        return grid;
+    }
+
     /// <summary>
     /// Generate one vehicle's binary 8Bit map at one level, in nav (on-disk) orientation. Equivalent to
     /// <c>EmitNav(GenerateGrid(...))</c> and byte-identical to the original generator. <paramref name="objs"/>
@@ -264,6 +280,7 @@ public static class SearchMapGenerator
     /// <summary>nav(x,y) -> world grid (gx,gy) for the given orientation code (n = grid side).</summary>
     static (int gx, int gy) NavToGrid(int ori, int x, int y, int n) => ori switch
     {
+        0 => (x, y),   // identity: on-disk nav is already world order (row=Z, col=X) — the validated default
         1 => (y, x),
         5 => (y, n - 1 - x),
         6 => (n - 1 - y, x),
