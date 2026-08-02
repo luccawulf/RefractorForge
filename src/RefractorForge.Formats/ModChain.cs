@@ -255,12 +255,16 @@ public static class ModChain
     public static bool IsLevelArchive(string path) => path.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
     public static bool IsTextureArchive(string leaf) => leaf.StartsWith("texture", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>Archives that hold no geometry/texture the editor can show (audio, music, menu art, movies, AI
-    /// meshes). Skipping these on a 300-archive FHSW chain avoids opening ~gigabytes for nothing.</summary>
+    /// <summary>Archives that hold no geometry/texture the editor can show: audio, music, menu art, movies, fonts,
+    /// shaders, and skeletal animation data. Skipping these on a full FHSW chain avoids opening gigabytes for
+    /// nothing (FHSW's animations.rfa alone is ~9 MB of .baf/.ske/.skn with no static geometry).
+    /// NOTE: <c>aimeshes.rfa</c> is deliberately NOT filtered — despite the name it carries real BF1942 building
+    /// geometry (Bocage's church and windmill), so dropping it would lose visible objects.</summary>
     public static bool IsNonAssetArchive(string leaf)
     {
         var n = Path.GetFileNameWithoutExtension(leaf).ToLowerInvariant();
         return n is "sound" or "sounds" or "music" or "menu" or "movies" or "movie" or "font" or "fonts"
+                 or "shaders" or "animations"
             || n.StartsWith("sound_") || n.StartsWith("music_") || n.StartsWith("menu_");
     }
 }

@@ -561,24 +561,11 @@ if (rfaList.Length > 0)
         for (var pp = modDir; pp?.Parent is not null; pp = pp.Parent) if (pp.Name.Equals("Mods", OIC)) { gameRoot = pp.Parent; break; }
         if (gameRoot is not null)
         {
-            var chain = new List<string>();
-            var initCon = modDir is not null ? Path.Combine(modDir.FullName, "init.con") : null;
-            if (initCon is not null && File.Exists(initCon))
-                try
-                {
-                    foreach (var raw in File.ReadAllLines(initCon))
-                    {
-                        var l = raw.Trim(); int sp = l.IndexOf(' ');
-                        if (sp < 0 || !l[..sp].Equals("game.addModPath", OIC)) continue;
-                        var rel = l[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
-                        if (rel.Length == 0) continue;
-                        var abs = Path.GetFullPath(Path.Combine(gameRoot.FullName, rel));
-                        if (Directory.Exists(abs) && !chain.Any(c => c.Equals(abs, OIC))) chain.Add(abs);
-                    }
-                }
-                catch { }
-            foreach (var b in new[] { "bf1942", "BfVietnam", "bfvietnam" })
-            { var bp = Path.Combine(gameRoot.FullName, "Mods", b); if (Directory.Exists(bp) && !chain.Any(c => c.Equals(bp, OIC))) chain.Add(bp); }
+            // Transitive chain (ModChain): lets an add-on map borrow its base terrain from ANY mod in the stack -
+            // e.g. an FHSW map whose terrain actually lives in FH, which one-level parsing never reached.
+            var chain = modDir is not null
+                ? RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName).Paths.ToList()
+                : new List<string>();
             foreach (var mp in chain)
             {
                 var searchDir = Directory.Exists(Path.Combine(mp, "Archives")) ? Path.Combine(mp, "Archives") : mp;
@@ -776,28 +763,13 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
             for (var pp = modDir; pp?.Parent is not null; pp = pp.Parent)
                 if (pp.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { gameRoot = pp.Parent; break; }
             if (modDir is null || gameRoot is null) continue;
-            var chain = new List<string>();
-            var initCon = Path.Combine(modDir.FullName, "init.con");
-            if (File.Exists(initCon))
-                try
-                {
-                    foreach (var raw in File.ReadAllLines(initCon))
-                    {
-                        var line = raw.Trim(); int sp = line.IndexOf(' ');
-                        if (sp < 0 || !line[..sp].Equals("game.addModPath", StringComparison.OrdinalIgnoreCase)) continue;
-                        var rel = line[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
-                        if (rel.Length == 0) continue;
-                        var abs = Path.GetFullPath(Path.Combine(gameRoot.FullName, rel));
-                        if (Directory.Exists(abs) && !chain.Any(c => c.Equals(abs, StringComparison.OrdinalIgnoreCase))) chain.Add(abs);
-                    }
-                }
-                catch { }
-            foreach (var b in new[] { "bf1942", "BfVietnam", "bfvietnam" })   // always ensure the base game mod is in the chain
-            {
-                var bp = Path.Combine(gameRoot.FullName, "Mods", b);
-                if (Directory.Exists(bp) && !chain.Any(c => c.Equals(bp, StringComparison.OrdinalIgnoreCase))) chain.Add(bp);
-            }
-            foreach (var mp in chain)
+            // TRANSITIVE: ModChain follows each dependency's own init.con too, so opening an FHSW-family map
+            // directly (the common case - no .rfproj involved) mounts FH as well, not just FHSW + the base game.
+            var resolved = RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName);
+            Console.WriteLine($"Mod chain for {modDir.Name}: {resolved.Describe()}");
+            if (resolved.Missing.Count > 0)
+                Console.WriteLine($"   WARNING - init.con names {resolved.Missing.Count} mod(s) that are NOT installed: {string.Join(", ", resolved.Missing)}");
+            foreach (var mp in resolved.Paths)
             {
                 var mpArc = Path.Combine(mp, "Archives");
                 foreach (var f in Glob(Directory.Exists(mpArc) ? mpArc : mp)) yield return f;
