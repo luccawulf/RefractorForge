@@ -74,6 +74,7 @@ if (args.Length >= 1 && args[0] == "--relay")
 
 // GUI mode: show the launch splash immediately (its own STA thread keeps it painted during the level/GL load).
 Loc.Init();          // UI language (must precede the ImGui controller: the font atlas depends on the script)
+AppPrefs.Load();     // level-assembly options (inherited mod deps, base-map layering) - read by the load block below
 SplashScreen.Show();
 
 // GLSL shaders. Declared up front: in top-level programs a local function (OnLoad) cannot reference
@@ -552,7 +553,9 @@ if (rfaList.Length > 0)
         }
         catch { return true; }   // unreadable -> assume fine, don't add a fallback
     }
-    if (!rfaList.Any(HasTerrain))
+    // Only when the opened archive has no terrain of its own AND the user wants add-on maps layered over their base
+    // (an FHSWEurope patch .rfa carries only ObjectiveMode + custom ships; its ground and objects live in the base map).
+    if (AppPrefs.LayerBaseMap && !rfaList.Any(HasTerrain))
     {
         var name = Path.GetFileNameWithoutExtension(rfaList[0]);
         DirectoryInfo? arc = null; try { arc = new FileInfo(Path.GetFullPath(rfaList[0])).Directory; } catch { }
@@ -564,7 +567,7 @@ if (rfaList.Length > 0)
             // Transitive chain (ModChain): lets an add-on map borrow its base terrain from ANY mod in the stack -
             // e.g. an FHSW map whose terrain actually lives in FH, which one-level parsing never reached.
             var chain = modDir is not null
-                ? RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName).Paths.ToList()
+                ? RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName, AppPrefs.ResolveInheritedMods).Paths.ToList()
                 : new List<string>();
             foreach (var mp in chain)
             {
@@ -765,7 +768,7 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
             if (modDir is null || gameRoot is null) continue;
             // TRANSITIVE: ModChain follows each dependency's own init.con too, so opening an FHSW-family map
             // directly (the common case - no .rfproj involved) mounts FH as well, not just FHSW + the base game.
-            var resolved = RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName);
+            var resolved = RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName, AppPrefs.ResolveInheritedMods);
             Console.WriteLine($"Mod chain for {modDir.Name}: {resolved.Describe()}");
             if (resolved.Missing.Count > 0)
                 Console.WriteLine($"   WARNING - init.con names {resolved.Missing.Count} mod(s) that are NOT installed: {string.Join(", ", resolved.Missing)}");
@@ -7222,7 +7225,7 @@ bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] te
     // each dependency's own init.con, so a mini-mod that names FHSW but forgets FH still gets FH's objects (the
     // Japanese FHSW community's case). Inherited mounts are appended at the lowest precedence, so they only ever
     // fill gaps and can never outrank what the game itself would mount.
-    var chain = RefractorForge.Formats.ModChain.Resolve(gameRoot, modDir);
+    var chain = RefractorForge.Formats.ModChain.Resolve(gameRoot, modDir, AppPrefs.ResolveInheritedMods);
     var modPaths = chain.Mounts.Select(m => m.Path).ToList();
     if (modPaths.Count == 0) modPaths.Add(modDir);
     Console.WriteLine($"Mod chain ({chain.Mounts.Count}): {chain.Describe()}");
@@ -8424,6 +8427,20 @@ void BuildUi()
         if (ImGui.BeginMenu(Loc.TL("View")))
         {
             ImGui.MenuItem(Loc.TL("Log / Errors"), null, ref showLog);
+            ImGui.Separator();
+            // How a level is ASSEMBLED. Both pull in content the opened .rfa doesn't itself contain, which is what
+            // the game does - but while authoring it can be confusing, so both can be switched off. Reopen to apply.
+            if (ImGui.BeginMenu(Loc.TL("Level assembly")))
+            {
+                bool inh = AppPrefs.ResolveInheritedMods, layer = AppPrefs.LayerBaseMap;
+                if (ImGui.MenuItem(Loc.TL("Resolve inherited mod dependencies"), null, ref inh))
+                { AppPrefs.ResolveInheritedMods = inh; AppPrefs.Save(); Toast(Loc.T("Reopen the map to apply.")); }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Follow each dependency's own init.con, so a mod that lists FHSW also gets FH."));
+                if (ImGui.MenuItem(Loc.TL("Layer base map under add-on maps"), null, ref layer))
+                { AppPrefs.LayerBaseMap = layer; AppPrefs.Save(); Toast(Loc.T("Reopen the map to apply.")); }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("When the opened .rfa has no terrain, load the same-named base map underneath it."));
+                ImGui.EndMenu();
+            }
             ImGui.Separator();
             // UI language. The font atlas is baked once at startup (Japanese needs CJK glyphs the built-in font
             // lacks), so switching language restarts the editor.
