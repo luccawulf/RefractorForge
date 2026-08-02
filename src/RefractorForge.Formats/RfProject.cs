@@ -24,6 +24,10 @@ public sealed class RfProject
     public string? GameRoot;                // the game install dir (holds BF1942.exe / BfVietnam.exe + Mods\)
     public bool RunTestPacked = true;
 
+    /// <summary>Follow each dependency's own init.con to mount mods the author didn't list (e.g. a mini-mod that
+    /// names FHSW but not FH). Inherited mounts are appended at the lowest precedence. Default on.</summary>
+    public bool IncludeInheritedMods = true;
+
     // Custom mode:
     public List<string> MeshArchives = new();
     public List<string> TextureArchives = new();
@@ -60,6 +64,7 @@ public sealed class RfProject
             Mode = string.Equals(S("Mode"), "Custom", StringComparison.OrdinalIgnoreCase) ? RfMode.Custom : RfMode.Default,
             GameRoot = S("GameRoot") is { Length: > 0 } gr ? gr : null,
             RunTestPacked = !string.Equals(S("RunTestPacked"), "false", StringComparison.OrdinalIgnoreCase),
+            IncludeInheritedMods = !string.Equals(S("IncludeInheritedMods"), "false", StringComparison.OrdinalIgnoreCase),
             MeshArchives = L("MeshArchives"),
             TextureArchives = L("TextureArchives"),
             LexiconFiles = L("LexiconFiles"),
@@ -83,12 +88,12 @@ public sealed class RfProject
             new XElement("Mod", Mod),
             new XElement("PatchNumber", PatchNumber ?? ""),
             new XElement("Mode", Mode.ToString()));
-        if (Mode == RfMode.Default)
-        {
-            root.Add(new XElement("GameRoot", GameRoot ?? ""));
-            root.Add(new XElement("RunTestPacked", RunTestPacked ? "true" : "false"));
-        }
-        else
+        // Written for BOTH modes: the game install + mod chain settings also drive Test-launch and target-mod
+        // resolution, which a Custom project needs just as much as a Default one.
+        root.Add(new XElement("GameRoot", GameRoot ?? ""));
+        root.Add(new XElement("RunTestPacked", RunTestPacked ? "true" : "false"));
+        root.Add(new XElement("IncludeInheritedMods", IncludeInheritedMods ? "true" : "false"));
+        if (Mode == RfMode.Custom)
         {
             root.Add(List("MeshArchives", MeshArchives));
             root.Add(List("TextureArchives", TextureArchives));
@@ -107,48 +112,36 @@ public sealed class RfProject
     /// referenced (Custom: explicit; Default: derived from the game/mod chain like the Open-Mod flow).</summary>
     public (string levelDir, string[] meshArchives, string[] texArchives) Resolve()
     {
+        var mesh = new List<string>();
+        var tex = new List<string>();
+
+        // Custom mode: the explicitly listed archives come FIRST (highest precedence - the libraries are first-wins).
         if (Mode == RfMode.Custom)
-            return (ProjectFolder,
-                    MeshArchives.Where(File.Exists).ToArray(),
-                    TextureArchives.Where(File.Exists).ToArray());
+        {
+            mesh.AddRange(MeshArchives.Where(File.Exists));
+            tex.AddRange(TextureArchives.Where(File.Exists));
+        }
 
-        // Default: derive the mesh/texture archives from GameRoot + Mod (non-interactive Open-Mod gathering).
-        if (string.IsNullOrEmpty(GameRoot)) return (ProjectFolder, Array.Empty<string>(), Array.Empty<string>());
-        var (mesh, tex) = CollectModArchives(GameRoot!, Mod);
-        return (ProjectFolder, mesh, tex);
+        // TARGET MOD (both modes): append the mod's full resolved mount chain - the mod, its dependencies
+        // (transitively, so FHSW brings FH) and the base game. Appending means a Custom project's explicit picks
+        // still win, while a map authored for a mini-mod automatically gets that mod's whole asset stack.
+        if (!string.IsNullOrWhiteSpace(GameRoot) && !string.IsNullOrWhiteSpace(Mod))
+        {
+            var (cm, ct) = CollectModArchives(GameRoot!, Mod, IncludeInheritedMods);
+            foreach (var p in cm) if (!mesh.Contains(p, StringComparer.OrdinalIgnoreCase)) mesh.Add(p);
+            foreach (var p in ct) if (!tex.Contains(p, StringComparer.OrdinalIgnoreCase)) tex.Add(p);
+        }
+        return (ProjectFolder, mesh.ToArray(), tex.ToArray());
     }
 
-    /// <summary>Collect a mod's mesh + texture archives (Archives\**\*.rfa across the init.con mount chain + the base
-    /// game, split by name), matching Program.GatherModPaths but non-interactive. Level .rfa are excluded (the level
-    /// is loaded from the project folder).</summary>
-    public static (string[] mesh, string[] tex) CollectModArchives(string gameRoot, string mod)
-    {
-        var modDir = Path.Combine(gameRoot, "Mods", mod);
-        var modPaths = new List<string>();
-        var initCon = Path.Combine(modDir, "init.con");
-        if (File.Exists(initCon))
-            foreach (var raw in File.ReadAllLines(initCon))
-            {
-                var line = raw.Trim(); int sp = line.IndexOf(' ');
-                if (sp < 0 || !line[..sp].Equals("game.addModPath", StringComparison.OrdinalIgnoreCase)) continue;
-                var rel = line[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
-                if (rel.Length == 0) continue;
-                var abs = Path.GetFullPath(Path.Combine(gameRoot, rel));
-                if (Directory.Exists(abs) && !modPaths.Any(x => x.Equals(abs, StringComparison.OrdinalIgnoreCase))) modPaths.Add(abs);
-            }
-        if (modPaths.Count == 0 && Directory.Exists(modDir)) modPaths.Add(modDir);
-        var baseGuess = new[] { "BfVietnam", "bf1942", "bfvietnam" }.Select(b => Path.Combine(gameRoot, "Mods", b)).FirstOrDefault(Directory.Exists);
-        if (baseGuess is not null && !modPaths.Any(x => x.Equals(baseGuess, StringComparison.OrdinalIgnoreCase))) modPaths.Add(baseGuess);
+    /// <summary>Resolve this project's target mod to its full mount chain (see <see cref="ModChain"/>): the mod, its
+    /// dependencies (transitively — the FHSW case), and the base game, in precedence order. Null when the project
+    /// has no game install recorded.</summary>
+    public ModChainResult? ResolveChain()
+        => string.IsNullOrEmpty(GameRoot) ? null : ModChain.ResolveByName(GameRoot!, Mod, IncludeInheritedMods);
 
-        static string[] AllRfa(string dir) => Directory.Exists(dir)
-            ? Directory.EnumerateFiles(dir, "*.rfa", SearchOption.AllDirectories).Where(f => !Path.GetFileName(f).StartsWith("~")).ToArray()
-            : Array.Empty<string>();
-        static bool IsLevelRfa(string p) => p.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
-        static bool IsTex(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
-        var all = new List<string>();
-        foreach (var mp in modPaths) all.AddRange(AllRfa(Directory.Exists(Path.Combine(mp, "Archives")) ? Path.Combine(mp, "Archives") : mp));
-        var mesh = all.Where(p => !IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        var tex = all.Where(p => IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        return (mesh, tex);
-    }
+    /// <summary>Collect a mod's mesh + texture archives across its FULL mount chain, in precedence order.
+    /// Delegates to <see cref="ModChain"/> so the Viewer and the project system share one resolver.</summary>
+    public static (string[] mesh, string[] tex) CollectModArchives(string gameRoot, string mod, bool includeInherited = true)
+        => ModChain.CollectArchives(ModChain.ResolveByName(gameRoot, mod, includeInherited));
 }

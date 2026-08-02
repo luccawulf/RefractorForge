@@ -63,11 +63,11 @@ internal static class StartupWindow
             using var sub = new Font("Segoe UI", 11f);
             using var credit = new Font("Segoe UI", 10f);
             using (var gold = new SolidBrush(Color.FromArgb(240, 200, 90))) g.DrawString("RefractorForge", title, gold, 28, 20);
-            g.DrawString("BF1942 / BFVietnam Map Editor", sub, Brushes.Gainsboro, 32, 72);
+            g.DrawString(Loc.T("BF1942 / BFVietnam Map Editor"), sub, Brushes.Gainsboro, 32, 72);
             var cs = "developed by Lucas Ludwiczak"; var csz = g.MeasureString(cs, credit);
             using (var cb = new SolidBrush(Color.FromArgb(215, 215, 225))) g.DrawString(cs, credit, cb, W - csz.Width - 24, 30);
             using (var pen = new Pen(Color.FromArgb(60, 255, 255, 255))) g.DrawLine(pen, 24, 104, W - 24, 104);
-            using (var hb = new SolidBrush(Color.FromArgb(180, 190, 200))) g.DrawString("Recent Projects", sub, hb, 28, 112);
+            using (var hb = new SolidBrush(Color.FromArgb(180, 190, 200))) g.DrawString(Loc.T("Recent Projects"), sub, hb, 28, 112);
         };
 
         var recents = RecentProjects.Load();
@@ -95,7 +95,7 @@ internal static class StartupWindow
         form.Controls.Add(list);
         if (recents.Count == 0)
         {
-            var hint = new Label { Text = "No recent projects — open a level or create a new map to get started.", AutoSize = false, Left = 28, Top = 150, Width = W - 56, Height = 40, ForeColor = Color.FromArgb(150, 155, 165), BackColor = Color.Transparent, Font = new Font("Segoe UI", 10.5f) };
+            var hint = new Label { Text = Loc.T("No recent projects — open a level or create a new map to get started."), AutoSize = false, Left = 28, Top = 150, Width = W - 56, Height = 40, ForeColor = Color.FromArgb(150, 155, 165), BackColor = Color.Transparent, Font = new Font("Segoe UI", 10.5f) };
             form.Controls.Add(hint); hint.BringToFront();
         }
 
@@ -105,7 +105,7 @@ internal static class StartupWindow
             int bw = (W - pad * 2 - gap * (n - 1)) / n;
             var b = new Button
             {
-                Text = text, Left = pad + idx * (bw + gap), Top = H - 68, Width = bw, Height = 46,
+                Text = Loc.T(text), Left = pad + idx * (bw + gap), Top = H - 68, Width = bw, Height = 46,
                 FlatStyle = FlatStyle.Flat, BackColor = col, ForeColor = TextOn(col),
                 Font = new Font("Segoe UI", 10.5f, FontStyle.Bold), Cursor = Cursors.Hand, TabStop = false,
             };

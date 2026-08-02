@@ -62,7 +62,10 @@ internal static class ProjectFlows
         catch (Exception ex) { Picker.Error("Extract failed:\n" + ex.Message); return null; }
 
         var p = new RfProject { Name = mapName, Game = game, Mod = mod, GameRoot = gameRoot, Mode = RfMode.Default, ProjectFolder = dest };
-        if (gameRoot is null) FallbackCustom(p, rfas);   // couldn't find the game install -> reuse the last-used library
+        // The .rfa sat inside a game install, so its mod (and therefore its whole dependency chain) is known.
+        // Otherwise ask which mod this map targets; only fall back to the last-used archives if the user skips.
+        if (gameRoot is null && !AskModTarget(p)) FallbackCustom(p, rfas);
+        foreach (var r in rfas) if (File.Exists(r) && !p.LevelArchives.Contains(r, StringComparer.OrdinalIgnoreCase)) p.LevelArchives.Add(r);
         return p;
     }
 
@@ -75,7 +78,14 @@ internal static class ProjectFlows
 
         var name = new DirectoryInfo(dir.TrimEnd('\\', '/')).Name;
         var p = new RfProject { Name = name, Game = DetectGame(dir), Mode = RfMode.Custom, ProjectFolder = dir };
-        FallbackCustom(p, Array.Empty<string>());
+        // If the folder lives inside a game install we can infer the mod; otherwise ask which mod it targets.
+        if (ModChain.FindGameRoot(dir) is string gr)
+        {
+            var modDir = new DirectoryInfo(dir);
+            while (modDir?.Parent is not null && !modDir.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) modDir = modDir.Parent;
+            if (modDir is not null) { p.GameRoot = gr; p.Mod = modDir.Name; p.Mode = RfMode.Default; }
+        }
+        if (string.IsNullOrEmpty(p.GameRoot) && !AskModTarget(p)) FallbackCustom(p, Array.Empty<string>());
         return p;
     }
 
@@ -97,8 +107,31 @@ internal static class ProjectFlows
         catch (Exception ex) { Picker.Error("New map failed:\n" + ex.Message); return null; }
 
         var p = new RfProject { Name = spec.Name, Game = spec.Game, Mode = RfMode.Custom, ProjectFolder = dir };
-        FallbackCustom(p, Array.Empty<string>());
+        // Ask which mod the new map is FOR, so its whole dependency chain (e.g. FHSW -> FH -> bf1942) is mounted
+        // and the mapper can place that mod's objects. Skipping falls back to the last-used archives.
+        if (!AskModTarget(p)) FallbackCustom(p, Array.Empty<string>());
         return p;
+    }
+
+    /// <summary>Ask which mod a project targets and record it (Default mode resolves that mod's full mount chain).
+    /// Returns false if the user skipped. Seeds the dialog from the project, else the last-used game install.</summary>
+    private static bool AskModTarget(RfProject p)
+    {
+        string? guessRoot = p.GameRoot;
+        if (string.IsNullOrEmpty(guessRoot))
+        {
+            var saved = Settings.Load();
+            foreach (var hint in new[] { saved?.Level, saved?.MeshArchives?.FirstOrDefault(), saved?.Textures?.FirstOrDefault() })
+                if (!string.IsNullOrEmpty(hint) && ModChain.FindGameRoot(hint!) is string g) { guessRoot = g; break; }
+        }
+        var target = ModPickerDialog.Show(guessRoot, string.IsNullOrWhiteSpace(p.Mod) ? null : p.Mod, p.IncludeInheritedMods);
+        if (target is null) return false;
+        p.GameRoot = target.GameRoot;
+        p.Mod = target.Mod;
+        p.IncludeInheritedMods = target.IncludeInherited;
+        if (p.Mode == RfMode.Custom && p.MeshArchives.Count == 0 && p.TextureArchives.Count == 0) p.Mode = RfMode.Default;
+        if (target.GameRoot.ToLowerInvariant().Contains("vietnam")) p.Game = "BFVietnam";
+        return true;
     }
 
     /// <summary>Fill a Custom project's mesh/texture libraries from the last-used archives (so a new/extracted map

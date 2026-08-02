@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using RefractorForge.Formats.Con;
@@ -73,6 +73,7 @@ if (args.Length >= 1 && args[0] == "--relay")
 }
 
 // GUI mode: show the launch splash immediately (its own STA thread keeps it painted during the level/GL load).
+Loc.Init();          // UI language (must precede the ImGui controller: the font atlas depends on the script)
 SplashScreen.Show();
 
 // GLSL shaders. Declared up front: in top-level programs a local function (OnLoad) cannot reference
@@ -1947,7 +1948,25 @@ void OnLoad()
     if (kb is not null) kb.KeyDown += OnKeyDown;
 
     // Dear ImGui editor UI - renders into this same GL context/window each frame.
-    imgui = new ImGuiController(gl, window, input);
+    // When a non-English UI language is active, build the font atlas from a CJK-capable Windows font with the
+    // Japanese glyph ranges - ImGui's built-in font is ASCII-only, so Japanese would otherwise draw as blank
+    // boxes. The font atlas is baked once here, which is why switching language restarts the editor.
+    var uiFont = Loc.FindUiFont();
+    if (uiFont is not null)
+    {
+        try
+        {
+            imgui = new ImGuiController(gl, window, input,
+                new ImGuiFontConfig(uiFont, 16, io => io.Fonts.GetGlyphRangesJapanese()));
+            Console.WriteLine($"UI font: {Path.GetFileName(uiFont)} (Japanese glyph ranges) for language '{Loc.Current}'.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"UI font '{Path.GetFileName(uiFont)}' failed ({ex.Message}); falling back to the built-in font.");
+            imgui = new ImGuiController(gl, window, input);
+        }
+    }
+    else imgui = new ImGuiController(gl, window, input);
     ImGui.GetIO().ConfigWindowsMoveFromTitleBarOnly = true;   // body-drags (model-viewer orbit, minimap click) don't move the window; the title bar still does
     try { ClipboardBridge.Install(); } catch { }   // Ctrl+C/V in text boxes -> OS clipboard (e.g. paste a collab IP)
     ApplyTheme();
@@ -7147,6 +7166,15 @@ void RelaunchToStartup()
     window.Close();
 }
 
+// Switch UI language and restart: the ImGui font atlas is built once at startup (Japanese needs a CJK font), so a
+// live swap would leave the new script unrenderable. Keeps the active project, so the same map reopens.
+void SetLanguageAndRestart(string code)
+{
+    try { Loc.SetLanguage(code); } catch (Exception ex) { Toast("Language switch failed: " + ex.Message); return; }
+    Console.WriteLine($"UI language -> {code}; restarting...");
+    RelaunchAndExit();
+}
+
 // Run a project flow from the File ▸ Project menu (native pickers + extract/create), then relaunch to load the new
 // active project. ProjectFlows already saved the .rfproj + set it active + added it to recents.
 void OpenProjectMenu(Func<RefractorForge.Formats.RfProject?> flow)
@@ -7217,39 +7245,22 @@ bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] te
         if (d.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { gameRoot = d.Parent.FullName; break; }
     if (gameRoot is null) { Console.WriteLine("Open mod: that folder isn't under a Battlefield Mods\\ directory."); return false; }
 
-    // The MOUNT CHAIN: a Refractor mod's init.con lists `game.addModPath Mods/<X>/` lines in precedence order
-    // (mod first, its dependency mods next, the base game LAST). Parse them (relative to gameRoot); fall back to
-    // [mod, base] if there's no init.con.
-    var modPaths = new List<string>();
-    var initCon = Path.Combine(modDir, "init.con");
-    if (File.Exists(initCon))
-        foreach (var raw in File.ReadAllLines(initCon))
-        {
-            var line = raw.Trim();
-            int sp = line.IndexOf(' ');
-            if (sp < 0 || !line[..sp].Equals("game.addModPath", StringComparison.OrdinalIgnoreCase)) continue;
-            var rel = line[(sp + 1)..].Trim().Trim('"').Replace('/', Path.DirectorySeparatorChar).TrimEnd(Path.DirectorySeparatorChar);
-            if (rel.Length == 0) continue;
-            var abs = Path.GetFullPath(Path.Combine(gameRoot, rel));
-            if (Directory.Exists(abs) && !modPaths.Any(p => p.Equals(abs, StringComparison.OrdinalIgnoreCase))) modPaths.Add(abs);
-        }
-    if (modPaths.Count == 0) modPaths.Add(modDir);   // no init.con chain -> at least the mod itself
-    // ALWAYS ensure the base game mod is in the chain (many mods only addModPath themselves). Appended LAST
-    // (lowest precedence, first-wins) so it just fills gaps; harmless for a self-contained mod.
-    var baseGuess = new[] { "BfVietnam", "bf1942", "bfvietnam" }.Select(b => Path.Combine(gameRoot, "Mods", b)).FirstOrDefault(Directory.Exists);
-    if (baseGuess is not null && !modPaths.Any(p => p.Equals(baseGuess, StringComparison.OrdinalIgnoreCase))) modPaths.Add(baseGuess);
+    // The MOUNT CHAIN: a Refractor mod's init.con lists `game.addModPath Mods/<X>/` lines in precedence order (mod
+    // first, its dependency mods next, the base game LAST). ModChain resolves that TRANSITIVELY - it also follows
+    // each dependency's own init.con, so a mini-mod that names FHSW but forgets FH still gets FH's objects (the
+    // Japanese FHSW community's case). Inherited mounts are appended at the lowest precedence, so they only ever
+    // fill gaps and can never outrank what the game itself would mount.
+    var chain = RefractorForge.Formats.ModChain.Resolve(gameRoot, modDir);
+    var modPaths = chain.Mounts.Select(m => m.Path).ToList();
+    if (modPaths.Count == 0) modPaths.Add(modDir);
+    Console.WriteLine($"Mod chain ({chain.Mounts.Count}): {chain.Describe()}");
+    if (chain.Missing.Count > 0)
+        Console.WriteLine($"   WARNING - init.con names {chain.Missing.Count} mod(s) that are NOT installed: {string.Join(", ", chain.Missing)}");
 
-    // Collect each mod-path's Archives\**\*.rfa in chain order (first listed = highest precedence). Skip ~$ leftovers.
-    string[] AllRfa(string dir) => Directory.Exists(dir)
-        ? Directory.EnumerateFiles(dir, "*.rfa", SearchOption.AllDirectories).Where(f => !Path.GetFileName(f).StartsWith("~")).ToArray()
-        : Array.Empty<string>();
-    bool IsLevelRfa(string p) => p.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
-    bool IsTex(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
-    var allRfas = new List<string>();
-    foreach (var mp in modPaths)
-        allRfas.AddRange(AllRfa(Directory.Exists(Path.Combine(mp, "Archives")) ? Path.Combine(mp, "Archives") : mp));
-    meshList = allRfas.Where(p => !IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-    texList = allRfas.Where(p => IsTex(p) && !IsLevelRfa(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    // Collect each mount's Archives\**\*.rfa in chain order (first = highest precedence; the mesh/texture libraries
+    // are first-wins). Level archives and pure audio/menu archives are skipped - on a full FHSW chain that is
+    // several GB of files that can hold nothing the editor draws.
+    (meshList, texList) = RefractorForge.Formats.ModChain.CollectArchives(chain);
 
     bool isBfv = gameRoot.ToLowerInvariant().Contains("vietnam") || modPaths.Any(p => Path.GetFileName(p).Equals("BfVietnam", StringComparison.OrdinalIgnoreCase));
     string baseSub = isBfv ? "BfVietnam" : "bf1942";
@@ -7259,7 +7270,7 @@ bool GatherModPaths(out string[] lvlRfas, out string[] meshList, out string[] te
     lvlRfas = Picker.Files("Select the map .rfa to open from this mod  (base + any patch, Ctrl/Shift-click)",
                            "RFA archives|*.rfa|All files|*.*", levelsHint);
     if (lvlRfas.Length == 0) { Console.WriteLine("Open mod: no level chosen."); return false; }
-    Console.WriteLine($"Open mod {Path.GetFileName(modDir)}: chain [{string.Join(" -> ", modPaths.Select(p => Path.GetFileName(p)))}], {meshList.Length} mesh + {texList.Length} texture archive(s), level {Path.GetFileName(lvlRfas[0])}.");
+    Console.WriteLine($"Open mod {Path.GetFileName(modDir)}: chain [{chain.Describe()}], {meshList.Length} mesh + {texList.Length} texture archive(s), level {Path.GetFileName(lvlRfas[0])}.");
     return true;
 }
 
@@ -8313,106 +8324,106 @@ void BuildUi()
     if (ImGui.BeginMainMenuBar())
     {
         menuH = ImGui.GetWindowSize().Y;
-        if (ImGui.BeginMenu("File"))
+        if (ImGui.BeginMenu(Loc.TL("File")))
         {
-            if (ImGui.BeginMenu("Project"))
+            if (ImGui.BeginMenu(Loc.TL("Project")))
             {
-                if (ImGui.MenuItem("New Project (map)...")) OpenProjectMenu(() => ProjectFlows.NewMapFlow());
-                if (ImGui.MenuItem("Open Project (.rfproj)...")) OpenProjectMenu(() => ProjectFlows.OpenProjectFlow());
-                if (ImGui.MenuItem("Open Level RFA (extract to folder)...")) OpenProjectMenu(() => ProjectFlows.OpenRfaFlow());
-                if (ImGui.MenuItem("Open Level Folder...")) OpenProjectMenu(() => ProjectFlows.OpenFolderFlow());
+                if (ImGui.MenuItem(Loc.TL("New Project (map)..."))) OpenProjectMenu(() => ProjectFlows.NewMapFlow());
+                if (ImGui.MenuItem(Loc.TL("Open Project (.rfproj)..."))) OpenProjectMenu(() => ProjectFlows.OpenProjectFlow());
+                if (ImGui.MenuItem(Loc.TL("Open Level RFA (extract to folder)..."))) OpenProjectMenu(() => ProjectFlows.OpenRfaFlow());
+                if (ImGui.MenuItem(Loc.TL("Open Level Folder..."))) OpenProjectMenu(() => ProjectFlows.OpenFolderFlow());
                 ImGui.Separator();
-                if (ImGui.MenuItem("Project Settings...", null, false, activeRfProject is not null)) OpenProjectSettings();
-                if (ImGui.MenuItem("Startup Screen (Close Project)")) RelaunchToStartup();
+                if (ImGui.MenuItem(Loc.TL("Project Settings..."), null, false, activeRfProject is not null)) OpenProjectSettings();
+                if (ImGui.MenuItem(Loc.TL("Startup Screen (Close Project)"))) RelaunchToStartup();
                 ImGui.EndMenu();
             }
             ImGui.Separator();
-            if (ImGui.MenuItem("New Map...")) OpenNewMap();
-            if (ImGui.MenuItem("Open Level / .rfa...", "Ctrl+O")) OpenLevel();
-            if (ImGui.MenuItem("Open Mod...")) OpenMod();
-            if (ImGui.MenuItem("Save", "Ctrl+S", false, so is not null && soPath is not null)) DoSave();
-            if (ImGui.MenuItem("Test This Level (in-game)", "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
+            if (ImGui.MenuItem(Loc.TL("New Map..."))) OpenNewMap();
+            if (ImGui.MenuItem(Loc.TL("Open Level / .rfa..."), "Ctrl+O")) OpenLevel();
+            if (ImGui.MenuItem(Loc.TL("Open Mod..."))) OpenMod();
+            if (ImGui.MenuItem(Loc.TL("Save"), "Ctrl+S", false, so is not null && soPath is not null)) DoSave();
+            if (ImGui.MenuItem(Loc.TL("Test This Level (in-game)"), "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads.");
-            if (ImGui.MenuItem("Save as Patch .rfa...", null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
-            if (ImGui.MenuItem("Auto-backup on save", null, autoBackup)) autoBackup = !autoBackup;
-            if (ImGui.MenuItem("Import .obj...", null, false, meshLib is not null && so is not null)) DoImportObj();
-            if (ImGui.MenuItem("Import treeMesh.rfa...", null, false, meshLib is not null && so is not null)) DoImportTreeMesh();
-            if (ImGui.MenuItem("Play .bik video...")) DoPlayBik();
+            if (ImGui.MenuItem(Loc.TL("Save as Patch .rfa..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
+            if (ImGui.MenuItem(Loc.TL("Auto-backup on save"), null, autoBackup)) autoBackup = !autoBackup;
+            if (ImGui.MenuItem(Loc.TL("Import .obj..."), null, false, meshLib is not null && so is not null)) DoImportObj();
+            if (ImGui.MenuItem(Loc.TL("Import treeMesh.rfa..."), null, false, meshLib is not null && so is not null)) DoImportTreeMesh();
+            if (ImGui.MenuItem(Loc.TL("Play .bik video..."))) DoPlayBik();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Play a Bink (.bik) movie from the mod's movies/ folder (or anywhere) inside the editor.\nDecoded with FFmpeg if present, else opened in the RAD Bink player.");
-            if (ImGui.MenuItem("Play map video (.bik in this map)...", null, false, rfaList.Length > 0)) DoPlayMapBik();
+            if (ImGui.MenuItem(Loc.TL("Play map video (.bik in this map)..."), null, false, rfaList.Length > 0)) DoPlayMapBik();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Find + play any .bik video embedded in the loaded map's .rfa.");
-            if (ImGui.MenuItem("Generate Minimap", null, false, heightmap is not null)) DoGenerateMinimap();
-            if (ImGui.MenuItem("Bake Sun Shadows", null, false, heightmap is not null)) DoBakeShadows();
-            if (ImGui.MenuItem("Reload Level Lightmap (display)", null, false, heightmap is not null)) InitTerrainShadowOnLoad();
-            if (ImGui.MenuItem("Save / Generate AI Navmaps", null, false, heightmap is not null)) DoGenerateNavmaps();
-            if (ImGui.MenuItem("Open AI Pathmap (.raw)...")) OpenPathmapFile();
-            if (ImGui.MenuItem("Scatter Objects...", null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
-            if (ImGui.MenuItem("Write LightmapShadowBits.lsb on Save", null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
+            if (ImGui.MenuItem(Loc.TL("Generate Minimap"), null, false, heightmap is not null)) DoGenerateMinimap();
+            if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows"), null, false, heightmap is not null)) DoBakeShadows();
+            if (ImGui.MenuItem(Loc.TL("Reload Level Lightmap (display)"), null, false, heightmap is not null)) InitTerrainShadowOnLoad();
+            if (ImGui.MenuItem(Loc.TL("Save / Generate AI Navmaps"), null, false, heightmap is not null)) DoGenerateNavmaps();
+            if (ImGui.MenuItem(Loc.TL("Open AI Pathmap (.raw)..."))) OpenPathmapFile();
+            if (ImGui.MenuItem(Loc.TL("Scatter Objects..."), null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
+            if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
             // Flips correct a mirrored shadow for BOTH the on-screen lightmap display AND the .lsb write-back; toggling
             // re-displays the loaded lightmap immediately so you can see which orientation is right.
-            if (ImGui.MenuItem("   .lsb: flip X (if shadows are mirrored L/R)", null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
-            if (ImGui.MenuItem("   .lsb: flip Y (if mirrored top/bottom)", null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
+            if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
+            if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
             ImGui.Separator();
-            if (ImGui.MenuItem("Exit")) window.Close();
+            if (ImGui.MenuItem(Loc.TL("Exit"))) window.Close();
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("Edit"))
+        if (ImGui.BeginMenu(Loc.TL("Edit")))
         {
-            if (ImGui.MenuItem("Undo", "Z")) DoUndo();
-            if (ImGui.MenuItem("Redo", "Y")) DoRedo();
+            if (ImGui.MenuItem(Loc.TL("Undo"), "Z")) DoUndo();
+            if (ImGui.MenuItem(Loc.TL("Redo"), "Y")) DoRedo();
             ImGui.Separator();
             bool canDelete = selected >= 0 || gpIndex >= 0;
-            if (ImGui.MenuItem("Delete", "Del", false, canDelete) && hist is not null)
+            if (ImGui.MenuItem(Loc.TL("Delete"), "Del", false, canDelete) && hist is not null)
             {
                 if (gpIndex >= 0) { hist.Do(new GameplayDeleteCommand(gameplayEdit, gpKind, gpIndex, null)); gpIndex = -1; }
                 else if (selected >= 0 && so is not null)
                 { hist.Do(new DeleteObject(so.Objects[selected].Id)); selected = -1; SyncMarkers(); RebuildObjects(); UploadMarkers(); }
             }
             ImGui.Separator();
-            if (ImGui.MenuItem("Save Selection as Prefab...", null, false, multi.Count > 0)) savePrefabRequest = true;
+            if (ImGui.MenuItem(Loc.TL("Save Selection as Prefab..."), null, false, multi.Count > 0)) savePrefabRequest = true;
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("Object"))
+        if (ImGui.BeginMenu(Loc.TL("Object")))
         {
-            if (ImGui.MenuItem("Duplicate", "Ctrl+D", false, multi.Count > 0)) DuplicateSelected();
-            if (ImGui.MenuItem("Drop to ground", "G", false, multi.Count > 0)) DropSelectedToGround();
-            if (ImGui.MenuItem("Delete", "Del", false, multi.Count > 0 || gpIndex >= 0)) OnKeyDown(kb!, Key.Delete, 0);
+            if (ImGui.MenuItem(Loc.TL("Duplicate"), "Ctrl+D", false, multi.Count > 0)) DuplicateSelected();
+            if (ImGui.MenuItem(Loc.TL("Drop to ground"), "G", false, multi.Count > 0)) DropSelectedToGround();
+            if (ImGui.MenuItem(Loc.TL("Delete"), "Del", false, multi.Count > 0 || gpIndex >= 0)) OnKeyDown(kb!, Key.Delete, 0);
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("Tools"))
+        if (ImGui.BeginMenu(Loc.TL("Tools")))
         {
-            if (ImGui.MenuItem("Road tool", null, roadMode)) { roadMode = !roadMode; if (roadMode) measureMode = false; roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; }
-            if (ImGui.MenuItem("Measure", null, measureMode)) { measureMode = !measureMode; if (measureMode) roadMode = false; measurePts.Clear(); }
-            if (ImGui.MenuItem("Validate map...")) { validateReport = ValidateMap(); validateRequest = true; }
+            if (ImGui.MenuItem(Loc.TL("Road tool"), null, roadMode)) { roadMode = !roadMode; if (roadMode) measureMode = false; roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; }
+            if (ImGui.MenuItem(Loc.TL("Measure"), null, measureMode)) { measureMode = !measureMode; if (measureMode) roadMode = false; measurePts.Clear(); }
+            if (ImGui.MenuItem(Loc.TL("Validate map..."))) { validateReport = ValidateMap(); validateRequest = true; }
             ImGui.Separator();
-            if (ImGui.MenuItem("Generate Material Map (from terrain)", null, false, heightmap is not null)) DoGenerateMaterialMap();
-            if (ImGui.MenuItem("Generate Surface Maps (bake from set)", null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
+            if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
+            if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.Separator();
-            if (ImGui.MenuItem("Bake Object Lightmaps (from sun)", null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+            if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps (from sun)"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Bake each building/object's lighting (sun + terrain shadow) into its lightmap from the\ncurrent sun, then Save to ship them to the game. Pair with File > 'Write LightmapShadowBits.lsb'\nfor the terrain shadow. Set the sun first in the Environment > Sun panel.");
             ImGui.Separator();
-            if (ImGui.MenuItem("Convert TGA -> DDS...")) DoConvertTgaToDds();
-            if (ImGui.MenuItem("Batch TGA -> DDS (folder)...")) DoBatchTgaToDds();
+            if (ImGui.MenuItem(Loc.TL("Convert TGA -> DDS..."))) DoConvertTgaToDds();
+            if (ImGui.MenuItem(Loc.TL("Batch TGA -> DDS (folder)..."))) DoBatchTgaToDds();
             ImGui.Separator();
             bool haveOver = growth?.Over is not null && growth.OverPalette is not null;
-            if (ImGui.MenuItem("Save Overgrowth Settings", null, false, levelDir is not null)) SaveOvergrowthSettings();
-            if (ImGui.MenuItem("Export Overgrowth (map + .wst)...", null, false, haveOver)) DoExportOvergrowthFiles();
-            if (ImGui.MenuItem("Bake Overgrowth -> StaticObjects.con...", null, false, haveOver && meshLib is not null)) DoBakeOvergrowthToCon();
+            if (ImGui.MenuItem(Loc.TL("Save Overgrowth Settings"), null, false, levelDir is not null)) SaveOvergrowthSettings();
+            if (ImGui.MenuItem(Loc.TL("Export Overgrowth (map + .wst)..."), null, false, haveOver)) DoExportOvergrowthFiles();
+            if (ImGui.MenuItem(Loc.TL("Bake Overgrowth -> StaticObjects.con..."), null, false, haveOver && meshLib is not null)) DoBakeOvergrowthToCon();
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("Terrain"))
+        if (ImGui.BeginMenu(Loc.TL("Terrain")))
         {
-            if (ImGui.MenuItem("Import Heightmap.raw...", null, false, heightmap is not null)) DoImportHeightmap();
-            if (ImGui.MenuItem("Export Heightmap.raw...", null, false, heightmap is not null)) DoExportHeightmap();
+            if (ImGui.MenuItem(Loc.TL("Import Heightmap.raw..."), null, false, heightmap is not null)) DoImportHeightmap();
+            if (ImGui.MenuItem(Loc.TL("Export Heightmap.raw..."), null, false, heightmap is not null)) DoExportHeightmap();
             ImGui.EndMenu();
         }
         foreach (var m in new[] { "View", "Layer", "Window" })
-            if (ImGui.BeginMenu(m)) { ImGui.MenuItem("(coming soon)", null, false, false); ImGui.EndMenu(); }
-        if (ImGui.BeginMenu("Collab"))
+            if (ImGui.BeginMenu(m)) { ImGui.MenuItem(Loc.TL("(coming soon)"), null, false, false); ImGui.EndMenu(); }
+        if (ImGui.BeginMenu(Loc.TL("Collab")))
         {
             if (collab is null)
             {
-                if (ImGui.MenuItem("Collaborate...")) { collabError = ""; collabRequest = true; }
+                if (ImGui.MenuItem(Loc.TL("Collaborate..."))) { collabError = ""; collabRequest = true; }
             }
             else
             {
@@ -8434,16 +8445,34 @@ void BuildUi()
                     pmi++;
                 }
                 ImGui.Separator();
-                if (ImGui.MenuItem("Disconnect")) { collab.Stop(); collab = null; }
+                if (ImGui.MenuItem(Loc.TL("Disconnect"))) { collab.Stop(); collab = null; }
             }
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("View"))
+        if (ImGui.BeginMenu(Loc.TL("View")))
         {
-            ImGui.MenuItem("Log / Errors", null, ref showLog);
+            ImGui.MenuItem(Loc.TL("Log / Errors"), null, ref showLog);
+            ImGui.Separator();
+            // UI language. The font atlas is baked once at startup (Japanese needs CJK glyphs the built-in font
+            // lacks), so switching language restarts the editor.
+            if (ImGui.BeginMenu(Loc.TL("Language")))
+            {
+                foreach (var lang in Loc.Available)
+                {
+                    bool active = string.Equals(lang.Code, Loc.Current, StringComparison.OrdinalIgnoreCase);
+                    if (ImGui.MenuItem(lang.DisplayName + "##lang_" + lang.Code, null, active) && !active) SetLanguageAndRestart(lang.Code);
+                }
+                ImGui.Separator();
+                if (ImGui.MenuItem(Loc.TL("Export translation template...")))
+                {
+                    try { Toast("Template written: " + Loc.WriteTemplate(Loc.Current == "en" ? "ja" : Loc.Current, Loc.Seen)); }
+                    catch (Exception ex) { Toast("Template failed: " + ex.Message); }
+                }
+                ImGui.EndMenu();
+            }
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu("Help")) { if (ImGui.MenuItem("User Guide / Controls")) showHelp = true; ImGui.Separator(); ImGui.MenuItem("RefractorForge", null, false, false); ImGui.EndMenu(); }
+        if (ImGui.BeginMenu(Loc.TL("Help"))) { if (ImGui.MenuItem(Loc.TL("User Guide / Controls"))) showHelp = true; ImGui.Separator(); ImGui.MenuItem(Loc.TL("RefractorForge"), null, false, false); ImGui.EndMenu(); }
         ImGui.EndMainMenuBar();
     }
     if (menuH <= 0) menuH = ImGui.GetFrameHeight();

@@ -56,6 +56,11 @@
     <Content Include="Assets\RefractorForge.ico" CopyToOutputDirectory="PreserveNewest">
       <Link>RefractorForge.ico</Link>
     </Content>
+    <!-- UI translations, shipped as lang\<code>.json beside the exe. Keys are the English source strings, so a
+         missing entry simply falls back to English and translators can edit the file with no rebuild. -->
+    <Content Include="Assets\lang\*.json" CopyToOutputDirectory="PreserveNewest">
+      <Link>lang\%(Filename)%(Extension)</Link>
+    </Content>
     <!-- Launch splash image (shown briefly at startup with the RefractorForge name + author credit). -->
     <Content Include="Assets\refractorforgesplash.png" CopyToOutputDirectory="PreserveNewest">
       <Link>refractorforgesplash.png</Link>
