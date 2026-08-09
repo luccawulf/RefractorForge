@@ -16,7 +16,7 @@ internal static class ProjectSettingsDialog
         {
             using var f = new Form
             {
-                Text = "Project Settings", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen,
+                Text = Loc.T("Project Settings"), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen,
                 MaximizeBox = false, MinimizeBox = false, ClientSize = new Size(440, 410),
                 BackColor = Color.FromArgb(32, 34, 38), ForeColor = Color.Gainsboro,
             };
@@ -65,9 +65,9 @@ internal static class ProjectSettingsDialog
             mod.Leave += (_, _) => ShowChain();
             gameRoot.Leave += (_, _) => ShowChain();
 
-            var save = new Button { Text = "Save", Left = 256, Top = 364, Width = 76, DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 114, 178), ForeColor = Color.White };
-            var cancel = new Button { Text = "Cancel", Left = 340, Top = 364, Width = 76, DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat };
-            f.Controls.AddRange(new Control[] { L("Name", 0), name, L("Game", 1), game, L("Mod", 2), mod, L("Patch number", 3), patch, L("Mode", 4), mode, L("Game install", 5), gameRoot, L("Game test dir", 6), testDir, inherit, pick, chainLbl, save, cancel });
+            var save = new Button { Text = Loc.T("Save"), Left = 256, Top = 364, Width = 76, DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 114, 178), ForeColor = Color.White };
+            var cancel = new Button { Text = Loc.T("Cancel"), Left = 340, Top = 364, Width = 76, DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat };
+            f.Controls.AddRange(new Control[] { L(Loc.T("Name"), 0), name, L(Loc.T("Game"), 1), game, L(Loc.T("Mod"), 2), mod, L(Loc.T("Patch number"), 3), patch, L(Loc.T("Mode"), 4), mode, L(Loc.T("Game install"), 5), gameRoot, L(Loc.T("Game test dir"), 6), testDir, inherit, pick, chainLbl, save, cancel });
             ShowChain();
             f.AcceptButton = save; f.CancelButton = cancel;
             if (f.ShowDialog() == DialogResult.OK)

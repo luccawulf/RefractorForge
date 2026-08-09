@@ -32,8 +32,10 @@ public sealed class MeshLibrary
     private TextureLibrary? _textures;
 
     /// <summary>One material's triangles, its shader-derived color (fallback/tint), and its decoded
-    /// texture if the texture archive is available.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false);
+    /// texture if the texture archive is available. <paramref name="TextureName"/> is the .rs shader's texture
+    /// reference (e.g. <c>texture/sky/kursk/kursksky</c>) when known — tools that rewrite material bindings
+    /// (the skybox face editor) key on it.</summary>
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -1237,7 +1239,7 @@ public sealed class MeshLibrary
             // (fade flag, foliage names, or genuine cutout alpha) are HARD alpha-tested with flat foliage lighting.
             bool blend = sh?.Transparent == true;
             bool cutout = !blend && (sh?.TextureFade == true || IsCutout(sh?.Texture) || HasTransparency(tex));
-            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend));
+            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend, TextureName: sh?.Texture));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())
@@ -1292,6 +1294,25 @@ public sealed class MeshLibrary
         }
         catch { /* shader is optional; fall back to default coloring */ }
         return null;
+    }
+
+    /// <summary>The raw text + archive entry name of a mesh's sibling <c>.rs</c> render shader (honouring any
+    /// attached override folder), for tools that rewrite material bindings — e.g. the skybox face editor, which
+    /// ships a level-side override .rs pointing a face at a different texture or a Bink movie. False when the
+    /// mesh has no indexed .rs.</summary>
+    public bool TryGetRsText(string meshName, out string entryName, out string text)
+    {
+        entryName = ""; text = "";
+        string rsName = meshName.EndsWith(".rs", StringComparison.OrdinalIgnoreCase) ? meshName : meshName + ".rs";
+        try
+        {
+            if (_rsOverrideFiles.TryGetValue(rsName, out var file))
+            { entryName = rsName; text = File.ReadAllText(file); return true; }
+            if (_rsByName.TryGetValue(rsName, out var e))
+            { entryName = e.Name; text = System.Text.Encoding.Latin1.GetString(OwningArchive(e).Read(e)); return true; }
+        }
+        catch { }
+        return false;
     }
 
     private RefractorFlatArchive OwningArchive(RefractorFlatArchiveEntry e)

@@ -17,7 +17,7 @@ internal static class NewMapDialog
         {
             using var f = new Form
             {
-                Text = "New Map", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen,
+                Text = Loc.T("New Map"), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen,
                 MaximizeBox = false, MinimizeBox = false, ClientSize = new Size(360, 200),
                 BackColor = Color.FromArgb(32, 34, 38), ForeColor = Color.Gainsboro,
             };
@@ -27,9 +27,9 @@ internal static class NewMapDialog
             game.Items.AddRange(new object[] { "BF1942", "BFVietnam" }); game.SelectedIndex = 0;
             var size = new ComboBox { Left = 116, Top = 88, Width = 224, DropDownStyle = ComboBoxStyle.DropDownList };
             size.Items.AddRange(new object[] { "Small (1024 m)", "Medium (2048 m)", "Large (4096 m)" }); size.SelectedIndex = 1;
-            var ok = new Button { Text = "Create", Left = 180, Top = 150, Width = 76, DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 158, 115), ForeColor = Color.White };
-            var cancel = new Button { Text = "Cancel", Left = 264, Top = 150, Width = 76, DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat };
-            f.Controls.AddRange(new Control[] { L("Name", 18), name, L("Game", 54), game, L("Size", 90), size, ok, cancel });
+            var ok = new Button { Text = Loc.T("Create"), Left = 180, Top = 150, Width = 76, DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 158, 115), ForeColor = Color.White };
+            var cancel = new Button { Text = Loc.T("Cancel"), Left = 264, Top = 150, Width = 76, DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat };
+            f.Controls.AddRange(new Control[] { L(Loc.T("Name"), 18), name, L(Loc.T("Game"), 54), game, L(Loc.T("Size"), 90), size, ok, cancel });
             f.AcceptButton = ok; f.CancelButton = cancel;
             if (f.ShowDialog() == DialogResult.OK && name.Text.Trim().Length > 0)
             {

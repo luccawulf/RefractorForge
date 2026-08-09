@@ -21,10 +21,13 @@ namespace RefractorForge.Formats.Rfa;
 /// <para>Archives are always written in standard format (v1.0). Each entry's data is either a
 /// raw byte region (<c>BlockSize == UncompressedSize</c> → verbatim, no LZO) or a block-wrapped
 /// region (<c>u32 numBlocks</c>, then per-block descriptors and LZO1X payloads).</para>
-/// <para>The writer uses real LZO1X compression (via <see cref="Lzo1x.Compress"/>). Blocks that
-/// do not compress are stored verbatim (<c>comp == unc</c>) so the engine copies them directly
-/// without invoking the decompressor. Unchanged entries in a repack are always copied byte-for-byte
-/// from the original so their known-good retail LZO streams are never re-encoded.</para>
+/// <para>The writer compresses with MiniLZO and VERIFIES every block by round-tripping it through the
+/// independent clean-room <see cref="Lzo1x"/> decoder (validated against retail archives with liblzo2 as
+/// oracle) — a block that fails verification is stored verbatim (<c>comp == unc</c>), so a stream the
+/// engine cannot read is structurally impossible to write. Entries whose wrapped form would not shrink
+/// are stored raw (<c>BlockSize == UncompressedSize</c>, a layout retail compressed archives also use),
+/// which keeps the raw-vs-wrapped size discriminator unambiguous. Unchanged entries in a repack are
+/// always copied byte-for-byte from the original so known-good retail streams are never re-encoded.</para>
 /// <para>All offset arithmetic uses <see cref="long"/> so streaming writes of multi-GiB archives
 /// (e.g. uncompressed <c>texture.rfa</c> ≈ 2.3 GiB) work without exceeding the managed-array
 /// size limit. The on-disk container uses <c>u32</c> offsets, which caps archives at ~4 GiB.</para>
@@ -192,8 +195,17 @@ public sealed class RefractorFlatArchive
             int len = Math.Min(ChunkSize, n - start);
             var chunk = data.AsSpan(start, len);
             var lzo = MiniLZO.MiniLZO.Compress(chunk.ToArray());
-            // If LZO grows the block (incompressible data), store the raw chunk instead.
-            comps.Add(lzo.Length < len ? lzo : chunk.ToArray());
+            // SAVE-TIME VERIFICATION NET: a saved map the game can't read is the worst possible failure, so every
+            // compressed block must round-trip through the INDEPENDENT clean-room decoder (Lzo1x — validated
+            // byte-for-byte against retail archives with liblzo2 as the oracle, i.e. it accepts exactly what the
+            // engine accepts). Any block that fails is stored verbatim instead — slightly larger, never corrupt.
+            bool verified = false;
+            if (lzo.Length < len)
+            {
+                try { verified = Lzo1x.Decompress(lzo, len).AsSpan().SequenceEqual(chunk); }
+                catch { verified = false; }
+            }
+            comps.Add(verified ? lzo : chunk.ToArray());
             uncs[i] = len;
         }
 
@@ -208,7 +220,13 @@ public sealed class RefractorFlatArchive
             cum += comps[i].Length;
         }
         foreach (var c in comps) ms.Write(c, 0, c.Length);
-        return ms.ToArray();
+        var region = ms.ToArray();
+
+        // If wrapping didn't actually shrink the entry, store it RAW (BlockSize == UncompressedSize — 276 such
+        // entries exist inside retail compressed archives, so the engine provably accepts them). This also makes
+        // the reader's raw-vs-wrapped size discriminator unambiguous: a wrapped region can never have exactly the
+        // uncompressed length, so it can never be misread as raw data.
+        return region.Length >= n ? data : region;
     }
 
     /// <summary>Streaming archive core. Writes header, entry regions, then the TOC, patching the
@@ -354,6 +372,75 @@ public sealed class RefractorFlatArchive
             .Where(e => !IsClientOnlyEntry(e.Name))
             .Select(e => (e.Name, Read(e)))
             .ToList();
+
+    /// <summary>Cheap header sniff: was this archive written by RefractorForge? Our writer stamps
+    /// "RefractorForge" into the 143-byte descriptor field (retail tools leave other bytes there). Used by the
+    /// patch-save flow to tell OUR working patch (safe to rewrite on every Ctrl+S) apart from retail/other-tool
+    /// patches (never touched — a new higher-numbered patch is created instead).</summary>
+    public static bool WasWrittenByRefractorForge(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            Span<byte> hdr = stackalloc byte[8 + 14];
+            if (fs.Length < 156) return false;
+            fs.ReadExactly(hdr);
+            return hdr.Slice(8).SequenceEqual("RefractorForge"u8);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Post-save validation: open the archive at <paramref name="path"/> and strictly verify every entry —
+    /// TOC sanity, and every LZO block decoded with the INDEPENDENT engine-validated <see cref="Lzo1x"/> decoder
+    /// (not the codec that wrote it). Returns null when everything checks out, else a description of the first
+    /// problem. This is how the editor turns silent corruption into an immediate, loud error.</summary>
+    public static string? Validate(string path, long maxEntryBytes = 128L * 1024 * 1024)
+    {
+        try
+        {
+            var a = new RefractorFlatArchive(path);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            foreach (var e in a.Entries)
+            {
+                if (e.BlockSize < 0 || e.UncompressedSize < 0 || e.Offset + (long)e.BlockSize > fs.Length)
+                    return $"{e.Name}: region out of bounds (offset {e.Offset}, blockSize {e.BlockSize}, file {fs.Length})";
+                if (e.UncompressedSize > maxEntryBytes) continue;   // skip pathological sizes, keep saves fast
+
+                fs.Seek(e.Offset, SeekOrigin.Begin);
+                var region = new byte[e.BlockSize];
+                fs.ReadExactly(region);
+                if (region.Length == e.UncompressedSize) continue;  // raw entry — nothing to decode
+
+                int nb = (int)BinaryPrimitives.ReadUInt32LittleEndian(region);
+                long need = 4 + (long)nb * 12;
+                if (nb < 0 || need > region.Length) return $"{e.Name}: malformed block table ({nb} blocks in {region.Length} bytes)";
+                int dataStart = (int)need, written = 0;
+                for (int i = 0; i < nb; i++)
+                {
+                    int b = 4 + i * 12;
+                    int comp = (int)BinaryPrimitives.ReadUInt32LittleEndian(region.AsSpan(b));
+                    int unc = (int)BinaryPrimitives.ReadUInt32LittleEndian(region.AsSpan(b + 4));
+                    int cum = (int)BinaryPrimitives.ReadUInt32LittleEndian(region.AsSpan(b + 8));
+                    if (unc == 0) continue;
+                    if (comp < 0 || cum < 0 || dataStart + (long)cum + comp > region.Length)
+                        return $"{e.Name}: block {i} out of bounds";
+                    var src = region.AsSpan(dataStart + cum, comp);
+                    if (comp == unc) { written += unc; continue; }   // verbatim block
+                    try
+                    {
+                        var dst = new byte[unc];
+                        Lzo1x.Decompress(src, dst, unc);             // the engine-validated decoder is the referee
+                    }
+                    catch (Exception ex) { return $"{e.Name}: block {i} failed engine-validated LZO decode ({ex.Message})"; }
+                    written += unc;
+                }
+                if (written != e.UncompressedSize)
+                    return $"{e.Name}: blocks reassemble to {written} bytes, expected {e.UncompressedSize}";
+            }
+            return null;
+        }
+        catch (Exception ex) { return $"archive unreadable: {ex.GetType().Name}: {ex.Message}"; }
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

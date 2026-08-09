@@ -187,4 +187,42 @@ public class NavTests
         var dec = PathmapRaw.Load(comp, "Tank0Level0Map.raw", out int sc);
         Assert.True(sc == side && SearchMapGenerator.UnemitNav(dec, sc).SequenceEqual(world), "compressed .raw round-trips to the world grid");
     }
+
+    [Fact]
+    public void LoadVehicleWorldGrid_prefers_the_levels_existing_maps()
+    {
+        // The editor must seed the AI Path painter from the navmap the level SHIPS (designer intent), not a fresh
+        // terrain generation. Simulated level storage = a leaf-name dictionary, as the Viewer provides.
+        int side = 128;
+        var world = new byte[side * side];
+        for (int i = 0; i < world.Length; i++) world[i] = (i % 5 == 0) ? (byte)0xFF : (byte)0x00;
+        var nav = SearchMapGenerator.EmitNav(world, side);
+        var tank = SearchMapParams.Standard[0];   // Tank0, levels {0,1,2}
+        var boat = SearchMapParams.Standard[2];   // Boat2, levels {2,3,4,5}
+
+        // 8Bit form present at the finest level -> loaded exactly
+        var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
+        { [$"Tank0Level0Map8Bit.raw"] = nav };
+        var got = PathmapRaw.LoadVehicleWorldGrid(n => files.GetValueOrDefault(n), tank, side);
+        Assert.NotNull(got);
+        Assert.True(got!.SequenceEqual(world), "8Bit map loads back as the exact world grid");
+
+        // only the COMPRESSED engine form present -> decoded via CompressedSearchMap
+        files = new(StringComparer.OrdinalIgnoreCase) { ["Tank0Level0Map.raw"] = CompressedSearchMap.Encode(nav, side, 0) };
+        got = PathmapRaw.LoadVehicleWorldGrid(n => files.GetValueOrDefault(n), tank, side);
+        Assert.True(got is not null && got.SequenceEqual(world), "compressed-only levels load too");
+
+        // water vehicle shipping only its coarser L2 -> upsampled to the paint grid
+        files = new(StringComparer.OrdinalIgnoreCase) { ["Boat2Level2Map8Bit.raw"] = nav };
+        got = PathmapRaw.LoadVehicleWorldGrid(n => files.GetValueOrDefault(n), boat, side * 4);
+        Assert.True(got is not null && got.Length == side * 4 * side * 4, "coarser map upsamples to the target side");
+        Assert.Equal(0xFF, got![0]);   // first blocked cell survives the upsample
+
+        // nothing in the level -> null (caller falls back to generation)
+        Assert.Null(PathmapRaw.LoadVehicleWorldGrid(_ => null, tank, side));
+
+        // a corrupt file is skipped, not fatal
+        files = new(StringComparer.OrdinalIgnoreCase) { ["Tank0Level0Map8Bit.raw"] = new byte[123] };
+        Assert.Null(PathmapRaw.LoadVehicleWorldGrid(n => files.GetValueOrDefault(n), tank, side));
+    }
 }

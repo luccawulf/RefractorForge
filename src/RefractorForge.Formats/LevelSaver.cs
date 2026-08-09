@@ -180,18 +180,40 @@ public static class LevelSaver
     public static byte[] SerializeStaticObjects(StaticObjectsFile so)
         => Latin1(string.Join("\r\n", so.Write()) + "\r\n");
 
+    /// <summary>Editor-side files that must NEVER be packed into a game archive: project manifests, sidecars,
+    /// backups, temp/lock leftovers and OS litter. Packing these shipped junk into the level (and a stale
+    /// <c>Backups\</c> tree inside an archive means duplicated old .con files mounted at weird sub-paths).</summary>
+    public static bool IsEditorOnlyFile(string relPath)
+    {
+        var p = relPath.Replace('\\', '/');
+        var leaf = Path.GetFileName(p);
+        if (p.StartsWith("Backups/", System.StringComparison.OrdinalIgnoreCase) || p.Contains("/Backups/", System.StringComparison.OrdinalIgnoreCase)) return true;
+        var ext = Path.GetExtension(leaf).ToLowerInvariant();
+        if (ext is ".rfproj" or ".rfatmp" or ".bak") return true;
+        return leaf.Equals("refractorforge.game", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("refractorforge.json", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("sound_debug.log", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("imgui.ini", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("Thumbs.db", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("desktop.ini", System.StringComparison.OrdinalIgnoreCase)
+            || leaf.StartsWith("~", System.StringComparison.Ordinal);
+    }
+
     /// <summary>Pack a level <em>folder</em> into a fresh .rfa. Entry names are the folder-relative
-    /// paths (forward slashes) under an optional <paramref name="prefix"/> (e.g. "bf1942/levels/Foo/").</summary>
-    public static int PackFolder(string folderDir, string outRfaPath, string? prefix = null)
+    /// paths (forward slashes) under an optional <paramref name="prefix"/> (e.g. "bf1942/levels/Foo/").
+    /// Editor-side files (<see cref="IsEditorOnlyFile"/>: .rfproj, Backups\, sidecars, OS litter) are skipped.
+    /// <paramref name="xPackId"/> lets expansion/mod maps keep their DLL binding (default = base game).</summary>
+    public static int PackFolder(string folderDir, string outRfaPath, string? prefix = null, XPackId xPackId = XPackId.Default)
     {
         prefix = string.IsNullOrEmpty(prefix) ? "" : prefix.Replace('\\', '/').TrimEnd('/') + "/";
         var entries = new List<(string, byte[])>();
         foreach (var f in Directory.EnumerateFiles(folderDir, "*", SearchOption.AllDirectories).OrderBy(x => x))
         {
             var rel = Path.GetRelativePath(folderDir, f).Replace('\\', '/');
+            if (IsEditorOnlyFile(rel)) continue;
             entries.Add((prefix + rel, File.ReadAllBytes(f)));
         }
-        RefractorFlatArchive.WriteFile(outRfaPath, entries, compress: true, xPackId: XPackId.Default);
+        RefractorFlatArchive.WriteFile(outRfaPath, entries, compress: true, xPackId: xPackId);
         return entries.Count;
     }
 
@@ -332,15 +354,57 @@ public static class LevelSaver
         StaticObjectsFile? so, Heightmap? heightmap, MaterialMap? material, EditableGameplay? gameplay,
         GrowthMaps? growth = null, LightmapShadowBits? shadow = null, TerrainConfig? terrainConfig = null,
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles = null,
-        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
+        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null,
+        bool serverSideOnly = false)
     {
         var arch = new RefractorFlatArchive(baseRfaPath);
         var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries);
+        // SSM (server-side mod) patches: drop client-only content (textures, sounds, movies, baked light) so the
+        // patch only carries what a dedicated server needs — the .con gameplay files. Clients never download it.
+        if (serverSideOnly)
+        {
+            foreach (var drop in repl.Keys.Where(RefractorFlatArchive.IsClientOnlyEntry).ToList())
+            { repl.Remove(drop); names.RemoveAll(n => string.Equals(n, drop, System.StringComparison.OrdinalIgnoreCase)); }
+        }
         // Deterministic order; entries are addressed by name so order doesn't affect mounting.
         var entries = repl.OrderBy(kv => kv.Key, System.StringComparer.OrdinalIgnoreCase)
                           .Select(kv => (kv.Key, kv.Value)).ToList();
-        RefractorFlatArchive.WriteFile(outPatchPath, entries, compress: true, xPackId: XPackId.Default);
+        // The patch inherits the BASE archive's XPack ID — a Road-to-Rome / Secret Weapons map patch stamped with
+        // the base-game ID would bind the wrong game DLL.
+        RefractorFlatArchive.WriteFile(outPatchPath, entries, compress: true, xPackId: arch.XPackId);
         return names;
+    }
+
+    /// <summary>
+    /// Where the NEXT save of an .rfa level should go, patch-first: never the base archive. Rules:
+    /// <list type="bullet">
+    /// <item>Strip any <c>_NNN</c> suffix to find the level's base stem, then find the highest existing
+    /// <c>&lt;stem&gt;_NNN.rfa</c> beside it.</item>
+    /// <item>If that highest patch was written by RefractorForge (header fingerprint), it is OUR working patch —
+    /// return it so repeated saves keep rewriting one file instead of littering _004, _005, _006…</item>
+    /// <item>Otherwise (retail/other-tool patch, or no patch yet) return <c>&lt;stem&gt;_&lt;max+1&gt;.rfa</c> so
+    /// existing archives are never modified.</item>
+    /// </list>
+    /// </summary>
+    public static string NextPatchPath(string baseRfaPath)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(baseRfaPath)) ?? ".";
+        var stem = Path.GetFileNameWithoutExtension(baseRfaPath);
+        var m = System.Text.RegularExpressions.Regex.Match(stem, @"^(.*?)_(\d{3})$");
+        string baseStem = m.Success ? m.Groups[1].Value : stem;
+        int max = 0; string? maxPath = null;
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, baseStem + "_*.rfa"))
+            {
+                var mm = System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(f), @"_(\d{3})$");
+                if (mm.Success && int.TryParse(mm.Groups[1].Value, out var n) && n > max) { max = n; maxPath = f; }
+            }
+        }
+        catch { }
+        if (maxPath is not null && RefractorFlatArchive.WasWrittenByRefractorForge(maxPath))
+            return maxPath;                                        // our own working patch — keep rewriting it
+        return Path.Combine(dir, $"{baseStem}_{max + 1:000}.rfa");  // retail/foreign patches stay untouched
     }
 
     /// <summary>Extract level <c>.rfa</c>(s) (base + patches, later archives win) into <paramref name="destDir"/>,
