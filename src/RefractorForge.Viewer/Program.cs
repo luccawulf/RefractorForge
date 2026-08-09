@@ -4880,7 +4880,7 @@ bool LibTile(string id, uint tex, Vector2 size, bool selected)
 void DrawTextureBrowser(float height)
 {
     ImGui.SetNextItemWidth(140f); ImGui.Combo(Loc.TL("Category"), ref texLibCatIdx, texLibCats, texLibCats.Length);
-    ImGui.SameLine(); ImGui.SetNextItemWidth(130f); ImGui.InputTextWithHint("##texsearch", "search", ref texLibSearch, 64);
+    ImGui.SameLine(); ImGui.SetNextItemWidth(130f); ImGui.InputTextWithHint("##texsearch", Loc.T("search"), ref texLibSearch, 64);
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Refresh"))) RefreshTextureLibrary();
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Import..."))) ImportToLibrary();
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Folder"))) OpenLibraryFolder();
@@ -6047,7 +6047,7 @@ void MapperButton(int m, string tip)
 {
     bool active = mapper == m;
     if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
-    bool clicked = ImGui.Button($"{mapperNames[m]}##mapper{m}");
+    bool clicked = ImGui.Button($"{Loc.T(mapperNames[m])}###mapper{m}");
     if (active) ImGui.PopStyleColor();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(tip);
     if (clicked) SetMapper(m);
@@ -6056,7 +6056,7 @@ void MapperButton(int m, string tip)
 // Context strip under the mapper row: only the active mapper's quick tools.
 void MapperSubToolbar()
 {
-    ImGui.TextDisabled(mapperNames[mapper] + " mapper:"); ImGui.SameLine();
+    ImGui.TextDisabled(string.Format(Loc.T("{0} mapper:"), Loc.T(mapperNames[mapper]))); ImGui.SameLine();
     if (mapper == 0)
     {
         for (int i = 0; i < sculptModeLabels.Length; i++)
@@ -6181,7 +6181,7 @@ void Inspector()
     string tn = toolNames[tool];
     if (tn is "Sculpt" or "Smooth" or "Paint")
     {
-        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), $"{mapperNames[mapper]} Mapper");
+        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), string.Format(Loc.T("{0} Mapper"), Loc.T(mapperNames[mapper])));
         ImGui.Separator();
         if (tn == "Paint")
         {
@@ -6542,7 +6542,7 @@ void Inspector()
     if (meshLib is not null && !meshLib.TryGet(o.Template, out _) && !meshLib.TryGetAssembledMesh(o.Template, out _))
         ImGui.TextColored(new Vector4(1f, 0.55f, 0.3f, 1f),
             meshLib.HasMeshEntry(o.Template) ? "mesh not shown: .sm present but failed to parse" : "mesh not found in loaded archives");
-    if (multi.Count > 1) ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), $"{multi.Count} selected - editing primary (gizmo moves all)");
+    if (multi.Count > 1) ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), string.Format(Loc.T("{0} selected - editing primary (gizmo moves all)"), multi.Count));
     ImGui.Separator();
 
     if (!ImGui.IsAnyItemActive())   // don't clobber a field that's mid-drag
@@ -8585,7 +8585,7 @@ void BuildUi()
             ImGui.EndMenu();
         }
         foreach (var m in new[] { "View", "Layer", "Window" })
-            if (ImGui.BeginMenu(m)) { ImGui.MenuItem(Loc.TL("(coming soon)"), null, false, false); ImGui.EndMenu(); }
+            if (ImGui.BeginMenu(Loc.TL(m) + "##stub_" + m)) { ImGui.MenuItem(Loc.TL("(coming soon)"), null, false, false); ImGui.EndMenu(); }
         if (ImGui.BeginMenu(Loc.TL("Collab")))
         {
             if (collab is null)
@@ -8680,7 +8680,7 @@ void BuildUi()
     if (ImGui.Begin(Loc.TL("Object Library"), fixedFlags))
     {
         ImGui.PushItemWidth(-1);
-        ImGui.InputTextWithHint("##search", "Search objects...", ref searchText, 64);
+        ImGui.InputTextWithHint("##search", Loc.T("Search objects..."), ref searchText, 64);
         ImGui.PopItemWidth();
         ImGui.Separator();
         string filter = searchText.Trim();
@@ -8692,7 +8692,7 @@ void BuildUi()
                                    || t.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToArray();
             if (shown.Length == 0) continue;
             var nodeFlags = (ci < 2 || filter.Length > 0) ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None;
-            if (ImGui.TreeNodeEx($"{label}  ({shown.Length})", nodeFlags))
+            if (ImGui.TreeNodeEx($"{Loc.T(label)}  ({shown.Length})###cat_{label}", nodeFlags))
             {
                 foreach (var t in shown)
                 {
@@ -8701,7 +8701,7 @@ void BuildUi()
                     bool special = isGp || isPf;   // gameplay sentinels + prefabs show their raw name, not ShortName
                     // Clicking a Gameplay entry arms that placement kind; a prefab arms it for stamping (+ Place
                     // tool); a static template selects it for the browser. All are drag sources too.
-                    if (ImGui.Selectable(special ? t : ShortName(t), !special && browserTemplate == t))
+                    if (ImGui.Selectable(special ? Loc.T(t) + "###gp_" + t : ShortName(t), !special && browserTemplate == t))
                     {
                         if (GpKindForDrag(t) is GpKind k) { gpPlaceKind = k; tool = Array.IndexOf(toolNames, "Place"); mapper = 2; }
                         else { browserTemplate = t; if (isPf) { gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2; } }
@@ -8714,7 +8714,7 @@ void BuildUi()
                     {
                         dragTemplate = t;
                         ImGui.SetDragDropPayload("RF_OBJ", IntPtr.Zero, 0);
-                        ImGui.Text(special ? t : ShortName(t));         // drag preview tooltip
+                        ImGui.Text(special ? Loc.T(t) : ShortName(t));  // drag preview tooltip
                         ImGui.EndDragDropSource();
                     }
                 }
@@ -8747,12 +8747,12 @@ void BuildUi()
         }
         else ImGui.Text(Loc.T("Cursor  --"));
         ImGui.SameLine(); Sep();
-        ImGui.Text(multi.Count > 0 ? $"{multi.Count} selected" : "0 selected"); ImGui.SameLine(); Sep();
+        ImGui.Text(string.Format(Loc.T("{0} selected"), multi.Count)); ImGui.SameLine(); Sep();
         ImGui.Text(Loc.T("Tool:")); ImGui.SameLine();
-        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), toolNames[tool]); ImGui.SameLine(); Sep();
-        ImGui.Text($"Snap {(snapOn ? "On" : "Off")}"); ImGui.SameLine(); Sep();
-        ImGui.Text($"world {cfg.WorldSize:0} m"); ImGui.SameLine(); Sep();
-        ImGui.Text($"{(so?.Objects.Count ?? markers.Length)} objects"); ImGui.SameLine(); Sep();
+        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T(toolNames[tool])); ImGui.SameLine(); Sep();
+        ImGui.Text(string.Format(Loc.T("Snap {0}"), snapOn ? Loc.T("On") : Loc.T("Off"))); ImGui.SameLine(); Sep();
+        ImGui.Text(string.Format(Loc.T("world {0} m"), cfg.WorldSize.ToString("0"))); ImGui.SameLine(); Sep();
+        ImGui.Text(string.Format(Loc.T("{0} objects"), so?.Objects.Count ?? markers.Length)); ImGui.SameLine(); Sep();
         ImGui.Text($"{lastFps:0} fps");
         if (toastT > 0f && toastText.Length > 0)
         { ImGui.SameLine(); Sep(); ImGui.TextColored(new Vector4(0.55f, 0.95f, 0.6f, MathF.Min(1f, toastT)), toastText); }
