@@ -1,4 +1,4 @@
-using System.Drawing;
+﻿using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
@@ -115,10 +115,10 @@ internal static class StartupWindow
             return b;
         }
         // Okabe-Ito colorblind-safe hues (no two confusable under red/green CB).
-        form.Controls.Add(Btn("Open Project  (.rfproj)", Color.FromArgb(0, 114, 178), 0, StartupAction.OpenProject));   // blue
-        form.Controls.Add(Btn("Open Level RFA", Color.FromArgb(230, 159, 0), 1, StartupAction.OpenRfa));                // orange
-        form.Controls.Add(Btn("Open Level Folder", Color.FromArgb(204, 121, 167), 2, StartupAction.OpenFolder));       // reddish-purple
-        form.Controls.Add(Btn("New Map", Color.FromArgb(0, 158, 115), 3, StartupAction.NewMap));                        // bluish-green
+        form.Controls.Add(Btn(Loc.T("Open Project  (.rfproj)"), Color.FromArgb(0, 114, 178), 0, StartupAction.OpenProject));   // blue
+        form.Controls.Add(Btn(Loc.T("Open Level RFA"), Color.FromArgb(230, 159, 0), 1, StartupAction.OpenRfa));                // orange
+        form.Controls.Add(Btn(Loc.T("Open Level Folder"), Color.FromArgb(204, 121, 167), 2, StartupAction.OpenFolder));       // reddish-purple
+        form.Controls.Add(Btn(Loc.T("New Map"), Color.FromArgb(0, 158, 115), 3, StartupAction.NewMap));                        // bluish-green
 
         form.FormClosed += (_, _) => { try { bg?.Dispose(); } catch { } };
         return form;

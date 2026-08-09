@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using RefractorForge.Formats.Con;
@@ -2717,7 +2717,7 @@ void DrawMeasure()
 // Scan the level for common problems and return a short report (counts + warnings). Read-only.
 string ValidateMap()
 {
-    if (so is null) return "No level loaded.";
+    if (so is null) return Loc.T("No level loaded.");
     var sb = new System.Text.StringBuilder();
     int objN = so.Objects.Count, meshless = pointMarkers.Length;
     int cps = gameplayEdit.ControlPoints.Count, vss = gameplayEdit.VehicleSpawns.Count, sss = gameplayEdit.SoldierSpawns.Count;
@@ -2737,7 +2737,7 @@ string ValidateMap()
     foreach (var v in gameplayEdit.VehicleSpawns)
         if (string.IsNullOrWhiteSpace(v.Vehicle)) { W($"vehicle spawn '{v.Name}' has no vehicle set."); }
     sb.AppendLine();
-    sb.AppendLine(warn == 0 ? "No problems found." : $"{warn} warning(s).");
+    sb.AppendLine(warn == 0 ? Loc.T("No problems found.") : string.Format(Loc.T("{0} warning(s)."), warn));
     return sb.ToString();
 }
 
@@ -5957,7 +5957,7 @@ List<(string label, string[] items)> LoadCatalog()
     if (result.Count == 0 && so is not null)
     {
         var items = so.Objects.Select(o => o.Template).Distinct().OrderBy(t => t).ToArray();
-        if (items.Length > 0) result.Add(("Level Objects", items));
+        if (items.Length > 0) result.Add((Loc.T("Level Objects"), items));
     }
     return result;
 }
@@ -6019,7 +6019,7 @@ bool IconTool(int idx, System.Action<ImDrawListPtr, Vector2, float, uint> glyph,
     var mn = ImGui.GetItemRectMin(); var mx = ImGui.GetItemRectMax();
     var ctr = new Vector2((mn.X + mx.X) * 0.5f, (mn.Y + mx.Y) * 0.5f);
     glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - 8f, ImGui.GetColorU32(ImGuiCol.Text));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(tip);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
     if (clicked) tool = idx;
     return clicked;
 }
@@ -6049,7 +6049,7 @@ void MapperButton(int m, string tip)
     if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
     bool clicked = ImGui.Button($"{Loc.T(mapperNames[m])}###mapper{m}");
     if (active) ImGui.PopStyleColor();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(tip);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
     if (clicked) SetMapper(m);
 }
 
@@ -6208,7 +6208,7 @@ void Inspector()
                     if (ImGui.ColorButton($"tex{i}", texSwatch[i], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)) && has)
                         { activeTexture = (byte)i; paintFromLib = false; }   // picking a palette slot leaves library-paint mode
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{(i < surfNames.Length ? surfNames[i] : "?")}  #{i}{(has ? "" : "  (missing)")}{(texSource[i] is not null ? "  (custom)" : "")}");
+                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{(i < surfNames.Length ? Loc.T(surfNames[i]) : "?")}  #{i}{(has ? "" : Loc.T("  (missing)"))}{(texSource[i] is not null ? Loc.T("  (custom)") : "")}");
                     if (i % 8 != 7 && i != texSwatch.Length - 1) ImGui.SameLine();
                 }
                 SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
@@ -6260,7 +6260,7 @@ void Inspector()
                     ImGui.TextDisabled(Loc.T("Click the terrain to save that square as a .dds."));
                 }
                 ImGui.Spacing();
-                ImGui.BulletText(captureMode ? "Click terrain to capture a square as a texture." : "Drag on terrain to paint the surface.");
+                ImGui.BulletText(Loc.T(captureMode ? "Click terrain to capture a square as a texture." : "Drag on terrain to paint the surface."));
                 ImGui.BulletText(Loc.T("Alt-click picks the surface under the cursor."));
                 ImGui.BulletText(Loc.T("Wheel resizes; Z / Y undo and redo."));
                 ImGui.BulletText(Loc.T("Ctrl+S bakes it into the level's terrain tiles."));
@@ -6284,7 +6284,7 @@ void Inspector()
                     if (ImGui.ColorButton($"mat{i}", texSwatch[slot], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)))
                         activeMaterial = (byte)i;
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"#{i}  {(slot < surfNames.Length ? surfNames[slot] : "?")}");
+                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}");
                     if (i % 8 != 7 && i != 15) ImGui.SameLine();
                 }
                 SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
@@ -6351,13 +6351,13 @@ void Inspector()
         }
 
         ImGui.Spacing();
-        ImGui.BulletText(tn == "Smooth" ? "Drag to average out bumps." : modeNow switch
+        ImGui.BulletText(tn == "Smooth" ? Loc.T("Drag to average out bumps.") : modeNow switch
         {
             BrushMode.Raise => "Drag to raise; hold Shift to lower.",
             BrushMode.Lower => "Drag to lower; hold Shift to raise.",
-            BrushMode.Flatten => "Drag to ease terrain toward the target height.",
-            BrushMode.Set => "Drag to set terrain to the target height.",
-            _ => "Drag on the terrain.",
+            BrushMode.Flatten => Loc.T("Drag to ease terrain toward the target height."),
+            BrushMode.Set => Loc.T("Drag to set terrain to the target height."),
+            _ => Loc.T("Drag on the terrain."),
         });
         ImGui.BulletText(Loc.T("Mouse wheel resizes the brush."));
         ImGui.BulletText(Loc.T("Z / Y undo and redo each stroke."));
@@ -6976,7 +6976,7 @@ void SaveCloudsFolder()
         }
         cloudsDirty = false;
         Console.WriteLine("   Clouds: patched SkyAndSun.con (test in-game; needs a 'cloud' mesh).");
-        Toast(cloudsOn ? "Clouds written to SkyAndSun.con (test in-game)." : "Clouds removed from SkyAndSun.con.");
+        Toast(Loc.T(cloudsOn ? "Clouds written to SkyAndSun.con (test in-game)." : "Clouds removed from SkyAndSun.con."));
     }
     catch (Exception ex) { Toast(Loc.T("Cloud save failed: ") + ex.Message); }
 }
@@ -7243,7 +7243,7 @@ void DoCreateNewMap()
     try
     {
         var name = nmName.Trim();
-        if (name.Length == 0) { nmError = "Enter a map name."; return; }
+        if (name.Length == 0) { nmError = Loc.T("Enter a map name."); return; }
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) { nmError = "Name has invalid characters."; return; }
         if (string.IsNullOrWhiteSpace(nmFolder) || !Directory.Exists(nmFolder)) { nmError = "Choose a valid output folder."; return; }
 
@@ -7258,7 +7258,7 @@ void DoCreateNewMap()
         // why cranking the height range still looked flat. The user's yScale is kept as a floor.
         // Validate the heightmap pick up front (type 4) so we fail with a clear message before creating anything.
         if (nmTerrainType == 4 && (nmHeightmapPath.Trim().Length == 0 || !File.Exists(nmHeightmapPath.Trim())))
-        { nmError = "Choose a heightmap .raw file to import."; return; }
+        { nmError = Loc.T("Choose a heightmap .raw file to import."); return; }
 
         float maxMeters = MathF.Max(MathF.Max(nmMinH, nmMaxH), nmFlatHeight);
         // Flat + imported terrain use the user's yScale verbatim; the fractal types auto-fit it so tall peaks aren't clamped.
@@ -7492,7 +7492,7 @@ float SliderInput(string label, float v, float min, float max, string sliderFmt,
     ImGui.PopItemWidth();
     ImGui.SameLine();
     ImGui.PushItemWidth(96f);
-    ImGui.InputFloat(label, ref v, 0f, 0f, inputFmt);
+    ImGui.InputFloat(Loc.TL(label), ref v, 0f, 0f, inputFmt);
     ImGui.PopItemWidth();
     return Math.Clamp(v, min, max);
 }
@@ -7501,7 +7501,7 @@ float SliderInput(string label, float v, float min, float max, string sliderFmt,
 void DoScatter()
 {
     scatterError = "";
-    if (so is null || hist is null || terrainPick is null || meshLib is null) { scatterError = "No level/library loaded."; return; }
+    if (so is null || hist is null || terrainPick is null || meshLib is null) { scatterError = Loc.T("No level/library loaded."); return; }
 
     // Gather candidate templates from the selected library categories; keep only meshes the library can resolve
     // (so scattered objects actually render, not mesh-less markers).
@@ -7519,12 +7519,12 @@ void DoScatter()
     var candidates = wanted.Distinct(StringComparer.OrdinalIgnoreCase)
         .Where(t => meshLib.TryGet(t, out _) || meshLib.TryGetAssembledMesh(t, out _))
         .ToList();
-    if (candidates.Count == 0) { scatterError = "No resolvable objects in the selected categories."; return; }
+    if (candidates.Count == 0) { scatterError = Loc.T("No resolvable objects in the selected categories."); return; }
 
     var placements = ObjectScatter.Scatter(candidates, cfg, terrainPick.HeightAt,
         scatterCount, 0f, scatterMaxSlope, scatterAvoidWater, scatterClearance, scatterSpacing, scatterSeed,
         edgeMargin: cfg.WorldSize * 0.02f, minScale: scatterScaleMin, maxScale: scatterScaleMax);
-    if (placements.Count == 0) { scatterError = "No valid spots (loosen slope / water / spacing)."; return; }
+    if (placements.Count == 0) { scatterError = Loc.T("No valid spots (loosen slope / water / spacing)."); return; }
 
     var cmds = new List<IEditCommand>(placements.Count);
     var ids = new List<string>(placements.Count);
@@ -7544,7 +7544,7 @@ void DoScatter()
 
 void ScatterModal()
 {
-    if (scatterRequest) { ImGui.OpenPopup("Scatter Objects"); scatterRequest = false; }
+    if (scatterRequest) { ImGui.OpenPopup(Loc.TL("Scatter Objects")); scatterRequest = false; }
     var fbs = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbs.X * 0.5f, fbs.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     ImGui.SetNextWindowSize(new Vector2(380, 0), ImGuiCond.Appearing);
@@ -7579,7 +7579,7 @@ void ScatterModal()
 
 void NewMapModal()
 {
-    if (newMapRequest) { ImGui.OpenPopup("New Map"); newMapRequest = false; }
+    if (newMapRequest) { ImGui.OpenPopup(Loc.TL("New Map")); newMapRequest = false; }
 
     var fb = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fb.X * 0.5f, fb.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
@@ -7613,7 +7613,7 @@ void NewMapModal()
 
     ImGui.Separator();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Terrain"));
-    ImGui.Combo(Loc.TL("Type"), ref nmTerrainType, nmTerrainTypeLabels, nmTerrainTypeLabels.Length);
+    ImGui.Combo(Loc.TL("Type"), ref nmTerrainType, Array.ConvertAll(nmTerrainTypeLabels, Loc.T), nmTerrainTypeLabels.Length);
     if (nmTerrainType == 0)
         nmFlatHeight = SliderInput("Ground height (m)", nmFlatHeight, -100f, 500f, "%.1f", "%.1f");
     else if (nmTerrainType == 4)
@@ -7660,7 +7660,7 @@ void NewMapModal()
     if (ImGui.Combo(Loc.TL("Game"), ref nmGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) nmGameBf1942 = nmGameIdx == 0;
     ImGui.TextDisabled(nmGameBf1942 ? "BF1942: no overgrowth / tunnel features." : "BF Vietnam: full feature set.");
     ImGui.Checkbox(Loc.TL("Playable (Conquest: flags, spawns, kits)"), ref nmPlayable);
-    if (nmPlayable) ImGui.TextDisabled(nmGameBf1942 ? "Adds Axis + Allies + neutral flags with spawn points." : "Adds US + NVA + neutral flags with spawn points.");
+    if (nmPlayable) ImGui.TextDisabled(Loc.T(nmGameBf1942 ? "Adds Axis + Allies + neutral flags with spawn points." : "Adds US + NVA + neutral flags with spawn points."));
 
     int ms = nmMatSizes[Math.Clamp(nmMatSizeIdx, 0, nmMatSizes.Length - 1)];
     ImGui.TextDisabled($"{ms}x{ms} grid, {(float)Math.Clamp(nmWorldSize, 64, 131072) / ms:0.##} m/sample");
@@ -7728,12 +7728,12 @@ void DoSavePrefab()
     spError = "";
     try
     {
-        if (so is null || multi.Count == 0) { spError = "Select one or more objects first."; return; }
+        if (so is null || multi.Count == 0) { spError = Loc.T("Select one or more objects first."); return; }
         var name = spName.Trim();
-        if (name.Length == 0) { spError = "Enter a prefab name."; return; }
+        if (name.Length == 0) { spError = Loc.T("Enter a prefab name."); return; }
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) { spError = "Name has invalid characters."; return; }
         var sel = multi.Where(i => i >= 0 && i < so.Objects.Count).Select(i => so.Objects[i]).ToList();
-        if (sel.Count == 0) { spError = "Selection is empty."; return; }
+        if (sel.Count == 0) { spError = Loc.T("Selection is empty."); return; }
         var pdir = Path.Combine(AppContext.BaseDirectory, "prefabs");
         Directory.CreateDirectory(pdir);
         Prefab.FromObjects(name, sel).Save(Path.Combine(pdir, name + ".rfprefab"));
@@ -7746,7 +7746,7 @@ void DoSavePrefab()
 
 void SavePrefabModal()
 {
-    if (savePrefabRequest) { ImGui.OpenPopup("Save Prefab"); savePrefabRequest = false; }
+    if (savePrefabRequest) { ImGui.OpenPopup(Loc.TL("Save Prefab")); savePrefabRequest = false; }
     var fb = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fb.X * 0.5f, fb.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     bool open = true;
@@ -8075,7 +8075,7 @@ void DoCollabHost()
     collabError = "";
     try
     {
-        if (so is null) { collabError = "Load a level first."; return; }
+        if (so is null) { collabError = Loc.T("Load a level first."); return; }
         collab = CollabSession.StartHost(so, collabPort, string.IsNullOrWhiteSpace(collabName) ? "Host" : collabName.Trim(),
                                          string.IsNullOrEmpty(collabPass) ? null : collabPass, BuildHostWorld());
         Console.WriteLine(collab.Status);
@@ -8109,7 +8109,7 @@ void DoCollabJoin()
     collabError = "";
     try
     {
-        if (so is null) { collabError = "Load a level first."; return; }
+        if (so is null) { collabError = Loc.T("Load a level first."); return; }
         collab = CollabSession.StartJoin(collabHostAddr.Trim(), collabPort, string.IsNullOrWhiteSpace(collabName) ? "Guest" : collabName.Trim(),
                                          string.IsNullOrEmpty(collabPass) ? null : collabPass);
         Console.WriteLine(collab.Status);
@@ -8120,7 +8120,7 @@ void DoCollabJoin()
 
 void CollabModal()
 {
-    if (collabRequest) { ImGui.OpenPopup("Collaborate"); collabRequest = false; }
+    if (collabRequest) { ImGui.OpenPopup(Loc.TL("Collaborate")); collabRequest = false; }
     var fbc = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbc.X * 0.5f, fbc.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     bool open = true;
@@ -8343,7 +8343,7 @@ void BikWindow()
                 if (LoadPngRgba(bikFrames[bikFrameIdx]) is { } t) { if (bikTex != 0) gl.DeleteTexture(bikTex); bikTex = UploadTexture(t); bikW = t.Width; bikH = t.Height; }
                 bikLoadedFrame = bikFrameIdx;
             }
-            if (ImGui.Button(bikPlaying ? "Pause" : "Play ")) bikPlaying = !bikPlaying;
+            if (ImGui.Button(Loc.T(bikPlaying ? "Pause" : "Play ") + "###bikPlay")) bikPlaying = !bikPlaying;
             ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Loop"), ref bikLoop);
             ImGui.SameLine(); ImGui.TextDisabled($"{bikFrameIdx + 1}/{bikFrames.Length}  {bikFps:0.#}fps");
             int fi = bikFrameIdx; ImGui.SetNextItemWidth(-1f);
@@ -8584,7 +8584,7 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Export Heightmap.raw..."), null, false, heightmap is not null)) DoExportHeightmap();
             ImGui.EndMenu();
         }
-        foreach (var m in new[] { "View", "Layer", "Window" })
+        foreach (var m in new[] { "Layer", "Window" })
             if (ImGui.BeginMenu(Loc.TL(m) + "##stub_" + m)) { ImGui.MenuItem(Loc.TL("(coming soon)"), null, false, false); ImGui.EndMenu(); }
         if (ImGui.BeginMenu(Loc.TL("Collab")))
         {
@@ -8594,20 +8594,20 @@ void BuildUi()
             }
             else
             {
-                ImGui.MenuItem(collab.Status, null, false, false);
+                ImGui.MenuItem(Loc.T(collab.Status), null, false, false);
                 if (collab.IsHost)
                 {
-                    if (!string.IsNullOrEmpty(collab.LocalIp)) ImGui.MenuItem($"LAN: {collab.LocalIp}:{collab.Port}", null, false, false);
-                    ImGui.MenuItem($"Internet: {collab.PublicIp}:{collab.Port} (forward port)", null, false, false);
+                    if (!string.IsNullOrEmpty(collab.LocalIp)) ImGui.MenuItem(string.Format(Loc.T("LAN: {0}:{1}"), collab.LocalIp, collab.Port), null, false, false);
+                    ImGui.MenuItem(string.Format(Loc.T("Internet: {0}:{1} (forward port)"), collab.PublicIp, collab.Port), null, false, false);
                 }
                 ImGui.Separator();
-                ImGui.MenuItem($"{collab.Peers.Count} peer(s) connected", null, false, false);
+                ImGui.MenuItem(string.Format(Loc.T("{0} peer(s) connected"), collab.Peers.Count), null, false, false);
                 int pmi = 0;
                 foreach (var peer in collab.Peers.Values)
                 {
                     var pc = peerColors[pmi % peerColors.Length];
                     ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(pc.X, pc.Y, pc.Z, 1f));
-                    if (ImGui.MenuItem($"  {peer.Name}   (jump to)")) cam.Position = new Vector3(peer.Cursor.X, peer.Cursor.Y, peer.Cursor.Z);
+                    if (ImGui.MenuItem(string.Format(Loc.T("  {0}   (jump to)"), peer.Name))) cam.Position = new Vector3(peer.Cursor.X, peer.Cursor.Y, peer.Cursor.Z);
                     ImGui.PopStyleColor();
                     pmi++;
                 }
@@ -8878,7 +8878,7 @@ void LogWindow()
 // Read-only map-validation report popup (filled by the Tools -> Validate map command).
 void ValidateModal()
 {
-    if (validateRequest) { ImGui.OpenPopup("Validate Map"); validateRequest = false; }
+    if (validateRequest) { ImGui.OpenPopup(Loc.TL("Validate Map")); validateRequest = false; }
     var fbv = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbv.X * 0.5f, fbv.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     ImGui.SetNextWindowSize(new Vector2(420, 0), ImGuiCond.Appearing);
@@ -8928,7 +8928,7 @@ void OpenGpEditor(GpKind kind, int idx)
 // over collaboration). Flag geometry / team flags on the template are preserved verbatim on save.
 void EditCpModal()
 {
-    if (editCpRequest) { ImGui.OpenPopup("Edit Control Point"); editCpRequest = false; }
+    if (editCpRequest) { ImGui.OpenPopup(Loc.TL("Edit Control Point")); editCpRequest = false; }
     var fbm = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbm.X * 0.5f, fbm.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     ImGui.SetNextWindowSize(new Vector2(360, 0), ImGuiCond.Appearing);
@@ -8943,8 +8943,8 @@ void EditCpModal()
     ImGui.DragFloat(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
     // Team labels follow the target game: BF1942 = Axis/Allies, BF Vietnam = NVA/US. (Index 1/2 are the same slots.)
     string[] teams = gameIsBf1942
-        ? new[] { "Neutral (0)", "Axis (1)", "Allies (2)" }
-        : new[] { "Neutral (0)", "Vietcong / NVA (1)", "US Army (2)" };
+        ? new[] { Loc.T("Neutral (0)"), Loc.T("Axis (1)"), Loc.T("Allies (2)") }
+        : new[] { Loc.T("Neutral (0)"), Loc.T("Vietcong / NVA (1)"), Loc.T("US Army (2)") };
     int teamIdx = Math.Clamp(ecpTeam, 0, 2);
     if (ImGui.Combo(Loc.TL("Team"), ref teamIdx, teams, teams.Length)) ecpTeam = teamIdx;
     ImGui.InputInt(Loc.TL("Area value"), ref ecpArea);
@@ -8996,7 +8996,7 @@ void EditCpModal()
 // Battlecraft-style "Edit Object Spawn" dialog: a vehicle spawner's name, position, rotation, owning OS id and team.
 void EditVehModal()
 {
-    if (editVehRequest) { ImGui.OpenPopup("Edit Object Spawn"); editVehRequest = false; }
+    if (editVehRequest) { ImGui.OpenPopup(Loc.TL("Edit Object Spawn")); editVehRequest = false; }
     var fbm = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbm.X * 0.5f, fbm.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     ImGui.SetNextWindowSize(new Vector2(340, 0), ImGuiCond.Appearing);
@@ -9009,8 +9009,8 @@ void EditVehModal()
     ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
     ImGui.InputInt(Loc.TL("OS id"), ref evOsId);
     string[] vteams = gameIsBf1942
-        ? new[] { "Neutral (0)", "Axis (1)", "Allies (2)" }
-        : new[] { "Neutral (0)", "Vietcong / NVA (1)", "US Army (2)" };
+        ? new[] { Loc.T("Neutral (0)"), Loc.T("Axis (1)"), Loc.T("Allies (2)") }
+        : new[] { Loc.T("Neutral (0)"), Loc.T("Vietcong / NVA (1)"), Loc.T("US Army (2)") };
     int vteamIdx = Math.Clamp(evTeam, 0, 2);
     if (ImGui.Combo(Loc.TL("Team"), ref vteamIdx, vteams, vteams.Length)) evTeam = vteamIdx;
     ImGui.Spacing();
@@ -9034,7 +9034,7 @@ void EditVehModal()
 // Battlecraft-style "Edit Soldier Spawn" dialog: name, spawn group, spawn id, paratrooper flag, position, rotation.
 void EditSolModal()
 {
-    if (editSolRequest) { ImGui.OpenPopup("Edit Soldier Spawn"); editSolRequest = false; }
+    if (editSolRequest) { ImGui.OpenPopup(Loc.TL("Edit Soldier Spawn")); editSolRequest = false; }
     var fbm = window.FramebufferSize;
     ImGui.SetNextWindowPos(new Vector2(fbm.X * 0.5f, fbm.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     ImGui.SetNextWindowSize(new Vector2(340, 0), ImGuiCond.Appearing);
@@ -9077,8 +9077,8 @@ void HelpWindow()
     {
         if (helpText is null)
         {
-            try { var hp = Path.Combine(AppContext.BaseDirectory, "USER_GUIDE.md"); helpText = File.Exists(hp) ? File.ReadAllText(hp) : "USER_GUIDE.md was not found next to the editor. See the RefractorForge GitHub repository for the full documentation."; }
-            catch (Exception ex) { helpText = "Could not load USER_GUIDE.md: " + ex.Message; }
+            try { var hp = Path.Combine(AppContext.BaseDirectory, "USER_GUIDE.md"); helpText = File.Exists(hp) ? File.ReadAllText(hp) : Loc.T("USER_GUIDE.md was not found next to the editor. See the RefractorForge GitHub repository for the full documentation."); }
+            catch (Exception ex) { helpText = Loc.T("Could not load USER_GUIDE.md: ") + ex.Message; }
         }
         ImGui.PushTextWrapPos(0f);
         ImGui.TextUnformatted(helpText);

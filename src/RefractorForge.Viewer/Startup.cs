@@ -21,7 +21,7 @@ public static class Picker
         {
             using var d = new FolderBrowserDialog
             {
-                Description = title,
+                Description = Loc.T(title),
                 UseDescriptionForTitle = true,
                 ShowNewFolderButton = false,
             };
@@ -32,7 +32,7 @@ public static class Picker
     public static string? File(string title, string filter, string? startNear)
         => RunSta(() =>
         {
-            using var d = new OpenFileDialog { Title = title, Filter = filter, CheckFileExists = true };
+            using var d = new OpenFileDialog { Title = Loc.T(title), Filter = filter, CheckFileExists = true };
             if (!string.IsNullOrEmpty(startNear))
             {
                 var dir = Directory.Exists(startNear) ? startNear : Path.GetDirectoryName(startNear);
@@ -47,7 +47,7 @@ public static class Picker
         string[] result = Array.Empty<string>();
         var t = new Thread(() =>
         {
-            using var d = new OpenFileDialog { Title = title, Filter = filter, CheckFileExists = true, Multiselect = true };
+            using var d = new OpenFileDialog { Title = Loc.T(title), Filter = filter, CheckFileExists = true, Multiselect = true };
             if (!string.IsNullOrEmpty(startNear))
             {
                 var dir = Directory.Exists(startNear) ? startNear : Path.GetDirectoryName(startNear);

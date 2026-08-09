@@ -1,4 +1,4 @@
-using System.Drawing;
+﻿using System.Drawing;
 using System.Windows.Forms;
 using RefractorForge.Formats;
 
@@ -47,7 +47,7 @@ internal static class ModPickerDialog
             {
                 mods.Items.Clear();
                 var dir = Path.Combine(root.Text.Trim(), "Mods");
-                if (!Directory.Exists(dir)) { chain.Text = "No Mods\\ folder under that path."; return; }
+                if (!Directory.Exists(dir)) { chain.Text = Loc.T("No Mods\\ folder under that path."); return; }
                 foreach (var d in Directory.EnumerateDirectories(dir).OrderBy(x => Path.GetFileName(x), StringComparer.OrdinalIgnoreCase))
                     mods.Items.Add(Path.GetFileName(d));
                 if (initialMod is { Length: > 0 })
@@ -72,12 +72,12 @@ internal static class ModPickerDialog
                         lines.Add($"WARNING: not installed -> {string.Join(", ", r.Missing)}");
                     chain.Text = string.Join(Environment.NewLine, lines);
                 }
-                catch (Exception ex) { chain.Text = "Could not resolve: " + ex.Message; }
+                catch (Exception ex) { chain.Text = Loc.T("Could not resolve: ") + ex.Message; }
             }
 
             browse.Click += (_, _) =>
             {
-                using var d = new FolderBrowserDialog { Description = "Select the game install folder (the one containing Mods\\)", UseDescriptionForTitle = true };
+                using var d = new FolderBrowserDialog { Description = Loc.T("Select the game install folder (the one containing Mods\\)"), UseDescriptionForTitle = true };
                 if (Directory.Exists(root.Text.Trim())) d.SelectedPath = root.Text.Trim();
                 if (d.ShowDialog() == DialogResult.OK) { root.Text = d.SelectedPath; FillMods(); Preview(); }
             };

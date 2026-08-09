@@ -1,4 +1,4 @@
-using System.Drawing;
+﻿using System.Drawing;
 using System.Windows.Forms;
 using RefractorForge.Formats;
 
@@ -34,8 +34,8 @@ internal static class ProjectSettingsDialog
             var testDir = T(p.GameTestDir ?? "", 6);
             // Target mod + dependency chain: the mod supplies this map's objects, and its init.con chain is
             // resolved transitively (FHSW -> FH -> bf1942), so a map for a mini-mod sees every inherited asset.
-            var inherit = new CheckBox { Text = "Mount inherited mod dependencies", Left = 132, Top = y0 + dy * 7, Width = 288, Height = 24, Checked = p.IncludeInheritedMods, ForeColor = Color.Gainsboro };
-            var pick = new Button { Text = "Choose target mod / show dependency chain...", Left = 132, Top = y0 + dy * 8, Width = 288, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 114, 178), ForeColor = Color.White };
+            var inherit = new CheckBox { Text = Loc.T("Mount inherited mod dependencies"), Left = 132, Top = y0 + dy * 7, Width = 288, Height = 24, Checked = p.IncludeInheritedMods, ForeColor = Color.Gainsboro };
+            var pick = new Button { Text = Loc.T("Choose target mod / show dependency chain..."), Left = 132, Top = y0 + dy * 8, Width = 288, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 114, 178), ForeColor = Color.White };
             var chainLbl = new Label { Left = 16, Top = y0 + dy * 9 + 4, Width = 404, Height = 34, ForeColor = Color.FromArgb(150, 200, 150), Font = new Font("Segoe UI", 8.5f) };
 
             void ShowChain()
@@ -49,7 +49,7 @@ internal static class ProjectSettingsDialog
                         chainLbl.ForeColor = r.Missing.Count > 0 ? Color.FromArgb(230, 170, 90) : Color.FromArgb(150, 200, 150);
                         if (r.Missing.Count > 0) chainLbl.Text += $"   [missing: {string.Join(", ", r.Missing)}]";
                     }
-                    else chainLbl.Text = "Chain: set a game install + mod to resolve dependencies.";
+                    else chainLbl.Text = Loc.T("Chain: set a game install + mod to resolve dependencies.");
                 }
                 catch { chainLbl.Text = ""; }
             }
