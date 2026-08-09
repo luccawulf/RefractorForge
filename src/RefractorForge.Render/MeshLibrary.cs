@@ -17,6 +17,12 @@ public sealed class MeshLibrary
 {
     private readonly List<RefractorFlatArchive> _archives = new();
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _byName = new(StringComparer.OrdinalIgnoreCase);
+    // "parentFolder/name.sm" -> entry. Per-vehicle level folders reuse the same LEAF names (Akina_Mountain ships
+    // nine cars, each with its own BodyWhite.sm / Lwheel.sm / Taillights.sm under standardmesh/<CAR>/), so the
+    // leaf-only _byName index is first-wins-wrong there; a path-bearing GeometryTemplate.file resolves through
+    // this two-segment index first and only falls back to the bare leaf.
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _byTail2 = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByTail2 = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _treeByName = new(StringComparer.OrdinalIgnoreCase);   // BF1942 .tm tree meshes (basename, no ext)
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _rsOverrideFiles = new(StringComparer.OrdinalIgnoreCase);
@@ -220,11 +226,24 @@ public sealed class MeshLibrary
             foreach (var e in arc.Entries)
             {
                 lib.IndexCategory(e.Name);   // derive object->category from the archive folder structure (any mod)
-                var baseName = e.Name.Replace('\\', '/');
-                baseName = baseName[(baseName.LastIndexOf('/') + 1)..];   // strip path
-                if (baseName.EndsWith(".sm", StringComparison.OrdinalIgnoreCase)) _ = lib._byName.TryAdd(baseName, e);
+                var norm = e.Name.Replace('\\', '/');
+                var baseName = norm[(norm.LastIndexOf('/') + 1)..];   // strip path
+                // Two-segment key ("parentFolder/name.ext") alongside the leaf key, so same-named meshes in
+                // different folders (per-car level folders) stay individually addressable.
+                string? tail2 = null;
+                int sl2 = norm.LastIndexOf('/');
+                if (sl2 > 0) { int sl1 = norm.LastIndexOf('/', sl2 - 1); tail2 = norm[(sl1 + 1)..]; }
+                if (baseName.EndsWith(".sm", StringComparison.OrdinalIgnoreCase))
+                {
+                    _ = lib._byName.TryAdd(baseName, e);
+                    if (tail2 is not null) _ = lib._byTail2.TryAdd(tail2, e);
+                }
                 else if (baseName.EndsWith(".tm", StringComparison.OrdinalIgnoreCase)) _ = lib._treeByName.TryAdd(baseName[..^3], e);   // BF1942 tree mesh (treeMesh.rfa)
-                else if (baseName.EndsWith(".rs", StringComparison.OrdinalIgnoreCase)) _ = lib._rsByName.TryAdd(baseName, e);
+                else if (baseName.EndsWith(".rs", StringComparison.OrdinalIgnoreCase))
+                {
+                    _ = lib._rsByName.TryAdd(baseName, e);
+                    if (tail2 is not null) _ = lib._rsByTail2.TryAdd(tail2, e);
+                }
                 else if (baseName.EndsWith(".con", StringComparison.OrdinalIgnoreCase))
                 {
                     lib._conEntries.Add(e);   // any .con may define ObjectTemplate.geometry for a static object
@@ -1043,9 +1062,20 @@ public sealed class MeshLibrary
     /// fallback. (The object-template indirection lives in <see cref="Resolve"/>.)</summary>
     private RefractorFlatArchiveEntry? ResolveByName(string t)
     {
-        // GeometryTemplate.file values are often PATHS (e.g. "\DesertCombat\STRYKER\STRYKER_Hull"); the .sm index is
-        // keyed by bare basename, so strip any folder prefix first or the lookup + LOD/prefix fallbacks all miss.
-        t = t.Replace('\\', '/'); int sl = t.LastIndexOf('/'); if (sl >= 0) t = t[(sl + 1)..];
+        // PATH-AWARE first: GeometryTemplate.file values are often PATHS, and per-vehicle level folders reuse the
+        // same LEAF names (Akina_Mountain: nine cars, each with BodyWhite.sm / Lwheel.sm / ...). Stripping straight
+        // to the leaf made every car resolve to the FIRST one's meshes, so when the ref carries a folder, try the
+        // "parentFolder/name" key before falling back to the bare leaf.
+        t = t.Replace('\\', '/');
+        int psl = t.LastIndexOf('/');
+        if (psl > 0)
+        {
+            int p2 = t.LastIndexOf('/', psl - 1);
+            var stem = t[(p2 + 1)..];                        // "AE86/BodyWhite"
+            foreach (var cand in new[] { stem + ".sm", stem + "_m1.sm", stem + "_m2.sm" })
+                if (_byTail2.TryGetValue(cand, out var e2)) return e2;
+        }
+        int sl = t.LastIndexOf('/'); if (sl >= 0) t = t[(sl + 1)..];
         foreach (var cand in new[] { t + ".sm", t + "_m1.sm", t + "_m2.sm" })
             if (_byName.TryGetValue(cand, out var e)) return e;
 
@@ -1282,13 +1312,23 @@ public sealed class MeshLibrary
     /// <summary>Find and parse the .rs shader set for a mesh entry (basename match; level override first).</summary>
     private RsShaderSet? LoadShaders(RefractorFlatArchiveEntry smEntry)
     {
-        string baseName = smEntry.Name.Replace('\\', '/');
-        baseName = baseName[(baseName.LastIndexOf('/') + 1)..];
+        string norm = smEntry.Name.Replace('\\', '/');
+        string baseName = norm[(norm.LastIndexOf('/') + 1)..];
         string rsName = Path.ChangeExtension(baseName, ".rs");
         try
         {
             if (_rsOverrideFiles.TryGetValue(rsName, out var file))
                 return RsShaderSet.Parse(File.ReadAllText(file));
+            // Prefer the SIBLING .rs (same folder as the .sm): per-car level folders reuse leaf names, so the
+            // leaf-keyed lookup would hand every car the FIRST car's materials/textures.
+            int sl2 = norm.LastIndexOf('/');
+            if (sl2 > 0)
+            {
+                int sl1 = norm.LastIndexOf('/', sl2 - 1);
+                var tail2 = Path.ChangeExtension(norm[(sl1 + 1)..], ".rs");
+                if (_rsByTail2.TryGetValue(tail2, out var sib))
+                    return RsShaderSet.Parse(System.Text.Encoding.Latin1.GetString(OwningArchive(sib).Read(sib)));
+            }
             if (_rsByName.TryGetValue(rsName, out var e))
                 return RsShaderSet.Parse(System.Text.Encoding.Latin1.GetString(OwningArchive(e).Read(e)));
         }

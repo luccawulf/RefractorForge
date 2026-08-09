@@ -6430,7 +6430,7 @@ void Inspector()
             GpKind.Vehicle => ("Vehicle Spawn", new Vector4(1f, 0.62f, 0.25f, 1f)),
             _ => ("Soldier Spawn", new Vector4(0.45f, 1f, 0.5f, 1f)),
         };
-        ImGui.TextColored(colr, label);
+        ImGui.TextColored(colr, Loc.T(label));   // "Control Point" / "Vehicle Spawn" / "Soldier Spawn"
         ImGui.Separator();
 
         if (!ImGui.IsAnyItemActive())   // don't clobber a field that is mid-edit
@@ -6475,7 +6475,7 @@ void Inspector()
                 hist.Do(new GameplaySetItemCommand(gameplayEdit, GpKind.Vehicle, gpIndex, v with { Vehicle = gpVehBuf }, null));
             }
         }
-        ImGui.DragFloat3("Position", ref gpInsPos, 0.25f);
+        ImGui.DragFloat3(Loc.TL("Position"), ref gpInsPos, 0.25f);
         if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
             hist.Do(new GameplayMoveCommand(gameplayEdit, gpKind, gpIndex, new Vec3(gpInsPos.X, gpInsPos.Y, gpInsPos.Z), null));
         if (gpKind == GpKind.ControlPoint)
@@ -6498,7 +6498,7 @@ void Inspector()
         }
         else
         {
-            ImGui.DragFloat3("Rotation yaw/pitch/roll", ref gpInsRot, 1f);
+            ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref gpInsRot, 1f);
             if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
                 hist.Do(new GameplayRotateCommand(gameplayEdit, gpKind, gpIndex, new Vec3(gpInsRot.X, gpInsRot.Y, gpInsRot.Z), null));
             // Full Battlecraft-style spawn editors (team / OS id for vehicles; group / spawn id / paratrooper for soldiers).
@@ -6555,13 +6555,13 @@ void Inspector()
     ImGui.TextDisabled(Loc.T("TRANSFORM"));
     ImGui.PushItemWidth(-80f);   // fields fill the row but leave room for the Position/Rotation/Scale labels (not -1, which clips them)
 
-    if (ImGui.DragFloat3("Position", ref insPos, 0.25f, 0f, 0f))
+    if (ImGui.DragFloat3(Loc.TL("Position"), ref insPos, 0.25f, 0f, 0f))
     { o.Position = new Vec3(insPos.X, insPos.Y, insPos.Z); SyncTransformEdit(); }
     if (ImGui.IsItemActivated()) dragFromV3 = o.Position;
     if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
     { var to = new Vec3(insPos.X, insPos.Y, insPos.Z); o.Position = dragFromV3; hist.Do(new MoveObject(o.Id, to)); SyncTransformEdit(); }
 
-    if (ImGui.DragFloat3("Rotation", ref insRot, 0.5f, 0f, 0f))
+    if (ImGui.DragFloat3(Loc.TL("Rotation"), ref insRot, 0.5f, 0f, 0f))
     { o.Rotation = new Vec3(insRot.X, insRot.Y, insRot.Z); SyncTransformEdit(); }
     if (ImGui.IsItemActivated()) dragFromV3 = o.Rotation;
     if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
@@ -6751,13 +6751,13 @@ void LayersPanel()
     ImGui.Checkbox(Loc.TL("Texture transparency"), ref alphaTransparency);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
     if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) collisionDirty = true;
-    ImGui.Checkbox($"Vehicles ({gameplayEdit.VehicleSpawns.Count})###vehLayer", ref showVehicles);
-    ImGui.Checkbox($"Control Points ({gameplayEdit.ControlPoints.Count})###cpLayer", ref showControlPoints);
-    ImGui.Checkbox($"Spawn Points ({gameplayEdit.SoldierSpawns.Count})###spawnLayer", ref showSpawns);
+    ImGui.Checkbox(string.Format(Loc.T("Vehicles ({0})"), gameplayEdit.VehicleSpawns.Count) + "###vehLayer", ref showVehicles);
+    ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
+    ImGui.Checkbox(string.Format(Loc.T("Spawn Points ({0})"), gameplayEdit.SoldierSpawns.Count) + "###spawnLayer", ref showSpawns);
     ImGui.Checkbox(Loc.TL("Spawn Links"), ref showSpawnLinks);
     if (sounds.Count > 0)
     {
-        ImGui.Checkbox($"Sounds ({sounds.Count})###soundLayer", ref showSounds);
+        ImGui.Checkbox(string.Format(Loc.T("Sounds ({0})"), sounds.Count) + "###soundLayer", ref showSounds);
         ImGui.SameLine();
         if (ImGui.Checkbox(Loc.TL("Play##sounds"), ref playSounds))
         {
@@ -8939,7 +8939,7 @@ void EditCpModal()
 
     ImGui.InputText(Loc.TL("Name"), ref ecpName, 64u);
     ImGui.InputText(Loc.TL("Control point name"), ref ecpCpName, 64u);
-    ImGui.DragFloat3("Position", ref ecpPos, 0.25f);
+    ImGui.DragFloat3(Loc.TL("Position"), ref ecpPos, 0.25f);
     ImGui.DragFloat(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
     // Team labels follow the target game: BF1942 = Axis/Allies, BF Vietnam = NVA/US. (Index 1/2 are the same slots.)
     string[] teams = gameIsBf1942
@@ -9005,8 +9005,8 @@ void EditVehModal()
         return;
     if (evIndex < 0 || evIndex >= gameplayEdit.VehicleSpawns.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
     ImGui.InputText(Loc.TL("Name"), ref evName, 64u);
-    ImGui.DragFloat3("Position", ref evPos, 0.25f);
-    ImGui.DragFloat3("Rotation yaw/pitch/roll", ref evRot, 1f);
+    ImGui.DragFloat3(Loc.TL("Position"), ref evPos, 0.25f);
+    ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
     ImGui.InputInt(Loc.TL("OS id"), ref evOsId);
     string[] vteams = gameIsBf1942
         ? new[] { "Neutral (0)", "Axis (1)", "Allies (2)" }
@@ -9046,8 +9046,8 @@ void EditSolModal()
     ImGui.InputInt(Loc.TL("Spawn group"), ref esGroup);
     ImGui.InputInt(Loc.TL("Spawn id"), ref esSpawnId);
     ImGui.Checkbox(Loc.TL("Spawn as paratrooper"), ref esPara);
-    ImGui.DragFloat3("Position", ref esPos, 0.25f);
-    ImGui.DragFloat3("Rotation yaw/pitch/roll", ref esRot, 1f);
+    ImGui.DragFloat3(Loc.TL("Position"), ref esPos, 0.25f);
+    ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref esRot, 1f);
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("Spawn group ties this to its control point."));
     ImGui.Separator();
