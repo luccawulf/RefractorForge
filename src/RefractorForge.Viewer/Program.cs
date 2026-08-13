@@ -1230,6 +1230,16 @@ Vector3 waterColor = new(0.10f, 0.22f, 0.30f); float waterAlpha = 0.6f;   // wat
 Vector3 deepColor = new(0.16f, 0.35f, 0.55f);   // submerged-terrain tint (from the level's water.deepcolor)
 
 Camera cam = Camera.FrameAerial(cfg.WorldSize, (minH + maxH) * 0.5f, opts.Size.X / (float)opts.Size.Y);
+// Start where the LEVEL says to look from. Refractor levels carry the pre-spawn camera in Init.con as
+// `game.setBeforeSpawnCameraPosition <team> x/y/z` - the vantage the game itself opens the map on, usually framing
+// the action rather than the empty corner an aerial framing picks. Aim it at the map centre; fall back silently to
+// the aerial view for levels that do not define one.
+if (LevelStartCamera() is { } startCam)
+{
+    cam.Position = startCam;
+    cam.LookAt(new Vector3(cfg.WorldSize * 0.5f, (minH + maxH) * 0.5f, cfg.WorldSize * 0.5f));
+    Console.WriteLine($"Camera: starting at the level's pre-spawn view {startCam.X:0}/{startCam.Y:0}/{startCam.Z:0}.");
+}
 cam.MirrorX = true;   // no view reflection - the native orientation already matches the game (left stays left)
 // Movement speed and zoom step both scale with how high the camera is above the lowest terrain, so
 // navigation is fast at map-overview height and fine when zoomed in next to an object.
@@ -9722,6 +9732,54 @@ byte[]? ReadLevelNavFile(string leaf)
             var a = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rfaList[i]);
             var e = a.Entries.FirstOrDefault(x => x.Name.Replace('\\', '/').EndsWith("/Pathfinding/" + leaf, StringComparison.OrdinalIgnoreCase));
             if (e is not null) return a.Read(e);
+        }
+    }
+    catch { }
+    return null;
+}
+
+// The level's own opening camera: `game.setBeforeSpawnCameraPosition <team> x/y/z` in Init.con. Read from the
+// level folder or straight out of the mounted .rfa chain (later archives win, so a patch can move it). Returns
+// null when the level defines none, or when anything about the parse is not clean.
+Vector3? LevelStartCamera()
+{
+    try
+    {
+        byte[]? bytes = null;
+        if (levelDir is not null && System.IO.Directory.Exists(levelDir))
+        {
+            var f = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories).FirstOrDefault();
+            if (f is not null) bytes = System.IO.File.ReadAllBytes(f);
+        }
+        else
+        {
+            for (int i = rfaList.Length - 1; i >= 0 && bytes is null; i--)
+            {
+                if (!System.IO.File.Exists(rfaList[i])) continue;
+                var arc = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rfaList[i]);
+                var e = arc.Entries.FirstOrDefault(x => x.Name.EndsWith("/Init.con", StringComparison.OrdinalIgnoreCase)
+                                                     || x.Name.EndsWith("\\Init.con", StringComparison.OrdinalIgnoreCase));
+                if (e is not null) bytes = arc.Read(e);
+            }
+        }
+        if (bytes is null) return null;
+
+        foreach (var raw in System.Text.Encoding.Latin1.GetString(bytes).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;
+            int at = line.IndexOf("setBeforeSpawnCameraPosition", StringComparison.OrdinalIgnoreCase);
+            if (at < 0) continue;
+            // "...setBeforeSpawnCameraPosition <team> x/y/z" - take the last whitespace-separated token
+            var parts = line[at..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            var vec = parts.LastOrDefault(p => p.Count(ch => ch == '/') == 2);
+            if (vec is null) continue;
+            var xyz = vec.Split('/');
+            if (xyz.Length == 3 &&
+                float.TryParse(xyz[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cx) &&
+                float.TryParse(xyz[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cy) &&
+                float.TryParse(xyz[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cz))
+                return new Vector3(cx, cy, cz);
         }
     }
     catch { }
