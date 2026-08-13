@@ -21,6 +21,45 @@ public static class LevelSaver
         => Directory.EnumerateFiles(levelDir, name, SearchOption.AllDirectories).FirstOrDefault()
            ?? Path.Combine(levelDir, name);
 
+    /// <summary>Every game-mode folder in the level — any directory holding gameplay instance files. Found by
+    /// content rather than by a fixed name list, so a mod's own mode (or a differently-cased <c>CTF</c>) is picked
+    /// up as readily as the stock Conquest/Ctf/TDM/SinglePlayer/Coop set.</summary>
+    public static List<string> GameModeDirs(string levelDir)
+    {
+        var dirs = new List<string>();
+        if (!Directory.Exists(levelDir)) return dirs;
+        foreach (var d in Directory.EnumerateDirectories(levelDir, "*", SearchOption.AllDirectories))
+            if (File.Exists(Path.Combine(d, "ControlPoints.con")) ||
+                File.Exists(Path.Combine(d, "ObjectSpawns.con")) ||
+                File.Exists(Path.Combine(d, "SoldierSpawns.con")))
+                dirs.Add(d);
+        return dirs;
+    }
+
+    /// <summary>Patch the three template files that carry editable per-object properties, in one gameplay folder.
+    /// Each mode keeps its own copies, so they are patched per folder rather than once for the level.</summary>
+    private static void PatchGameplayTemplates(string levelDir, string dir, GameplayObjects immo, List<string> written)
+    {
+        // Radius/team/timings live on the control-point templates.
+        var tpl = Path.Combine(dir, "ControlPointTemplates.con");
+        if (!File.Exists(tpl)) tpl = Resolve(levelDir, "ControlPointTemplates.con");
+        if (File.Exists(tpl)) { GameplayWriter.PatchControlPointRadiiFile(tpl, immo.ControlPoints); written.Add(tpl); }
+
+        // Soldier spawn group / spawnId / paratrooper live on the SoldierSpawn templates.
+        var stpl = Path.Combine(dir, "SoldierSpawnTemplates.con");
+        if (!File.Exists(stpl)) stpl = Resolve(levelDir, "SoldierSpawnTemplates.con");
+        if (File.Exists(stpl)) { GameplayWriter.PatchSoldierSpawnTemplatesFile(stpl, immo.SoldierSpawns); written.Add(stpl); }
+
+        // Give newly placed vehicle spawners a template so they spawn in-game.
+        var ost = Path.Combine(dir, "ObjectSpawnTemplates.con");
+        if (!File.Exists(ost)) ost = Resolve(levelDir, "ObjectSpawnTemplates.con");
+        if (File.Exists(ost))
+        {
+            File.WriteAllText(ost, GameplayWriter.AppendMissingSpawnerTemplates(File.ReadAllLines(ost), immo.VehicleSpawns));
+            written.Add(ost);
+        }
+    }
+
     public static List<string> SaveFolder(string levelDir,
         StaticObjectsFile? staticObjects, string? staticObjectsPath,
         Heightmap? heightmap, MaterialMap? material, EditableGameplay? gameplay,
@@ -66,24 +105,18 @@ public static class LevelSaver
             written.Add(Path.Combine(cdir, "ObjectSpawns.con"));
             written.Add(Path.Combine(cdir, "SoldierSpawns.con"));
 
-            // Radius lives on the control-point templates; patch the file in the gameplay dir
-            // (the one the gameplay actually loads from), falling back to a search.
-            var tpl = Path.Combine(cdir, "ControlPointTemplates.con");
-            if (!File.Exists(tpl)) tpl = Resolve(levelDir, "ControlPointTemplates.con");
-            if (File.Exists(tpl)) { GameplayWriter.PatchControlPointRadiiFile(tpl, immo.ControlPoints); written.Add(tpl); }
+            PatchGameplayTemplates(levelDir, cdir, immo, written);
 
-            // Soldier spawn group / spawnId / paratrooper live on the SoldierSpawn templates — patch them too.
-            var stpl = Path.Combine(cdir, "SoldierSpawnTemplates.con");
-            if (!File.Exists(stpl)) stpl = Resolve(levelDir, "SoldierSpawnTemplates.con");
-            if (File.Exists(stpl)) { GameplayWriter.PatchSoldierSpawnTemplatesFile(stpl, immo.SoldierSpawns); written.Add(stpl); }
-
-            // Give newly placed vehicle spawners a template so they spawn in-game.
-            var ost = Path.Combine(cdir, "ObjectSpawnTemplates.con");
-            if (!File.Exists(ost)) ost = Resolve(levelDir, "ObjectSpawnTemplates.con");
-            if (File.Exists(ost))
+            // The level's OTHER game modes. A map ships parallel Conquest/Ctf/TDM/SinglePlayer folders holding the
+            // same objects at the same coordinates, so an edit that only touches the mode we loaded from leaves the
+            // rest of the map silently stale. Those folders are PATCHED, never rewritten: the modes deliberately
+            // differ (Kharkov_Day2 has 5 control points in Conquest and TDM but 3 in CTF), so we move what they
+            // already have and add or remove nothing.
+            foreach (var other in GameModeDirs(levelDir))
             {
-                File.WriteAllText(ost, GameplayWriter.AppendMissingSpawnerTemplates(File.ReadAllLines(ost), immo.VehicleSpawns));
-                written.Add(ost);
+                if (string.Equals(other, cdir, System.StringComparison.OrdinalIgnoreCase)) continue;
+                written.AddRange(GameplayWriter.PatchInstanceFiles(other, immo));
+                PatchGameplayTemplates(levelDir, other, immo, written);
             }
         }
         if (shadow is not null)
@@ -91,6 +124,60 @@ public static class LevelSaver
             // Engine reads Textures/LightmapShadowBits.lsb; land on the existing file if present.
             var p = Resolve(levelDir, "LightmapShadowBits.lsb");
             shadow.Save(p); written.Add(p);
+        }
+
+        // The support files Battlecraft keeps in step on save. Additive: an object added in the editor gets an
+        // entry, anything already there (including a mapper's deliberate tuning) is left exactly as it was.
+        written.AddRange(UpdateSupportFiles(levelDir, staticObjects, gameplay?.ToImmutable()));
+        return written;
+    }
+
+    /// <summary>Bring <c>cullRadius.con</c>, <c>PreCache.con</c> and <c>ai/StrategicAreas.con</c> in step with the
+    /// level's current objects. Returns the paths written (empty when nothing was missing).</summary>
+    public static List<string> UpdateSupportFiles(string levelDir, StaticObjectsFile? staticObjects, GameplayObjects? gameplay)
+    {
+        var written = new List<string>();
+        if (!Directory.Exists(levelDir)) return written;
+
+        // cullRadius.con — every static template the level places needs a cull scale, or it pops in at distance.
+        if (staticObjects is not null)
+        {
+            var templates = staticObjects.Objects.Select(o => o.Template)
+                                         .Where(n => !string.IsNullOrWhiteSpace(n))
+                                         .Distinct(System.StringComparer.OrdinalIgnoreCase);
+            var path = Path.Combine(levelDir, "cullRadius.con");
+            var existing = File.Exists(path) ? File.ReadAllLines(path) : null;
+            if (LevelSupportFiles.AppendMissingCullRadius(existing, templates) is { } text)
+            { File.WriteAllText(path, text); written.Add(path); }
+        }
+
+        // PreCache.con — the load-time warm-up list; a vehicle missing from it stutters when it first spawns.
+        if (gameplay is not null)
+        {
+            var templates = gameplay.VehicleSpawns
+                                    .SelectMany(v => new[] { v.Vehicle, v.Vehicle1, v.Vehicle2 })
+                                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                                    .Select(n => n!)
+                                    .Distinct(System.StringComparer.OrdinalIgnoreCase);
+            var path = Path.Combine(levelDir, "PreCache.con");
+            var existing = File.Exists(path) ? File.ReadAllLines(path) : null;
+            if (LevelSupportFiles.AppendMissingPreCache(existing, templates) is { } text)
+            { File.WriteAllText(path, text); written.Add(path); }
+        }
+
+        // ai/StrategicAreas.con — the commander AI's picture of the map. Only written when the level has NONE:
+        // a shipped file is usually hand-authored around terrain, and a generated one would be a downgrade.
+        if (gameplay is not null && gameplay.ControlPoints.Count > 0)
+        {
+            var aiDir = Directory.EnumerateDirectories(levelDir, "ai", SearchOption.AllDirectories).FirstOrDefault()
+                        ?? Path.Combine(levelDir, "ai");
+            var path = Path.Combine(aiDir, "StrategicAreas.con");
+            if (!File.Exists(path))
+            {
+                Directory.CreateDirectory(aiDir);
+                File.WriteAllText(path, LevelSupportFiles.BuildStrategicAreas(gameplay.ControlPoints));
+                written.Add(path);
+            }
         }
         return written;
     }
@@ -229,6 +316,21 @@ public static class LevelSaver
         return first;
     }
 
+    /// <summary>EVERY entry ending in <paramref name="suffix"/>. A packed level carries one copy of each gameplay
+    /// file per game mode (Conquest/, Ctf/, TDM/, SinglePlayer/), so replacing only the first left the rest of the
+    /// map describing the pre-edit layout — the same divergence the folder save had.</summary>
+    private static List<string> FindEntries(RefractorFlatArchive a, string suffix)
+    {
+        var names = new List<string>();
+        foreach (var e in a.Entries)
+            if (e.Name.EndsWith(suffix, System.StringComparison.OrdinalIgnoreCase))
+                names.Add(e.Name);
+        return names;
+    }
+
+    private static string[] EntryLines(RefractorFlatArchive a, string name)
+        => Encoding.Latin1.GetString(a.Read(a.Entries.First(e => e.Name == name))).Split('\n');
+
     /// <summary>Compute the name->bytes substitutions for the edited files against a base archive: each edited
     /// asset is matched to its existing entry (by trailing file name) so the replacement reuses the archive's
     /// EXACT entry name. Shared by <see cref="RepackToRfa"/> (full repack) and <see cref="WritePatchRfa"/>
@@ -279,33 +381,50 @@ public static class LevelSaver
         if (gameplay is not null)
         {
             var immo = gameplay.ToImmutable();
-            Put(FindEntry(arch, "ControlPoints.con", true), Latin1(GameplayWriter.BuildControlPoints(immo.ControlPoints)));
-            Put(FindEntry(arch, "ObjectSpawns.con", true), Latin1(GameplayWriter.BuildObjectSpawns(immo.VehicleSpawns)));
-            Put(FindEntry(arch, "SoldierSpawns.con", true), Latin1(GameplayWriter.BuildSoldierSpawns(immo.SoldierSpawns)));
 
-            var tplName = FindEntry(arch, "ControlPointTemplates.con", true);
-            if (tplName is not null)
+            // The mode the editor loaded from is written in full; every OTHER mode's copy is PATCHED in place, so
+            // an edit reaches the whole map without adding a Conquest-only object to CTF or dropping a CTF-only one.
+            void WriteInstances(string suffix, string full)
             {
-                var tplEntry = arch.Entries.First(e => e.Name == tplName);
-                var lines = Encoding.Latin1.GetString(arch.Read(tplEntry)).Split('\n');
-                Put(tplName, Latin1(GameplayWriter.PatchControlPointRadii(lines, immo.ControlPoints)));
+                var primary = FindEntry(arch, suffix, true);
+                Put(primary, Latin1(full));
+                foreach (var name in FindEntries(arch, suffix))
+                {
+                    if (string.Equals(name, primary, System.StringComparison.OrdinalIgnoreCase)) continue;
+                    Put(name, Latin1(GameplayWriter.PatchInstanceTransforms(EntryLines(arch, name), immo)));
+                }
             }
 
-            var stplName = FindEntry(arch, "SoldierSpawnTemplates.con", true);
-            if (stplName is not null)
-            {
-                var stplEntry = arch.Entries.First(e => e.Name == stplName);
-                var slines = Encoding.Latin1.GetString(arch.Read(stplEntry)).Split('\n');
-                Put(stplName, Latin1(GameplayWriter.PatchSoldierSpawnTemplates(slines, immo.SoldierSpawns)));
-            }
+            WriteInstances("ControlPoints.con", GameplayWriter.BuildControlPoints(immo.ControlPoints));
+            WriteInstances("ObjectSpawns.con", GameplayWriter.BuildObjectSpawns(immo.VehicleSpawns));
+            WriteInstances("SoldierSpawns.con", GameplayWriter.BuildSoldierSpawns(immo.SoldierSpawns));
 
-            var ostName = FindEntry(arch, "ObjectSpawnTemplates.con", true);
-            if (ostName is not null)
-            {
-                var ostEntry = arch.Entries.First(e => e.Name == ostName);
-                var lines = Encoding.Latin1.GetString(arch.Read(ostEntry)).Split('\n');
-                Put(ostName, Latin1(GameplayWriter.AppendMissingSpawnerTemplates(lines, immo.VehicleSpawns)));
-            }
+            // Templates carry per-object properties and each mode keeps its own copy, so patch them all.
+            foreach (var n in FindEntries(arch, "ControlPointTemplates.con"))
+                Put(n, Latin1(GameplayWriter.PatchControlPointRadii(EntryLines(arch, n), immo.ControlPoints)));
+            foreach (var n in FindEntries(arch, "SoldierSpawnTemplates.con"))
+                Put(n, Latin1(GameplayWriter.PatchSoldierSpawnTemplates(EntryLines(arch, n), immo.SoldierSpawns)));
+            foreach (var n in FindEntries(arch, "ObjectSpawnTemplates.con"))
+                Put(n, Latin1(GameplayWriter.AppendMissingSpawnerTemplates(EntryLines(arch, n), immo.VehicleSpawns)));
+        }
+
+        // The support files Battlecraft keeps in step. Additive against whatever the archive already ships.
+        if (so is not null && FindEntry(arch, "cullRadius.con", false) is { } cullName)
+        {
+            var templates = so.Objects.Select(o => o.Template)
+                              .Where(n => !string.IsNullOrWhiteSpace(n))
+                              .Distinct(System.StringComparer.OrdinalIgnoreCase);
+            if (LevelSupportFiles.AppendMissingCullRadius(EntryLines(arch, cullName), templates) is { } t)
+                Put(cullName, Latin1(t));
+        }
+        if (gameplay is not null && FindEntry(arch, "PreCache.con", false) is { } preName)
+        {
+            var immo = gameplay.ToImmutable();
+            var templates = immo.VehicleSpawns.SelectMany(v => new[] { v.Vehicle, v.Vehicle1, v.Vehicle2 })
+                                .Where(n => !string.IsNullOrWhiteSpace(n))
+                                .Distinct(System.StringComparer.OrdinalIgnoreCase);
+            if (LevelSupportFiles.AppendMissingPreCache(EntryLines(arch, preName), templates) is { } t)
+                Put(preName, Latin1(t));
         }
 
         // Arbitrary edited assets matched by trailing file name (e.g. sound .ssc scripts).

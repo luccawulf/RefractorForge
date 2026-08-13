@@ -3946,7 +3946,7 @@ void DoGenerateMinimap()
     if (heightmap is null) return;
     var ingame = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap);
     var thumb = Minimap.Render(256, heightmap, cfg, terrainTex, materialMap);
-    string? a = null, b = null;
+    string? a = null, b = null, c = null;
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
         var texDir = System.IO.Directory.EnumerateDirectories(levelDir, "Textures", System.IO.SearchOption.AllDirectories).FirstOrDefault()
@@ -3957,6 +3957,10 @@ void DoGenerateMinimap()
         System.IO.Directory.CreateDirectory(menuDir);
         a = System.IO.Path.Combine(texDir, "InGameMap.dds");
         b = System.IO.Path.Combine(menuDir, "Thumbnail.dds");
+        // Menu/Briefing.dds is the map picture on the briefing screen. Battlecraft writes it alongside the
+        // thumbnail (retail ships 256x256 uncompressed BGRA here, 64x64 for the thumbnail); we had never written
+        // it, so an edited map kept the original author's briefing art showing the pre-edit terrain.
+        c = System.IO.Path.Combine(menuDir, "Briefing.dds");
     }
     else if (levelDir is not null)
     {
@@ -3964,6 +3968,7 @@ void DoGenerateMinimap()
         var name = System.IO.Path.GetFileNameWithoutExtension(levelDir);
         a = System.IO.Path.Combine(dir, name + ".InGameMap.dds");
         b = System.IO.Path.Combine(dir, name + ".Thumbnail.dds");
+        c = System.IO.Path.Combine(dir, name + ".Briefing.dds");
     }
     if (a is not null && b is not null)
     {
@@ -3971,6 +3976,7 @@ void DoGenerateMinimap()
         DdsTexture.Save(thumb, b);
         Console.WriteLine($"Minimap -> {a}");
         Console.WriteLine($"        -> {b}");
+        if (c is not null) { DdsTexture.Save(thumb, c); Console.WriteLine($"        -> {c}"); }
     }
 }
 

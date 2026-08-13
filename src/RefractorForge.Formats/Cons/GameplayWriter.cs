@@ -126,6 +126,88 @@ public static class GameplayWriter
         File.WriteAllText(templateConPath, patched);
     }
 
+    /// <summary>
+    /// Surgically move/re-aim the instances in an EXISTING gameplay instance file, matching by the name on
+    /// <c>Object.create</c>. Only <c>absolutePosition</c> / <c>rotation</c> / <c>setTeam</c> / <c>setOSId</c> lines
+    /// of matched objects are rewritten; every other line - comments, ordering, and any instance this edit does
+    /// not know about - is preserved exactly.
+    ///
+    /// This is how an edit reaches a level's OTHER game modes. A map ships parallel <c>Conquest/</c>, <c>Ctf/</c>,
+    /// <c>TDM/</c> and <c>SinglePlayer/</c> folders that share most objects but deliberately differ (Kharkov_Day2
+    /// ships 5 control points for Conquest and TDM but only 3 for CTF), and the shared ones sit at identical
+    /// coordinates. So moving a flag must move it in every mode that HAS that flag, while never adding a
+    /// Conquest-only object to CTF or deleting a CTF-only one - which is exactly what rewriting the file wholesale
+    /// would do.
+    /// </summary>
+    public static string PatchInstanceTransforms(IEnumerable<string> lines, GameplayObjects gp)
+    {
+        // name -> (position, rotation?, team?, osId?). Later definitions win, matching the writers above.
+        var pos = new Dictionary<string, Vec3>(System.StringComparer.OrdinalIgnoreCase);
+        var rot = new Dictionary<string, Vec3>(System.StringComparer.OrdinalIgnoreCase);
+        var team = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+        var osId = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+
+        foreach (var c in gp.ControlPoints) pos[c.Name] = c.Position;
+        foreach (var s in gp.SoldierSpawns) { pos[s.Name] = s.Position; rot[s.Name] = s.Rotation; }
+        foreach (var v in gp.VehicleSpawns)
+        {
+            pos[v.Name] = v.Position; rot[v.Name] = v.Rotation;
+            team[v.Name] = v.Team;
+            if (v.OsId != 0) osId[v.Name] = v.OsId;
+        }
+
+        var sb = new StringBuilder();
+        string? cur = null;
+        foreach (var raw in lines)
+        {
+            var line = raw.Replace("\r", "").Replace("\n", "");
+            var trimmed = line.TrimStart();
+            var sp = trimmed.Split(new[] { ' ', '\t' }, System.StringSplitOptions.RemoveEmptyEntries);
+            var key = sp.Length > 0 ? sp[0].ToLowerInvariant() : "";
+
+            if (key == "object.create")
+            {
+                // only track names this edit actually knows; anything else stays untouched
+                var name = sp.Length >= 2 ? sp[1] : null;
+                cur = name is not null && pos.ContainsKey(name) ? name : null;
+            }
+            else if (cur is not null)
+            {
+                string? repl = key switch
+                {
+                    "object.absoluteposition" => "Object.absolutePosition " + Pos(pos[cur]),
+                    "object.rotation" when rot.ContainsKey(cur) => "Object.rotation " + Pos(rot[cur]),
+                    "object.setteam" when team.ContainsKey(cur) => "Object.setTeam " + team[cur].ToString(CultureInfo.InvariantCulture),
+                    "object.setosid" when osId.ContainsKey(cur) => "Object.setOSId " + osId[cur].ToString(CultureInfo.InvariantCulture),
+                    _ => null,
+                };
+                if (repl is not null)
+                {
+                    int indent = line.Length - trimmed.Length;
+                    sb.Append(line, 0, indent).Append(repl).Append(NL);
+                    continue;
+                }
+            }
+            sb.Append(line).Append(NL);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Apply <see cref="PatchInstanceTransforms"/> to whichever of the three instance files exist in
+    /// <paramref name="dir"/>. Returns the paths actually rewritten.</summary>
+    public static List<string> PatchInstanceFiles(string dir, GameplayObjects gp)
+    {
+        var touched = new List<string>();
+        foreach (var name in new[] { "ControlPoints.con", "ObjectSpawns.con", "SoldierSpawns.con" })
+        {
+            var p = Path.Combine(dir, name);
+            if (!File.Exists(p)) continue;
+            File.WriteAllText(p, PatchInstanceTransforms(File.ReadAllLines(p), gp));
+            touched.Add(p);
+        }
+        return touched;
+    }
+
     /// <summary>Append <c>ObjectSpawner</c> templates for vehicle spawns that don't already have one (i.e.
     /// newly placed spawners), linking each to its chosen vehicle for both teams so it spawns in-game.
     /// Existing templates are preserved verbatim; spawns with no vehicle set or a known name are skipped.</summary>
