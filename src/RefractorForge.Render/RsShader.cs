@@ -12,7 +12,14 @@ namespace RefractorForge.Render;
 /// </summary>
 public sealed class RsShaderSet
 {
-    public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade, bool Transparent = false);
+    /// <summary><paramref name="AlphaTestRef"/> is the engine's cutoff for a material that CUTS OUT rather than
+    /// blends. Refractor overloads <c>transparent true</c>: on its own it means real alpha blending (glass, canopies,
+    /// gunsights), but paired with an <c>alphaTestRef</c> it means an alpha TEST at that threshold - grilles, decals,
+    /// ropes, painted markings. Across the stock BF1942 shaders that split is 178 blends vs 59 cutouts, and getting
+    /// it wrong is what made the Willys' engine grill see-through: its sheet is 71% low-alpha, so blending it left
+    /// almost nothing on screen where the engine punches a clean grille out of it.</summary>
+    public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade,
+                                        bool Transparent = false, float? AlphaTestRef = null);
 
     private readonly Dictionary<string, MaterialShader> _byName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -23,6 +30,7 @@ public sealed class RsShaderSet
         var set = new RsShaderSet();
         string? curName = null, curTex = null;
         Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
+        float? alphaRef = null;
 
         foreach (var rawLine in text.Split('\n'))
         {
@@ -32,13 +40,13 @@ public sealed class RsShaderSet
                 // subshader "Name" "StandardMesh/Default"
                 var q = SplitQuoted(line);
                 curName = q.Count > 0 ? q[0] : null;
-                curTex = null; diffuse = Vector3.One; fade = false; transp = false;
+                curTex = null; diffuse = Vector3.One; fade = false; transp = false; alphaRef = null;
             }
             else if (line.StartsWith("{")) inBlock = true;
             else if (line.StartsWith("}"))
             {
                 if (curName is not null)
-                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp);
+                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp, alphaRef);
                 inBlock = false; curName = null;
             }
             else if (inBlock && curName is not null)
@@ -61,6 +69,14 @@ public sealed class RsShaderSet
                     fade = line.Contains("true", StringComparison.OrdinalIgnoreCase);
                 else if (line.StartsWith("transparent", StringComparison.OrdinalIgnoreCase))
                     transp = line.Contains("true", StringComparison.OrdinalIgnoreCase);   // BF1942 glass/canopy: alpha-blended material
+                else if (line.StartsWith("alphaTestRef", StringComparison.OrdinalIgnoreCase))
+                {
+                    // "alphaTestRef 0.7" - texels below this alpha are DISCARDED outright. Its presence is what
+                    // distinguishes a cutout from a blend, so record the value even when it is malformed-but-present.
+                    var p = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                    alphaRef = p.Length >= 2 && float.TryParse(p[1].TrimEnd(';'), NumberStyles.Float, CultureInfo.InvariantCulture, out var ar)
+                        ? Math.Clamp(ar, 0f, 1f) : 0.5f;
+                }
             }
         }
         return set;

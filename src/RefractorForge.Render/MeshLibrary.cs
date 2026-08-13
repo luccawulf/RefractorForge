@@ -41,7 +41,11 @@ public sealed class MeshLibrary
     /// texture if the texture archive is available. <paramref name="TextureName"/> is the .rs shader's texture
     /// reference (e.g. <c>texture/sky/kursk/kursksky</c>) when known — tools that rewrite material bindings
     /// (the skybox face editor) key on it.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null);
+    /// <summary><paramref name="AlphaRef"/> is set only for a HARD-SURFACE cutout - one the .rs asked for by name
+    /// with an <c>alphaTestRef</c> (grilles, decals, painted markings). It carries the engine's own discard
+    /// threshold, and its presence also says "shade this like solid geometry", unlike the foliage cutouts that
+    /// <paramref name="AlphaTest"/> alone implies and that are deliberately lit flat.</summary>
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -717,7 +721,7 @@ public sealed class MeshLibrary
             {
                 var idx = new int[mp.Indices.Length];
                 for (int k = 0; k < idx.Length; k++) idx[k] = mp.Indices[k] + baseV;
-                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend));
+                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend, mp.TextureName, mp.AlphaRef));
             }
         }
         return mats.Count > 0
@@ -1289,14 +1293,20 @@ public sealed class MeshLibrary
             // parts of the atlas don't render as opaque rectangles.
             // Glass/canopy (explicit `transparent`) blends softly with NORMAL lighting; foliage/fences/cutout sheets
             // (fade flag, foliage names, or genuine cutout alpha) are HARD alpha-tested with flat foliage lighting.
-            bool blend = sh?.Transparent == true;
+            // `transparent true` alone means BLEND, but paired with an `alphaTestRef` it means CUT OUT at that
+            // threshold - the engine overloads the one keyword. The Willys' engine grill is the second kind
+            // (`transparent true; alphaTestRef 0.7`, sheet 71% low-alpha), so blending it left a see-through panel
+            // where the game punches a clean grille. Stock BF1942 splits 178 blends / 59 cutouts on exactly this.
+            bool blend = sh?.Transparent == true && sh.AlphaTestRef is null;
             // The texture's own alpha is only a LAST RESORT, used when the .rs told us nothing about this material.
             // BF1942 vehicle skins routinely keep a SPECULAR/gloss mask in the alpha channel - the Willys' willy3_z
             // is 62% low-alpha - and reading that as a cutout mask discards most of the surface. That is what made
             // the jeep's engine grill see-through: the shader threw away every texel the gloss mask left dark.
             // When a material HAS a shader, believe it: `textureFade`/`transparent` and the foliage name list decide.
-            bool cutout = !blend && (sh?.TextureFade == true || IsCutout(sh?.Texture) || (sh is null && HasTransparency(tex)));
-            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend, TextureName: sh?.Texture));
+            bool cutout = !blend && (sh?.AlphaTestRef is not null || sh?.TextureFade == true || IsCutout(sh?.Texture)
+                                     || (sh is null && HasTransparency(tex)));
+            parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend,
+                                       TextureName: sh?.Texture, AlphaRef: sh?.AlphaTestRef));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())

@@ -13,7 +13,29 @@ namespace RefractorForge.Viewer;
 /// </summary>
 sealed class GlObjects
 {
-    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; }
+    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; }
+
+    /// <summary>The shader's uAlphaTest mode for a part, plus the alpha threshold that goes with it. A part whose
+    /// .rs named an <c>alphaTestRef</c> is a hard-surface cutout (mode 3, shaded solid); anything else alpha-tested
+    /// is foliage (mode 1, lit flat) and keeps the long-standing 0.33 cutoff.</summary>
+    private static (int Mode, float Ref) AlphaModeOf(Part p) =>
+        p.Blend ? (2, 0f) : p.AlphaTest ? (p.AlphaRef is { } r ? (3, r) : (1, 0.33f)) : (0, 0f);
+
+    // uAlphaRef is resolved here rather than threaded through every Draw* signature (there are a dozen call sites).
+    private uint _refProg; private int _refLoc = -1;
+    private int AlphaRefLoc(GL gl, uint prog)
+    {
+        if (prog != _refProg) { _refProg = prog; _refLoc = gl.GetUniformLocation(prog, "uAlphaRef"); }
+        return _refLoc;
+    }
+
+    private void SetAlpha(GL gl, uint prog, int uAlphaTest, Part part)
+    {
+        var (mode, aref) = AlphaModeOf(part);
+        gl.Uniform1(uAlphaTest, mode);
+        int loc = AlphaRefLoc(gl, prog);
+        if (loc >= 0) gl.Uniform1(loc, aref);
+    }
     private sealed class Template { public uint Vao; public Part[] Parts = Array.Empty<Part>(); public Vector3 BbMin; public Vector3 BbMax; }
 
     private readonly Dictionary<string, Template> _templates = new(StringComparer.OrdinalIgnoreCase);
@@ -228,7 +250,7 @@ sealed class GlObjects
                 {
                     gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                     gl.Uniform1(uUseTex, 1);
-                    gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
+                    SetAlpha(gl, prog, uAlphaTest, part);
                 }
                 else
                 {
@@ -293,7 +315,7 @@ sealed class GlObjects
                     {
                         gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                         gl.Uniform1(uUseTex, 1);
-                        gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
+                        SetAlpha(gl, prog, uAlphaTest, part);
                     }
                     else
                     {
@@ -344,7 +366,7 @@ sealed class GlObjects
             int off = allIdx.Count;
             foreach (var ix in part.Indices) allIdx.Add((uint)ix);
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
-            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend });
+            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef });
         }
         Bounds(pos, out var bbMin, out var bbMax);
         var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = parts.ToArray(), BbMin = bbMin, BbMax = bbMax };
@@ -378,7 +400,7 @@ sealed class GlObjects
             {
                 gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                 gl.Uniform1(uUseTex, 1);
-                gl.Uniform1(uAlphaTest, part.Blend ? 2 : (part.AlphaTest ? 1 : 0));   // 2 = soft-blend glass, 1 = cutout
+                SetAlpha(gl, prog, uAlphaTest, part);
             }
             else
             {

@@ -381,7 +381,10 @@ void main(){ gl_Position = uMVP * vec4(aPos,1.0); vN = mat3(uModel) * aNormal; v
 const string ObjFrag = @"#version 330 core
 in vec3 vN; in vec2 vUv; in vec2 vLmUv; in vec3 vWorld;
 uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
+// uAlphaTest: 0 = opaque, 1 = foliage cutout (flat vegetation lighting), 2 = blended glass,
+// 3 = hard-surface cutout (grille/decal/marking: alpha-tested like foliage, but SHADED and OPAQUE like solid metal).
 uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
+uniform float uAlphaRef;   // discard threshold for modes 1/3 - the .rs `alphaTestRef` when the material declares one
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
@@ -403,7 +406,7 @@ void main(){
     vec4 tc = texture(uTex, vUv);
     vec3 base = (uUseTex==1) ? tc.rgb : uColor;
     float a   = (uUseTex==1) ? tc.a   : 1.0;
-    if (uAlphaTest==1 && uAlphaEnable==1 && a < 0.33) discard;   // cutout discard only while transparency is enabled (toggle off -> solid)
+    if ((uAlphaTest==1 || uAlphaTest==3) && uAlphaEnable==1 && a < uAlphaRef) discard;   // cutout discard only while transparency is enabled (toggle off -> solid)
     vec3 c;
     if (uHasLightmap==1) {
         vec3 lm = texture(uLightmap, vLmUv).rgb;          // baked lighting already has shadows baked in -> no shadow map
@@ -422,11 +425,13 @@ void main(){
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
         c = mix(c, uFogColor, fog);
     }
-    // cutout(1) carries the texture's alpha as-is; glass(2) gets a MINIMUM opacity so a pane cannot vanish.
-    // BF1942 glass textures are often fully transparent in alpha - the Willys' katy_window_I is 100% below the
-    // half-alpha mark - so honouring that literally erased the windscreen. A floor keeps it see-through but present.
+    // An alpha TEST is binary: a texel that survives is fully opaque, so modes 1 and 3 write alpha 1.0. Carrying the
+    // texture's alpha through instead left every surviving texel of a partly-glossy sheet semi-transparent, which is
+    // half of why the Willys' grill could be seen through even where it had not been cut away.
+    // Glass(2) gets a MINIMUM opacity so a pane cannot vanish: BF1942 glass is often fully transparent in alpha - the
+    // Willys' katy_window_I is 100% below the half-alpha mark - so honouring that literally erased the windscreen.
     float outA = 1.0;
-    if (uAlphaTest!=0 && uAlphaEnable==1) outA = (uAlphaTest==2) ? max(a, 0.30) : a;
+    if (uAlphaTest==2 && uAlphaEnable==1) outA = max(a, 0.30);
     frag = vec4(c, outA);
 }";
 
@@ -9743,46 +9748,59 @@ byte[]? ReadLevelNavFile(string leaf)
 // null when the level defines none, or when anything about the parse is not clean.
 Vector3? LevelStartCamera()
 {
+    // A level carries SEVERAL Init.con files - the level's own plus per-menu / per-game-mode copies - and only the
+    // root one holds the camera. Reading just the first match found the Menu copy on Wake and gave up, which is why
+    // the editor kept opening on the aerial view. So collect every candidate, shallowest path first (the same
+    // shadowing rule LevelArchive.Find uses), and keep looking until one actually yields a position.
+    var candidates = new List<byte[]>();
     try
     {
-        byte[]? bytes = null;
-        if (levelDir is not null && System.IO.Directory.Exists(levelDir))
+        if (rfaList.Length > 0)
         {
-            var f = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories).FirstOrDefault();
-            if (f is not null) bytes = System.IO.File.ReadAllBytes(f);
-        }
-        else
-        {
-            for (int i = rfaList.Length - 1; i >= 0 && bytes is null; i--)
+            for (int i = rfaList.Length - 1; i >= 0; i--)   // later archives (patches) override the base
             {
                 if (!System.IO.File.Exists(rfaList[i])) continue;
                 var arc = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rfaList[i]);
-                var e = arc.Entries.FirstOrDefault(x => x.Name.EndsWith("/Init.con", StringComparison.OrdinalIgnoreCase)
-                                                     || x.Name.EndsWith("\\Init.con", StringComparison.OrdinalIgnoreCase));
-                if (e is not null) bytes = arc.Read(e);
+                foreach (var e in arc.Entries
+                             .Where(x => x.Name.EndsWith("/Init.con", StringComparison.OrdinalIgnoreCase)
+                                      || x.Name.EndsWith("\\Init.con", StringComparison.OrdinalIgnoreCase))
+                             .OrderBy(x => x.Name.Count(c => c is '/' or '\\')))
+                    candidates.Add(arc.Read(e));
             }
         }
-        if (bytes is null) return null;
-
-        foreach (var raw in System.Text.Encoding.Latin1.GetString(bytes).Split('\n'))
+        else if (levelDir is not null && System.IO.Directory.Exists(levelDir))
         {
-            var line = raw.Trim();
-            if (line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;
-            int at = line.IndexOf("setBeforeSpawnCameraPosition", StringComparison.OrdinalIgnoreCase);
-            if (at < 0) continue;
-            // "...setBeforeSpawnCameraPosition <team> x/y/z" - take the last whitespace-separated token
-            var parts = line[at..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-            var vec = parts.LastOrDefault(p => p.Count(ch => ch == '/') == 2);
-            if (vec is null) continue;
-            var xyz = vec.Split('/');
-            if (xyz.Length == 3 &&
-                float.TryParse(xyz[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cx) &&
-                float.TryParse(xyz[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cy) &&
-                float.TryParse(xyz[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cz))
-                return new Vector3(cx, cy, cz);
+            foreach (var f in System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
+                         .OrderBy(p => p.Count(c => c is '\\' or '/')))
+                candidates.Add(System.IO.File.ReadAllBytes(f));
         }
     }
     catch { }
+
+    foreach (var bytes in candidates)
+    {
+        try
+        {
+            foreach (var raw in System.Text.Encoding.Latin1.GetString(bytes).Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;
+                int at = line.IndexOf("setBeforeSpawnCameraPosition", StringComparison.OrdinalIgnoreCase);
+                if (at < 0) continue;
+                // "...setBeforeSpawnCameraPosition <team> x/y/z" - take the last whitespace-separated token
+                var parts = line[at..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                var vec = parts.LastOrDefault(p => p.Count(ch => ch == '/') == 2);
+                if (vec is null) continue;
+                var xyz = vec.Split('/');
+                if (xyz.Length == 3 &&
+                    float.TryParse(xyz[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cx) &&
+                    float.TryParse(xyz[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cy) &&
+                    float.TryParse(xyz[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cz))
+                    return new Vector3(cx, cy, cz);
+            }
+        }
+        catch { }
+    }
     return null;
 }
 
