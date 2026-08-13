@@ -107,6 +107,94 @@ public class StrategicMapTests
         Assert.Throws<InvalidDataException>(() => StrategicMap.Load(truncated));
     }
 
+    private static IEnumerable<string> RealInfoMaps()
+    {
+        foreach (var root in new[]
+                 {
+                     @"D:\Games\EA GAMES\Battlefield 1942",
+                     @"D:\Games\EA GAMES\Battlefield Vietnam",
+                 })
+        {
+            if (!Directory.Exists(root)) continue;
+            IEnumerable<string> files;
+            try { files = Directory.EnumerateFiles(root, "*Info.raw", SearchOption.AllDirectories); }
+            catch { continue; }
+            foreach (var f in files)
+                if (f.Contains(Path.DirectorySeparatorChar + "Pathfinding" + Path.DirectorySeparatorChar,
+                               StringComparison.OrdinalIgnoreCase))
+                    yield return f;
+        }
+    }
+
+    [Fact]
+    public void Info_map_packs_two_bits_per_cell_in_32x32_blocks()
+    {
+        int side = 64;                                    // 2x2 blocks
+        var cells = new byte[side * side];
+        for (int i = 0; i < cells.Length; i++) cells[i] = (byte)(i % 4);   // force a mixed block
+        var enc = StrategicInfoMap.Encode(cells, side, level: 1);
+        var dec = StrategicInfoMap.Decode(enc, out int gotSide, out int gotLevel);
+
+        Assert.Equal(side, gotSide);
+        Assert.Equal(1, gotLevel);
+        Assert.Equal(cells, dec);
+        // 4 blocks, all mixed: header + 4 * (descriptor + 256-byte payload)
+        Assert.Equal(32 + 4 * (4 + 256), enc.Length);
+    }
+
+    [Fact]
+    public void Info_map_collapses_uniform_blocks()
+    {
+        int side = 64;
+        var cells = new byte[side * side];               // all zero -> every block uniform
+        var enc = StrategicInfoMap.Encode(cells, side, level: 1);
+        Assert.Equal(32 + 4 * 4, enc.Length);            // header + 4 bare descriptors, no payloads
+        Assert.Equal(cells, StrategicInfoMap.Decode(enc, out _, out _));
+    }
+
+    /// <summary>Every shipped <c>&lt;Veh&gt;Info.raw</c> must decode to values in 0..3, at a side exactly 32x the
+    /// matching strategic table's width, and re-encode byte-identical.</summary>
+    [Fact]
+    public void Every_installed_info_map_round_trips_byte_exact()
+    {
+        var files = RealInfoMaps().Take(400).ToList();
+        if (files.Count == 0) return;
+
+        int okFiles = 0, paired = 0;
+        var failures = new List<string>();
+        foreach (var f in files)
+        {
+            byte[] data;
+            try { data = File.ReadAllBytes(f); } catch { continue; }
+
+            byte[] cells; int side, level;
+            try { cells = StrategicInfoMap.Decode(data, out side, out level); }
+            catch (Exception ex) { failures.Add($"decode failed: {Path.GetFileName(f)}: {ex.Message}"); continue; }
+
+            Assert.All(cells, c => Assert.InRange(c, 0, StrategicInfoMap.MaxRegion));
+
+            var re = StrategicInfoMap.Encode(cells, side, level);
+            if (!re.SequenceEqual(data)) { failures.Add("round-trip differs: " + f); continue; }
+            okFiles++;
+
+            // the sibling table must describe the same area: one strategic cell per 32x32 info cells
+            var name = Path.GetFileNameWithoutExtension(f);
+            var tbl = Path.Combine(Path.GetDirectoryName(f)!, name[..^"Info".Length] + ".raw");
+            if (!File.Exists(tbl)) continue;
+            var tblData = File.ReadAllBytes(tbl);
+            if (!StrategicMap.LooksLikeStrategicMap(tblData)) continue;
+            var sm = StrategicMap.Load(tblData);
+            int blockSide = StrategicInfoMap.BlockSideFor(StrategicInfoMap.BaseCellBits, level);
+            if (sm.Width != side / blockSide)
+                failures.Add($"grid mismatch: {Path.GetFileName(f)} side {side} vs table {sm.Width}");
+            else paired++;
+        }
+
+        Assert.True(failures.Count == 0, string.Join("\n", failures.Take(10)));
+        Assert.True(okFiles > 0, "found info maps but decoded none");
+        Assert.True(paired > 0, "no info map could be paired with its strategic table");
+    }
+
     /// <summary>The real gate: every shipped companion map on this machine must parse AND re-serialise to the
     /// identical bytes - which also proves the uninitialised padding is carried through untouched.</summary>
     [Fact]
