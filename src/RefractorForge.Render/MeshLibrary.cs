@@ -1333,7 +1333,12 @@ public sealed class MeshLibrary
         for (int i = 0; i < n; i += step) { int a = d[i * 4 + 3]; sampled++; if (a < 128) trans++; else if (a >= 240) solid++; }
         if (sampled == 0) return false;
         float tf = (float)trans / sampled, sf = (float)solid / sampled;
-        return tf > 0.02f && tf < 0.85f && sf > 0.05f;   // some transparent + some solid -> genuine glass/cutout
+        float mid = 1f - tf - sf;
+        // A real cutout mask is BIMODAL - a texel is either a hole or it is not - so almost nothing sits between.
+        // A SPECULAR/gloss mask is the opposite: a smooth ramp, mostly mid-tones. The Willys' willy3_z is 62%
+        // below the halfway mark but 23% in between, and reading it as a cutout discarded most of the engine
+        // grill, leaving it see-through. Requiring bimodality tells the two apart (leaf atlases sit near 5%).
+        return tf > 0.02f && tf < 0.85f && sf > 0.05f && mid < 0.12f;
     }
 
     /// <summary>Find and parse the .rs shader set for a mesh entry (basename match; level override first).</summary>
