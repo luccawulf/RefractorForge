@@ -402,8 +402,34 @@ public sealed class TerrainTexture
     /// the grid side. A high-res terrain texture (e.g. 2048px tiles in a 2×2 grid) wants a 4096 atlas, not 2048.</summary>
     public int NativeSize => _maxTile * Math.Max(_gridW, _gridH);
 
+    /// <summary>Metres of world covered by one terrain tile. Constant across the retail maps: Bocage and El Alamein
+    /// ship 8x8 tiles over 2048 m, Kharkov 4x4 over 1024 m.</summary>
+    public const float MetresPerTile = 256f;
+
+    /// <summary>Tile offset of the shipped tiles within the map's full tile grid — non-zero when a level textures
+    /// only part of its world.</summary>
+    private readonly float _tileOriginX, _tileOriginY;
+    private readonly int _gridFullW, _gridFullH;
+
     private TerrainTexture(Texture2D?[,] tiles, int gw, int gh, float worldSize, int maxTile, string?[,]? tileNames = null)
-    { _tiles = tiles; _gridW = gw; _gridH = gh; _worldSize = worldSize; _maxTile = maxTile; _tileNames = tileNames; }
+    {
+        _tiles = tiles; _gridW = gw; _gridH = gh; _worldSize = worldSize; _maxTile = maxTile; _tileNames = tileNames;
+        // A tile is always 256 m, so a map's FULL grid follows from its world size. Naval maps texture only the
+        // middle of the world and ship fewer tiles than that (Wake: 4x4 for a map that spans 8x8), leaving open
+        // ocean around the edge. Anchoring those tiles at the origin corner - which is what indexing them directly
+        // does - drags the whole painted surface outward, so the beach ends up out at sea. Centre them instead.
+        int fullW = worldSize > 0 ? (int)Math.Round(worldSize / MetresPerTile) : gw;
+        _gridFullW = Math.Max(gw, fullW);
+        _gridFullH = Math.Max(gh, fullW);
+        _tileOriginX = (_gridFullW - gw) * 0.5f;
+        _tileOriginY = (_gridFullH - gh) * 0.5f;
+    }
+
+    /// <summary>The shipped tiles' extent within the world, as a UV rectangle. <c>(0,0,1,1)</c> when the level
+    /// textures its whole map.</summary>
+    public (float U0, float V0, float U1, float V1) TexturedExtent => (
+        _tileOriginX / _gridFullW, _tileOriginY / _gridFullH,
+        (_tileOriginX + _gridW) / _gridFullW, (_tileOriginY + _gridH) / _gridFullH);
 
     public static TerrainTexture? Load(string texturesDir, float worldSize)
     {
@@ -467,7 +493,12 @@ public sealed class TerrainTexture
     public Vector3 SampleUv(float u, float v)
     {
         u -= MathF.Floor(u); v -= MathF.Floor(v);
-        float fu = u * _gridW, fv = v * _gridH;
+        // Work in FULL-grid tile units, then step into the shipped block. For a level that textures its whole map
+        // the origin is 0 and this is exactly the old maths; for one that textures only the middle (naval maps),
+        // it puts the tiles where they actually belong instead of jammed into the origin corner.
+        float fu = u * _gridFullW - _tileOriginX, fv = v * _gridFullH - _tileOriginY;
+        if (fu < 0f || fv < 0f || fu >= _gridW || fv >= _gridH)
+            return new Vector3(0.45f, 0.5f, 0.38f);   // outside the textured area: the untextured-ground colour
         int col = Math.Clamp((int)fu, 0, _gridW - 1);
         int row = Math.Clamp((int)fv, 0, _gridH - 1);
         float lu = fu - col, lv = fv - row;
