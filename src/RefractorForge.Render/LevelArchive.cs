@@ -142,6 +142,12 @@ public static class LevelArchive
             }
         var sounds = SoundLibrary.FromTexts(soundCons, soundSsc);
 
+        // A level that ships fewer terrain tiles than its world size implies has them CENTRED (naval maps texture
+        // only the middle). That is inferred, so check it against the material map, which knows where the level
+        // actually has terrain content, and fall back to corner-anchored if the two disagree.
+        if (tex is not null && material is not null)
+            tex.ValidateCentringAgainst(material.Samples, cfg.MaterialSize);
+
         return new Loaded(cfg, hm, so, tex, gameplay, material, growth, env, shadow, sounds);
     }
 

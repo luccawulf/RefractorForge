@@ -408,8 +408,8 @@ public sealed class TerrainTexture
 
     /// <summary>Tile offset of the shipped tiles within the map's full tile grid — non-zero when a level textures
     /// only part of its world.</summary>
-    private readonly float _tileOriginX, _tileOriginY;
-    private readonly int _gridFullW, _gridFullH;
+    private float _tileOriginX, _tileOriginY;      // cleared by ValidateCentringAgainst if the map disagrees
+    private int _gridFullW, _gridFullH;
 
     private TerrainTexture(Texture2D?[,] tiles, int gw, int gh, float worldSize, int maxTile, string?[,]? tileNames = null)
     {
@@ -430,6 +430,52 @@ public sealed class TerrainTexture
     public (float U0, float V0, float U1, float V1) TexturedExtent => (
         _tileOriginX / _gridFullW, _tileOriginY / _gridFullH,
         (_tileOriginX + _gridW) / _gridFullW, (_tileOriginY + _gridH) / _gridFullH);
+
+    /// <summary>
+    /// CHECK the centring against the level's own data instead of trusting the rule.
+    ///
+    /// Centring is inferred from tile count versus world size, but that alone cannot tell "only the middle is
+    /// textured" from "fewer, larger tiles covering everything" - and guessing wrong moves the ground texture on a
+    /// map that was fine. The MaterialMap spans the whole world and says where the level actually has terrain
+    /// content, so it settles it per map: if that content does not fit inside the centred block, the assumption is
+    /// wrong and we fall back to the original corner-anchored mapping.
+    ///
+    /// Measured on the retail maps: Wake/Iwo Jima/Coral Sea/Midway all have their material content inside the
+    /// centred block (Wake 0.29..0.74 inside 0.25..0.75), while Berlin's sits in the TOP-RIGHT corner
+    /// (0.81..0.93) - which is exactly the case this guard exists to refuse.
+    /// </summary>
+    public void ValidateCentringAgainst(byte[] materialSamples, int side)
+    {
+        if (_tileOriginX == 0f && _tileOriginY == 0f) return;             // nothing inferred, nothing to check
+        if (materialSamples is null || side <= 0 || materialSamples.Length < side * side) return;
+
+        var hist = new Dictionary<byte, int>();
+        foreach (var b in materialSamples) { hist.TryGetValue(b, out var c); hist[b] = c + 1; }
+        if (hist.Count <= 1) return;                                       // uniform: tells us nothing either way
+        byte bg = hist.OrderByDescending(k => k.Value).First().Key;
+
+        int x0 = side, y0 = side, x1 = -1, y1 = -1;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+                if (materialSamples[y * side + x] != bg)
+                {
+                    if (x < x0) x0 = x; if (x > x1) x1 = x;
+                    if (y < y0) y0 = y; if (y > y1) y1 = y;
+                }
+        if (x1 < 0) return;
+
+        var (u0, v0, u1, v1) = TexturedExtent;
+        const float slack = 0.02f;   // a little tolerance: content may touch the very edge of its tiles
+        bool fits = x0 / (float)side >= u0 - slack && (x1 + 1) / (float)side <= u1 + slack &&
+                    y0 / (float)side >= v0 - slack && (y1 + 1) / (float)side <= v1 + slack;
+        if (fits) return;
+
+        Console.WriteLine($"Terrain tiles: content spans u {x0 / (float)side:0.00}..{(x1 + 1) / (float)side:0.00}, " +
+                          $"v {y0 / (float)side:0.00}..{(y1 + 1) / (float)side:0.00}, outside the centred block " +
+                          $"{u0:0.00}..{u1:0.00} - keeping the tiles corner-anchored.");
+        _tileOriginX = 0f; _tileOriginY = 0f;
+        _gridFullW = _gridW; _gridFullH = _gridH;
+    }
 
     public static TerrainTexture? Load(string texturesDir, float worldSize)
     {
