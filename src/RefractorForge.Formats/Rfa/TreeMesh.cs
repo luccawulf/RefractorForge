@@ -32,6 +32,16 @@ public sealed class TreeMesh
     public Vertex[] Vertices = Array.Empty<Vertex>();
     public ushort[] Indices = Array.Empty<ushort>();
     public bool HasCollision;
+
+    /// <summary>The tree's COLLISION hull, decoded from the section the parser used to skip. Trees are solid
+    /// in-game, so without this the editor's collision overlay silently showed nothing for every tree and bush.
+    /// Note the hull is not bound by <see cref="Min"/>/<see cref="Max"/> (those describe the visible mesh): real
+    /// trunks sink several metres below the render box to anchor them, and some conifer hulls run taller.</summary>
+    public Vec3[] CollisionVertices = Array.Empty<Vec3>();
+
+    /// <summary>Triangle indices into <see cref="CollisionVertices"/> (3 per face).</summary>
+    public ushort[] CollisionIndices = Array.Empty<ushort>();
+
     public int Consumed;   // bytes parsed; == file length for a clean parse
 
     public static TreeMesh Parse(byte[] b)
@@ -62,8 +72,21 @@ public sealed class TreeMesh
         if (colflag != 0)
         {
             U32();                                        // colu1 (=5)
-            int cvn = (int)U32(); p += cvn * 16;          // collider vertices (16B each)
-            int cfn = (int)U32(); p += cfn * 8;           // collider faces (8B each)
+            // Collider vertices: float3 position + 4 spare bytes. Collider faces: 3 x u16 index + 1 x u16 spare.
+            int cvn = (int)U32();
+            tm.CollisionVertices = new Vec3[cvn];
+            for (int i = 0; i < cvn; i++) { tm.CollisionVertices[i] = F3(); p += 4; }
+            int cfn = (int)U32();
+            tm.CollisionIndices = new ushort[cfn * 3];
+            for (int i = 0; i < cfn; i++)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    tm.CollisionIndices[i * 3 + k] = BinaryPrimitives.ReadUInt16LittleEndian(b.AsSpan(p));
+                    p += 2;
+                }
+                p += 2;                                   // spare u16
+            }
             U32(); U32();                                 // h_u1, h_u2
             int hn = (int)U32(); p += hn * 32;            // hdata (32B each)
             SkipBspNode(b, ref p);                        // recursive AABB BSP

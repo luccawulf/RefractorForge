@@ -181,7 +181,29 @@ public sealed class MeshLibrary
     private CollisionMesh? BuildCollision(string template)
     {
         var entry = Resolve(template) ?? (LodStem(template) is { } stem ? Resolve(stem) : null);
-        return entry is null ? null : BuildCollisionFromEntry(entry);
+        if (entry is not null && BuildCollisionFromEntry(entry) is { } sm) return sm;
+        // No .sm collision: trees and bushes are BF1942 .tm meshes, a separate format the .sm resolver never
+        // finds. They are solid in-game, so without this branch the collision overlay drew nothing for every
+        // tree on the map — the geometry was in the file all along, just skipped over by the parser.
+        return BuildTreeCollision(template);
+    }
+
+    private CollisionMesh? BuildTreeCollision(string template)
+    {
+        var e = ResolveTree(template);
+        if (e is null) return null;
+        try
+        {
+            if (!RefractorForge.Formats.Rfa.TreeMesh.TryParse(OwningArchive(e).Read(e), out var tm) || tm is null) return null;
+            if (!tm.HasCollision || tm.CollisionIndices.Length == 0 || tm.CollisionVertices.Length == 0) return null;
+            var pos = new Vector3[tm.CollisionVertices.Length];
+            for (int i = 0; i < pos.Length; i++)
+                pos[i] = new Vector3(tm.CollisionVertices[i].X, tm.CollisionVertices[i].Y, tm.CollisionVertices[i].Z);
+            var idx = new int[tm.CollisionIndices.Length];
+            for (int i = 0; i < idx.Length; i++) idx[i] = tm.CollisionIndices[i];
+            return new CollisionMesh(pos, idx);
+        }
+        catch { return null; }
     }
 
     // Decode a resolved .sm entry's first usable collision section. Cached per entry so a vehicle that reuses the same

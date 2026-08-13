@@ -1142,11 +1142,11 @@ int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object progra
 bool sunOverride = false;
 float sunAzimuthDeg = 135f, sunElevationDeg = 40f;
 float camSpeedMult = 1f;               // user multiplier on WASD fly speed (and scroll dolly)
-// Battlecraft-style GROUND camera: WASD skims the map at a fixed height ABOVE THE TERRAIN instead of flying free,
-// so crossing a ridge lifts you over it rather than burying the view inside it, and the pace is the same anywhere
-// on the map (the fly camera scales speed by absolute altitude, which crawls in a valley and races over a peak).
+// Battlecraft-style camera: you travel toward whatever sits in the MIDDLE OF THE SCREEN. W/S follow the true view
+// vector, so aiming down and holding W descends and aiming up climbs - the height comes from where you look, with
+// no need to touch Q/E. The default fly camera instead flattens forward onto XZ and keeps your altitude fixed
+// until you press Q/E, which is the difference between the two modes.
 bool groundCam = AppPrefs.GroundCamera;   // AppPrefs.Load() already ran, so this picks up the remembered choice
-float camHover = 60f;                     // metres held above the ground under the camera, in ground mode
 bool writeShadowLsb = false;            // on save, also bake + write the engine's LightmapShadowBits.lsb
 bool shadowLsbFlipX = false, shadowLsbFlipY = false;   // in-game shadow mirror correction (toggle if shadows land mirrored)
 uint detailTexId = 0;   // tiling detail texture (REPEAT + mipmaps), 0 = none
@@ -1929,13 +1929,6 @@ void OnLoad()
             if (UiWantsMouse()) return;
             if (toolNames[tool] is "Sculpt" or "Smooth" or "Paint")
                 brushRadius = Math.Clamp(brushRadius * (1f + s.Y * 0.1f), 2f, 600f);   // wheel resizes the brush
-            else if (groundCam && heightmap is not null)
-            {
-                // Ground mode: the wheel changes how high you sit above the terrain (zoom out/in), NOT a dolly
-                // along the look vector - a dolly would immediately break the fixed-height-above-ground invariant.
-                camHover = Math.Clamp(camHover * (1f - s.Y * 0.12f), 2f, 20000f);
-                AnchorCamToGround();
-            }
             else
                 cam.Dolly(s.Y * Altitude() * 0.2f * camSpeedMult);
         };
@@ -2364,19 +2357,15 @@ void OnUpdate(double dt)
     if (cam.MirrorX) str = -str;   // the view is X-mirrored, so A/D and screen-left/right stay intuitive
     float up = (kb.IsKeyPressed(Key.E) ? 1 : 0) - (kb.IsKeyPressed(Key.Q) ? 1 : 0);
     float boost = kb.IsKeyPressed(Key.ShiftLeft) ? 4f : 1f;
-    if (groundCam && heightmap is not null)
+    float amt = Altitude() * 1.2f * camSpeedMult * (float)dt * boost;
+    if (groundCam)
     {
-        // Pace comes from the HOVER height (how far out you are zoomed), not absolute altitude, so a valley and a
-        // mountaintop feel identical. Q/E scale the hover smoothly; the move then re-anchors to the ground below.
-        if (up != 0) camHover = Math.Clamp(camHover * (1f + up * (float)dt * 1.5f), 2f, 20000f);
-        if (fwd != 0 || str != 0) cam.Move(fwd, str, 0f, Math.Max(6f, camHover) * 1.2f * camSpeedMult * (float)dt * boost);
-        if (fwd != 0 || str != 0 || up != 0) AnchorCamToGround();
+        // W/S along the TRUE view direction (Dolly keeps the Y component), so you fly toward the middle of the
+        // screen and gain/lose height by aiming. Strafe and Q/E stay planar/vertical so they remain predictable.
+        if (fwd != 0) cam.Dolly(fwd * amt);
+        if (str != 0 || up != 0) cam.Move(0f, str, up, amt);
     }
-    else
-    {
-        float amt = Altitude() * 1.2f * camSpeedMult * (float)dt * boost;
-        if (fwd != 0 || str != 0 || up != 0) cam.Move(fwd, str, up, amt);
-    }
+    else if (fwd != 0 || str != 0 || up != 0) cam.Move(fwd, str, up, amt);
 }
 
 void OnKeyDown(IKeyboard k, Key key, int _)
@@ -7161,13 +7150,8 @@ void EnvironmentPanel()
     SldF(Loc.TL("Fly speed"), ref camSpeedMult, 0.1f, 8f, "%.2fx");
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Multiplier on WASD fly speed + scroll-zoom. Hold Shift for a 4x burst.\nRight-click a slider to type an exact value."));
     bool gcam = groundCam;
-    if (ImGui.Checkbox(Loc.TL("Ground camera (Battlecraft style)  [F7]"), ref gcam)) SetGroundCam(gcam);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("WASD skims the map at a fixed height above the terrain, so a ridge lifts you over it\ninstead of burying the view, and the pace is the same everywhere on the map.\nQ/E and the mouse wheel raise/lower that height; right-drag still looks around.\nOff = the free fly camera."));
-    if (groundCam)
-    {
-        ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Height above ground"), ref camHover, 2f, 4000f, "%.0f m")) AnchorCamToGround();
-    }
+    if (ImGui.Checkbox(Loc.TL("Battlecraft camera (fly where you look)  [F7]"), ref gcam)) SetGroundCam(gcam);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("W/S travel toward whatever is in the middle of the screen, so aiming down descends and\naiming up climbs - the height follows your view instead of needing Q/E.\nA/D still strafe level and Q/E still move straight up/down.\nOff = the fly camera, which keeps your altitude until you press Q/E."));
 
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("ENVIRONMENT"));
@@ -9652,30 +9636,16 @@ byte[]? ReadLevelNavFile(string leaf)
     return null;
 }
 
-// ---- Battlecraft-style ground camera --------------------------------------------------------------------------
+// ---- Battlecraft-style camera ----------------------------------------------------------------------------------
 
-/// Re-seat the camera camHover metres above the terrain directly beneath it. Bilinear so skimming a slope is
-/// smooth rather than stepping from heightmap post to post.
-void AnchorCamToGround()
-{
-    if (heightmap is null) return;
-    float g = RefractorForge.Formats.Terrain.SearchMapGenerator.SampleHeight(cfg, heightmap, cam.Position.X, cam.Position.Z);
-    cam.Position.Y = g + camHover;
-}
-
-/// Switch camera mode. Entering ground mode ADOPTS the height the camera is already at (rather than snapping to a
-/// fixed default), so the toggle never teleports you - the view you had is the view you keep.
+/// Switch camera mode. Position and orientation are untouched, so the toggle never moves the view - only how
+/// W/S is interpreted changes (true view vector vs flattened onto XZ).
 void SetGroundCam(bool on)
 {
     groundCam = on;
     AppPrefs.GroundCamera = on;
     AppPrefs.Save();
-    if (on && heightmap is not null)
-    {
-        float g = RefractorForge.Formats.Terrain.SearchMapGenerator.SampleHeight(cfg, heightmap, cam.Position.X, cam.Position.Z);
-        camHover = Math.Clamp(cam.Position.Y - g, 2f, 20000f);
-    }
-    Toast(on ? Loc.T("Ground camera on: WASD skims the terrain (F7).") : Loc.T("Fly camera on: WASD flies free (F7)."));
+    Toast(on ? Loc.T("Battlecraft camera on: W/S fly where you look (F7).") : Loc.T("Fly camera on: W/S stay level (F7)."));
 }
 
 void EnsureAiNav()
