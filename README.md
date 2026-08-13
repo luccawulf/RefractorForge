@@ -7,8 +7,6 @@ Vietnam (2004).**
 > reads and writes real game files — **always keep a backup of any map you care about before saving
 > over it.** Expect rough edges.
 
-**DOWNLOAD** - https://www.mediafire.com/file/oqr1hub1e9if6f3/RefractorForge_BETA.zip/file
-
 *See below for build instructions!*
 
 RefractorForge opens a level, renders it in real time (terrain, real object meshes, water, sky,
