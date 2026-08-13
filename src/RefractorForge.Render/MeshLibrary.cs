@@ -1290,7 +1290,12 @@ public sealed class MeshLibrary
             // Glass/canopy (explicit `transparent`) blends softly with NORMAL lighting; foliage/fences/cutout sheets
             // (fade flag, foliage names, or genuine cutout alpha) are HARD alpha-tested with flat foliage lighting.
             bool blend = sh?.Transparent == true;
-            bool cutout = !blend && (sh?.TextureFade == true || IsCutout(sh?.Texture) || HasTransparency(tex));
+            // The texture's own alpha is only a LAST RESORT, used when the .rs told us nothing about this material.
+            // BF1942 vehicle skins routinely keep a SPECULAR/gloss mask in the alpha channel - the Willys' willy3_z
+            // is 62% low-alpha - and reading that as a cutout mask discards most of the surface. That is what made
+            // the jeep's engine grill see-through: the shader threw away every texel the gloss mask left dark.
+            // When a material HAS a shader, believe it: `textureFade`/`transparent` and the foliage name list decide.
+            bool cutout = !blend && (sh?.TextureFade == true || IsCutout(sh?.Texture) || (sh is null && HasTransparency(tex)));
             parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend, TextureName: sh?.Texture));
         }
         if (parts.Count == 0) return null;
