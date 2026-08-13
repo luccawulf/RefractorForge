@@ -52,6 +52,23 @@ System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
     catch { return null; }
 };
 
+// A WinExe has no console, so an unhandled exception terminates the process SILENTLY - the editor just never
+// appears and the user has nothing to report. Surface it instead: show the message and write it next to the exe.
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    var ex = e.ExceptionObject as Exception;
+    var text = ex?.ToString() ?? "unknown error";
+    try { System.IO.File.WriteAllText(System.IO.Path.Combine(System.AppContext.BaseDirectory, "crash.log"), text); } catch { }
+    try
+    {
+        Picker.Error("RefractorForge hit an unexpected error and has to close:\n\n" +
+                     (ex?.Message ?? "unknown error") +
+                     "\n\nThe full details were written to crash.log next to the editor.",
+                     "RefractorForge - crash");
+    }
+    catch { }
+};
+
 // Headless relay (WinExe has no console): re-attach the launching terminal's console so its output/input work.
 if (args.Length >= 1 && args[0] == "--relay") ConsoleLog.AttachParentConsole();
 try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
@@ -856,6 +873,15 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
 
 float minH = float.MaxValue, maxH = float.MinValue;
 foreach (var p in mesh.Positions) { if (p.Y < minH) minH = p.Y; if (p.Y > maxH) maxH = p.Y; }
+
+// Silk.NET finds its windowing/input backends by PROBING THE APP DIRECTORY for Silk.NET.Windowing.Glfw.dll and
+// Silk.NET.Input.Glfw.dll. A single-file publish has no such files to probe, so nothing registers and the very
+// next line throws PlatformNotSupportedException ("Couldn't find a suitable window platform") - which, in a
+// WinExe with no console, kills the process with no message at all. That is exactly how the first packaged
+// build failed: the startup screen and file pickers (plain WinForms) worked, then the editor simply never opened.
+// Registering the backends explicitly does not depend on files on disk, so it works in BOTH layouts.
+Silk.NET.Windowing.Glfw.GlfwWindowing.RegisterPlatform();
+Silk.NET.Input.Glfw.GlfwInput.RegisterPlatform();
 
 var opts = WindowOptions.Default;
 opts.Size = new Vector2D<int>(1280, 800);          // restored size when un-maximized

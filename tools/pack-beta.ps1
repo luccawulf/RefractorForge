@@ -78,8 +78,15 @@ if ($IncludeFfmpeg -and -not (Test-Path (Join-Path $stage "ffmpeg\ffmpeg.exe")))
 if (Get-ChildItem $stage -Recurse -Directory | Where-Object { $_.Name -eq "ffmpeg" -and $_.Parent.Name -eq "ffmpeg" }) {
     throw "ffmpeg was nested as ffmpeg\ffmpeg - the editor will not find it"
 }
-$loose = (Get-ChildItem $stage -Filter *.dll -File).Count
-if ($loose -ne 0) { throw "$loose loose DLL(s) beside the exe - single-file bundling did not take" }
+# The MANAGED assemblies must be bundled into the exe - that is what single-file buys. The few NATIVE libraries
+# (glfw3, cimgui, NAudio's) stay loose on purpose: Silk.NET resolves them relative to the exe, and bundling them
+# for self-extract made GlfwPlatform report itself "not applicable" so the editor never opened.
+$managedLoose = Get-ChildItem $stage -Filter *.dll -File |
+    Where-Object { $_.Name -like "RefractorForge.*" -or $_.Name -like "System.*" -or $_.Name -like "Silk.NET.*" -or $_.Name -like "Microsoft.*" }
+if ($managedLoose) { throw "managed assemblies left loose ($($managedLoose.Count)) - single-file bundling did not take: $($managedLoose[0].Name)" }
+$natives = (Get-ChildItem $stage -Filter *.dll -File).Count
+if ($natives -eq 0) { throw "no native libraries beside the exe - glfw3.dll etc. must ship loose or the window cannot be created" }
+if (-not (Test-Path (Join-Path $stage "glfw3.dll"))) { throw "glfw3.dll missing - Silk.NET will fail with 'no suitable window platform'" }
 
 $zip = Join-Path $distDir "RefractorForge-$Version-win-x64.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -87,5 +94,5 @@ Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Compression
 
 $n  = (Get-ChildItem $stage -Recurse -File).Count
 $mb = [math]::Round(((Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
-Write-Host "`nOK  $n files, $mb MB staged, 0 loose DLLs, $($expect.Count) content file(s) verified"
+Write-Host "`nOK  $n files, $mb MB staged, $natives native DLL(s) + 0 managed, $($expect.Count) content file(s) verified"
 Write-Host ("zip $zip  ({0:N1} MB)" -f ((Get-Item $zip).Length / 1MB))
