@@ -422,7 +422,12 @@ void main(){
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
         c = mix(c, uFogColor, fog);
     }
-    frag = vec4(c, (uAlphaTest!=0 && uAlphaEnable==1) ? a : 1.0);   // cutout(1)+glass(2) carry real alpha when enabled; else fully opaque
+    // cutout(1) carries the texture's alpha as-is; glass(2) gets a MINIMUM opacity so a pane cannot vanish.
+    // BF1942 glass textures are often fully transparent in alpha - the Willys' katy_window_I is 100% below the
+    // half-alpha mark - so honouring that literally erased the windscreen. A floor keeps it see-through but present.
+    float outA = 1.0;
+    if (uAlphaTest!=0 && uAlphaEnable==1) outA = (uAlphaTest==2) ? max(a, 0.30) : a;
+    frag = vec4(c, outA);
 }";
 
 // Depth-only shader for the sun shadow-map pass: render terrain + objects from the sun's POV into a depth texture.
