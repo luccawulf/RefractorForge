@@ -22,10 +22,14 @@ public static class AppPrefs
     /// Off = show only what the opened archive actually contains.</summary>
     public static bool LayerBaseMap { get; set; } = true;
 
+    /// <summary>Battlecraft-style ground camera: WASD skims the map at a fixed height above the terrain instead of
+    /// flying free. Off = the original fly camera. Remembered because it is a matter of taste, not of the level.</summary>
+    public static bool GroundCamera { get; set; } = false;
+
     private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge");
     private static string FilePath => Path.Combine(Dir, "prefs.json");
 
-    private sealed record Data(bool? ResolveInheritedMods, bool? LayerBaseMap);
+    private sealed record Data(bool? ResolveInheritedMods, bool? LayerBaseMap, bool? GroundCamera = null);
 
     /// <summary>Load persisted preferences. Call once at startup, BEFORE the level load block reads them.</summary>
     public static void Load()
@@ -36,6 +40,7 @@ public static class AppPrefs
             if (JsonSerializer.Deserialize<Data>(File.ReadAllText(FilePath)) is not { } d) return;
             if (d.ResolveInheritedMods is bool a) ResolveInheritedMods = a;
             if (d.LayerBaseMap is bool b) LayerBaseMap = b;
+            if (d.GroundCamera is bool c) GroundCamera = c;
         }
         catch { /* a corrupt prefs file must never stop the editor starting */ }
     }
@@ -45,7 +50,7 @@ public static class AppPrefs
         try
         {
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap),
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera),
                 new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }

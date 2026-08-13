@@ -1142,6 +1142,11 @@ int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object progra
 bool sunOverride = false;
 float sunAzimuthDeg = 135f, sunElevationDeg = 40f;
 float camSpeedMult = 1f;               // user multiplier on WASD fly speed (and scroll dolly)
+// Battlecraft-style GROUND camera: WASD skims the map at a fixed height ABOVE THE TERRAIN instead of flying free,
+// so crossing a ridge lifts you over it rather than burying the view inside it, and the pace is the same anywhere
+// on the map (the fly camera scales speed by absolute altitude, which crawls in a valley and races over a peak).
+bool groundCam = AppPrefs.GroundCamera;   // AppPrefs.Load() already ran, so this picks up the remembered choice
+float camHover = 60f;                     // metres held above the ground under the camera, in ground mode
 bool writeShadowLsb = false;            // on save, also bake + write the engine's LightmapShadowBits.lsb
 bool shadowLsbFlipX = false, shadowLsbFlipY = false;   // in-game shadow mirror correction (toggle if shadows land mirrored)
 uint detailTexId = 0;   // tiling detail texture (REPEAT + mipmaps), 0 = none
@@ -1924,6 +1929,13 @@ void OnLoad()
             if (UiWantsMouse()) return;
             if (toolNames[tool] is "Sculpt" or "Smooth" or "Paint")
                 brushRadius = Math.Clamp(brushRadius * (1f + s.Y * 0.1f), 2f, 600f);   // wheel resizes the brush
+            else if (groundCam && heightmap is not null)
+            {
+                // Ground mode: the wheel changes how high you sit above the terrain (zoom out/in), NOT a dolly
+                // along the look vector - a dolly would immediately break the fixed-height-above-ground invariant.
+                camHover = Math.Clamp(camHover * (1f - s.Y * 0.12f), 2f, 20000f);
+                AnchorCamToGround();
+            }
             else
                 cam.Dolly(s.Y * Altitude() * 0.2f * camSpeedMult);
         };
@@ -2347,12 +2359,24 @@ void OnUpdate(double dt)
 
     if (kb is null) return;
     if (imgui is not null && ImGui.GetIO().WantCaptureKeyboard) return;   // don't fly the camera with WASD/Q-E while typing in an inspector field
-    float amt = Altitude() * 1.2f * camSpeedMult * (float)dt * (kb.IsKeyPressed(Key.ShiftLeft) ? 4f : 1f);
     float fwd = (kb.IsKeyPressed(Key.W) ? 1 : 0) - (kb.IsKeyPressed(Key.S) ? 1 : 0);
     float str = (kb.IsKeyPressed(Key.D) ? 1 : 0) - (kb.IsKeyPressed(Key.A) ? 1 : 0);
     if (cam.MirrorX) str = -str;   // the view is X-mirrored, so A/D and screen-left/right stay intuitive
     float up = (kb.IsKeyPressed(Key.E) ? 1 : 0) - (kb.IsKeyPressed(Key.Q) ? 1 : 0);
-    if (fwd != 0 || str != 0 || up != 0) cam.Move(fwd, str, up, amt);
+    float boost = kb.IsKeyPressed(Key.ShiftLeft) ? 4f : 1f;
+    if (groundCam && heightmap is not null)
+    {
+        // Pace comes from the HOVER height (how far out you are zoomed), not absolute altitude, so a valley and a
+        // mountaintop feel identical. Q/E scale the hover smoothly; the move then re-anchors to the ground below.
+        if (up != 0) camHover = Math.Clamp(camHover * (1f + up * (float)dt * 1.5f), 2f, 20000f);
+        if (fwd != 0 || str != 0) cam.Move(fwd, str, 0f, Math.Max(6f, camHover) * 1.2f * camSpeedMult * (float)dt * boost);
+        if (fwd != 0 || str != 0 || up != 0) AnchorCamToGround();
+    }
+    else
+    {
+        float amt = Altitude() * 1.2f * camSpeedMult * (float)dt * boost;
+        if (fwd != 0 || str != 0 || up != 0) cam.Move(fwd, str, up, amt);
+    }
 }
 
 void OnKeyDown(IKeyboard k, Key key, int _)
@@ -2368,6 +2392,7 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.F4: SetMapper(3); return;
         case Key.F5: SetMapper(4); return;
         case Key.F6: SetMapper(5); return;
+        case Key.F7: SetGroundCam(!groundCam); return;   // fly <-> Battlecraft-style ground camera
         case Key.S: if (ctrl) { DoSave(); return; } break;
         case Key.L: if (ctrl) { DoTestLevel(); return; } break;
     }
@@ -3966,23 +3991,46 @@ void DoGenerateNavmaps()
         : null;
     var std = RefractorForge.Formats.Terrain.SearchMapParams.Standard;
 
-    // Painted vehicles win; un-painted vehicles are left to the base unless NOTHING is painted (then generate all).
+    // Per vehicle, in strict priority order. The rule is that the editor NEVER invents a navmap over one the level
+    // already ships: retail and hand-tuned maps carry designer intent (bridges, ramps, deliberately blocked alleys)
+    // that a terrain-derived regeneration silently destroys, and the generator is a from-scratch slope/height
+    // approximation, not the engine's. So generation is the last resort, for a vehicle the level has NO map for.
+    //   1. painted in this session -> write the painted buffer
+    //   2. the level ships one     -> leave it completely alone (not even re-encoded; byte-identical is the point)
+    //   3. neither                 -> generate from terrain (a fresh/new map, which genuinely has none)
+    int want = RefractorForge.Formats.Terrain.SearchMapGenerator.FinestSide(cfg.MaterialSize);
     var files = new List<(string Name, byte[] Bytes)>();
-    int painted = 0;
-    for (int v = 0; v < std.Count && v < aiNavBufs.Length; v++)
-        if (aiNavBufDirty[v] && aiNavBufs[v] is not null)
+    int painted = 0, generated = 0, kept = 0;
+    for (int v = 0; v < std.Count; v++)
+    {
+        var vp = std[v];
+        if (v < aiNavBufs.Length && aiNavBufDirty[v] && aiNavBufs[v] is not null)
         {
             int side = (int)Math.Round(Math.Sqrt(aiNavBufs[v]!.Length));
-            foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.EncodeVehicleLevels(std[v], aiNavBufs[v]!, side))
+            foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.EncodeVehicleLevels(vp, aiNavBufs[v]!, side))
                 files.Add((f.FileName, f.Data));
             painted++;
+            continue;
         }
-    bool generatedAll = files.Count == 0;
-    if (generatedAll)
-        foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.GenerateAll(cfg, heightmap, foots))
+        if (RefractorForge.Formats.Terrain.PathmapRaw.LoadVehicleWorldGrid(ReadLevelNavFile, vp, want) is not null) { kept++; continue; }
+        var grid = RefractorForge.Formats.Terrain.SearchMapGenerator.GenerateGrid(cfg, heightmap, vp, 0, foots);
+        foreach (var f in RefractorForge.Formats.Terrain.SearchMapGenerator.EncodeVehicleLevels(vp, grid, want))
             files.Add((f.FileName, f.Data));
-    if (files.Count == 0) return;
-    string what = generatedAll ? "generated from terrain" : $"{painted} painted vehicle(s)";
+        generated++;
+    }
+    if (files.Count == 0)
+    {
+        // Nothing to do is the NORMAL outcome on a finished map: every vehicle already has a navmap and none was
+        // painted. Say so plainly rather than writing a regenerated set nobody asked for.
+        Console.WriteLine($"AI navmaps: nothing to write - the level already ships maps for all {kept} vehicle(s) and none were painted.");
+        Toast(string.Format(Loc.T("The level already ships AI navmaps for all {0} vehicles - nothing regenerated. Paint one to change it."), kept));
+        return;
+    }
+    var parts = new List<string>();
+    if (painted > 0) parts.Add($"{painted} painted");
+    if (generated > 0) parts.Add($"{generated} generated (level shipped none)");
+    if (kept > 0) parts.Add($"{kept} left as shipped");
+    string what = string.Join(", ", parts);
 
     // Packed .rfa: write the navmaps INTO the archive (override the base entries the engine loads), exactly like
     // Ctrl+S. extraFiles silently drops names the base doesn't ship, so a map without Pathfinding/ entries needs
@@ -7106,6 +7154,14 @@ void EnvironmentPanel()
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Fly speed"), ref camSpeedMult, 0.1f, 8f, "%.2fx");
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Multiplier on WASD fly speed + scroll-zoom. Hold Shift for a 4x burst.\nRight-click a slider to type an exact value."));
+    bool gcam = groundCam;
+    if (ImGui.Checkbox(Loc.TL("Ground camera (Battlecraft style)  [F7]"), ref gcam)) SetGroundCam(gcam);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("WASD skims the map at a fixed height above the terrain, so a ridge lifts you over it\ninstead of burying the view, and the pace is the same everywhere on the map.\nQ/E and the mouse wheel raise/lower that height; right-drag still looks around.\nOff = the free fly camera."));
+    if (groundCam)
+    {
+        ImGui.SetNextItemWidth(150f);
+        if (SldF(Loc.TL("Height above ground"), ref camHover, 2f, 4000f, "%.0f m")) AnchorCamToGround();
+    }
 
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("ENVIRONMENT"));
@@ -9588,6 +9644,32 @@ byte[]? ReadLevelNavFile(string leaf)
     }
     catch { }
     return null;
+}
+
+// ---- Battlecraft-style ground camera --------------------------------------------------------------------------
+
+/// Re-seat the camera camHover metres above the terrain directly beneath it. Bilinear so skimming a slope is
+/// smooth rather than stepping from heightmap post to post.
+void AnchorCamToGround()
+{
+    if (heightmap is null) return;
+    float g = RefractorForge.Formats.Terrain.SearchMapGenerator.SampleHeight(cfg, heightmap, cam.Position.X, cam.Position.Z);
+    cam.Position.Y = g + camHover;
+}
+
+/// Switch camera mode. Entering ground mode ADOPTS the height the camera is already at (rather than snapping to a
+/// fixed default), so the toggle never teleports you - the view you had is the view you keep.
+void SetGroundCam(bool on)
+{
+    groundCam = on;
+    AppPrefs.GroundCamera = on;
+    AppPrefs.Save();
+    if (on && heightmap is not null)
+    {
+        float g = RefractorForge.Formats.Terrain.SearchMapGenerator.SampleHeight(cfg, heightmap, cam.Position.X, cam.Position.Z);
+        camHover = Math.Clamp(cam.Position.Y - g, 2f, 20000f);
+    }
+    Toast(on ? Loc.T("Ground camera on: WASD skims the terrain (F7).") : Loc.T("Fly camera on: WASD flies free (F7)."));
 }
 
 void EnsureAiNav()

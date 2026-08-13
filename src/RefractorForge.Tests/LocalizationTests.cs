@@ -81,6 +81,42 @@ public class LocalizationTests
             "UI:\n  " + string.Join("\n  ", unmatched));
     }
 
+    private static string Unescape(string s)
+        => s.Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("\\n", "\n");
+
+    /// <summary>Every string literal inside a <c>Loc.T(...)</c>/<c>Loc.TL(...)</c> argument list, scanned over the
+    /// BALANCED paren region. A leading-literal regex would miss <c>Loc.T(cond ? "a" : "b")</c> — a real pattern in
+    /// this codebase, and one that silently left 10 strings untranslated until this scan replaced the regex.</summary>
+    private static List<string> LocCallLiterals(string src)
+    {
+        var found = new List<string>();
+        foreach (Match m in Regex.Matches(src, @"Loc\.TL?\("))
+        {
+            int i = m.Index + m.Length, depth = 1;
+            while (i < src.Length && depth > 0)
+            {
+                char c = src[i];
+                if (c == '"')
+                {
+                    int j = i + 1;
+                    var sb = new StringBuilder();
+                    while (j < src.Length && src[j] != '"')
+                    {
+                        if (src[j] == '\\' && j + 1 < src.Length) { sb.Append(src[j]).Append(src[j + 1]); j += 2; }
+                        else sb.Append(src[j++]);
+                    }
+                    found.Add(sb.ToString());
+                    i = j + 1;
+                    continue;
+                }
+                if (c == '(') depth++;
+                else if (c == ')') depth--;
+                i++;
+            }
+        }
+        return found;
+    }
+
     [Fact]
     public void Japanese_dictionary_covers_every_string_the_ui_asks_to_translate()
     {
@@ -93,7 +129,6 @@ public class LocalizationTests
         // (Picker titles, tool/mapper tooltips, slider labels) - those never appear next to a Loc call.
         var patterns = new[]
         {
-            @"Loc\.TL?\(\s*""((?:[^""\\]|\\.)*)""",
             @"Picker\.(?:File|Folder|Files)\(\s*""((?:[^""\\]|\\.)*)""",
             @"MapperButton\(\s*\d+\s*,\s*""((?:[^""\\]|\\.)*)""",
             @"IconTool\(\s*\d+\s*,\s*\w+\s*,\s*""((?:[^""\\]|\\.)*)""",
@@ -104,9 +139,10 @@ public class LocalizationTests
         foreach (var file in Directory.EnumerateFiles(ViewerDir(), "*.cs"))
         {
             var src = File.ReadAllText(file);
+            foreach (var lit in LocCallLiterals(src)) asked.Add(Unescape(lit));
             foreach (var p in patterns)
                 foreach (Match m in Regex.Matches(src, p))
-                    asked.Add(m.Groups[1].Value.Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("\\n", "\n"));
+                    asked.Add(Unescape(m.Groups[1].Value));
         }
 
         // The product name deliberately stays English in every language.
