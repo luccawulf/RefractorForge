@@ -532,6 +532,42 @@ public static class LevelSaver
     /// to a working folder" step; the folder is then edited + saved like any folder level, and export re-packs only
     /// the modified files. Shared mesh/texture archives are NOT passed here — only the level's own <c>.rfa</c>.
     /// Returns the number of files written.</summary>
+    /// <summary>Add each archive's numeric-suffix patch siblings (<c>Wake_001.rfa</c> next to <c>Wake.rfa</c>),
+    /// appended AFTER their base and numerically ordered so last-wins merging matches the engine.
+    ///
+    /// The engine layers these automatically and a level's terrain textures often live in one, so anything that
+    /// consumes a level's archives has to expand them. The viewer's load path always did; creating a PROJECT did
+    /// not, and extracted only the archives the user happened to multi-select in the file dialog - which is why a
+    /// project opened from a base .rfa came up with the wrong ground textures.</summary>
+    public static string[] WithPatchArchives(IEnumerable<string> rfaPaths)
+    {
+        var outp = new List<string>();
+        bool Known(string s) => outp.Any(x => Path.GetFullPath(x).Equals(Path.GetFullPath(s), StringComparison.OrdinalIgnoreCase));
+        foreach (var baseRfa in rfaPaths)
+        {
+            if (string.IsNullOrEmpty(baseRfa)) continue;
+            if (!Known(baseRfa)) outp.Add(baseRfa);
+            var dir = Path.GetDirectoryName(Path.GetFullPath(baseRfa));
+            var stem = Path.GetFileNameWithoutExtension(baseRfa);
+            if (dir is null || !Directory.Exists(dir)) continue;
+            // The suffix must be PURELY numeric: Bocage_006 is a patch of Bocage, Bocage_Day2 and Bocage_MOD are
+            // separate maps that merely share the prefix.
+            var rx = new System.Text.RegularExpressions.Regex(
+                "^" + System.Text.RegularExpressions.Regex.Escape(stem) + @"_(\d+)$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            // Order by the NUMBER, not the text. Levels carry anywhere from zero to many patches and do not pad to a
+            // fixed width, so a lexicographic sort would mount _10 before _2 and let the lower patch win the merge.
+            foreach (var s in Directory.EnumerateFiles(dir, stem + "_*.rfa")
+                         .Select(s => (Path: s, M: rx.Match(Path.GetFileNameWithoutExtension(s))))
+                         .Where(t => t.M.Success)
+                         .OrderBy(t => long.TryParse(t.M.Groups[1].Value, out var v) ? v : long.MaxValue)
+                         .ThenBy(t => t.Path, StringComparer.OrdinalIgnoreCase)
+                         .Select(t => t.Path))
+                if (!Known(s)) outp.Add(s);
+        }
+        return outp.ToArray();
+    }
+
     public static int ExtractToFolder(IEnumerable<string> rfaPaths, string destDir)
     {
         // Merge entries by name across archives so a patch overrides the base (later wins), matching the loader.

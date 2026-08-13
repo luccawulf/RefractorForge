@@ -13,13 +13,17 @@ namespace RefractorForge.Viewer;
 /// </summary>
 sealed class GlObjects
 {
-    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; }
+    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; }
 
-    /// <summary>The shader's uAlphaTest mode for a part, plus the alpha threshold that goes with it. A part whose
-    /// .rs named an <c>alphaTestRef</c> is a hard-surface cutout (mode 3, shaded solid); anything else alpha-tested
-    /// is foliage (mode 1, lit flat) and keeps the long-standing 0.33 cutoff.</summary>
+    /// <summary>The shader's uAlphaTest mode for a part, plus its alpha-test threshold. Mode picks OUTPUT and
+    /// LIGHTING; the threshold is independent and applies in every mode, because a blended material can carry an
+    /// <c>alphaTestRef</c> too (headlight glows do). A blend wins the mode - it still discards below its ref.
+    /// Otherwise vegetation is mode 1 (lit flat) and a hard surface is mode 3 (shaded solid); both use the material's
+    /// own threshold, which for foliage is derived from the texture and falls back to the long-standing 0.33.</summary>
     private static (int Mode, float Ref) AlphaModeOf(Part p) =>
-        p.Blend ? (2, 0f) : p.AlphaTest ? (p.AlphaRef is { } r ? (3, r) : (1, 0.33f)) : (0, 0f);
+        p.Blend ? (2, p.AlphaRef ?? 0f)
+        : p.AlphaTest ? (p.Foliage ? 1 : 3, p.AlphaRef ?? 0.33f)
+        : (0, 0f);
 
     // uAlphaRef is resolved here rather than threaded through every Draw* signature (there are a dozen call sites).
     private uint _refProg; private int _refLoc = -1;
@@ -366,7 +370,7 @@ sealed class GlObjects
             int off = allIdx.Count;
             foreach (var ix in part.Indices) allIdx.Add((uint)ix);
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
-            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef });
+            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage });
         }
         Bounds(pos, out var bbMin, out var bbMax);
         var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = parts.ToArray(), BbMin = bbMin, BbMax = bbMax };

@@ -64,6 +64,10 @@ internal static class ProjectFlows
         var (game, mod, gameRoot, mapName) = InferFromPath(rfas[0]);
         var dest = Picker.Folder($"Choose an EMPTY folder to extract '{mapName}' into (this becomes the project folder)", null);
         if (dest is null) return null;
+        // Pull in the level's patch archives even when the user picked only the base. The engine mounts
+        // <Map>_NNN.rfa over <Map>.rfa automatically and a level's terrain textures often live in one, so
+        // extracting the base alone produced a project folder whose ground rendered from incomplete tiles.
+        rfas = LevelSaver.WithPatchArchives(rfas);
         try { LevelSaver.ExtractToFolder(rfas, dest); }
         catch (Exception ex) { Picker.Error("Extract failed:\n" + ex.Message); return null; }
 

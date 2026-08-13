@@ -5,11 +5,14 @@ using Xunit;
 namespace RefractorForge.Tests;
 
 /// <summary>
-/// Refractor overloads one keyword: <c>transparent true</c> ALONE means alpha blending (glass, canopies, gunsights),
-/// but paired with an <c>alphaTestRef</c> it means an alpha TEST at that threshold (grilles, decals, painted
-/// markings, ropes). Reading every <c>transparent</c> as a blend is what made the Willys jeep's engine grill
-/// see-through in the editor - its sheet is 71% low-alpha, so blending it left almost nothing on screen where the
-/// engine punches a clean grille out of it.
+/// <c>transparent true</c> and <c>alphaTestRef</c> are INDEPENDENT render states: the first enables alpha blending,
+/// the second enables an alpha test at that threshold. A material may declare both, and 39 of the 100 that name a
+/// ref also name a <c>blendDest</c> - a blend destination factor, which is meaningless without blending.
+///
+/// Getting this wrong broke things in both directions. Blending a material without applying its ref made the Willys
+/// jeep's engine grill see-through (its sheet is 71% low-alpha, so the texels the engine discards were smeared
+/// across the panel instead). Then treating the pair as "cutout, NOT blend" made Interstate's headlight glows and
+/// some trees disappear entirely. The rule is: honour both flags, separately.
 /// </summary>
 public class RsShaderTests
 {
@@ -46,13 +49,37 @@ public class RsShaderTests
         }
         """;
 
+    // Verbatim from Interstate's dbs70lightfront.rs - a headlight glow. Blended AND alpha-tested: the blendDest
+    // proves the blending, so rendering it as a pure cutout made the headlights vanish.
+    private const string HeadlightGlow = """
+        subshader "dbs70lightfront_Material0" "StandardMesh/Default"
+        {
+        	lighting false;
+        	materialDiffuse 0.588235 0.588235 0.588235;
+        	blendDest one;
+        	transparent true;
+        	alphaTestRef 0.7;
+        	depthWrite false;
+        	twosided true;
+        	texture "texture/phareglowblanc";
+        }
+        """;
+
     [Fact]
-    public void GrillIsACutoutAtItsAuthoredThreshold()
+    public void GrillCarriesBothFlags()
     {
         var set = RsShaderSet.Parse(WillysHull);
         var grill = set.Materials["Willy_Hul_M1_Material2"];
-        Assert.True(grill.Transparent);                  // the keyword IS there...
-        Assert.Equal(0.7f, grill.AlphaTestRef!.Value, 3);  // ...but the ref is what decides how to render it
+        Assert.True(grill.Transparent);                     // blends...
+        Assert.Equal(0.7f, grill.AlphaTestRef!.Value, 3);   // ...AND discards below 0.7. Both, not either.
+    }
+
+    [Fact]
+    public void HeadlightGlowBlendsAndAlphaTests()
+    {
+        var glow = RsShaderSet.Parse(HeadlightGlow).Materials["dbs70lightfront_Material0"];
+        Assert.True(glow.Transparent);                      // must stay blended or the light disappears
+        Assert.Equal(0.7f, glow.AlphaTestRef!.Value, 3);
     }
 
     [Fact]

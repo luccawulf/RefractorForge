@@ -381,10 +381,11 @@ void main(){ gl_Position = uMVP * vec4(aPos,1.0); vN = mat3(uModel) * aNormal; v
 const string ObjFrag = @"#version 330 core
 in vec3 vN; in vec2 vUv; in vec2 vLmUv; in vec3 vWorld;
 uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
-// uAlphaTest: 0 = opaque, 1 = foliage cutout (flat vegetation lighting), 2 = blended glass,
-// 3 = hard-surface cutout (grille/decal/marking: alpha-tested like foliage, but SHADED and OPAQUE like solid metal).
+// uAlphaTest picks OUTPUT + LIGHTING: 0 = opaque, 1 = foliage cutout (flat vegetation lighting), 2 = blended
+// glass/glow, 3 = hard-surface cutout (grille/decal/marking: SHADED and OPAQUE like solid metal).
+// uAlphaRef is the alpha-test threshold and is INDEPENDENT of that - mode 2 carries one whenever its .rs does.
 uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
-uniform float uAlphaRef;   // discard threshold for modes 1/3 - the .rs `alphaTestRef` when the material declares one
+uniform float uAlphaRef;   // 0 = this material never discards
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
@@ -406,7 +407,10 @@ void main(){
     vec4 tc = texture(uTex, vUv);
     vec3 base = (uUseTex==1) ? tc.rgb : uColor;
     float a   = (uUseTex==1) ? tc.a   : 1.0;
-    if ((uAlphaTest==1 || uAlphaTest==3) && uAlphaEnable==1 && a < uAlphaRef) discard;   // cutout discard only while transparency is enabled (toggle off -> solid)
+    // The alpha test is INDEPENDENT of the blend mode - a blended material can carry an alphaTestRef too, and the
+    // engine runs both. uAlphaRef is 0 for materials that never discard. Still gated on uAlphaEnable so the
+    // transparency toggle turns everything solid.
+    if (uAlphaEnable==1 && uAlphaRef > 0.0 && a < uAlphaRef) discard;
     vec3 c;
     if (uHasLightmap==1) {
         vec3 lm = texture(uLightmap, vLmUv).rgb;          // baked lighting already has shadows baked in -> no shadow map
@@ -535,6 +539,11 @@ Vector3[] markers = Array.Empty<Vector3>();
 // Declared before the load block because SyncMarkers() (called during load) reads meshLib and writes
 // pointMarkers; in top-level programs both must be assigned/declared before that first call.
 MeshLibrary? meshLib = null;
+// Team labels for the gameplay dialogs, read from the LEVEL rather than assumed from the game: teams are a per-map
+// property (stock Wake is Japan vs US Marines, Bocage is Germany vs US, Interstate's Akina is British vs US), so
+// "Axis/Allies" was wrong on everything but a stock WWII map. Computed once on first use, by LevelTeams().
+// Declared HERE, before the straight-line load block, per the CS0841/CS0165 rule at the top of this file.
+RefractorForge.Formats.Con.TeamNames? teamNamesCache = null;
 Vector3[] pointMarkers = Array.Empty<Vector3>();
 TerrainTexture? terrainTex = null;   // level's baked tiles, flattened to a GPU atlas in OnLoad
 Texture2D? atlasCpu = null;          // CPU copy of the baked atlas, kept so the Texture paint tool can edit it
@@ -567,24 +576,15 @@ string[] rfaList = levelArchives.Length > 0 ? levelArchives
 // AUTO-MOUNT PATCH ARCHIVES: the engine layers <Level>_NNN.rfa over the base (Dystopia_City_001.rfa overrides
 // 3 StaticObjects.con + 1400 entries). Users usually pick just the base, so add numeric-suffix siblings of every
 // picked archive automatically - appended AFTER their base (LevelArchive is last-wins) and numerically ordered.
+// Shared with the PROJECT flow (LevelSaver.WithPatchArchives), which extracts a level to a folder and used to miss
+// these entirely - one implementation so the two paths cannot drift apart on which archives a level really is.
 if (rfaList.Length > 0)
 {
-    var expanded = new List<string>(rfaList);
-    foreach (var baseRfa in rfaList)
-    {
-        var dir0 = Path.GetDirectoryName(Path.GetFullPath(baseRfa));
-        var stem0 = Path.GetFileNameWithoutExtension(baseRfa);
-        if (dir0 is null || !Directory.Exists(dir0)) continue;
-        var sibs = Directory.EnumerateFiles(dir0, stem0 + "_*.rfa")
-            .Where(s => System.Text.RegularExpressions.Regex.IsMatch(
-                Path.GetFileNameWithoutExtension(s), "^" + System.Text.RegularExpressions.Regex.Escape(stem0) + @"_\d+$",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
-            .OrderBy(s => s, StringComparer.OrdinalIgnoreCase);
-        foreach (var s in sibs)
-            if (!expanded.Any(x => Path.GetFullPath(x).Equals(Path.GetFullPath(s), StringComparison.OrdinalIgnoreCase)))
-            { expanded.Add(s); Console.WriteLine($"Auto-mounted level patch: {Path.GetFileName(s)}"); }
-    }
-    rfaList = expanded.ToArray();
+    var before = rfaList;
+    rfaList = RefractorForge.Formats.LevelSaver.WithPatchArchives(rfaList);
+    foreach (var s in rfaList)
+        if (!before.Any(x => Path.GetFullPath(x).Equals(Path.GetFullPath(s), StringComparison.OrdinalIgnoreCase)))
+            Console.WriteLine($"Auto-mounted level patch: {Path.GetFileName(s)}");
 }
 // TERRAIN-REUSE add-on maps: many mod maps (FHSW/FH/DC/bf1918 Aberdeen, Bocage, Battleaxe, Adak_Island...) ship
 // Heightmap.raw + StaticObjects but NO Terrain.con - they LAYER over the base game's same-named map, which the engine
@@ -6067,8 +6067,11 @@ List<(string label, string[] items)> LoadCatalog()
         }
 
         // A friendly order first, then any extra (mod-specific) categories alphabetically, then Other last.
+        // "Map Objects" leads: it holds the handful of things THIS level ships itself (custom cars, props), which is
+        // what a mapper opening a custom map is looking for, and it would otherwise be lost among thousands.
         string[] pref =
         {
+            RefractorForge.Render.MeshLibrary.MapObjectsCategory,
             "Structures", "Vegetation", "Overgrowth", "Undergrowth", "Land Vehicles", "Water Vehicles",
             "Air Vehicles", "Vehicles", "Stationary Weapons", "Hand Weapons", "Soldiers", "Props",
             "Props (Low)", "Pickups", "Effects", "Tunnels", "Destructibles", "Misc",
@@ -7826,6 +7829,7 @@ void NewMapModal()
     if (ImGui.Combo(Loc.TL("Game"), ref nmGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) nmGameBf1942 = nmGameIdx == 0;
     ImGui.TextDisabled(nmGameBf1942 ? "BF1942: no overgrowth / tunnel features." : "BF Vietnam: full feature set.");
     ImGui.Checkbox(Loc.TL("Playable (Conquest: flags, spawns, kits)"), ref nmPlayable);
+    // A NEW map has no Init.con to read teams from yet, so this one stays game-based on purpose.
     if (nmPlayable) ImGui.TextDisabled(Loc.T(nmGameBf1942 ? "Adds Axis + Allies + neutral flags with spawn points." : "Adds US + NVA + neutral flags with spawn points."));
 
     int ms = nmMatSizes[Math.Clamp(nmMatSizeIdx, 0, nmMatSizes.Length - 1)];
@@ -8358,11 +8362,17 @@ unsafe void RenderMeshPreview()
     foreach (var p in m.Positions) { mn = Vector3.Min(mn, p); mx = Vector3.Max(mx, p); }
     var centre = (mn + mx) * 0.5f;
     float radius = MathF.Max((mx - mn).Length() * 0.5f, 0.01f);
+    // The yaw is NEGATED to go with the X mirror below: the two cancel, so dragging and auto-rotate still spin the
+    // model the same way on screen as they always did, while the image itself comes out the right way round.
     var model = Matrix4x4.CreateTranslation(-centre) * Matrix4x4.CreateScale(1f / radius)
-              * Matrix4x4.CreateRotationY(meshViewerYaw) * Matrix4x4.CreateRotationX(meshViewerPitch);
+              * Matrix4x4.CreateRotationY(-meshViewerYaw) * Matrix4x4.CreateRotationX(meshViewerPitch);
     float mvDist = 2.6f / Math.Clamp(meshViewerZoom, 0.25f, 6f);   // scroll/+/- zoom moves the camera in/out
     var view = Matrix4x4.CreateLookAt(new Vector3(0f, 0f, mvDist), Vector3.Zero, Vector3.UnitY);
     var proj = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4f, 1f, 0.02f, 100f);
+    // Mirror X exactly as the main 3D view does (Camera.MirrorX). Battlefield stores level and mesh data in a frame
+    // whose X reads mirrored relative to how the game presents it; the scene view corrects for that and the preview
+    // did not, so every badge and decal came out backwards - a Skyline's boot read "enilyks".
+    var mvViewProj = view * proj * Matrix4x4.CreateScale(-1f, 1f, 1f);
 
     gl.BindFramebuffer(FramebufferTarget.Framebuffer, mvFbo);
     gl.Viewport(0, 0, (uint)mvSize, (uint)mvSize);
@@ -8375,7 +8385,7 @@ unsafe void RenderMeshPreview()
     gl.Uniform1(gl.GetUniformLocation(objProg, "uFogEnable"), 0);   // isolated preview: kill the leftover scene fog
     var ld = Vector3.Normalize(new Vector3(0.4f, 0.85f, 0.45f));    // (else fog saturates to grey over the whole mesh)
     gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
-    glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO, view * proj, "mv::" + meshViewerTemplate, m, model, Vector3.One);
+    glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO, mvViewProj, "mv::" + meshViewerTemplate, m, model, Vector3.One);
 
     gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     var fb = window.FramebufferSize;
@@ -9107,10 +9117,7 @@ void EditCpModal()
     ImGui.InputText(Loc.TL("Control point name"), ref ecpCpName, 64u);
     ImGui.DragFloat3(Loc.TL("Position"), ref ecpPos, 0.25f);
     ImGui.DragFloat(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
-    // Team labels follow the target game: BF1942 = Axis/Allies, BF Vietnam = NVA/US. (Index 1/2 are the same slots.)
-    string[] teams = gameIsBf1942
-        ? new[] { Loc.T("Neutral (0)"), Loc.T("Axis (1)"), Loc.T("Allies (2)") }
-        : new[] { Loc.T("Neutral (0)"), Loc.T("Vietcong / NVA (1)"), Loc.T("US Army (2)") };
+    string[] teams = TeamLabels();
     int teamIdx = Math.Clamp(ecpTeam, 0, 2);
     if (ImGui.Combo(Loc.TL("Team"), ref teamIdx, teams, teams.Length)) ecpTeam = teamIdx;
     ImGui.InputInt(Loc.TL("Area value"), ref ecpArea);
@@ -9759,38 +9766,61 @@ byte[]? ReadLevelNavFile(string leaf)
 // The level's own opening camera: `game.setBeforeSpawnCameraPosition <team> x/y/z` in Init.con. Read from the
 // level folder or straight out of the mounted .rfa chain (later archives win, so a patch can move it). Returns
 // null when the level defines none, or when anything about the parse is not clean.
-Vector3? LevelStartCamera()
+RefractorForge.Formats.Con.TeamNames LevelTeams()
 {
-    // A level carries SEVERAL Init.con files - the level's own plus per-menu / per-game-mode copies - and only the
-    // root one holds the camera. Reading just the first match found the Menu copy on Wake and gave up, which is why
-    // the editor kept opening on the aerial view. So collect every candidate, shallowest path first (the same
-    // shadowing rule LevelArchive.Find uses), and keep looking until one actually yields a position.
-    var candidates = new List<byte[]>();
+    if (teamNamesCache is not null) return teamNamesCache;
+    // Init.con names the soldier skins; ControlPointTemplates.con names the flag models as a fallback.
+    var cons = LevelConCandidates("Init.con").Concat(LevelConCandidates("ControlPointTemplates.con"));
+    teamNamesCache = RefractorForge.Formats.Con.TeamNames.Parse(cons, !gameIsBf1942);
+    Console.WriteLine($"Teams: 1 = {teamNamesCache.Team1}, 2 = {teamNamesCache.Team2}.");
+    return teamNamesCache;
+}
+
+string[] TeamLabels()
+{
+    var t = LevelTeams();
+    return new[] { Loc.T(t.Labelled(0)), t.Labelled(1), t.Labelled(2) };
+}
+
+/// <summary>Every copy of a named .con in the level, shallowest path first (patch archives before the base, so an
+/// override wins). Shared by the start-camera and team-name readers - a level carries several Init.con files and
+/// only the root one is the level's own.</summary>
+IEnumerable<byte[]> LevelConCandidates(string fileName)
+{
+    var outp = new List<byte[]>();
     try
     {
         if (rfaList.Length > 0)
         {
-            for (int i = rfaList.Length - 1; i >= 0; i--)   // later archives (patches) override the base
+            for (int i = rfaList.Length - 1; i >= 0; i--)
             {
                 if (!System.IO.File.Exists(rfaList[i])) continue;
                 var arc = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rfaList[i]);
                 foreach (var e in arc.Entries
-                             .Where(x => x.Name.EndsWith("/Init.con", StringComparison.OrdinalIgnoreCase)
-                                      || x.Name.EndsWith("\\Init.con", StringComparison.OrdinalIgnoreCase))
+                             .Where(x => x.Name.EndsWith("/" + fileName, StringComparison.OrdinalIgnoreCase)
+                                      || x.Name.EndsWith("\\" + fileName, StringComparison.OrdinalIgnoreCase))
                              .OrderBy(x => x.Name.Count(c => c is '/' or '\\')))
-                    candidates.Add(arc.Read(e));
+                    outp.Add(arc.Read(e));
             }
         }
         else if (levelDir is not null && System.IO.Directory.Exists(levelDir))
         {
-            foreach (var f in System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
+            foreach (var f in System.IO.Directory.EnumerateFiles(levelDir, fileName, System.IO.SearchOption.AllDirectories)
                          .OrderBy(p => p.Count(c => c is '\\' or '/')))
-                candidates.Add(System.IO.File.ReadAllBytes(f));
+                outp.Add(System.IO.File.ReadAllBytes(f));
         }
     }
     catch { }
+    return outp;
+}
 
-    foreach (var bytes in candidates)
+Vector3? LevelStartCamera()
+{
+    // A level carries SEVERAL Init.con files - the level's own plus per-menu / per-game-mode copies - and only the
+    // root one holds the camera. Reading just the first match found the Menu copy on Wake and gave up, which is why
+    // the editor kept opening on the aerial view. LevelConCandidates returns them shallowest-first (the same
+    // shadowing rule LevelArchive.Find uses); keep looking until one actually yields a position.
+    foreach (var bytes in LevelConCandidates("Init.con"))
     {
         try
         {

@@ -45,7 +45,11 @@ public sealed class MeshLibrary
     /// with an <c>alphaTestRef</c> (grilles, decals, painted markings). It carries the engine's own discard
     /// threshold, and its presence also says "shade this like solid geometry", unlike the foliage cutouts that
     /// <paramref name="AlphaTest"/> alone implies and that are deliberately lit flat.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null);
+    /// <summary><paramref name="Foliage"/> marks vegetation, which is lit FLAT (leaf cards have arbitrary normals, so
+    /// diffuse shading turns a canopy near-black). It is tracked separately from <paramref name="AlphaRef"/> because
+    /// foliage now carries a threshold of its own, worked out from the texture; before that, "has a ref" was used as
+    /// a stand-in for "is a hard surface", and reusing it here would have made every tree dark.</summary>
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -136,7 +140,8 @@ public sealed class MeshLibrary
                     if ((uint)vi >= (uint)pos.Count) continue;
                     AppendSpriteCross(pos, uvs, sidx, pos[vi], spriteH);
                 }
-                if (sidx.Count > 0) parts.Add(new MaterialPart(sidx.ToArray(), color, tex, AlphaTest: true));
+                if (sidx.Count > 0) parts.Add(new MaterialPart(sidx.ToArray(), color, tex, AlphaTest: true,
+                                                               AlphaRef: ProfileAlpha(tex) is { Cutout: true } sp ? sp.Ref : null, Foliage: true));
                 continue;
             }
             int cnt = (e - s) - ((e - s) % 3);   // whole triangles only
@@ -145,8 +150,12 @@ public sealed class MeshLibrary
             for (int k = 0; k < cnt; k++) idx[k] = tm.Indices[s + k];
             // Cutout PER-MATERIAL by texture (name + real alpha), not by group index (.tm groups aren't class-pure):
             // a foliage name OR a texture that actually carries transparency renders alpha-tested; opaque bark stays solid.
-            bool cutout = IsCutout(m.TexName) || HasTransparency(tex);
-            parts.Add(new MaterialPart(idx, color, tex, AlphaTest: cutout));
+            // Trees carry no .rs at all, so the alpha profile is the ONLY evidence for most of them - Pacific_Palm_A
+            // binds `palmleaf_T` and was caught by name, while Pacific_Palm_1..4 bind `pahile_c` and were not.
+            var prof = ProfileAlpha(tex);
+            bool cutout = IsCutout(m.TexName) || prof.Cutout;
+            parts.Add(new MaterialPart(idx, color, tex, AlphaTest: cutout,
+                                       AlphaRef: cutout && prof.Cutout ? prof.Ref : null, Foliage: true));
         }
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray());
     }
@@ -278,10 +287,14 @@ public sealed class MeshLibrary
                     var pth = e.Name.Replace('\\', '/');
                     // Match "vehicles" ANYWHERE in the path (not just "/Vehicles/") so mod folder variants like
                     // Op_Remembrance's "Objects/E_Vehicles/..." (Enhanced Vehicles) are recognized as assemblies too.
+                    // A LEVEL's own objects count as well: a map may ship custom vehicles and props inside its .rfa
+                    // (Interstate's Akina_Mountain carries the AE86 and friends), which the engine mounts for that map
+                    // alone, so they exist in no mod archive and used to be invisible to the Object Library.
                     if (baseName.Equals("Objects.con", StringComparison.OrdinalIgnoreCase)
                         && (pth.Contains("vehicles", StringComparison.OrdinalIgnoreCase)
                             || pth.Contains("/Stationary_Weapons/", StringComparison.OrdinalIgnoreCase)
-                            || pth.Contains("/HandWeapons/", StringComparison.OrdinalIgnoreCase)))
+                            || pth.Contains("/HandWeapons/", StringComparison.OrdinalIgnoreCase)
+                            || IsLevelLocalObjectPath(norm)))
                         lib._vehicleCons.Add(e);
                 }
             }
@@ -331,7 +344,22 @@ public sealed class MeshLibrary
     public IReadOnlyDictionary<string, string> CategoryOf => _categoryOf;
 
     private static readonly HashSet<string> _genericFolders = new(StringComparer.OrdinalIgnoreCase)
-    { "art", "meshes", "mesh", "textures", "texture", "tex", "common", "sounds", "sound", "ai", "animations", "anim", "lods", "lod" };
+    // "objects" is generic too: a level's objects/objects.con is its object LIST, not a template called "objects".
+    { "art", "meshes", "mesh", "textures", "texture", "tex", "common", "sounds", "sound", "ai", "animations", "anim", "lods", "lod", "objects" };
+
+    /// <summary>The category a level's own embedded objects are filed under, so a mapper can find the handful of
+    /// things that belong to THIS map without hunting through the mod's thousands.</summary>
+    public const string MapObjectsCategory = "Map Objects";
+
+    /// <summary>True for a path like <c>bf1942/levels/&lt;Map&gt;/objects/&lt;Template&gt;/Objects.con</c> - a level's
+    /// OWN object, which sits one level shallower than a mod's <c>objects/&lt;Category&gt;/&lt;Template&gt;/</c> and so
+    /// was missed by both the assembly index and the category index.</summary>
+    private static bool IsLevelLocalObjectPath(string normalizedPath)
+    {
+        var segs = normalizedPath.Split('/');
+        int oi = Array.FindIndex(segs, s => s.Equals("objects", StringComparison.OrdinalIgnoreCase));
+        return oi > 0 && Array.FindIndex(segs, 0, oi, s => s.Equals("levels", StringComparison.OrdinalIgnoreCase)) >= 0;
+    }
 
     private static string StemName(string n) =>
         System.Text.RegularExpressions.Regex.Replace(n, @"_(?:m\d+|l\d+|lod\d+)$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -367,6 +395,21 @@ public sealed class MeshLibrary
         int oi = -1;
         for (int i = 0; i < segs.Length; i++) if (segs[i].Equals("objects", StringComparison.OrdinalIgnoreCase)) { oi = i; break; }
         if (oi < 0 || oi + 2 >= segs.Length) return;
+
+        // A level's own objects are laid out objects/<Template>/... - no category folder in between - so the normal
+        // walk below reads the FILE name as the object and gives up. File them under one obvious heading instead.
+        // Assignment, not TryAdd: a map that ships its own version of an object overrides the mod's in-game, and the
+        // level archives are indexed last, so the map's label should win here too.
+        if (IsLevelLocalObjectPath(entryName.Replace('\\', '/')))
+        {
+            string local = segs[oi + 1];
+            if (local.Length > 0 && !local.Contains('.') && !_genericFolders.Contains(local))
+            {
+                var lk = StemName(local).ToLowerInvariant();
+                if (lk.Length > 0) _categoryOf[lk] = MapObjectsCategory;
+            }
+            return;
+        }
 
         string folder = segs[oi + 1];
         int objIdx = oi + 2;
@@ -721,7 +764,7 @@ public sealed class MeshLibrary
             {
                 var idx = new int[mp.Indices.Length];
                 for (int k = 0; k < idx.Length; k++) idx[k] = mp.Indices[k] + baseV;
-                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend, mp.TextureName, mp.AlphaRef));
+                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend, mp.TextureName, mp.AlphaRef, mp.Foliage));
             }
         }
         return mats.Count > 0
@@ -1293,20 +1336,35 @@ public sealed class MeshLibrary
             // parts of the atlas don't render as opaque rectangles.
             // Glass/canopy (explicit `transparent`) blends softly with NORMAL lighting; foliage/fences/cutout sheets
             // (fade flag, foliage names, or genuine cutout alpha) are HARD alpha-tested with flat foliage lighting.
-            // `transparent true` alone means BLEND, but paired with an `alphaTestRef` it means CUT OUT at that
-            // threshold - the engine overloads the one keyword. The Willys' engine grill is the second kind
-            // (`transparent true; alphaTestRef 0.7`, sheet 71% low-alpha), so blending it left a see-through panel
-            // where the game punches a clean grille. Stock BF1942 splits 178 blends / 59 cutouts on exactly this.
-            bool blend = sh?.Transparent == true && sh.AlphaTestRef is null;
+            // `transparent true` and `alphaTestRef` are INDEPENDENT render states, not two spellings of one choice:
+            // the first turns alpha blending on, the second turns an alpha test on, and a material may use both.
+            // The proof is `blendDest` - a blend DESTINATION FACTOR - sitting on 39 of the 100 materials that
+            // declare a ref; you cannot have a blend factor without blending. Treating the pair as "cutout, not
+            // blend" made Interstate's headlight glows and some trees vanish.
+            // So: blend whenever the shader says transparent, and separately discard below the ref when it names
+            // one. That is what fixes the Willys' grill - its sheet is 71% low-alpha, and the bug was never the
+            // blending, it was blending those low-alpha texels instead of discarding them.
+            bool blend = sh?.Transparent == true;
             // The texture's own alpha is only a LAST RESORT, used when the .rs told us nothing about this material.
             // BF1942 vehicle skins routinely keep a SPECULAR/gloss mask in the alpha channel - the Willys' willy3_z
             // is 62% low-alpha - and reading that as a cutout mask discards most of the surface. That is what made
             // the jeep's engine grill see-through: the shader threw away every texel the gloss mask left dark.
             // When a material HAS a shader, believe it: `textureFade`/`transparent` and the foliage name list decide.
-            bool cutout = !blend && (sh?.AlphaTestRef is not null || sh?.TextureFade == true || IsCutout(sh?.Texture)
-                                     || (sh is null && HasTransparency(tex)));
+            // ...but only when the ref is REACHABLE. Eight stock materials name a threshold their own texture never
+            // gets near - Interstate's headlight beam `phareblanc` is a gradient peaking at alpha 0.34 behind a
+            // ref of 0.70, and the disco lights and jet canopies are the same shape. Testing those erases the
+            // surface completely, which is plainly not what the author meant, so the ref is ignored and the
+            // material simply blends. The 66 refs that DO keep something (the Willys grille, fences, hangar
+            // windows) are honoured exactly as written.
+            float? aref = sh?.AlphaTestRef is { } r && AlphaReaches(tex, r) ? r : null;
+            // No shader to consult -> read the alpha channel itself, exactly as the .tm tree path does.
+            var auto = sh is null ? ProfileAlpha(tex) : default;
+            bool cutout = !blend && (aref is not null || sh?.TextureFade == true || IsCutout(sh?.Texture) || auto.Cutout);
+            // Vegetation is lit flat; a material the .rs explicitly alpha-tested is a hard surface and is shaded solid.
+            bool foliage = cutout && aref is null;
             parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend,
-                                       TextureName: sh?.Texture, AlphaRef: sh?.AlphaTestRef));
+                                       TextureName: sh?.Texture, AlphaRef: aref ?? (auto.Cutout ? auto.Ref : null),
+                                       Foliage: foliage));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())
@@ -1331,6 +1389,68 @@ public sealed class MeshLibrary
     // True when a decoded texture actually contains transparency (a leaf/cutout atlas): a meaningful fraction of texels
     // are non-opaque. Lets the .tm foliage path mark leaf materials alpha-tested by their REAL alpha (DXT5 leaf atlases)
     // rather than a fragile group-index guess. Sampled (not full-scanned) for speed.
+    /// <summary>Would an alpha test at <paramref name="aref"/> leave anything of this texture on screen? Used to
+    /// reject a threshold no texel can satisfy, which would silently delete the whole surface. Unknown textures
+    /// answer true - we cannot show what we could not load either way.</summary>
+    private static bool AlphaReaches(Texture2D? tex, float aref)
+    {
+        if (tex?.Rgba is not { Length: > 0 } d) return true;
+        int n = d.Length / 4, cut = (int)(aref * 255), step = Math.Max(1, n / 16384), sampled = 0, keep = 0;
+        for (int i = 0; i < n; i += step) { sampled++; if (d[i * 4 + 3] >= cut) keep++; }
+        return sampled > 0 && (float)keep / sampled >= 0.01f;
+    }
+
+    /// <summary>What a texture's alpha channel says about how to draw it, worked out from the channel itself rather
+    /// than guessed from its name: whether it is a cutout at all, and the threshold to cut it at.
+    ///
+    /// The threshold is Otsu's method - the split that best separates the transparent population from the solid one,
+    /// i.e. the bottom of the valley between them. BF1942's palm leaf sheet <c>pahile_c</c> lands at 0.45 rather
+    /// than the flat 0.33 we used to assume for everything.</summary>
+    public readonly record struct AlphaProfile(bool Cutout, float Ref);
+
+    // Textures are shared across many materials and meshes, and these sheets run to 2048x2048, so profile once.
+    private static readonly Dictionary<Texture2D, AlphaProfile> _alphaProfiles = new();
+
+    public static AlphaProfile ProfileAlpha(Texture2D? tex)
+    {
+        if (tex?.Rgba is not { Length: > 0 } d) return new AlphaProfile(false, 0.33f);
+        lock (_alphaProfiles)
+        {
+            if (_alphaProfiles.TryGetValue(tex, out var hit)) return hit;
+            int n = d.Length / 4, step = Math.Max(1, n / 16384), sampled = 0, trans = 0, solid = 0;
+            var hist = new int[256];
+            for (int i = 0; i < n; i += step) { int a = d[i * 4 + 3]; sampled++; hist[a]++; if (a < 128) trans++; else if (a >= 240) solid++; }
+
+            var prof = new AlphaProfile(false, 0.33f);
+            if (sampled > 0)
+            {
+                float tf = (float)trans / sampled, sf = (float)solid / sampled;
+                // A cutout needs BOTH a real transparent region and a real solid one. Note what is deliberately NOT
+                // required: that the two be cleanly separated. Demanding that (mid < 12%) threw away every antialiased
+                // leaf sheet - BF1942's pahile_c is 61% transparent and 20% solid but 18.6% in between, so the palms
+                // on Wake rendered as opaque white cards. Anti-aliasing is not a reason to call something opaque.
+                if (tf > 0.02f && tf < 0.95f && sf > 0.02f)
+                {
+                    // Otsu: maximise between-class variance over the alpha histogram.
+                    double sum = 0; for (int i = 0; i < 256; i++) sum += (double)i * hist[i];
+                    double sumB = 0, wB = 0, best = -1; int cut = 84;
+                    for (int i = 0; i < 256; i++)
+                    {
+                        wB += hist[i]; if (wB == 0) continue;
+                        double wF = sampled - wB; if (wF <= 0) break;
+                        sumB += (double)i * hist[i];
+                        double mB = sumB / wB, mF = (sum - sumB) / wF, between = wB * wF * (mB - mF) * (mB - mF);
+                        if (between > best) { best = between; cut = i; }
+                    }
+                    // Clamped: an extreme automatic threshold would either erase the sheet or keep its whole halo.
+                    prof = new AlphaProfile(true, Math.Clamp(cut / 255f, 0.20f, 0.80f));
+                }
+            }
+            _alphaProfiles[tex] = prof;
+            return prof;
+        }
+    }
+
     private static bool HasTransparency(Texture2D? tex)
     {
         if (tex?.Rgba is not { Length: > 0 } d) return false;
