@@ -45,7 +45,12 @@ foreach ($item in @("textures", "RefractorForge.ico", "refractorforgesplash.png"
 
 if ($IncludeFfmpeg) {
     if (-not (Test-Path (Join-Path $FfmpegFrom "ffmpeg.exe"))) { throw "no ffmpeg.exe under $FfmpegFrom" }
-    Copy-Item $FfmpegFrom (Join-Path $stage "ffmpeg") -Recurse -Force
+    # Copy the CONTENTS, not the folder: publish already created ffmpeg\ (for the notice), and Copy-Item -Recurse
+    # onto an existing directory nests the source inside it as ffmpeg\ffmpeg\ - which the editor would never find.
+    $dst = Join-Path $stage "ffmpeg"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item (Join-Path $FfmpegFrom "*") $dst -Recurse -Force
+    if (-not (Test-Path (Join-Path $dst "ffmpeg.exe"))) { throw "ffmpeg.exe did not land at ffmpeg\ffmpeg.exe" }
 }
 
 Write-Host "== verifying against the build output =="
@@ -64,6 +69,15 @@ if ($missing.Count -gt 0) {
     throw "package is incomplete"
 }
 if (-not (Test-Path (Join-Path $stage "RefractorForge.Viewer.exe"))) { throw "no exe in package" }
+# Runtime-loaded assets the editor resolves by exact relative path. The build-output comparison above cannot see
+# these (ffmpeg's binaries are not in the repo, only its notice), so assert them explicitly.
+foreach ($must in @("textures\surf00.bmp", "brushes\Round.bmp", "lang\ja.json", "refractorforgesplash.png")) {
+    if (-not (Test-Path (Join-Path $stage $must))) { throw "package is missing $must" }
+}
+if ($IncludeFfmpeg -and -not (Test-Path (Join-Path $stage "ffmpeg\ffmpeg.exe"))) { throw "ffmpeg requested but not packaged" }
+if (Get-ChildItem $stage -Recurse -Directory | Where-Object { $_.Name -eq "ffmpeg" -and $_.Parent.Name -eq "ffmpeg" }) {
+    throw "ffmpeg was nested as ffmpeg\ffmpeg - the editor will not find it"
+}
 $loose = (Get-ChildItem $stage -Filter *.dll -File).Count
 if ($loose -ne 0) { throw "$loose loose DLL(s) beside the exe - single-file bundling did not take" }
 
