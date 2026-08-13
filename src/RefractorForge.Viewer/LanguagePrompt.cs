@@ -17,8 +17,22 @@ namespace RefractorForge.Viewer;
 internal static class LanguagePrompt
 {
     /// <summary>Ask which language to use. Returns the chosen code ("en" / "ja"); defaults to English if the
-    /// dialog is closed without a choice.</summary>
+    /// dialog is closed without a choice.
+    ///
+    /// Runs on a dedicated STA thread, exactly like <see cref="Picker"/> and <see cref="StartupWindow"/>. The
+    /// program's main thread is MTA (there is no [STAThread] Main in a top-level-statements app), and showing a
+    /// WinForms dialog from an MTA thread misbehaves - which a try/catch here would hide rather than fix.</summary>
     public static string Ask()
+    {
+        string chosen = "en";
+        var t = new Thread(() => { try { chosen = ShowDialogSta(); } catch { } }) { Name = "langprompt" };
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        return chosen;
+    }
+
+    private static string ShowDialogSta()
     {
         string chosen = "en";
 
@@ -82,7 +96,7 @@ internal static class LanguagePrompt
             TextAlign = ContentAlignment.MiddleCenter,
         });
 
-        try { form.ShowDialog(); } catch { /* never block startup on a dialog failure */ }
+        form.ShowDialog();
         return chosen;
     }
 }
