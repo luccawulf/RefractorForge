@@ -74,6 +74,9 @@ if (args.Length >= 1 && args[0] == "--relay")
 
 // GUI mode: show the launch splash immediately (its own STA thread keeps it painted during the level/GL load).
 Loc.Init();          // UI language (must precede the ImGui controller: the font atlas depends on the script)
+// First run only: ask which language to use, in both languages. Without this a Japanese speaker has to find
+// View > Language inside an English menu to discover the editor speaks Japanese at all.
+if (!Loc.HasChosenLanguage) Loc.SetLanguage(LanguagePrompt.Ask());
 AppPrefs.Load();     // level-assembly options (inherited mod deps, base-map layering) - read by the load block below
 SplashScreen.Show();
 

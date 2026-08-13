@@ -31,6 +31,11 @@ public static class Loc
     /// <summary>The active language code ("en" = pass-through).</summary>
     public static string Current { get; private set; } = "en";
 
+    /// <summary>True once the user has picked a language at least once. Drives the FIRST-RUN prompt: a Japanese
+    /// speaker should not have to find View ▸ Language in an English menu to discover the editor speaks Japanese.
+    /// Backed by the settings file, so choosing English is remembered too and the prompt does not return.</summary>
+    public static bool HasChosenLanguage => File.Exists(SettingsPath);
+
     /// <summary>True when a non-English language is active (so the UI needs a CJK-capable font).</summary>
     public static bool NeedsWideFont => !string.Equals(Current, "en", StringComparison.OrdinalIgnoreCase);
 
