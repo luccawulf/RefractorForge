@@ -425,13 +425,17 @@ void main(){
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
         c = mix(c, uFogColor, fog);
     }
-    // An alpha TEST is binary: a texel that survives is fully opaque, so modes 1 and 3 write alpha 1.0. Carrying the
-    // texture's alpha through instead left every surviving texel of a partly-glossy sheet semi-transparent, which is
-    // half of why the Willys' grill could be seen through even where it had not been cut away.
     // Glass(2) gets a MINIMUM opacity so a pane cannot vanish: BF1942 glass is often fully transparent in alpha - the
     // Willys' katy_window_I is 100% below the half-alpha mark - so honouring that literally erased the windscreen.
+    // Hard cutouts(3) write 1.0: a grille texel that survives the alpha test is solid metal, and letting a glossy
+    // sheet's mid-alpha through left the Willys' grill see-through even where it had not been cut away.
+    // Foliage(1) deliberately KEEPS its own alpha. Forcing leaves opaque made every canopy read as a dark solid mass
+    // instead of letting sky through at the soft edges - vegetation needs those partly-transparent texels.
     float outA = 1.0;
-    if (uAlphaTest==2 && uAlphaEnable==1) outA = max(a, 0.30);
+    if (uAlphaEnable==1) {
+        if (uAlphaTest==2)      outA = max(a, 0.30);
+        else if (uAlphaTest==1) outA = a;
+    }
     frag = vec4(c, outA);
 }";
 
