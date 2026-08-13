@@ -37,3 +37,6 @@ src/RefractorForge.Viewer/Assets/ffmpeg/*.exe
 
 # Claude Code project instructions (AI tooling notes, kept local; not part of the public source)
 CLAUDE.md
+
+# Release packages built by tools/pack-beta.ps1
+dist/

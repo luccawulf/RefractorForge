@@ -10,7 +10,8 @@ namespace RefractorForge.Viewer;
 
 /// <summary>
 /// A borderless launch splash (the bundled refractorforgesplash.png + the "RefractorForge" title and
-/// "developed by Lucas Ludwiczak" credit overlaid). Runs on its own STA thread with a message loop so it keeps
+/// "developed by LuccaWulf" credit overlaid - the in-app credit uses the handle the BF modding community knows,
+/// while README/USER_GUIDE carry the full legal name). Runs on its own STA thread with a message loop so it keeps
 /// painting while the main (MTA) thread does the heavy level/GL load, then is closed once the editor is ready.
 /// </summary>
 internal static class SplashScreen
@@ -113,7 +114,7 @@ internal static class SplashScreen
             using var credit = new Font("Segoe UI", 11f, FontStyle.Regular, GraphicsUnit.Point);
             float ty = h - band + band * 0.28f;
             Text("RefractorForge", title, Brushes.White, 22f, ty);
-            Text("developed by Lucas Ludwiczak", credit, new SolidBrush(Color.FromArgb(220, 220, 230, 240)), 25f, ty + 48f);
+            Text("developed by LuccaWulf", credit, new SolidBrush(Color.FromArgb(220, 220, 230, 240)), 25f, ty + 48f);
 
             using var border = new Pen(Color.FromArgb(70, 255, 255, 255), 1f);
             g.DrawRectangle(border, 0, 0, w - 1, h - 1);

@@ -64,7 +64,7 @@ internal static class StartupWindow
             using var credit = new Font("Segoe UI", 10f);
             using (var gold = new SolidBrush(Color.FromArgb(240, 200, 90))) g.DrawString("RefractorForge", title, gold, 28, 20);
             g.DrawString(Loc.T("BF1942 / BFVietnam Map Editor"), sub, Brushes.Gainsboro, 32, 72);
-            var cs = "developed by Lucas Ludwiczak"; var csz = g.MeasureString(cs, credit);
+            var cs = "developed by LuccaWulf"; var csz = g.MeasureString(cs, credit);
             using (var cb = new SolidBrush(Color.FromArgb(215, 215, 225))) g.DrawString(cs, credit, cb, W - csz.Width - 24, 30);
             using (var pen = new Pen(Color.FromArgb(60, 255, 255, 255))) g.DrawLine(pen, 24, 104, W - 24, 104);
             using (var hb = new SolidBrush(Color.FromArgb(180, 190, 200))) g.DrawString(Loc.T("Recent Projects"), sub, hb, 28, 112);
