@@ -43,6 +43,16 @@ foreach ($item in @("textures", "RefractorForge.ico", "refractorforgesplash.png"
     else { throw "missing from build output: $item" }
 }
 
+# Licence and docs, straight from the repo root. These are NOT build output, so nothing above would ever pull them
+# in - and the zip is distributed standalone (ModDB, forums), where the GitHub repo is not there to supply them.
+# RefractorForge is GPLv3: the licence text has to travel WITH the distribution, not just live next to the source.
+# The user guide matters for the same reason - a download outside GitHub otherwise arrives with no documentation.
+foreach ($doc in @("LICENSE.txt", "README.md", "USER_GUIDE.md")) {
+    $src = Join-Path $repo $doc
+    if (Test-Path $src) { Copy-Item $src $stage -Force }
+    else { throw "missing from the repo root: $doc" }
+}
+
 if ($IncludeFfmpeg) {
     if (-not (Test-Path (Join-Path $FfmpegFrom "ffmpeg.exe"))) { throw "no ffmpeg.exe under $FfmpegFrom" }
     # Copy the CONTENTS, not the folder: publish already created ffmpeg\ (for the notice), and Copy-Item -Recurse
@@ -71,9 +81,13 @@ if ($missing.Count -gt 0) {
 if (-not (Test-Path (Join-Path $stage "RefractorForge.Viewer.exe"))) { throw "no exe in package" }
 # Runtime-loaded assets the editor resolves by exact relative path. The build-output comparison above cannot see
 # these (ffmpeg's binaries are not in the repo, only its notice), so assert them explicitly.
-foreach ($must in @("textures\surf00.bmp", "brushes\Round.bmp", "lang\ja.json", "refractorforgesplash.png")) {
+foreach ($must in @("textures\surf00.bmp", "brushes\Round.bmp", "lang\ja.json", "refractorforgesplash.png",
+                    "LICENSE.txt", "README.md", "USER_GUIDE.md")) {
     if (-not (Test-Path (Join-Path $stage $must))) { throw "package is missing $must" }
 }
+# A GPLv3 package that ships an empty or wrong-licence file is worse than one that ships none, so check the text.
+$lic = Get-Content (Join-Path $stage "LICENSE.txt") -Raw
+if ($lic.Length -lt 10000 -or $lic -notmatch "GNU GENERAL PUBLIC LICENSE") { throw "LICENSE.txt does not look like the GPL text" }
 if ($IncludeFfmpeg -and -not (Test-Path (Join-Path $stage "ffmpeg\ffmpeg.exe"))) { throw "ffmpeg requested but not packaged" }
 if (Get-ChildItem $stage -Recurse -Directory | Where-Object { $_.Name -eq "ffmpeg" -and $_.Parent.Name -eq "ffmpeg" }) {
     throw "ffmpeg was nested as ffmpeg\ffmpeg - the editor will not find it"
