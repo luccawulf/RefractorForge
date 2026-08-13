@@ -5,7 +5,7 @@ using System.Windows.Forms;
 
 namespace RefractorForge.Viewer;
 
-public enum StartupAction { OpenProject, OpenRfa, OpenFolder, NewMap, Cancel }
+public enum StartupAction { OpenProject, OpenRfa, OpenMod, OpenFolder, NewMap, Cancel }
 
 /// <summary>The user's choice on the startup screen. <see cref="RecentPath"/> is set only when a Recent Projects
 /// row was double-clicked (an Open-Project shortcut to that <c>.rfproj</c>).</summary>
@@ -116,7 +116,10 @@ internal static class StartupWindow
         }
         // Okabe-Ito colorblind-safe hues (no two confusable under red/green CB).
         form.Controls.Add(Btn(Loc.T("Open Project  (.rfproj)"), Color.FromArgb(0, 114, 178), 0, StartupAction.OpenProject));   // blue
-        form.Controls.Add(Btn(Loc.T("Open Level RFA"), Color.FromArgb(230, 159, 0), 1, StartupAction.OpenRfa));                // orange
+        // Open MOD rather than a bare map .rfa: a level opened on its own has no object or texture library behind
+        // it, so half a mod's map shows up empty. Picking the mod first resolves its init.con mount chain, and the
+        // map is then chosen from that mod's own levels folder.
+        form.Controls.Add(Btn(Loc.T("Open Mod"), Color.FromArgb(230, 159, 0), 1, StartupAction.OpenMod));                     // orange
         form.Controls.Add(Btn(Loc.T("Open Level Folder"), Color.FromArgb(204, 121, 167), 2, StartupAction.OpenFolder));       // reddish-purple
         form.Controls.Add(Btn(Loc.T("New Map"), Color.FromArgb(0, 158, 115), 3, StartupAction.NewMap));                        // bluish-green
 

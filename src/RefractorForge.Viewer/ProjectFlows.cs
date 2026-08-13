@@ -10,18 +10,24 @@ namespace RefractorForge.Viewer;
 /// window (like the old first-run flow), so it's pure path/file work.</summary>
 internal static class ProjectFlows
 {
-    /// <summary>Show the startup screen and run the chosen flow. Returns the project to load (saved + set active +
-    /// added to recents), or null to exit the app.</summary>
-    public static RfProject? RunStartup()
+    /// <summary>What the startup screen resolved to: a project to load, a request to run the Open Mod flow (which
+    /// is archive/Settings-based rather than a project, so it has no <see cref="RfProject"/>), or a cancel.</summary>
+    internal sealed record StartupResult(RfProject? Project = null, bool OpenMod = false, bool Cancelled = false);
+
+    /// <summary>Show the startup screen and run the chosen flow. The project flows are finalized here (saved + set
+    /// active + added to recents); Open Mod is handed back to the caller because it loads a mod's archive chain in
+    /// place instead of creating a project.</summary>
+    public static StartupResult RunStartup()
     {
         var choice = StartupWindow.Show();
         return choice.Action switch
         {
-            StartupAction.OpenProject => OpenProjectFlow(choice.RecentPath),
-            StartupAction.OpenRfa => OpenRfaFlow(),
-            StartupAction.OpenFolder => OpenFolderFlow(),
-            StartupAction.NewMap => NewMapFlow(),
-            _ => null,
+            StartupAction.OpenProject => new StartupResult(OpenProjectFlow(choice.RecentPath)),
+            StartupAction.OpenMod => new StartupResult(OpenMod: true),
+            StartupAction.OpenRfa => new StartupResult(OpenRfaFlow()),
+            StartupAction.OpenFolder => new StartupResult(OpenFolderFlow()),
+            StartupAction.NewMap => new StartupResult(NewMapFlow()),
+            _ => new StartupResult(Cancelled: true),
         };
     }
 

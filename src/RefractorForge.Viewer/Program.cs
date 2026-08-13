@@ -422,6 +422,14 @@ RefractorForge.Formats.RfProject? activeRfProject = null;   // the loaded .rfpro
 {
     var pathArgs = args.Where(a => !a.StartsWith("-", StringComparison.Ordinal)).ToArray();
     bool forcePick = args.Any(a => a is "--pick" or "-p");
+    // RESUMING THE LAST MAP IS OPT-IN, and only the editor's own relaunch asks for it.
+    //
+    // It used to be the default, which made a bad level unrecoverable: the load-failure handler below cleared the
+    // remembered plain level but NOT the active .rfproj, so a project whose level fails to load was retried on
+    // every single launch and the editor could never reach the startup screen again. Starting fresh at the picker
+    // means a failed map costs one click, not a reinstall. The in-editor Open Mod / Open Level / language switch
+    // still round-trip correctly because RelaunchAndExit passes --resume.
+    bool resume = args.Any(a => a is "--resume");
     if (pathArgs.Length >= 1)
     {
         levelDir = pathArgs[0];
@@ -433,7 +441,7 @@ RefractorForge.Formats.RfProject? activeRfProject = null;   // the loaded .rfpro
         var activeProj = ActiveProject.Get();
         // 1) An active project (.rfproj) -> load it. Folder-based: the level data lives in the project folder, with
         //    mesh/texture libraries referenced (Custom) or derived from the mod chain (Default).
-        if (!forcePick && activeProj is not null && File.Exists(activeProj))
+        if (resume && !forcePick && activeProj is not null && File.Exists(activeProj))
         {
             try
             {
@@ -446,7 +454,7 @@ RefractorForge.Formats.RfProject? activeRfProject = null;   // the loaded .rfpro
             catch { ActiveProject.Clear(); }   // corrupt/missing -> fall through to the startup screen
         }
         // 2) Back-compat: a remembered plain level from before the project system (FOLDER or one-or-more .rfa).
-        if (levelDir is null && !forcePick && saved is { Level: string sl } && (Directory.Exists(sl) || File.Exists(sl)))
+        if (levelDir is null && resume && !forcePick && saved is { Level: string sl } && (Directory.Exists(sl) || File.Exists(sl)))
         {
             levelDir = sl;
             levelArchives = (saved.LevelArchives is { Length: > 0 } la ? la
@@ -460,11 +468,23 @@ RefractorForge.Formats.RfProject? activeRfProject = null;   // the loaded .rfpro
         if (levelDir is null)
         {
             SplashScreen.Close();   // dismiss the splash so the startup window is visible
-            var proj = ProjectFlows.RunStartup();
-            if (proj is null) Environment.Exit(0);   // user cancelled -> exit before opening the GL window
-            var (pld, pma, pta) = proj!.Resolve();
-            levelDir = pld; meshArchives = pma; texPicks = pta; levelArchives = Array.Empty<string>();
-            activeRfProject = proj;
+            var startup = ProjectFlows.RunStartup();
+            if (startup.OpenMod)
+            {
+                // Mod folder first, then the map from that mod - the same pairing File > Open Mod uses. Loaded in
+                // place (no relaunch) because the GL window does not exist yet.
+                if (!GatherModPaths(out var modLvls, out var modMesh, out var modTex)) Environment.Exit(0);
+                levelArchives = modLvls; levelDir = modLvls[0]; meshArchives = modMesh; texPicks = modTex;
+                Settings.Save(new LevelPaths(modLvls[0], null, null, modTex, modMesh, modLvls));
+                ActiveProject.Clear();   // the Open-Mod path is Settings-based, not a project
+            }
+            else if (startup.Project is { } proj)
+            {
+                var (pld, pma, pta) = proj.Resolve();
+                levelDir = pld; meshArchives = pma; texPicks = pta; levelArchives = Array.Empty<string>();
+                activeRfProject = proj;
+            }
+            else Environment.Exit(0);   // cancelled or the flow failed -> exit before opening the GL window
         }
     }
 }
@@ -667,10 +687,12 @@ catch (Exception loadEx)
         "Couldn't open the level you selected:\n\n" +
         $"    {levelDir}\n\n" +
         $"{loadEx.Message}\n\n" +
-        "Opening a demo terrain instead. To open a real map, restart and choose the level FOLDER that " +
-        "contains Terrain.con (or its packed .rfa).",
+        "Opening a demo terrain instead. Restart to pick a different map.",
         "RefractorForge - level not loaded");
-    Settings.Save(new LevelPaths(null, null, null));   // forget the bad pick so the next launch re-prompts
+    // Forget the bad pick BOTH ways. Clearing only the remembered level used to leave a broken .rfproj active,
+    // and since that was auto-loaded on every launch the editor could never get back to the startup screen.
+    Settings.Save(new LevelPaths(null, null, null));
+    ActiveProject.Clear();
     levelDir = null;
     cfg = new TerrainConfig { MaterialSize = 1024, WorldSize = 4096, YScale = 0.5f, WaterLevel = 30 };
     heightmap = HeightmapGenerator.DiamondSquare(cfg.MaterialSize, 2026, 0.55f);
@@ -7348,9 +7370,15 @@ void RelaunchAndExit()
 {
     try
     {
-        var exe = Environment.ProcessPath;   // the apphost exe; with no args it loads Settings.Level (= the new map)
+        // --resume is what makes the relaunch reopen what was just chosen (Open Mod / Open Level / New Map / a
+        // language switch). A plain launch deliberately does NOT resume - see the arg parsing at the top.
+        var exe = Environment.ProcessPath;
         if (!string.IsNullOrEmpty(exe))
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false });
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false };
+            psi.ArgumentList.Add("--resume");
+            System.Diagnostics.Process.Start(psi);
+        }
     }
     catch (Exception ex) { Console.WriteLine($"Relaunch failed: {ex.Message}"); }
     window.Close();
