@@ -111,6 +111,10 @@ in vec3 vN; in float vH; in vec2 vUv; in vec3 vWorld;
 uniform vec3 uLightDir; uniform float uWater; uniform float uMaxH; uniform vec3 uDeepColor;
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
 uniform int uHasTex; uniform sampler2D uTer;
+// Terrain-atlas UV correction. The painted ground was landing in the wrong place (features magnified outward
+// from the map's origin corner), and the correct mapping could not be derived from the data alone - so it is
+// exposed as a live control instead of a hardcoded guess. 1.0 / 0.0 is the untouched mapping.
+uniform vec2 uTerUvScale; uniform vec2 uTerUvOffset;
 uniform int uShowMat; uniform sampler2D uMat;
 uniform int uHasDetail; uniform sampler2D uDetail; uniform float uDetailScale;
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map
@@ -144,7 +148,7 @@ vec3 matColor(int i){
     return p[i & 15];
 }
 void main(){
-    vec3 baseCol = (uHasTex==1) ? texture(uTer, vUv).rgb : rampLand(vH);
+    vec3 baseCol = (uHasTex==1) ? texture(uTer, vUv * uTerUvScale + uTerUvOffset).rgb : rampLand(vH);
     if (uHasDetail==1) baseCol *= clamp(texture(uDetail, vUv*uDetailScale).rgb*2.0, 0.0, 1.0);
     vec3 n = normalize(vN);
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
@@ -1193,6 +1197,12 @@ int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object progra
 bool sunOverride = false;
 float sunAzimuthDeg = 135f, sunElevationDeg = 40f;
 float camSpeedMult = 1f;               // user multiplier on WASD fly speed (and scroll dolly)
+// Live correction for where the terrain atlas lands on the ground. Six separate attempts to derive this from the
+// level data (colour classification, minimap and gradient correlation, land/water separation, per-tile matching,
+// the height formula) all came back as noise, so the parameter is exposed rather than guessed: dial it until the
+// paint sits on the terrain, then the value can be made the default. 1 / 0 = the original mapping.
+float terUvScale = 1f, terUvOffX = 0f, terUvOffY = 0f;
+int uTerUvScaleL = -1, uTerUvOffsetL = -1;
 // Battlecraft-style camera: you travel toward whatever sits in the MIDDLE OF THE SCREEN. W/S follow the true view
 // vector, so aiming down and holding W descends and aiming up climbs - the height comes from where you look, with
 // no need to touch Q/E. The default fly camera instead flattens forward onto XZ and keeps your altitude fixed
@@ -2071,6 +2081,9 @@ void OnLoad()
     gl.UseProgram(terrainProg);
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uTer"), 0);   // sampler -> texture unit 0
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uMat"), 1);   // material sampler -> texture unit 1
+    uTerUvScaleL = gl.GetUniformLocation(terrainProg, "uTerUvScale");
+    uTerUvOffsetL = gl.GetUniformLocation(terrainProg, "uTerUvOffset");
+    ApplyTerrainUv();
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uDetail"), 2); // detail sampler -> texture unit 2
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uShadowMap"), 3); // shadow-map sampler -> texture unit 3
     gl.Uniform1(uShowMat, 0);
@@ -7196,6 +7209,23 @@ void EnvironmentPanel()
     }
 
     ImGui.Separator();
+    // Terrain paint alignment: move/zoom the ground texture until it sits on the terrain it belongs to.
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("TERRAIN PAINT ALIGNMENT"));
+    ImGui.SetNextItemWidth(150f);
+    if (SldF(Loc.TL("Paint scale"), ref terUvScale, 0.25f, 4f, "%.4f")) ApplyTerrainUv();
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Zoom of the ground texture about the map's origin corner.\nBelow 1 pulls the paint inward, above 1 pushes it outward."));
+    ImGui.SetNextItemWidth(150f);
+    if (SldF(Loc.TL("Paint offset X"), ref terUvOffX, -1f, 1f, "%.4f")) ApplyTerrainUv();
+    ImGui.SetNextItemWidth(150f);
+    if (SldF(Loc.TL("Paint offset Z"), ref terUvOffY, -1f, 1f, "%.4f")) ApplyTerrainUv();
+    if (ImGui.Button(Loc.TL("Reset paint alignment"))) { terUvScale = 1f; terUvOffX = 0f; terUvOffY = 0f; ApplyTerrainUv(); }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Log values")))
+        Console.WriteLine($"Terrain paint alignment: scale={terUvScale:0.#####} offsetX={terUvOffX:0.#####} offsetZ={terUvOffY:0.#####}" +
+                          $"  (worldSize {cfg.WorldSize}, offset in metres = {terUvOffX * cfg.WorldSize:0.#}, {terUvOffY * cfg.WorldSize:0.#})");
+
+    ImGui.Separator();
     ImGui.TextDisabled(Loc.T("CAMERA"));
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Fly speed"), ref camSpeedMult, 0.1f, 8f, "%.2fx");
@@ -9691,6 +9721,15 @@ byte[]? ReadLevelNavFile(string leaf)
     }
     catch { }
     return null;
+}
+
+// Push the terrain-atlas UV correction to the shader. Cheap, so it is simply re-sent whenever a slider moves.
+void ApplyTerrainUv()
+{
+    if (terrainProg == 0 || uTerUvScaleL < 0) return;
+    gl.UseProgram(terrainProg);
+    gl.Uniform2(uTerUvScaleL, terUvScale, terUvScale);
+    gl.Uniform2(uTerUvOffsetL, terUvOffX, terUvOffY);
 }
 
 // ---- Battlecraft-style camera ----------------------------------------------------------------------------------
