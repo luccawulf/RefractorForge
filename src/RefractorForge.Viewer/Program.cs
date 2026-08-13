@@ -1237,13 +1237,22 @@ Vector3 deepColor = new(0.16f, 0.35f, 0.55f);   // submerged-terrain tint (from 
 Camera cam = Camera.FrameAerial(cfg.WorldSize, (minH + maxH) * 0.5f, opts.Size.X / (float)opts.Size.Y);
 // Start where the LEVEL says to look from. Refractor levels carry the pre-spawn camera in Init.con as
 // `game.setBeforeSpawnCameraPosition <team> x/y/z` - the vantage the game itself opens the map on, usually framing
-// the action rather than the empty corner an aerial framing picks. Aim it at the map centre; fall back silently to
-// the aerial view for levels that do not define one.
+// the action rather than the empty corner an aerial framing picks. Fall back silently to the aerial view for levels
+// that do not define one.
 if (LevelStartCamera() is { } startCam)
 {
     cam.Position = startCam;
-    cam.LookAt(new Vector3(cfg.WorldSize * 0.5f, (minH + maxH) * 0.5f, cfg.WorldSize * 0.5f));
-    Console.WriteLine($"Camera: starting at the level's pre-spawn view {startCam.X:0}/{startCam.Y:0}/{startCam.Z:0}.");
+    // ALWAYS face north. Tilt is taken from the map centre so the ground is framed rather than the horizon, but the
+    // heading is then forced due north (+Z, yaw 0) instead of whatever bearing the centre happens to lie on - the
+    // editor's minimap, heightmap and material maps are all north-up/east-right, and a mapper reading coordinates
+    // off them needs the 3D view to agree. A camera sitting almost exactly over the centre has no meaningful
+    // direction to the centre at all, so fall back to a gentle downward tilt there instead of staring at its feet.
+    var centre = new Vector3(cfg.WorldSize * 0.5f, (minH + maxH) * 0.5f, cfg.WorldSize * 0.5f);
+    cam.LookAt(centre);
+    float flat = new Vector2(centre.X - startCam.X, centre.Z - startCam.Z).Length();
+    if (flat < cfg.WorldSize * 0.01f) cam.Pitch = -0.35f;   // ~20 degrees down
+    cam.Yaw = 0f;                                          // due north
+    Console.WriteLine($"Camera: starting at the level's pre-spawn view {startCam.X:0}/{startCam.Y:0}/{startCam.Z:0}, facing north.");
 }
 cam.MirrorX = true;   // no view reflection - the native orientation already matches the game (left stays left)
 // Movement speed and zoom step both scale with how high the camera is above the lowest terrain, so
