@@ -216,7 +216,13 @@ public static class SearchMapGenerator
     }
 
     /// <summary>From one hand-edited WORLD-GRID finest map, produce the 8Bit + compressed files for every level in
-    /// the vehicle's level set (downsample to each level, then nav-orient + compress). Pairs with the AI Path painter.</summary>
+    /// the vehicle's level set (downsample to each level, then nav-orient + compress), PLUS the strategic companion
+    /// pair. Pairs with the AI Path painter.
+    ///
+    /// The companions matter: the engine's search hops between 64x64 blocks through the portals in
+    /// <c>&lt;Veh&gt;.raw</c> before running a local A*, so writing new level maps without rebuilding
+    /// <c>&lt;Veh&gt;.raw</c> / <c>&lt;Veh&gt;Info.raw</c> leaves the coarse layer describing the terrain as it was
+    /// BEFORE the edit. Emitting them here means every path that writes a navmap keeps the pair consistent.</summary>
     public static IReadOnlyList<(string FileName, byte[] Data)> EncodeVehicleLevels(SearchMapParams p, byte[] gridFinest, int finestSide)
     {
         var list = new List<(string, byte[])>();
@@ -229,6 +235,11 @@ public static class SearchMapGenerator
             list.Add((FileName(p, lvl), eight));
             list.Add((CompressedFileName(p, lvl), CompressedSearchMap.Encode(eight, side, lvl)));
         }
+        // The companions are derived from the world-grid map (the painter's own orientation), not from a
+        // nav-oriented level map, so they describe the same world the level files do.
+        if (finestSide >= StrategicMapGenerator.BlockFine && finestSide % StrategicMapGenerator.BlockFine == 0)
+            foreach (var f in StrategicMapGenerator.EncodeCompanions(p, gridFinest, finestSide))
+                list.Add((f.FileName, f.Data));
         return list;
     }
 

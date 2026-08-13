@@ -141,7 +141,11 @@ public class NavTests
         try
         {
             int n = SearchMapGenerator.WriteVehicleEditedFolder(tmpDir, tank, grid, finest);
-            Assert.True(n == 6, $"WriteVehicleEditedFolder wrote 6 files (got {n})");
+            // 3 levels x (8Bit + compressed) = 6, plus the strategic companion pair rebuilt from the same grid,
+            // so the coarse search layer never describes the pre-edit terrain.
+            Assert.True(n == 8, $"WriteVehicleEditedFolder wrote 8 files (got {n})");
+            Assert.True(File.Exists(Path.Combine(tmpDir, "Pathfinding", "Tank.raw")), "companion Tank.raw written");
+            Assert.True(File.Exists(Path.Combine(tmpDir, "Pathfinding", "TankInfo.raw")), "companion TankInfo.raw written");
             var wc = File.ReadAllBytes(Path.Combine(tmpDir, "Pathfinding", "Tank0Level0Map.raw"));
             var we = File.ReadAllBytes(Path.Combine(tmpDir, "Pathfinding", "Tank0Level0Map8Bit.raw"));
             Assert.True(CompressedSearchMap.Decode(wc, out _, out _).SequenceEqual(we), "written compressed L0 decodes to written 8Bit");
