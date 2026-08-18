@@ -3900,9 +3900,13 @@ void DoSaveCore()
         extras.AddRange(tiles);
         if (DetailDdsBytes() is { } detd) extras.Add(detd);   // imported detail texture -> Textures/detail.dds (override)
         var navFiles = DirtyNavFiles();                 // painted AI navmaps -> into the patch
-        extras.AddRange(navFiles);
         var (wxFiles, wxInit) = WeatherRfaPieces(baseRfa);    // weather: new Effects files + Init run-include
         if (wxInit is { } we) extras.Add(we);
+        // Navmaps UPSERT, they do not merely override. Plenty of levels ship no Pathfinding/ folder at all
+        // (Interstate's Akina_Mountain has zero such entries), and an override-only write matched nothing and
+        // silently dropped every painted map - which is exactly the "pathmaps do not save when I open by mod" bug.
+        // Adding them under the level's archive prefix is what the engine reads, same as a level that shipped them.
+        foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // baked object lightmaps -> upsert (override existing OR add new)
@@ -3934,7 +3938,7 @@ void DoSaveCore()
         else if (tiles.Count > 0) Console.WriteLine("   (painted surface tiles NOT saved: the base .rfa has no Textures/ tiles to override -- save to a folder level)");
         int navOk = navFiles.Count > 0 ? navFiles.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase))) : 0;
         if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Baked {navOk} AI navmap file(s) into the patch."); PreviewSavedNav(); }
-        else if (navFiles.Count > 0) Console.WriteLine("   (painted AI navmaps NOT saved: the base .rfa has no Pathfinding/ entries to override -- save to a folder level)");
+        else if (navFiles.Count > 0) { Console.WriteLine("   AI navmaps FAILED to write into the patch."); Toast(Loc.T("AI navmaps failed to save - see Log / Errors.")); showLog = true; }
         if (skyFaceAssign.Count > 0) skyFacesDirty = false;
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
         Toast(string.Format(Loc.T("Saved patch {0} ({1} files) - verified OK, base untouched."), Path.GetFileName(outPatch), names.Count));
@@ -3966,10 +3970,10 @@ void DoSavePatch(bool serverSideOnly = false)
         var tiles = PaintedTileBytes();                 // painted surface tiles -> into the patch
         extras.AddRange(tiles);
         if (DetailDdsBytes() is { } detd) extras.Add(detd);   // imported detail texture -> Textures/detail.dds (override)
-        var navFiles = DirtyNavFiles();                 // painted AI navmaps -> into the patch
-        extras.AddRange(navFiles);
+        var navFiles = DirtyNavFiles();                 // painted AI navmaps -> into the patch (UPSERT, see DoSaveCore)
         var (wxFiles, wxInit) = WeatherRfaPieces(baseRfa);   // weather: new Effects files + Init run-include
         if (wxInit is { } we) extras.Add(we);
+        foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
@@ -4009,9 +4013,9 @@ void DoRepackBaseInPlace()
         var extras = new List<(string Name, byte[] Bytes)>(sndScripts);
         extras.AddRange(PaintedTileBytes());
         if (DetailDdsBytes() is { } detd) extras.Add(detd);
-        extras.AddRange(DirtyNavFiles());
         var (wxFiles, wxInit) = WeatherRfaPieces(levelDir);
         if (wxInit is { } we) extras.Add(we);
+        foreach (var (name, bytes) in DirtyNavFiles()) wxFiles.Add(($"Pathfinding/{name}", bytes));   // UPSERT, see DoSaveCore
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));
         var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
         var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(levelDir);
@@ -4124,12 +4128,13 @@ void DoGenerateNavmaps()
     if (kept > 0) parts.Add($"{kept} left as shipped");
     string what = string.Join(", ", parts);
 
-    // Packed .rfa: write the navmaps INTO the archive (override the base entries the engine loads), exactly like
-    // Ctrl+S. extraFiles silently drops names the base doesn't ship, so a map without Pathfinding/ entries needs
-    // a folder save -- report that honestly instead of claiming success.
+    // Packed .rfa: write the navmaps INTO the archive, exactly like Ctrl+S. UPSERT rather than override-only -
+    // a level that ships no Pathfinding/ folder (Interstate's Akina_Mountain has none) matched nothing and lost
+    // every map silently; the entries are now ADDED under the level's archive prefix, which is what the engine reads.
     if (levelDir is not null && LevelArchive.IsRfa(levelDir))
     {
-        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, null, null, null, null, extraFiles: files);
+        var newNav = files.Select(f => ($"Pathfinding/{f.Name}", f.Bytes)).ToList();
+        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, null, null, null, null, newEntries: newNav);
         int navOk = files.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase)));
         if (navOk > 0)
         {
@@ -4140,8 +4145,8 @@ void DoGenerateNavmaps()
         }
         else
         {
-            Console.WriteLine("   (AI navmaps NOT saved: this .rfa ships no Pathfinding/ entries to override -- save to a folder level).");
-            Toast(Loc.T("AI navmaps NOT saved: this .rfa has no Pathfinding entries. Extract to a folder level and save there."));
+            Console.WriteLine("   AI navmaps FAILED to write into the archive.");
+            Toast(Loc.T("AI navmaps failed to save - see Log / Errors.")); showLog = true;
         }
         return;
     }

@@ -22,7 +22,7 @@
  "AI Path": "AI パス",
  "AI Pathmap Preview": "AI パスマップ プレビュー",
  "AI Pathmapping": "AI パスマップ",
- "AI navmaps NOT saved: this .rfa has no Pathfinding entries. Extract to a folder level and save there.": "AI ナビマップは保存されませんでした。この .rfa に Pathfinding エントリがありません。フォルダーに展開してから保存してください。",
+ "AI navmaps failed to save - see Log / Errors.": "AI ナビマップの保存に失敗しました。ログ / エラーを確認してください。",
  "AIPath": "AI パス",
  "ANIMATED CLOUDS (Refractor Cloud system)": "アニメーション雲（Refractor Cloud システム）",
  "Adds Axis + Allies + neutral flags with spawn points.": "枢軸軍・連合軍・中立の旗とスポーン地点を追加します。",

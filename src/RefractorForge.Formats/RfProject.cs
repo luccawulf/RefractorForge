@@ -115,11 +115,20 @@ public sealed class RfProject
         var mesh = new List<string>();
         var tex = new List<string>();
 
-        // Custom mode: the explicitly listed archives come FIRST (highest precedence - the libraries are first-wins).
+        // The MAP'S OWN archive first. A level can carry objects and textures that exist in no mod - Interstate's
+        // Akina_Mountain ships 37 custom vehicles inside its .rfa - and extracting the level to a project folder
+        // leaves those as loose files the mesh/texture libraries (which read .rfa) never see. Opening the same map
+        // via Open Mod worked precisely because the level archive WAS in that list, which is why map-side objects
+        // appeared there and not in a project. First = highest precedence: a map's own asset overrides the mod's,
+        // exactly as the engine resolves it.
+        mesh.AddRange(LevelArchives.Where(File.Exists));
+        tex.AddRange(LevelArchives.Where(File.Exists));
+
+        // Custom mode: the explicitly listed archives come next (the libraries are first-wins).
         if (Mode == RfMode.Custom)
         {
-            mesh.AddRange(MeshArchives.Where(File.Exists));
-            tex.AddRange(TextureArchives.Where(File.Exists));
+            foreach (var p in MeshArchives.Where(File.Exists)) if (!mesh.Contains(p, StringComparer.OrdinalIgnoreCase)) mesh.Add(p);
+            foreach (var p in TextureArchives.Where(File.Exists)) if (!tex.Contains(p, StringComparer.OrdinalIgnoreCase)) tex.Add(p);
         }
 
         // TARGET MOD (both modes): append the mod's full resolved mount chain - the mod, its dependencies
