@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
@@ -250,13 +250,16 @@ public sealed class MeshLibrary
         var lib = new MeshLibrary();
         foreach (var path in archivePaths)
         {
-            if (!File.Exists(path)) continue;
+            // A DIRECTORY is a valid source: an extracted level keeps its own objects as loose files, and reading
+            // them through the same entry API is what makes a map's custom content visible in a project.
+            bool isDir = Directory.Exists(path);
+            if (!isDir && !File.Exists(path)) continue;
             if (Path.GetFileName(path).StartsWith("~")) continue;   // ~$… temp/lock leftovers (e.g. a stray ~$andardMesh.rfa)
             RefractorFlatArchive arc;
             // A corrupt / partial / non-RFA file must NOT crash the whole editor (it's loaded straight-line, outside
             // the level-load try/catch) — skip it and keep going.
-            try { arc = new RefractorFlatArchive(path); }
-            catch (Exception ex) { System.Console.WriteLine($"MeshLibrary: skipping unreadable archive '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
+            try { arc = isDir ? RefractorFlatArchive.FromFolder(path) : new RefractorFlatArchive(path); }
+            catch (Exception ex) { System.Console.WriteLine($"MeshLibrary: skipping unreadable source '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
             lib._archives.Add(arc);
             foreach (var e in arc.Entries)
             {
@@ -400,13 +403,19 @@ public sealed class MeshLibrary
         // walk below reads the FILE name as the object and gives up. File them under one obvious heading instead.
         // Assignment, not TryAdd: a map that ships its own version of an object overrides the mod's in-game, and the
         // level archives are indexed last, so the map's label should win here too.
-        if (IsLevelLocalObjectPath(entryName.Replace('\\', '/')))
+        if (IsLevelLocalObjectPath(entryName.Replace((char)92, '/')))
         {
-            string local = segs[oi + 1];
-            if (local.Length > 0 && !local.Contains('.') && !_genericFolders.Contains(local))
+            // The template is the folder the file SITS IN, walking back past generic holders - NOT the first folder
+            // under objects/. Levels nest to whatever depth they like: Akina keeps objects/AE86/Objects.con while
+            // DC Basrah Nights keeps Objects/Buildings/Common/BN-clouds1_m1/objects.con, and reading the first
+            // segment there would file a category name ("Buildings") as though it were an object.
+            for (int i = segs.Length - 2; i > oi; i--)
             {
+                var local = segs[i];
+                if (local.Length == 0 || local.Contains('.') || _genericFolders.Contains(local)) continue;
                 var lk = StemName(local).ToLowerInvariant();
                 if (lk.Length > 0) _categoryOf[lk] = MapObjectsCategory;
+                break;
             }
             return;
         }

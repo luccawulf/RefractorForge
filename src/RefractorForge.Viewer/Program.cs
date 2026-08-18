@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using RefractorForge.Formats.Con;
@@ -843,10 +843,16 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
     if (discovered.Count > 0)
         Console.WriteLine($"Auto-discovered {discovered.Count} archive(s) from the level's mod + dependency chain.");
 
+    // A FOLDER level goes in too. An extracted map keeps its own objects as loose files, so a project that has no
+    // level .rfa to point at (anything opened via Open Level Folder, or extracted by hand) would otherwise show none
+    // of the map's custom content - the exact difference between opening DC Final's Basrah Nights by mod and by
+    // folder. MeshLibrary reads a directory through RefractorFlatArchive.FromFolder.
+    var levelFolder = levelDir is not null && Directory.Exists(levelDir) ? new[] { levelDir } : Array.Empty<string>();
     var meshA = WithMeshSiblings(meshArchives
             .Where(a => !Path.GetFileName(a).StartsWith("texture", StringComparison.OrdinalIgnoreCase)))
         .Concat(discovered.Where(a => !IsTexArc(a) && !IsNonMeshArc(a)))   // base mesh/object archives (aiMeshes, treeMesh, _001, ...)
         .Concat(rfaList.Where(File.Exists))
+        .Concat(levelFolder)
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToArray();
     if (meshA.Length > 0)
@@ -871,6 +877,7 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
         // earlier session reverted this fearing it broke tree leaves — but the bald trees were a separate .tm cutout bug,
         // now fixed in MeshFromTreeMesh/GlTextureFor, so level-first is safe AND engine-correct.)
         var texArchives = rfaList.Where(File.Exists)
+            .Concat(levelFolder)                  // an extracted level's own textures (see meshA above)
             .Concat(texPicks.Where(File.Exists))
             .Concat(texDirs.SelectMany(d => Directory.EnumerateFiles(d, "texture*.rfa", SearchOption.TopDirectoryOnly)))
             .Concat(discovered.Where(IsTexArc))   // texture*.rfa auto-discovered from the level's mod-chain Archives folders

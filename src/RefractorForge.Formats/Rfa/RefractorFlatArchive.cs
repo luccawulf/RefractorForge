@@ -45,6 +45,7 @@ public sealed class RefractorFlatArchive
     // ── State ────────────────────────────────────────────────────────────────
 
     private readonly string? _path;   // set when constructed via Open(string)
+    private readonly Dictionary<string, string>? _looseFiles;   // folder-backed: entry name -> file on disk
 
     public IReadOnlyList<RefractorFlatArchiveEntry> Entries { get; }
 
@@ -68,6 +69,47 @@ public sealed class RefractorFlatArchive
         IsCompressed = isCompressed;
         IsV11Format = isV11;
         XPackId = xpackId;
+    }
+
+    /// <summary>Present a DIRECTORY of loose files as if it were an archive, so everything that reads archives can
+    /// read an EXTRACTED level too.
+    ///
+    /// A level extracted into a project folder keeps its own objects and textures as ordinary files, while the mesh
+    /// and texture libraries only ever spoke .rfa - which is why a map's custom content showed up when the map was
+    /// opened through its mod (the archive was in the list) and vanished once extracted. Wrapping the folder here
+    /// means every lookup, category rule and assembly walker stays exactly as it was.
+    ///
+    /// Entry names get the <c>levels/&lt;folder&gt;/</c> prefix a real level archive carries, because the object
+    /// indexers read that shape to tell a level's OWN objects from a mod's. Reads are lazy - only names are walked.
+    /// </summary>
+    public static RefractorFlatArchive FromFolder(string dir)
+    {
+        var root = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string prefix = "levels/" + Path.GetFileName(root) + "/";
+        var entries = new List<RefractorFlatArchiveEntry>();
+        var loose = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        {
+            string rel = Path.GetRelativePath(root, file).Replace((char)92, '/');
+            if (Path.GetFileName(rel).StartsWith("~")) continue;
+            long len;
+            try { len = new FileInfo(file).Length; } catch { continue; }
+            if (len > int.MaxValue) continue;
+            var name = prefix + rel;
+            if (loose.ContainsKey(name)) continue;
+            loose[name] = file;
+            entries.Add(new RefractorFlatArchiveEntry(name, (int)len, (int)len, 0));
+        }
+        return new RefractorFlatArchive(entries, loose);
+    }
+
+    private RefractorFlatArchive(List<RefractorFlatArchiveEntry> entries, Dictionary<string, string> loose)
+    {
+        Entries = entries;
+        _looseFiles = loose;
+        IsCompressed = false;
+        IsV11Format = false;
+        XPackId = XPackId.Default;
     }
 
     // ── Shared header + TOC reader ────────────────────────────────────────────
@@ -123,6 +165,9 @@ public sealed class RefractorFlatArchive
     /// <summary>Decompress an entry to its full uncompressed bytes.</summary>
     public byte[] Read(RefractorFlatArchiveEntry e)
     {
+        // Folder-backed (see FromFolder): the "entry" is a file on disk - no block table to decode.
+        if (_looseFiles is not null)
+            return _looseFiles.TryGetValue(e.Name, out var f) ? File.ReadAllBytes(f) : Array.Empty<byte>();
         return DecodeRegion(ReadRegionFromFile(e), e.UncompressedSize, e.Name);
     }
 

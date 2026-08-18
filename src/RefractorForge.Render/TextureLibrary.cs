@@ -1,4 +1,4 @@
-﻿using RefractorForge.Formats.Rfa;
+using RefractorForge.Formats.Rfa;
 
 namespace RefractorForge.Render;
 
@@ -24,11 +24,12 @@ public sealed class TextureLibrary
         var lib = new TextureLibrary();
         foreach (var path in archivePaths)
         {
-            if (!File.Exists(path)) continue;
+            bool isDir = Directory.Exists(path);   // an extracted level's loose textures (see RefractorFlatArchive.FromFolder)
+            if (!isDir && !File.Exists(path)) continue;
             if (Path.GetFileName(path).StartsWith("~")) continue;   // ~$… temp/lock leftovers
             RefractorFlatArchive arc;
-            try { arc = new RefractorFlatArchive(path); }
-            catch (Exception ex) { System.Console.WriteLine($"TextureLibrary: skipping unreadable archive '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
+            try { arc = isDir ? RefractorFlatArchive.FromFolder(path) : new RefractorFlatArchive(path); }
+            catch (Exception ex) { System.Console.WriteLine($"TextureLibrary: skipping unreadable source '{Path.GetFileName(path)}' ({ex.GetType().Name})"); continue; }
             lib._archives.Add(arc);
             foreach (var e in arc.Entries)
             {
