@@ -44,7 +44,7 @@ Explorer. Typing just `build.bat` fails in PowerShell.
 **Or make a reusable `.exe`:** double-click **`build.bat`** once, then **`run.bat`** to launch.
 `build.bat` prints where the `.exe` landed:
 ```
-...\src\RefractorForge.Viewer\bin\Release\net8.0-windows\publish\RefractorForge.exe
+...\src\RefractorForge.Viewer\bin\Release\net10.0-windows\publish\RefractorForge.exe
 ```
 
 Either way, the **first launch pops a few dialogs**:

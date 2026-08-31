@@ -21,7 +21,7 @@ Set-Location $repo
 
 $proj    = "src\RefractorForge.Viewer"
 $pubDir  = Join-Path $repo "$proj\bin\Publish\Beta"
-$devDir  = Join-Path $repo "$proj\bin\Release\net8.0-windows"
+$devDir  = Join-Path $repo "$proj\bin\Release\net10.0-windows"
 $distDir = Join-Path $repo "dist"
 $stage   = Join-Path $distDir "RefractorForge-$Version"
 

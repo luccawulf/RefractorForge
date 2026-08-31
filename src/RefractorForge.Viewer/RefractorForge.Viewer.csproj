@@ -12,7 +12,7 @@
     <ApplicationIcon>Assets\RefractorForge.ico</ApplicationIcon>
     <!-- net8.0-windows + WinForms is used ONLY for the native folder/file picker dialogs; the 3D
          window is still Silk.NET/OpenGL. -->
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
