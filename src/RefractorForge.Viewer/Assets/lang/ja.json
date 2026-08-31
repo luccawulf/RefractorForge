@@ -3,7 +3,7 @@
  "   (objects + terrain + material + gameplay/vehicles)": "   （オブジェクト + 地形 + マテリアル + ゲームプレイ / ビークル）",
  "   .lsb: flip X (if shadows are mirrored L/R)": "   .lsb: X 反転（影が左右逆の場合）",
  "   .lsb: flip Y (if mirrored top/bottom)": "   .lsb: Y 反転（上下逆の場合）",
- "   RefractorForge.Viewer.exe --relay 7777 [levelFolder]": "   RefractorForge.Viewer.exe --relay 7777 [levelFolder]",
+ "   RefractorForge.exe --relay 7777 [levelFolder]": "   RefractorForge.Viewer.exe --relay 7777 [levelFolder]",
  "   add  --pass secret  to require a password; admin: list | kick <name> | quit": "   --pass secret でパスワード必須に。管理: list | kick <名前> | quit",
  "   add  --save serverState  to persist EVERYTHING across restarts": "   --save serverState で再起動後も全状態を保持",
  "   or both run a VPN (Tailscale / ZeroTier / Hamachi) and use its IP - no router setup.": "   または両者が VPN（Tailscale / ZeroTier / Hamachi）を使えばルーター設定は不要です。",

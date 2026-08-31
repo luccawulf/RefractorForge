@@ -13,7 +13,7 @@ This guide is also available inside the editor: **Help ▸ User Guide / Controls
 
 ## 1. Getting started
 
-1. Launch `RefractorForge.Viewer.exe`.
+1. Launch `RefractorForge.exe`.
 2. **File ▸ Open Level / .rfa…** — pick either an *unpacked* level folder or one or more `.rfa`
    archives (base + patches). For a modded map, use **File ▸ Open Mod…** and pick the mod folder; the
    editor mounts the mod's archives plus its dependency chain.

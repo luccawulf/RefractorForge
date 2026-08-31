@@ -4,6 +4,10 @@
     <!-- WinExe = no background CMD window on launch (the GUI subsystem). Diagnostics now live in the in-app
          Log/Errors box (ConsoleLog); the headless relay mode re-attaches the parent terminal's console. -->
     <OutputType>WinExe</OutputType>
+    <!-- The program is called RefractorForge; ".Viewer" is the project name, not the product. Only the
+         ASSEMBLY name changes here - RootNamespace still defaults to the project name, so the
+         RefractorForge.Viewer namespace and every using of it are untouched. -->
+    <AssemblyName>RefractorForge</AssemblyName>
     <!-- App/taskbar icon (Win32 resource). Regenerate from code with Assets\make_icon.ps1. -->
     <ApplicationIcon>Assets\RefractorForge.ico</ApplicationIcon>
     <!-- net8.0-windows + WinForms is used ONLY for the native folder/file picker dialogs; the 3D

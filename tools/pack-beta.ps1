@@ -95,7 +95,7 @@ if ($missing.Count -gt 0) {
     $missing | Select-Object -First 20 | ForEach-Object { Write-Host "   $_" }
     throw "package is incomplete"
 }
-if (-not (Test-Path (Join-Path $stage "RefractorForge.Viewer.exe"))) { throw "no exe in package" }
+if (-not (Test-Path (Join-Path $stage "RefractorForge.exe"))) { throw "no exe in package" }
 # Runtime-loaded assets the editor resolves by exact relative path. The build-output comparison above cannot see
 # these (ffmpeg's binaries are not in the repo, only its notice), so assert them explicitly.
 foreach ($must in @("textures\surf00.bmp", "brushes\Round.bmp", "lang\ja.json", "refractorforgesplash.png",

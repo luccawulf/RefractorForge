@@ -9148,7 +9148,7 @@ void CollabModal()
     ImGui.Separator();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Central server (no host clobbering)"));
     ImGui.TextDisabled(Loc.T("Run an always-on relay everyone Joins (nobody 'hosts'):"));
-    ImGui.TextDisabled(Loc.T("   RefractorForge.Viewer.exe --relay 7777 [levelFolder]"));
+    ImGui.TextDisabled(Loc.T("   RefractorForge.exe --relay 7777 [levelFolder]"));
     ImGui.TextDisabled(Loc.T("   add  --save serverState  to persist EVERYTHING across restarts"));
     ImGui.TextDisabled(Loc.T("   (objects + terrain + material + gameplay/vehicles)"));
     ImGui.TextDisabled(Loc.T("   add  --pass secret  to require a password; admin: list | kick <name> | quit"));

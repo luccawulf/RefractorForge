@@ -1,6 +1,6 @@
 # RefractorForge — How to Build & Run the Native Editor
 
-One native Windows program (`RefractorForge.Viewer.exe`) that renders on your GPU. It is
+One native Windows program (`RefractorForge.exe`) that renders on your GPU. It is
 **framework-dependent** (the .NET runtime is not baked into the `.exe`).
 
 On first launch it **asks you to pick the level folder and the two `.rfa` files through normal Windows
@@ -44,7 +44,7 @@ Explorer. Typing just `build.bat` fails in PowerShell.
 **Or make a reusable `.exe`:** double-click **`build.bat`** once, then **`run.bat`** to launch.
 `build.bat` prints where the `.exe` landed:
 ```
-...\src\RefractorForge.Viewer\bin\Release\net8.0-windows\publish\RefractorForge.Viewer.exe
+...\src\RefractorForge.Viewer\bin\Release\net8.0-windows\publish\RefractorForge.exe
 ```
 
 Either way, the **first launch pops a few dialogs**:

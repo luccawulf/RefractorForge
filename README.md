@@ -15,7 +15,7 @@ lighting), and lets you edit it the way Battlecraft does — but without Battlec
 struct; they don't exist in the map *files*, which are plain-text `.con` plus raw heightmaps). A tool
 that works directly on those files inherits none of those limits.
 
-It ships as a single self-contained `RefractorForge.Viewer.exe` and reads the game's own assets at
+It ships as a single self-contained `RefractorForge.exe` and reads the game's own assets at
 runtime, with a dark, Battlecraft-style Dear ImGui interface.
 
 ## Features
