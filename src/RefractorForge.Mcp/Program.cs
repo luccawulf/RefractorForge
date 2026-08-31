@@ -126,14 +126,17 @@ internal static class Program
                    ("y", "number", "World Y (metres); omit to snap to terrain", false),
                    ("yaw", "number", "Yaw degrees (default 0)", false),
                    ("pitch", "number", "Pitch degrees (default 0)", false),
-                   ("roll", "number", "Roll degrees (default 0)", false)),
+                   ("roll", "number", "Roll degrees (default 0)", false),
+                   ("avoidOverlap", "boolean", "Refuse if it would sit inside something already there, judged by the templates' real mesh footprints (default true)", false),
+                   ("clearance", "number", "Extra metres to keep clear of other footprints (default 0)", false)),
             a =>
             {
                 var s2 = Need(); string t = S(a, "template");
                 if (t.Length == 0) throw new ArgumentException("template is required");
                 float x = F(a, "x"), z = F(a, "z");
                 float? y = Has(a, "y") ? F(a, "y") : null;
-                string id = s2.PlaceObject(t, x, z, y, new Vec3(F(a, "yaw"), F(a, "pitch"), F(a, "roll")));
+                string id = s2.PlaceObject(t, x, z, y, new Vec3(F(a, "yaw"), F(a, "pitch"), F(a, "roll")),
+                                           B(a, "avoidOverlap", true), F(a, "clearance", 0f));
                 return $"placed {t} as {id} at {x:0.#}/{(y ?? s2.HeightAt(x, z)):0.#}/{z:0.#}";
             }));
 
@@ -152,6 +155,23 @@ internal static class Program
         s.Add(new McpTool("delete_object", "Delete an object by id.",
             Schema(("id", "string", "Object id", true)),
             a => { var s2 = Need(); string id = S(a, "id"); return s2.Delete(id) ? $"deleted {id}" : $"no object '{id}'"; }));
+
+        s.Add(new McpTool("find_overlaps",
+            "List placed objects whose footprints intersect - a house inside a house, a crate inside a wall. Footprints come from each template's real mesh, so a hut and a hangar are judged by their actual sizes rather than one shared guess. Worst first. Use it to check work after placing, then delete_object or move_object to fix what it finds.",
+            Schema(("clearance", "number", "Also count pairs within this many extra metres (default 0)", false),
+                   ("max", "number", "How many pairs to return (default 25)", false)),
+            a =>
+            {
+                var s2 = Need();
+                var hits = s2.FindOverlaps(F(a, "clearance", 0f), Math.Clamp(I(a, "max", 25), 1, 200));
+                if (hits.Count == 0) return "no overlapping objects";
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"{hits.Count} overlapping pair(s), deepest first:");
+                foreach (var (x, y, d) in hits)
+                    sb.AppendLine($"  {d,5:0.#} m in:  {x.Template} ({x.Id}) {x.Position.X:0}/{x.Position.Z:0}"
+                                  + $"   <->   {y.Template} ({y.Id}) {y.Position.X:0}/{y.Position.Z:0}");
+                return sb.ToString();
+            }));
 
         s.Add(new McpTool("scatter",
             "Randomly scatter objects across the whole map, constrained to a slope band, above water, and min-spaced. Returns how many landed.",
@@ -173,7 +193,7 @@ internal static class Program
                 int count = I(a, "count", 0);
                 int placed = s2.Scatter(t, count, F(a, "minSlope", 0f), F(a, "maxSlope", 30f),
                     B(a, "avoidWater", true), F(a, "waterClearance", 0.5f), F(a, "spacing", 8f),
-                    I(a, "seed", 1), F(a, "edgeMargin", 0f), F(a, "minScale", 1f), F(a, "maxScale", 1f));
+                    I(a, "seed", 1), F(a, "edgeMargin", 0f), F(a, "minScale", 1f), F(a, "maxScale", 1f), B(a, "avoidOverlap", true), F(a, "clearance", 0f));
                 return $"scattered {placed}/{count} objects (the rest were rejected by water/slope/spacing)";
             }));
 
@@ -202,7 +222,7 @@ internal static class Program
                 var layout = s2.GenerateCity(F(a, "minX"), F(a, "minZ"), F(a, "maxX"), F(a, "maxZ"), palette,
                     I(a, "seed", 1), F(a, "blockSize", 64f), F(a, "roadWidth", 8f), F(a, "setback", 4f),
                     F(a, "lotWidth", 16f), F(a, "spacing", 10f), F(a, "maxSlope", 18f),
-                    B(a, "avoidWater", true), F(a, "waterClearance", 0.5f), F(a, "minScale", 1f), F(a, "maxScale", 1f));
+                    B(a, "avoidWater", true), F(a, "waterClearance", 0.5f), F(a, "minScale", 1f), F(a, "maxScale", 1f), B(a, "avoidOverlap", true), F(a, "clearance", 0f));
                 return $"built city: {layout.Buildings.Count} buildings on a {layout.BlocksX}x{layout.BlocksZ} block grid " +
                        $"({layout.Roads.Count} streets) from {palette.Count} templates. Streets are generated as data; road texturing is a follow-up.";
             }));

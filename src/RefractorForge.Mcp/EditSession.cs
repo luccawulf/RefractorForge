@@ -36,6 +36,7 @@ public sealed class EditSession
     private LiveBridge? _live;
     private MeshLibrary? _catalog;
     private bool _catalogTried;
+    private readonly Dictionary<string, float> _footprint = new(StringComparer.OrdinalIgnoreCase);
 
     // Only write back what actually changed (a city edit shouldn't rewrite the heightmap or gameplay).
     public bool ObjectsDirty { get; private set; }
@@ -93,9 +94,13 @@ public sealed class EditSession
 
     // ---- Object edits (all reversible via the shared history) ----
 
-    public string PlaceObject(string template, float x, float z, float? y, Vec3 rot)
+    public string PlaceObject(string template, float x, float z, float? y, Vec3 rot, bool avoidOverlap = false, float clearance = 0f)
     {
         float yy = y ?? HeightAt(x, z);
+        if (avoidOverlap && WouldOverlap(template, new Vec3(x, yy, z), clearance))
+            throw new InvalidOperationException(
+                $"{template} at {x:0}/{z:0} would sit inside something already there " +
+                $"(its footprint is {FootprintRadius(template):0.#} m). Move it, or pass avoidOverlap false.");
         if (_live is not null) return _live.Add(template, new Vec3(x, yy, z), rot);
         string id = $"mcp-{++_addCounter}";
         _history.Do(new AddObject(id, template, new Vec3(x, yy, z), rot));
@@ -117,10 +122,12 @@ public sealed class EditSession
     /// <summary>Random scatter over the whole map (vegetation, props…). Area-targeted density is what
     /// <see cref="GenerateCity"/> is for; an area-bounded scatter overload can follow if needed.</summary>
     public int Scatter(IReadOnlyList<string> templates, int count, float minSlope, float maxSlope,
-        bool avoidWater, float waterClearance, float spacing, int seed, float edgeMargin, float minScale, float maxScale)
+        bool avoidWater, float waterClearance, float spacing, int seed, float edgeMargin, float minScale, float maxScale,
+        bool avoidOverlap = true, float clearance = 0f)
     {
         var placed = ObjectScatter.Scatter(templates, Cfg, HeightAt, count, minSlope, maxSlope,
             avoidWater, waterClearance, spacing, seed, edgeMargin, minScale, maxScale);
+        if (avoidOverlap) placed = FilterOverlaps(placed, clearance); else LastSkippedOverlaps = 0;
         ApplyBatch(placed);
         return placed.Count;
     }
@@ -129,10 +136,18 @@ public sealed class EditSession
     /// applied as objects, plus the street centerlines the Render layer can later texture).</summary>
     public CityLayout GenerateCity(float minX, float minZ, float maxX, float maxZ,
         IReadOnlyList<string> palette, int seed, float blockSize, float roadWidth, float setback,
-        float lotWidth, float spacing, float maxSlope, bool avoidWater, float waterClearance, float minScale, float maxScale)
+        float lotWidth, float spacing, float maxSlope, bool avoidWater, float waterClearance, float minScale, float maxScale,
+        bool avoidOverlap = true, float clearance = 0f)
     {
         var layout = CityGenerator.Generate(minX, minZ, maxX, maxZ, Cfg, HeightAt, palette, seed,
             blockSize, roadWidth, setback, lotWidth, spacing, maxSlope, avoidWater, waterClearance, minScale, maxScale);
+        if (avoidOverlap)
+        {
+            var kept = FilterOverlaps(layout.Buildings, clearance);
+            layout.Buildings.Clear();
+            layout.Buildings.AddRange(kept);
+        }
+        else LastSkippedOverlaps = 0;
         ApplyBatch(layout.Buildings);
         return layout;
     }
@@ -141,6 +156,24 @@ public sealed class EditSession
     /// them individually meant "undo" walked back a building at a time - the user asked for a city, so a city is the
     /// unit they get to take back. <see cref="CompositeCommand"/> already applies and reverses in the right order,
     /// and collab sees a single grouped op rather than a storm of them.</summary>
+    /// <summary>How many placements the last scatter/city dropped because they would have overlapped.</summary>
+    public int LastSkippedOverlaps { get; private set; }
+
+    /// <summary>Drop placements that would land inside something already placed, or inside each other.</summary>
+    private List<ScatterPlacement> FilterOverlaps(IReadOnlyList<ScatterPlacement> placements, float clearance)
+    {
+        var kept = new List<ScatterPlacement>(placements.Count);
+        var pending = new List<(Vec3 Pos, float R)>(placements.Count);
+        foreach (var p in placements)
+        {
+            if (WouldOverlap(p.Template, p.Position, clearance, pending)) continue;
+            kept.Add(p);
+            pending.Add((p.Position, FootprintRadius(p.Template)));
+        }
+        LastSkippedOverlaps = placements.Count - kept.Count;
+        return kept;
+    }
+
     private void ApplyBatch(IReadOnlyList<ScatterPlacement> placements)
     {
         if (placements.Count == 0) return;
@@ -204,6 +237,71 @@ public sealed class EditSession
             catch { _catalog = null; }
             return _catalog;
         }
+    }
+
+    /// <summary>How much ground a template occupies, as an XZ radius in metres, measured from its actual mesh.
+    /// Placement without this is what puts a house inside another house: a grid spacing that suits a hut is far too
+    /// tight for a hangar, and nothing in the level tells you which is which. Unknown templates (no resolvable mesh)
+    /// get a small default rather than zero, so they still keep some distance.</summary>
+    public float FootprintRadius(string template)
+    {
+        if (_footprint.TryGetValue(template, out var r)) return r;
+        r = 3f;
+        try
+        {
+            if (Catalog is { } lib && lib.TryGetRenderMesh(template, out var mesh) && mesh.Positions.Length > 0)
+            {
+                float minX = float.MaxValue, maxX = float.MinValue, minZ = float.MaxValue, maxZ = float.MinValue;
+                foreach (var p in mesh.Positions)
+                {
+                    if (p.X < minX) minX = p.X; if (p.X > maxX) maxX = p.X;
+                    if (p.Z < minZ) minZ = p.Z; if (p.Z > maxZ) maxZ = p.Z;
+                }
+                // Half the larger horizontal extent: a circle that covers the footprint whatever its yaw.
+                r = MathF.Max(MathF.Max(maxX - minX, maxZ - minZ) * 0.5f, 0.5f);
+            }
+        }
+        catch { }
+        _footprint[template] = r;
+        return r;
+    }
+
+    /// <summary>Would an object of this template at this spot sit inside something already there?</summary>
+    public bool WouldOverlap(string template, Vec3 pos, float clearance = 0f,
+                             IReadOnlyList<(Vec3 Pos, float R)>? alsoAvoid = null)
+    {
+        float r = FootprintRadius(template) + clearance;
+        foreach (var o in So.Objects)
+        {
+            float rr = r + FootprintRadius(o.Template);
+            float dx = o.Position.X - pos.X, dz = o.Position.Z - pos.Z;
+            if (dx * dx + dz * dz < rr * rr) return true;
+        }
+        if (alsoAvoid is not null)
+            foreach (var (p, orr) in alsoAvoid)
+            {
+                float rr = r + orr;
+                float dx = p.X - pos.X, dz = p.Z - pos.Z;
+                if (dx * dx + dz * dz < rr * rr) return true;
+            }
+        return false;
+    }
+
+    /// <summary>Pairs of placed objects whose footprints intersect — what is already wrong, rather than what would
+    /// be. Ordered worst-first by how deeply they interpenetrate.</summary>
+    public List<(StaticObject A, StaticObject B, float Overlap)> FindOverlaps(float clearance = 0f, int max = 50)
+    {
+        var objs = So.Objects;
+        var hits = new List<(StaticObject, StaticObject, float)>();
+        for (int i = 0; i < objs.Count; i++)
+            for (int j = i + 1; j < objs.Count; j++)
+            {
+                float rr = FootprintRadius(objs[i].Template) + FootprintRadius(objs[j].Template) + clearance;
+                float dx = objs[i].Position.X - objs[j].Position.X, dz = objs[i].Position.Z - objs[j].Position.Z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 < rr * rr) hits.Add((objs[i], objs[j], rr - MathF.Sqrt(d2)));
+            }
+        return hits.OrderByDescending(h => h.Item3).Take(max).ToList();
     }
 
     /// <summary>What the ground is doing at a world position.</summary>
