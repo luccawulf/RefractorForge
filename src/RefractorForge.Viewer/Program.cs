@@ -1339,7 +1339,7 @@ string? ffmpegPath = null;   // cached FFmpeg location ("" = looked, not found)
 
 // ---- editor UI state (Dear ImGui) ----
 ImGuiController imgui = null!;
-string[] toolNames = { "Select", "Move", "Rotate", "Scale", "Place", "Paint", "Sculpt", "Smooth", "AIPath", "Nudge" };
+string[] toolNames = { "Select", "Move", "Rotate", "Scale", "Place", "Paint", "Sculpt", "Smooth", "AIPath", "Nudge", "Point" };
 int tool = 1;                 // default: Move (within the Object mapper)
 // Top-level "mapper" mode (Battlecraft-style): drives the underlying tool + paint layer below, so every
 // existing input handler keeps working. 0 Terrain(sculpt+smooth) | 1 Material | 2 Object | 3 Surface | 4 Growth | 5 AI Path.
@@ -1468,6 +1468,16 @@ bool nudgeDrag = false;        // this drag came from the Nudge tool: keep the o
 // Battlecraft splits move and rotate into per-axis buttons: -1 = the free gizmo this editor already had, else 0/1/2
 // for world X / Y / Z. With an axis picked you just grab the object anywhere - no need to hit a thin gizmo handle.
 int axisLock = -1;
+// Point tool (Battlecraft's point manipulation): edit ONE heightmap vertex at a time instead of a brush footprint.
+// The selection is a grid index rather than a world position, because a vertex IS the grid - rounding to it is the
+// difference between "about here" and the actual data the game reads.
+int vertGx = -1, vertGz = -1;          // selected vertex, -1 = none
+bool vertDragging = false;             // dragging the selected vertex up/down
+float vertDragStartM = 0f;             // its height when the drag began, metres
+float vertDragStartMouseY = 0f;        // screen Y at grab time; vertical mouse travel drives the height
+int vertSmoothRadius = 2;              // cells blended around a moved vertex, so it leaves a slope not a spike
+float vertNudgeStep = 0.5f;            // metres per PageUp/PageDown press
+float vertHeightField = 0f;            // Inspector: type an exact height for the selected vertex
 int rotAxisDrag = -1; float rotAxisStartY = 0f;   // vertical-drag rotation about the locked axis
 HashSet<int> lockedIdxScratch = new();   // reused per frame; top-level locals cannot be readonly
 // rotate-gizmo drag state
@@ -1718,6 +1728,20 @@ void OnLoad()
                 }
                 return;
             }
+            // Dragging a vertex: vertical mouse travel is height. Screen-space rather than a ground raycast,
+            // because the point being dragged moves out from under the cursor as it rises.
+            if (vertDragging && stroke is not null && heightmap is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            {
+                float perPixel = 0.08f;                                  // metres per pixel of drag
+                if (kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight))) perPixel *= 0.2f;
+                float target = vertDragStartM + (vertDragStartMouseY - pos.Y) * perPixel;
+                stroke.SetVertex(vertGx, vertGz, target);
+                if (vertSmoothRadius > 0) stroke.SmoothAround(vertGx, vertGz, vertSmoothRadius);
+                vertHeightField = target;
+                terrainDirty = true;
+                return;
+            }
+
             // Active terrain stroke: keep stamping the brush under the cursor as it drags.
             if (stroke is not null && terrainPick is not null
                 && (mouse!.IsButtonPressed(MouseButton.Left) || (activeStrokeDir < 0 && mouse!.IsButtonPressed(MouseButton.Right))))
@@ -1823,6 +1847,7 @@ void OnLoad()
             // Finish a terrain stroke: coalesce into one edit and push it onto the shared undo stack.
             if (stroke is not null)
             {
+                vertDragging = false;
                 var edit = stroke.Finish(); stroke = null; activeStrokeDir = 0;
                 if (edit is not null && heightmap is not null)
                 {
@@ -2026,6 +2051,24 @@ void OnLoad()
             }
 
             // Terrain sculpt tools: begin a stroke and lay the first dab under the cursor.
+            // POINT tool: select the heightmap vertex nearest the cursor and start dragging its height. It uses
+            // the same `stroke` the brushes use, which is what gives it undo AND collab for free - the viewer
+            // broadcasts a finished stroke by rect, re-reading live heights, so a single vertex is just a 1x1 rect.
+            if (toolNames[tool] == "Point" && terrainEd is not null && terrainPick is not null && heightmap is not null
+                && terrainPick.Raycast(ray, out var vhit))
+            {
+                float vsp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+                vertGx = Math.Clamp((int)MathF.Round(vhit.X / vsp), 0, heightmap.Width - 1);
+                vertGz = Math.Clamp((int)MathF.Round(vhit.Z / vsp), 0, heightmap.Height - 1);
+                stroke = terrainEd.BeginStroke();
+                vertDragStartM = cfg.HeightToMeters(heightmap[vertGx, vertGz]);
+                vertHeightField = vertDragStartM;
+                vertDragStartMouseY = lastMouse.Y;
+                vertDragging = true;
+                activeStrokeDir = 0;
+                return;
+            }
+
             if ((toolNames[tool] == "Sculpt" || toolNames[tool] == "Smooth")
                 && terrainEd is not null && terrainPick is not null && terrainPick.Raycast(ray, out var thit))
             {
@@ -2800,6 +2843,14 @@ void OnKeyDown(IKeyboard k, Key key, int _)
                 if (dels.Count > 0) hist.Do(new CompositeCommand(dels));
                 multi.Clear(); selected = -1; SyncMarkers(); RebuildObjects(); UploadMarkers();
             }
+            break;
+        case Key.PageUp:
+            if (toolNames[tool] == "Point" && vertGx >= 0)
+            { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, vertNudgeStep)); vertHeightField += vertNudgeStep; }
+            break;
+        case Key.PageDown:
+            if (toolNames[tool] == "Point" && vertGx >= 0)
+            { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, -vertNudgeStep)); vertHeightField -= vertNudgeStep; }
             break;
         case Key.Z: DoUndo(); break;
         case Key.Y: DoRedo(); break;
@@ -10048,6 +10099,7 @@ void BuildUi()
     EditSolModal();
     HelpWindow();
     ValidateModal();
+    PointToolOverlay();
     LogWindow();
     TextureLibraryWindow();
     LayerToolWindow();
@@ -10158,6 +10210,113 @@ void LevelTreePanel()
     }
 
     ImGui.EndChild();
+}
+
+// Point tool: draw the heightmap lattice near the camera and highlight the selected vertex, plus a small panel
+// for typing an exact height. Only NEARBY vertices are projected - a 512^2 map is 262,144 of them and a 2048^2 map
+// is four million, so the near-field cull is what makes this usable rather than a slideshow.
+void PointToolOverlay()
+{
+    if (toolNames[tool] != "Point" || heightmap is null || terrainPick is null) return;
+    var fb = window.FramebufferSize;
+    var vp = cam.ViewProjection;
+    var dl = ImGui.GetBackgroundDrawList();
+    float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+
+    // Lattice around the camera, in grid cells. Kept small: this is a precision tool, used up close.
+    const float showRadius = 70f;
+    int cgx = Math.Clamp((int)MathF.Round(cam.Position.X / sp), 0, heightmap.Width - 1);
+    int cgz = Math.Clamp((int)MathF.Round(cam.Position.Z / sp), 0, heightmap.Height - 1);
+    int r = Math.Clamp((int)(showRadius / sp), 1, 40);
+
+    uint dot = ImGui.GetColorU32(new Vector4(0.55f, 0.75f, 1f, 0.55f));
+    for (int gz = Math.Max(0, cgz - r); gz <= Math.Min(heightmap.Height - 1, cgz + r); gz++)
+        for (int gx = Math.Max(0, cgx - r); gx <= Math.Min(heightmap.Width - 1, cgx + r); gx++)
+        {
+            if (gx == vertGx && gz == vertGz) continue;                 // the selection is drawn below, larger
+            var w = new Vector3(gx * sp, cfg.HeightToMeters(heightmap[gx, gz]), gz * sp);
+            if (Vector3.Distance(w, cam.Position) > showRadius) continue;
+            var scr = Gizmo.Project(w, vp, fb.X, fb.Y);
+            if (scr.X < 0 || scr.Y < 0 || scr.X > fb.X || scr.Y > fb.Y) continue;
+            dl.AddCircleFilled(scr, 2f, dot);
+        }
+
+    if (vertGx >= 0 && vertGz >= 0 && vertGx < heightmap.Width && vertGz < heightmap.Height)
+    {
+        float hm = cfg.HeightToMeters(heightmap[vertGx, vertGz]);
+        var w = new Vector3(vertGx * sp, hm, vertGz * sp);
+        var scr = Gizmo.Project(w, vp, fb.X, fb.Y);
+        uint sel = ImGui.GetColorU32(new Vector4(1f, 0.85f, 0.25f, 1f));
+        dl.AddCircleFilled(scr, 6f * uiScale, sel);
+        dl.AddCircle(scr, 9f * uiScale, ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.8f)), 0, 2f);
+        // The auto-smooth footprint, so its size is visible rather than guessed at.
+        if (vertSmoothRadius > 0)
+        {
+            var edge = Gizmo.Project(new Vector3(w.X + vertSmoothRadius * sp, hm, w.Z), vp, fb.X, fb.Y);
+            float rad = MathF.Abs(edge.X - scr.X);
+            if (rad > 2f && rad < fb.X)
+                dl.AddCircle(scr, rad, ImGui.GetColorU32(new Vector4(1f, 0.85f, 0.25f, 0.35f)), 0, 1.5f);
+        }
+    }
+
+    // A small panel: exact height, the auto-smooth radius, and level-to-neighbours.
+    ImGui.SetNextWindowPos(new Vector2(uiLeftW + 16f, uiMenuH + uiToolH + 16f), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSize(new Vector2(300f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Point"), ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        if (vertGx < 0)
+            ImGui.TextDisabled(Loc.T("Click a vertex to select it, then drag up or down."));
+        else
+        {
+            ImGui.Text($"{Loc.T("Vertex")} {vertGx}, {vertGz}   ({vertGx * sp:0} / {vertGz * sp:0} m)");
+            ImGui.SetNextItemWidth(120f * uiScale);
+            if (ImGui.InputFloat(Loc.TL("Height (m)"), ref vertHeightField, 0.1f, 1f, "%.2f")
+                && terrainEd is not null && heightmap is not null)
+                ApplyVertexEdit(st => st.SetVertex(vertGx, vertGz, vertHeightField));
+            ImGui.SetNextItemWidth(120f * uiScale);
+            ImGui.SliderInt(Loc.TL("Auto-smooth (cells)"), ref vertSmoothRadius, 0, 8);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Blend the ring around a moved vertex toward it, so it leaves a\nslope instead of a spike. 0 moves the single point only."));
+            ImGui.SetNextItemWidth(120f * uiScale);
+            SldF(Loc.TL("Step (m)"), ref vertNudgeStep, 0.05f, 5f, "%.2f");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far PageUp / PageDown move the selected vertex."));
+
+            if (ImGui.Button(Loc.TL("Level to neighbours")) && heightmap is not null)
+            {
+                // The average of the eight surrounding vertices: the quickest fix for one point left proud.
+                float sum = 0; int n = 0;
+                for (int oy = -1; oy <= 1; oy++)
+                    for (int ox = -1; ox <= 1; ox++)
+                    {
+                        if (ox == 0 && oy == 0) continue;
+                        int nx = Math.Clamp(vertGx + ox, 0, heightmap.Width - 1), nz = Math.Clamp(vertGz + oy, 0, heightmap.Height - 1);
+                        sum += cfg.HeightToMeters(heightmap[nx, nz]); n++;
+                    }
+                float avg = sum / Math.Max(n, 1);
+                vertHeightField = avg;
+                ApplyVertexEdit(st => st.SetVertex(vertGx, vertGz, avg));
+            }
+            ImGui.SameLine();
+            if (ImGui.Button(Loc.TL("Deselect"))) vertGx = vertGz = -1;
+            ImGui.TextDisabled(Loc.T("PageUp / PageDown nudge by the step. Ctrl-drag for fine control."));
+        }
+    }
+    ImGui.End();
+}
+
+// One vertex edit as its own committed stroke: applied, pushed on the shared undo stack, and broadcast by rect
+// exactly like a brush stroke. Going through the stroke rather than writing the heightmap is what makes a typed
+// height or a PageUp reach the other people in the session.
+void ApplyVertexEdit(Action<TerrainStroke> act)
+{
+    if (terrainEd is null || heightmap is null || vertGx < 0) return;
+    var st = terrainEd.BeginStroke();
+    act(st);
+    if (vertSmoothRadius > 0) st.SmoothAround(vertGx, vertGz, vertSmoothRadius);
+    var edit = st.Finish();
+    if (edit is null) return;
+    if (hist is not null) hist.Do(new TerrainStrokeCommand(edit, heightmap, RebuildTerrain));
+    else RebuildTerrain();
+    terrainDirty = true;
 }
 
 // In-app Log / Errors window: shows captured console output (errors highlighted). Auto-pops after a level load that

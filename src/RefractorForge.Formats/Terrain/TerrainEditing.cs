@@ -203,6 +203,73 @@ public sealed class TerrainStroke
             }
     }
 
+    // ---- Per-vertex editing (Battlecraft's point manipulation) ----
+    //
+    // These go through the SAME stroke bookkeeping as a brush dab - record each cell's original once, grow the
+    // bbox - so they coalesce into the same TerrainEdit and inherit undo and, more importantly, the collab path:
+    // the viewer broadcasts a stroke by RECT, re-reading the live heightmap, so a 1x1 rect needs no protocol
+    // change at all. Writing the heightmap directly instead would look right locally and be invisible to peers.
+
+    /// <summary>Set one heightmap vertex to an exact height in metres.</summary>
+    public void SetVertex(int gx, int gy, float metres)
+    {
+        if (gx < 0 || gy < 0 || gx >= _hm.Width || gy >= _hm.Height) return;
+        int idx = gy * _hm.Width + gx;
+        if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(gx, gy); }
+        _hm.Samples[idx] = _cfg.MetersToRaw(metres);
+    }
+
+    /// <summary>Raise (or lower, with a negative value) one vertex by a number of metres.</summary>
+    public void NudgeVertex(int gx, int gy, float deltaMetres)
+    {
+        if (gx < 0 || gy < 0 || gx >= _hm.Width || gy >= _hm.Height) return;
+        SetVertex(gx, gy, _cfg.HeightToMeters(_hm[gx, gy]) + deltaMetres);
+    }
+
+    /// <summary>Height of one vertex, in metres.</summary>
+    public float VertexHeight(int gx, int gy) =>
+        gx < 0 || gy < 0 || gx >= _hm.Width || gy >= _hm.Height ? 0f : _cfg.HeightToMeters(_hm[gx, gy]);
+
+    /// <summary>Blend the ring around a vertex toward it, so a pulled point leaves a slope instead of a spike.
+    /// This is what Battlecraft's auto-smooth radius does, and without it per-vertex editing produces terrain no
+    /// amount of later smoothing quite repairs.</summary>
+    public void SmoothAround(int gx, int gy, int radiusCells, float strength = 1f)
+    {
+        if (radiusCells <= 0) return;
+        strength = Math.Clamp(strength, 0f, 1f);
+
+        // Read from a snapshot so the result does not depend on which cell is visited first.
+        int x0 = Math.Max(0, gx - radiusCells), x1 = Math.Min(_hm.Width - 1, gx + radiusCells);
+        int y0 = Math.Max(0, gy - radiusCells), y1 = Math.Min(_hm.Height - 1, gy + radiusCells);
+        int w = x1 - x0 + 1, h = y1 - y0 + 1;
+        var pre = new ushort[w * h];
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+                pre[(y - y0) * w + (x - x0)] = _hm[x, y];
+
+        ushort Pre(int x, int y) => pre[(Math.Clamp(y, y0, y1) - y0) * w + (Math.Clamp(x, x0, x1) - x0)];
+
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+            {
+                if (x == gx && y == gy) continue;                 // the moved vertex keeps exactly what was asked for
+                float dx = x - gx, dy = y - gy;
+                float t = MathF.Sqrt(dx * dx + dy * dy) / radiusCells;
+                if (t > 1f) continue;
+                float fall = 1f - t;
+                fall = fall * fall * (3f - 2f * fall);
+
+                int sum = 0, n = 0;
+                for (int oy = -1; oy <= 1; oy++)
+                    for (int ox = -1; ox <= 1; ox++) { sum += Pre(x + ox, y + oy); n++; }
+                float avg = (float)sum / n;
+
+                int idx = y * _hm.Width + x;
+                if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(x, y); }
+                _hm.Samples[idx] = (ushort)Math.Clamp((int)MathF.Round(Lerp(_hm.Samples[idx], avg, fall * strength)), 0, ushort.MaxValue);
+            }
+    }
+
     /// <summary>Coalesce the stroke into one undoable edit (null if nothing changed).</summary>
     public TerrainEdit? Finish()
     {
