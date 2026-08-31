@@ -407,6 +407,62 @@ internal static class Program
                     png);
             }));
 
+        s.Add(new McpTool("flatten_area",
+            "Level a patch of ground, easing back into the terrain at the edge so it does not leave a mesa with vertical sides. Use it to prepare a build site before generate_city rather than hunting for ground that is already flat. Applies live when attached, and everyone in the session sees it.",
+            Schema(("x", "number", "Centre X in world metres", true),
+                   ("z", "number", "Centre Z in world metres", true),
+                   ("radius", "number", "Radius in metres (default 80)", false),
+                   ("height", "number", "Level it to this height; omit to use the mean of the middle, which is usually what you want", false),
+                   ("skirt", "number", "Fraction of the radius spent easing back out, 0-1 (default 0.35)", false)),
+            a =>
+            {
+                var s2 = Need();
+                var (hgt, cells) = s2.FlattenArea(F(a, "x"), F(a, "z"), F(a, "radius", 80f),
+                    Has(a, "height") ? F(a, "height") : null, F(a, "skirt", 0.35f));
+                return $"levelled {F(a, "radius", 80f):0} m around {F(a, "x"):0}/{F(a, "z"):0} to {hgt:0.#} m ({cells} cells)"
+                     + (s2.IsLive ? " - the editor's terrain has been updated." : ".");
+            }));
+
+        s.Add(new McpTool("smooth_area",
+            "Average out lumps and stair-stepping in a patch of ground, strongest in the middle and fading to nothing at the edge. Several light passes look better than one heavy one.",
+            Schema(("x", "number", "Centre X in world metres", true),
+                   ("z", "number", "Centre Z in world metres", true),
+                   ("radius", "number", "Radius in metres (default 60)", false),
+                   ("passes", "number", "How many smoothing passes (default 2)", false),
+                   ("strength", "number", "0-1 per pass (default 1)", false)),
+            a =>
+            {
+                var s2 = Need();
+                int cells = s2.SmoothArea(F(a, "x"), F(a, "z"), F(a, "radius", 60f),
+                    Math.Clamp(I(a, "passes", 2), 1, 20), F(a, "strength", 1f));
+                return $"smoothed {F(a, "radius", 60f):0} m around {F(a, "x"):0}/{F(a, "z"):0} ({cells} cells)"
+                     + (s2.IsLive ? " - the editor's terrain has been updated." : ".");
+            }));
+
+        s.Add(new McpTool("carve_channel",
+            "Cut a channel along a path - a pass for a road through a ridge, or a wadi. Depth is measured from the ground it runs under, so it follows the lie of the land instead of digging to a flat plane.",
+            Schema(("points", "string", "The path as \"x,z\" pairs, at least two", true),
+                   ("width", "number", "Channel width in metres (default 16)", false),
+                   ("depth", "number", "How deep to cut, metres (default 6)", false),
+                   ("skirt", "number", "Fraction of the half-width spent easing out, 0-1 (default 0.5)", false)),
+            a =>
+            {
+                var s2 = Need();
+                var pts = new List<(float X, float Z)>();
+                foreach (var raw in Arr(a, "points"))
+                {
+                    var bits = raw.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                    if (bits.Length >= 2
+                        && float.TryParse(bits[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var px)
+                        && float.TryParse(bits[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pz))
+                        pts.Add((px, pz));
+                }
+                if (pts.Count < 2) throw new ArgumentException("points needs at least two \"x,z\" entries");
+                int cells = s2.CarveChannel(pts, F(a, "width", 16f), F(a, "depth", 6f), F(a, "skirt", 0.5f));
+                return $"cut a {F(a, "depth", 6f):0.#} m channel through {pts.Count} point(s) ({cells} cells)"
+                     + (s2.IsLive ? " - the editor's terrain has been updated." : ".");
+            }));
+
         s.Add(new McpTool("set_water_level", "Set the level's water level (metres). Saved by patching Terrain.con.",
             Schema(("meters", "number", "Water level in metres", true)),
             a => { var s2 = Need(); float m = F(a, "meters"); s2.SetWaterLevel(m); return $"water level set to {m:0.##} m"; }));

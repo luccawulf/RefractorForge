@@ -203,8 +203,7 @@ public sealed class EditSession
         if (w == 0 || h == 0) throw new ArgumentException("the mountain lands entirely outside the map");
 
         float top = MountainGenerator.PeakHeight(Hm, Cfg, x0, y0, w, h);
-        if (_live is not null) _live.SendWorldOp($"TERRAIN {x0} {y0} {w} {h} {MountainGenerator.EncodeRect(Hm, x0, y0, w, h)}");
-        else HeightDirty = true;
+        ShipTerrain(x0, y0, w, h);
         return (top, w * h);
     }
 
@@ -342,6 +341,43 @@ public sealed class EditSession
         _live.SendWorldOp(RoadRaster.ToWire(patch));
         float len = samples[^1].ArcLen;
         return (samples.Count, len, patch.Width, patch.Height);
+    }
+
+    /// <summary>Send a changed heightmap rect to the editor, or mark it for saving when running headlessly. Every
+    /// terrain edit goes through here so they all reach other people in the session the same way - which is the
+    /// whole point of routing through the collab op rather than writing the heightmap and hoping.</summary>
+    private void ShipTerrain(int x0, int y0, int w, int h)
+    {
+        if (w <= 0 || h <= 0) return;
+        if (_live is not null) _live.SendWorldOp($"TERRAIN {x0} {y0} {w} {h} {MountainGenerator.EncodeRect(Hm, x0, y0, w, h)}");
+        else HeightDirty = true;
+    }
+
+    /// <summary>Level a patch of ground, easing back into the terrain at its edge.</summary>
+    public (float Height, int Cells) FlattenArea(float cx, float cz, float radius, float? target, float skirt)
+    {
+        var (x0, y0, w, h) = TerrainShaper.Flatten(Hm, Cfg, cx, cz, radius, target, skirt);
+        if (w == 0 || h == 0) throw new ArgumentException("that area is empty or off the map");
+        ShipTerrain(x0, y0, w, h);
+        return (SiteFinder.HeightAt(Hm, Cfg, cx, cz), w * h);
+    }
+
+    /// <summary>Take the lumps out of a patch of ground.</summary>
+    public int SmoothArea(float cx, float cz, float radius, int passes, float strength)
+    {
+        var (x0, y0, w, h) = TerrainShaper.Smooth(Hm, Cfg, cx, cz, radius, passes, strength);
+        if (w == 0 || h == 0) throw new ArgumentException("that area is empty or off the map");
+        ShipTerrain(x0, y0, w, h);
+        return w * h;
+    }
+
+    /// <summary>Cut a channel along a path - a pass for a road through a ridge, or a wadi.</summary>
+    public int CarveChannel(IReadOnlyList<(float X, float Z)> path, float width, float depth, float skirt)
+    {
+        var (x0, y0, w, h) = TerrainShaper.CarveChannel(Hm, Cfg, path, width, depth, skirt);
+        if (w == 0 || h == 0) throw new ArgumentException("that path is empty or off the map");
+        ShipTerrain(x0, y0, w, h);
+        return w * h;
     }
 
     public void SetWaterLevel(float meters)
