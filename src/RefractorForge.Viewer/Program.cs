@@ -7916,6 +7916,24 @@ void ImportCloudMesh()
 {
     if (!lightPreview) return (new Vector3(0.4f), new Vector3(0.6f));
     static float Lum(Vector3 c) => 0.299f * c.X + 0.587f * c.Y + 0.114f * c.Z;
+
+    // Terrain.ShadowAmbient is the engine's OWN colour for ground the sun cannot reach (Bocage says 80/80/90), so
+    // when a level states it, that is the ambient term - it is a measurement, not a guess. It also fixes a real
+    // problem with deriving ambient from Init.con instead: a level whose globalAmbient+ambient rivals its diffuse
+    // (Bocage: .3 against .38) normalises to an ambient-heavy split that flattens cast shadows to the point of
+    // looking absent. Trusting ShadowAmbient puts Bocage's shadows at 50% of lit ground instead of 63%.
+    if (env?.ShadowAmbient is { } sa && sa.X + sa.Y + sa.Z > 0f)
+    {
+        var ambS = new Vector3(sa.X, sa.Y, sa.Z) / 255f;
+        float sl = Lum(ambS);
+        if (sl < 0.10f) { ambS *= 0.10f / MathF.Max(sl, 1e-3f); sl = 0.10f; }   // a floor, but a light-handed one
+        // The key light fills what the ambient leaves, carrying the level's own diffuse HUE.
+        var hue = lightDiffuse;
+        float peak = MathF.Max(hue.X, MathF.Max(hue.Y, hue.Z));
+        hue = peak > 1e-3f ? hue / peak : Vector3.One;
+        return (ambS, hue * MathF.Max(1f - sl, 0.05f));
+    }
+
     var amb = lightGlobalAmb + lightAmb;
     var dif = lightDiffuse;
     float total = Lum(amb) + Lum(dif);
@@ -10551,6 +10569,14 @@ unsafe void BuildSkyCubemapFromFaces(Texture2D?[] faces, string label)
 {
     if (faces.Length < 6 || faces.Take(6).Any(f => f is null)) return;
     int sz = 0; for (int i = 0; i < 6; i++) sz = Math.Max(sz, Math.Max(faces[i]!.Width, faces[i]!.Height));
+    int native = sz;
+    // A cube-map costs 6 faces at the LARGEST face's size, so one hi-res face sets the price for all six - and
+    // remastered maps ship 4096px skies. Bocage's are 4096 with a 32x32 down face, which came to 384 MB uploaded
+    // plus as much again decoded on the way, on top of a 268 MB terrain atlas. Past 2048 a sky adds nothing you
+    // can see from inside the box, so it is capped: 384 MB becomes 96 MB. The GPU's own limit still applies on
+    // top, for hardware that cannot even manage that.
+    const int MaxSkyFace = 2048;
+    sz = Math.Min(sz, MaxSkyFace);
     Span<int> mcs = stackalloc int[1]; gl.GetInteger(GLEnum.MaxCubeMapTextureSize, mcs);
     if (mcs[0] > 0) sz = Math.Min(sz, mcs[0]);
     Texture2D Fit(Texture2D s)
@@ -10583,7 +10609,7 @@ unsafe void BuildSkyCubemapFromFaces(Texture2D?[] faces, string label)
     gl.TexParameter(TextureTarget.TextureCubeMap, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
     gl.TexParameter(TextureTarget.TextureCubeMap, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
     gl.TexParameter(TextureTarget.TextureCubeMap, TextureParameterName.TextureWrapR, (int)GLEnum.ClampToEdge);
-    Console.WriteLine($"Skybox cube-map '{label}': {sz}px faces.");
+    Console.WriteLine($"Skybox cube-map '{label}': {sz}px faces" + (native > sz ? $" (source {native}px, capped)" : "") + $" ~{6L * sz * sz * 4 / 1048576} MB.");
 }
 
 // Import a custom skybox: a folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), the BF Sky_X_0N order.
