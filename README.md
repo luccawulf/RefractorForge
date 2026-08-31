@@ -41,6 +41,7 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
 ## Documentation
 
 - **[USER_GUIDE.md](USER_GUIDE.md)** — full controls + feature walkthrough.
+- **[docs/MCP_SERVER.md](docs/MCP_SERVER.md)** — edit maps with an AI assistant, live in the running editor.
 - In the app: **Help ▸ User Guide / Controls**.
 - **For contributors** — reverse-engineered file-format notes in [`docs/`](docs/):
   [validated format facts](docs/Validated_Format_Facts.md),

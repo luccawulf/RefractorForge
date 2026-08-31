@@ -21,6 +21,22 @@ public sealed class EnvironmentSettings
     public float SkyRotationAngle { get; set; }
     /// <summary>Ambient/shadow colour 0..255 per channel (Terrain.ShadowAmbient); default mid-grey.</summary>
     public Vec3 ShadowAmbient { get; set; } = new(80f, 80f, 80f);
+
+    /// <summary>renderer.globalAmbientColor - the scene-wide ambient the engine adds to everything (Init.con).</summary>
+    public Vec3 GlobalAmbientColor { get; set; } = new(0.16f, 0.15f, 0.17f);
+    /// <summary>renderer.ambientColor - the key light's own ambient term.</summary>
+    public Vec3 AmbientColor { get; set; } = new(0.12f, 0.10f, 0.08f);
+    /// <summary>renderer.diffuseColor - the key (sun) light colour. This is what tints a level warm or cold.</summary>
+    public Vec3 DiffuseColor { get; set; } = new(0.975f, 1f, 0.95f);
+    /// <summary>renderer.specularColor - highlight colour on shiny surfaces.</summary>
+    public Vec3 SpecularColor { get; set; } = new(0.9f, 0.9f, 0.7f);
+    // Which of the four the level actually declared. Only declared keys are written back on a patch save, so a map
+    // that deliberately leaves one out - Operation_Irving ships globalAmbientColor commented out - does not silently
+    // gain one just because the editor has a default for it. Setting a flag is how the UI says "the user chose this".
+    public bool HasGlobalAmbient { get; set; }
+    public bool HasAmbient { get; set; }
+    public bool HasDiffuse { get; set; }
+    public bool HasSpecular { get; set; }
     /// <summary>Skybox StandardMesh name from SkyAndSun.con (GeometryTemplate.file), if present.</summary>
     public string? SkyBoxMesh { get; set; }
 
@@ -176,6 +192,10 @@ public sealed class EnvironmentSettings
                 var val = line[(sp + 1)..].Trim();
                 switch (key)
                 {
+                    case "renderer.globalambientcolor": if (TryVec(val, out var gac)) { e.GlobalAmbientColor = gac; e.HasGlobalAmbient = true; } break;
+                    case "renderer.ambientcolor": if (TryVec(val, out var amc)) { e.AmbientColor = amc; e.HasAmbient = true; } break;
+                    case "renderer.diffusecolor": if (TryVec(val, out var dfc)) { e.DiffuseColor = dfc; e.HasDiffuse = true; } break;
+                    case "renderer.specularcolor": if (TryVec(val, out var spc)) { e.SpecularColor = spc; e.HasSpecular = true; } break;
                     case "renderer.vertexfogenable": e.FogEnabled = val.StartsWith("1"); break;
                     case "renderer.fogcolorvec": if (TryVec(val, out var fc)) e.FogColor = fc; break;
                     case "renderer.fogstart": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fs)) e.FogStart = fs; break;
@@ -300,9 +320,9 @@ public sealed class EnvironmentSettings
         yield return "rem";
         yield return "rem **** level-specific rendering settings ****";
         yield return "rem";
-        yield return "renderer.diffuseColor .975/1/.95";
-        yield return "renderer.ambientColor .1/.1/.1";
-        yield return "renderer.specularColor .9/.9/.7";
+        yield return $"renderer.diffuseColor {V(DiffuseColor)}";
+        yield return $"renderer.ambientColor {V(AmbientColor)}";
+        yield return $"renderer.specularColor {V(SpecularColor)}";
         yield return "";
         yield return $"Game.ViewDistance {F(ViewDistance)}";
         yield return "";
@@ -324,6 +344,38 @@ public sealed class EnvironmentSettings
         yield return "water.waterAlphaDepth 20";
         yield return "water.waterColorDepth 20";
         yield return "water.waterShallowAlpha .25";
+    }
+
+    /// <summary>Patch the lighting lines into an existing <c>Init.con</c>, rewriting the keys in place and leaving
+    /// every other line untouched. Init.con carries real gameplay (kits, spawns, the run chain), so this rewrites
+    /// rather than regenerates. Keys the level never declared are only added once the editor has a value for them,
+    /// and go in right after the last existing <c>renderer.</c> line so they keep the file's own grouping.</summary>
+    public List<string> PatchInitConLines(IEnumerable<string> existing)
+    {
+        var wanted = new (string Key, string Line, bool Want)[]
+        {
+            ("renderer.globalambientcolor", $"renderer.globalAmbientColor {V(GlobalAmbientColor)}", HasGlobalAmbient),
+            ("renderer.ambientcolor",       $"renderer.ambientColor {V(AmbientColor)}",             HasAmbient),
+            ("renderer.diffusecolor",       $"renderer.diffuseColor {V(DiffuseColor)}",             HasDiffuse),
+            ("renderer.specularcolor",      $"renderer.specularColor {V(SpecularColor)}",           HasSpecular),
+        };
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var outLines = new List<string>();
+        int lastRenderer = -1;
+        foreach (var rawLine in existing)
+        {
+            var t = rawLine.Trim();
+            int sp = t.IndexOf(' ');
+            var key = (sp < 0 ? t : t[..sp]).ToLowerInvariant();
+            int w = Array.FindIndex(wanted, x => x.Key == key);
+            // A rem'd line reads as key "rem", so a commented-out setting is left exactly as it is.
+            if (w >= 0 && wanted[w].Want) { outLines.Add(wanted[w].Line); seen.Add(key); }
+            else outLines.Add(rawLine);
+            if (key.StartsWith("renderer.", StringComparison.Ordinal)) lastRenderer = outLines.Count - 1;
+        }
+        var missing = wanted.Where(x => x.Want && !seen.Contains(x.Key)).Select(x => x.Line).ToList();
+        if (missing.Count > 0) outLines.InsertRange(lastRenderer >= 0 ? lastRenderer + 1 : 0, missing);
+        return outLines;
     }
 
     /// <summary>Parse an "x/y/z" triple (the .con vector form).</summary>

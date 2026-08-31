@@ -13,6 +13,10 @@ namespace RefractorForge.Viewer;
 /// CPU work on the atlas RGBA — the viewer re-uploads the dirty rectangle to the GPU for a live preview and,
 /// on save, splits the painted atlas back into the level's txCxR.dds tiles.
 /// </summary>
+/// <summary>The surface-painter brushes that adjust the existing terrain image rather than stamping a texture
+/// onto it (Battlecraft guide figure 19).</summary>
+enum AtlasAdjust { Darken, Lighten, Blur, Color }
+
 sealed class AtlasPaintStroke
 {
     private readonly Texture2D _atlas;
@@ -72,6 +76,86 @@ sealed class AtlasPaintStroke
                 px[idx]     = (byte)(px[idx]     + (tc.X * 255f - px[idx])     * w + 0.5f);
                 px[idx + 1] = (byte)(px[idx + 1] + (tc.Y * 255f - px[idx + 1]) * w + 0.5f);
                 px[idx + 2] = (byte)(px[idx + 2] + (tc.Z * 255f - px[idx + 2]) * w + 0.5f);
+            }
+    }
+
+    /// <summary>Battlecraft's surface-painter brushes that do not stamp a texture but ADJUST what is already on the
+    /// terrain (guide figure 19): darken, lighten, blend (blur), and paint a flat colour. Shares this stroke's undo
+    /// bookkeeping and live-upload rect with <see cref="Dab"/>, so all the surface brushes behave identically.</summary>
+    public void DabAdjust(AtlasAdjust mode, System.Numerics.Vector3 color, float worldX, float worldZ,
+                          float radiusMeters, float hardness, float intensity, bool square)
+    {
+        int n = _atlas.Width;
+        float ws = _worldSize <= 0f ? 1f : _worldSize;
+        float cx = worldX / ws * n, cy = worldZ / ws * n;
+        float rp = MathF.Max(radiusMeters / ws * n, 1f);
+        int x0 = Math.Max(0, (int)MathF.Floor(cx - rp)), x1 = Math.Min(n - 1, (int)MathF.Ceiling(cx + rp));
+        int y0 = Math.Max(0, (int)MathF.Floor(cy - rp)), y1 = Math.Min(n - 1, (int)MathF.Ceiling(cy + rp));
+        LastW = 0; LastH = 0;
+        if (x0 > x1 || y0 > y1) return;
+        LastX = x0; LastY = y0; LastW = x1 - x0 + 1; LastH = y1 - y0 + 1;
+
+        float edge = 1f - Math.Clamp(hardness, 0f, 1f);
+        float inten = Math.Clamp(intensity, 0f, 1f);
+        var px = _atlas.Rgba;
+
+        // Blur reads its neighbours, so it must sample a SNAPSHOT of the rect - reading half-written pixels would
+        // smear the stroke in the direction of the scan rather than blending evenly.
+        byte[]? snap = null;
+        if (mode == AtlasAdjust.Blur)
+        {
+            snap = new byte[LastW * LastH * 4];
+            for (int y = 0; y < LastH; y++)
+                Array.Copy(px, ((y0 + y) * n + x0) * 4, snap, y * LastW * 4, LastW * 4);
+        }
+
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+            {
+                float dx = (x + 0.5f) - cx, dy = (y + 0.5f) - cy;
+                float t = square ? MathF.Max(MathF.Abs(dx), MathF.Abs(dy)) / rp
+                                 : MathF.Sqrt(dx * dx + dy * dy) / rp;
+                if (t > 1f) continue;
+                float f = edge <= 1e-4f ? 1f : Math.Clamp((1f - t) / edge, 0f, 1f);
+                float w = f * inten;
+                if (w <= 0f) continue;
+
+                int pi = y * n + x, idx = pi * 4;
+                if (!_orig.ContainsKey(pi))
+                {
+                    _orig[pi] = (uint)(px[idx] | (px[idx + 1] << 8) | (px[idx + 2] << 16) | (px[idx + 3] << 24));
+                    if (x < _minX) _minX = x; if (x > _maxX) _maxX = x;
+                    if (y < _minY) _minY = y; if (y > _maxY) _maxY = y;
+                }
+
+                float tr, tg, tb;   // the colour this texel is being pulled toward
+                switch (mode)
+                {
+                    case AtlasAdjust.Darken:  tr = 0f; tg = 0f; tb = 0f; break;
+                    case AtlasAdjust.Lighten: tr = 255f; tg = 255f; tb = 255f; break;
+                    case AtlasAdjust.Color:   tr = color.X * 255f; tg = color.Y * 255f; tb = color.Z * 255f; break;
+                    default:                  // Blur: the 3x3 mean from the snapshot
+                    {
+                        float sr = 0f, sg = 0f, sb = 0f; int cnt = 0;
+                        for (int oy = -1; oy <= 1; oy++)
+                            for (int ox = -1; ox <= 1; ox++)
+                            {
+                                int sx = x + ox - x0, sy = y + oy - y0;
+                                if (sx < 0 || sy < 0 || sx >= LastW || sy >= LastH) continue;
+                                int si = (sy * LastW + sx) * 4;
+                                sr += snap![si]; sg += snap[si + 1]; sb += snap[si + 2]; cnt++;
+                            }
+                        if (cnt == 0) continue;
+                        tr = sr / cnt; tg = sg / cnt; tb = sb / cnt;
+                        break;
+                    }
+                }
+                // Darken/Lighten move only PART of the way to black/white per dab, so they build up gradually the
+                // way a photo-editor dodge/burn brush does instead of flattening to pure black on one click.
+                float k = mode is AtlasAdjust.Darken or AtlasAdjust.Lighten ? w * 0.5f : w;
+                px[idx]     = (byte)Math.Clamp(px[idx]     + (tr - px[idx])     * k + 0.5f, 0f, 255f);
+                px[idx + 1] = (byte)Math.Clamp(px[idx + 1] + (tg - px[idx + 1]) * k + 0.5f, 0f, 255f);
+                px[idx + 2] = (byte)Math.Clamp(px[idx + 2] + (tb - px[idx + 2]) * k + 0.5f, 0f, 255f);
             }
     }
 

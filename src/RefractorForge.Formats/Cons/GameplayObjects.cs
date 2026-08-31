@@ -24,7 +24,11 @@ public readonly record struct ControlPointDef(string Name, Vec3 Position, float 
 /// fallback (team-2 preferred); <see cref="Vehicle1"/>/<see cref="Vehicle2"/> are the per-team templates from
 /// <c>setObjectTemplate 1/2</c> so the editor can show each spawner's team-appropriate vehicle.</summary>
 public readonly record struct VehicleSpawnDef(string Name, Vec3 Position, Vec3 Rotation, string Vehicle, int OsId,
-    string Vehicle1 = "", string Vehicle2 = "", int Team = 0);
+    string Vehicle1 = "", string Vehicle2 = "", int Team = 0,
+    // Battlecraft's "Edit Object Spawn Template" fields (guide figure 24). These live on the ObjectSpawner template,
+    // so every spawn using that template shares them. Defaults match what this editor writes for a NEW spawner.
+    int MinSpawnDelay = 20, int MaxSpawnDelay = 20, int SpawnDelayAtStart = 0, int TimeToLive = 120,
+    int Distance = 200, int DamageWhenLost = 10, int MaxNrOfObjectSpawned = 1);
 
 /// <summary>A soldier (infantry) spawn point. <see cref="Group"/> is its template <c>setGroup</c> id, which ties it to
 /// the control point whose <c>spawnGroupId</c> matches; <see cref="SpawnId"/> is <c>setSpawnId</c> and
@@ -58,6 +62,15 @@ public sealed record GameplayObjects(
     }
 
     /// <summary>Walk Object.create blocks, honouring rem line-comments and beginrem/endrem block-comments.</summary>
+    /// <summary>Just the object NAMES a gameplay .con declares - what <see cref="GameplayModes"/> needs to tell
+    /// which mode a handle belongs to, without paying for a full parse of every mode.</summary>
+    public static HashSet<string> ParseObjectNames(IEnumerable<string> lines)
+    {
+        var set = new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var b in ParseObjectBlocks(lines)) set.Add(b.Name);
+        return set;
+    }
+
     private static List<Block> ParseObjectBlocks(IEnumerable<string> lines)
     {
         var blocks = new List<Block>();
@@ -206,6 +219,58 @@ public sealed record GameplayObjects(
         return map;
     }
 
+    /// <summary>One ObjectSpawner template's editable timing fields (Battlecraft's Edit Object Spawn Template).</summary>
+    internal sealed class SpawnerTemplate
+    {
+        public string T1 = "", T2 = "";
+        public int MinSpawnDelay = 20, MaxSpawnDelay = 20, SpawnDelayAtStart = 0, TimeToLive = 120;
+        public int Distance = 200, DamageWhenLost = 10, MaxNrOfObjectSpawned = 1;
+    }
+
+    /// <summary>From ObjectSpawnTemplates.con: spawnerName -> its vehicles (setObjectTemplate 1/2) and the spawn
+    /// timing fields Battlecraft exposes. Absent fields keep their defaults, so a template that omits one is not
+    /// rewritten with a made-up value.</summary>
+    internal static Dictionary<string, SpawnerTemplate> ParseSpawnerTemplates(IEnumerable<string> lines)
+    {
+        var map = new Dictionary<string, SpawnerTemplate>(System.StringComparer.OrdinalIgnoreCase);
+        string? cur = null; int remDepth = 0;
+        foreach (var raw in lines)
+        {
+            var line = raw.Replace(((char)13).ToString(), "").Trim(); if (line.Length == 0) continue;
+            var low = line.ToLowerInvariant();
+            if (low == "beginrem") { remDepth++; continue; }
+            if (low == "endrem") { if (remDepth > 0) remDepth--; continue; }
+            if (remDepth > 0 || low.StartsWith("rem")) continue;
+            var sp = line.Split(new[] { ' ', (char)9 }, System.StringSplitOptions.RemoveEmptyEntries);
+            if (sp.Length < 2) continue;
+            var key = sp[0].ToLowerInvariant();
+            if (key == "objecttemplate.create") { cur = sp.Length >= 3 ? sp[2] : sp[1]; continue; }
+            if (cur is null) continue;
+            if (!map.TryGetValue(cur, out var t)) map[cur] = t = new SpawnerTemplate();
+            bool Num(out int v) => int.TryParse(sp[1], System.Globalization.NumberStyles.Float,
+                                                System.Globalization.CultureInfo.InvariantCulture, out v)
+                                || (float.TryParse(sp[1], System.Globalization.NumberStyles.Float,
+                                                   System.Globalization.CultureInfo.InvariantCulture, out var f)
+                                    && (v = (int)f) == v);
+            switch (key)
+            {
+                case "objecttemplate.setobjecttemplate" when sp.Length >= 3:
+                    if (sp[1] == "1") t.T1 = sp[2]; else if (sp[1] == "2") t.T2 = sp[2];
+                    break;
+                case "objecttemplate.minspawndelay": if (Num(out var a)) t.MinSpawnDelay = a; break;
+                case "objecttemplate.maxspawndelay": if (Num(out var b2)) t.MaxSpawnDelay = b2; break;
+                // BF1942 levels often carry a single SpawnDelay instead of the min/max pair; treat it as both.
+                case "objecttemplate.spawndelay": if (Num(out var c)) { t.MinSpawnDelay = c; t.MaxSpawnDelay = c; } break;
+                case "objecttemplate.spawndelayatstart": if (Num(out var d)) t.SpawnDelayAtStart = d; break;
+                case "objecttemplate.timetolive": if (Num(out var e)) t.TimeToLive = e; break;
+                case "objecttemplate.distance": if (Num(out var f2)) t.Distance = f2; break;
+                case "objecttemplate.damagewhenlost": if (Num(out var g)) t.DamageWhenLost = g; break;
+                case "objecttemplate.maxnrofobjectspawned": if (Num(out var h)) t.MaxNrOfObjectSpawned = h; break;
+            }
+        }
+        return map;
+    }
+
     /// <summary>From ObjectSpawnTemplates.con: spawnerName -> (team-1 vehicle, team-2 vehicle) from setObjectTemplate 1/2.</summary>
     private static Dictionary<string, (string t1, string t2)> ParseSpawnerVehicles(IEnumerable<string> lines)
     {
@@ -256,14 +321,17 @@ public sealed record GameplayObjects(
 
     public static IReadOnlyList<VehicleSpawnDef> ParseVehicleSpawns(IEnumerable<string> spawnLines, IEnumerable<string> templateLines)
     {
-        var veh = ParseSpawnerVehicles(templateLines);
+        var tmpl = ParseSpawnerTemplates(templateLines);
         var list = new List<VehicleSpawnDef>();
         foreach (var b in ParseObjectBlocks(spawnLines))
         {
-            veh.TryGetValue(b.Name, out var vt);   // (t1, t2); default ("",  "") when the spawner has no template file entry
-            string t1 = vt.t1 ?? "", t2 = vt.t2 ?? "";
+            tmpl.TryGetValue(b.Name, out var t);
+            t ??= new SpawnerTemplate();
+            string t1 = t.T1, t2 = t.T2;
             string disp = t2.Length > 0 ? t2 : (t1.Length > 0 ? t1 : b.Name);   // display fallback: team-2 preferred (unchanged behaviour)
-            list.Add(new VehicleSpawnDef(b.Name, b.Position, b.Rotation, disp, b.OsId, t1, t2, b.Team));
+            list.Add(new VehicleSpawnDef(b.Name, b.Position, b.Rotation, disp, b.OsId, t1, t2, b.Team,
+                                         t.MinSpawnDelay, t.MaxSpawnDelay, t.SpawnDelayAtStart, t.TimeToLive,
+                                         t.Distance, t.DamageWhenLost, t.MaxNrOfObjectSpawned));
         }
         return list;
     }

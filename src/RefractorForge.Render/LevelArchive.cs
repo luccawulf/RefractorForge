@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using RefractorForge.Formats.Con;
 using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Sound;
@@ -21,18 +21,21 @@ public static class LevelArchive
     public static bool IsRfa(string path) =>
         File.Exists(path) && path.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>Load a level from ONE or MORE packed <c>.rfa</c> — base + patch archives are merged, with
-    /// LATER archives overriding earlier ones for same-named files (this is how Refractor patch .rfa work).</summary>
+    /// <summary>Load a level from ONE or MORE sources — base + patch archives are merged, with LATER sources
+    /// overriding earlier ones for same-named files (this is how Refractor patch .rfa work). Each source may be a
+    /// packed <c>.rfa</c> OR an extracted level FOLDER: a project extracts its level to disk, so the folder form is
+    /// what most editing actually works against, and <see cref="RefractorFlatArchive.FromFolder"/> presents a
+    /// directory through the same entry API so nothing downstream has to care which it got.</summary>
     public static Loaded FromRfa(params string[] rfaPaths)
     {
         var arcs = new List<RefractorFlatArchive>();
-        foreach (var p in rfaPaths.Where(File.Exists))
+        foreach (var p in rfaPaths.Where(x => File.Exists(x) || Directory.Exists(x)))
         {
             if (Path.GetFileName(p).StartsWith("~")) continue;   // ~$… temp/lock leftovers
-            try { arcs.Add(new RefractorFlatArchive(p)); }
+            try { arcs.Add(Directory.Exists(p) ? RefractorFlatArchive.FromFolder(p) : new RefractorFlatArchive(p)); }
             catch (Exception ex) { System.Console.WriteLine($"LevelArchive: skipping unreadable '{Path.GetFileName(p)}' ({ex.GetType().Name})"); }
         }
-        if (arcs.Count == 0) throw new FileNotFoundException("No readable .rfa archive supplied.");
+        if (arcs.Count == 0) throw new FileNotFoundException("No readable .rfa archive or level folder supplied.");
         string label = arcs.Count == 1 ? Path.GetFileName(rfaPaths[0]) : $"{arcs.Count} archives";
 
         // Find an entry by trailing file name; LATER archives (patches) win over earlier ones.

@@ -58,7 +58,17 @@ sealed class GlObjects
     private readonly Dictionary<int, uint> _instLightmap = new();
     private bool _haveLightmaps;
     public bool ShowLightmaps = true;
+    /// <summary>Battlecraft's "View as Detail Mesh": draw every part in its flat material colour instead of its
+    /// texture, which makes it far easier to read where objects sit relative to each other.</summary>
+    public bool FlatShading = false;
     public int LightmapInstanceCount => _instLightmap.Count;
+
+    /// <summary>A template's local-space bounding box (Battlecraft's "View as Bounding Box" overlay draws these).</summary>
+    public bool TryGetTemplateBounds(string tmpl, out Vector3 min, out Vector3 max)
+    {
+        if (_templates.TryGetValue(tmpl, out var t)) { min = t.BbMin; max = t.BbMax; return true; }
+        min = default; max = default; return false;
+    }
 
     public int TemplateCount => _templates.Count;
     public int InstanceCount => Placements.Count;
@@ -153,6 +163,19 @@ sealed class GlObjects
     /// bounding box. Returns the object index (into StaticObjectsFile.Objects) or -1. This selects on the
     /// object's actual geometry rather than a pivot point, so clicks land reliably.
     /// </summary>
+    /// <summary>Ray-test one uploaded mesh at an arbitrary transform. Vehicle spawners are drawn from the gameplay
+    /// layer rather than from <see cref="Placements"/>, so they need this to be clickable on the vehicle ITSELF
+    /// instead of on a marker near its centre.</summary>
+    public bool RaycastTemplate(string key, Matrix4x4 world, Vector3 rayOrigin, Vector3 rayDir, out float t)
+    {
+        t = float.MaxValue;
+        if (!_templates.TryGetValue(key, out var tpl)) return false;
+        if (!Matrix4x4.Invert(world, out var inv)) return false;
+        var lo = Vector3.Transform(rayOrigin, inv);
+        var ld = Vector3.TransformNormal(rayDir, inv);
+        return RayAabb(lo, ld, tpl.BbMin, tpl.BbMax, out t);
+    }
+
     public int Raycast(Vector3 rayOrigin, Vector3 rayDir)
     {
         int best = -1; float bestT = float.MaxValue;
@@ -214,9 +237,14 @@ sealed class GlObjects
     }
 
     public unsafe void Draw(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
-                            Matrix4x4 viewProj, IReadOnlySet<int> selectedSet, int primaryIndex, Vector3 highlightTint)
+                            Matrix4x4 viewProj, IReadOnlySet<int> selectedSet, int primaryIndex, Vector3 highlightTint,
+                            IReadOnlySet<int>? lockedSet = null)
     {
         var secondary = Vector3.Lerp(Vector3.One, highlightTint, 0.55f);   // dimmer tint for non-primary selection
+        // Battlecraft tints locked objects red so you can see at a glance what will refuse to move. Selection still
+        // shows through as a brighter red, otherwise you could not tell which of the locked ones you had picked.
+        var lockedTint = new Vector3(1.6f, 0.42f, 0.38f);
+        var lockedSelTint = new Vector3(2.1f, 0.72f, 0.62f);
         gl.UseProgram(prog);
         gl.ActiveTexture(TextureUnit.Texture0);
         // Per-object baked lightmaps go on texture unit 1; sampled only for instances that have one (uHasLightmap==1).
@@ -234,7 +262,9 @@ sealed class GlObjects
             gl.UniformMatrix4(uModel, 1, false, (float*)&modelM);
             bool isPrimary = objIndex == primaryIndex;
             bool isSel = isPrimary || (selectedSet is not null && selectedSet.Contains(objIndex));
-            Vector3 tint = isPrimary ? highlightTint : isSel ? secondary : Vector3.One;
+            bool isLocked = lockedSet is not null && lockedSet.Contains(objIndex);
+            Vector3 tint = isLocked ? (isSel ? lockedSelTint : lockedTint)
+                         : isPrimary ? highlightTint : isSel ? secondary : Vector3.One;
             gl.Uniform3(uTint, tint.X, tint.Y, tint.Z);
             if (uHasLm >= 0)
             {
@@ -250,7 +280,7 @@ sealed class GlObjects
             gl.BindVertexArray(t.Vao);
             foreach (var part in t.Parts)
             {
-                if (part.Tex != 0)
+                if (part.Tex != 0 && !FlatShading)
                 {
                     gl.BindTexture(TextureTarget.Texture2D, part.Tex);
                     gl.Uniform1(uUseTex, 1);

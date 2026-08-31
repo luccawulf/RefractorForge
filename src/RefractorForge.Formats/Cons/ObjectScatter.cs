@@ -40,10 +40,8 @@ public static class ObjectScatter
 
             if (avoidWater && h < water + waterClearance) continue;
 
-            // slope (degrees) from a central finite difference of the terrain height.
-            float gx = (heightAt(MathF.Min(x + step, ws), z) - heightAt(MathF.Max(x - step, 0f), z)) / (2f * step);
-            float gz = (heightAt(x, MathF.Min(z + step, ws)) - heightAt(x, MathF.Max(z - step, 0f))) / (2f * step);
-            float slopeDeg = MathF.Atan(MathF.Sqrt(gx * gx + gz * gz)) * 180f / MathF.PI;
+            // slope band (degrees), from a central finite difference of the terrain height.
+            float slopeDeg = SlopeDegrees(heightAt, x, z, step, ws);
             if (slopeDeg < minSlopeDeg || slopeDeg > maxSlopeDeg) continue;
 
             if (minSpacing > 0f)
@@ -63,5 +61,15 @@ public static class ObjectScatter
             result.Add(new ScatterPlacement(template, new Vec3(x, h, z), yaw, scale));
         }
         return result;
+    }
+
+    /// <summary>Terrain slope in degrees at world (x,z), from a central finite difference of the height field;
+    /// <paramref name="step"/> is the sample distance (clamped to [0, worldSize]). Shared by random scatter and
+    /// the procedural <see cref="CityGenerator"/> so both reject cliffs by the same measure.</summary>
+    public static float SlopeDegrees(Func<float, float, float> heightAt, float x, float z, float step, float worldSize)
+    {
+        float gx = (heightAt(MathF.Min(x + step, worldSize), z) - heightAt(MathF.Max(x - step, 0f), z)) / (2f * step);
+        float gz = (heightAt(x, MathF.Min(z + step, worldSize)) - heightAt(x, MathF.Max(z - step, 0f))) / (2f * step);
+        return MathF.Atan(MathF.Sqrt(gx * gx + gz * gz)) * 180f / MathF.PI;
     }
 }

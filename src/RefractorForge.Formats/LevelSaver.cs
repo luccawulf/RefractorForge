@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -55,7 +55,12 @@ public static class LevelSaver
         if (!File.Exists(ost)) ost = Resolve(levelDir, "ObjectSpawnTemplates.con");
         if (File.Exists(ost))
         {
-            File.WriteAllText(ost, GameplayWriter.AppendMissingSpawnerTemplates(File.ReadAllLines(ost), immo.VehicleSpawns));
+            // Patch the editable spawner fields (vehicles + spawn timing) into the templates that exist, THEN append
+            // templates for any newly placed spawner. Patch-then-append, so an edit to an existing spawner is not
+            // lost behind a freshly appended duplicate.
+            var patched = GameplayWriter.PatchVehicleSpawnTemplates(File.ReadAllLines(ost), immo.VehicleSpawns);
+            File.WriteAllText(ost, GameplayWriter.AppendMissingSpawnerTemplates(
+                patched.Split((char)10).Select(l => l.TrimEnd((char)13)), immo.VehicleSpawns));
             written.Add(ost);
         }
     }

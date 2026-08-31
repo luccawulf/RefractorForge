@@ -118,6 +118,9 @@ uniform vec2 uTerUvScale; uniform vec2 uTerUvOffset;
 uniform int uShowMat; uniform sampler2D uMat;
 uniform int uHasDetail; uniform sampler2D uDetail; uniform float uDetailScale;
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map
+// The level's lighting (Init.con renderer.ambientColor / diffuseColor), balanced so the pair sums to the editor's
+// old flat 0.4/0.6 exposure - the level tints the light, it does not change how bright the editor is.
+uniform vec3 uAmbLight; uniform vec3 uDifLight;
 out vec4 frag;
 // Project a world point into the sun's light space and PCF-sample the depth map: 1 = lit, 0 = in cast shadow.
 float shadowVis(vec3 wp, vec3 nrm){
@@ -152,7 +155,7 @@ void main(){
     if (uHasDetail==1) baseCol *= clamp(texture(uDetail, vUv*uDetailScale).rgb*2.0, 0.0, 1.0);
     vec3 n = normalize(vN);
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
-    float d = 0.4 + 0.6*max(0.0, dot(n, normalize(uLightDir)))*vis;
+    vec3 d = uAmbLight + uDifLight*max(0.0, dot(n, normalize(uLightDir)))*vis;
     vec3 c = baseCol * d;
     if (vH < uWater) {                              // shallow shows the riverbed, deep reads as water
         float depth = clamp((uWater - vH)/8.0, 0.0, 1.0);
@@ -387,6 +390,7 @@ uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
 uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
 uniform float uAlphaRef;   // 0 = this material never discards
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
+uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
 out vec4 frag;
@@ -422,7 +426,10 @@ void main(){
         // Cutout foliage (leaf cards + tree sprite billboards) has arbitrary/sideways normals, and the sun can point
         // straight up (e.g. underwater maps) -> N.L ~ 0 would render the whole canopy near-black. Light it mostly-flat
         // (high ambient floor) like the engine does for vegetation; opaque geometry keeps normal diffuse shading.
-        float d = (uAlphaTest==1) ? (0.78 + 0.22*ndl*vis) : (0.4 + 0.6*ndl*vis);
+        // Foliage keeps its flat 0.78/0.22 balance and only takes the light's COLOUR (the total), because the
+        // reason it is flat-lit is its arbitrary normals, which a coloured key light does not fix.
+        vec3 d = (uAlphaTest==1) ? (uAmbLight + uDifLight) * (0.78 + 0.22*ndl*vis)
+                                 : uAmbLight + uDifLight*ndl*vis;
         c = base * uTint * d;
     }
     if (uFogEnable==1) {
@@ -555,6 +562,10 @@ TerrainPick? terrainPick = null;
 // Loaded-level state assigned straight-line by the load block below - declared here (before it) so the
 // top-level code can assign them; the editor's local functions capture these same variables by reference.
 GameplayObjects gameplay = GameplayObjects.Empty;
+// Battlecraft's "Show All / CQ / CTF / TDM" dropdown (guide figure 21): which game mode's gameplay to SHOW.
+// The editor still edits the one mode it loaded - this filters what is drawn and clickable, nothing else.
+GameplayModes gameplayModes = GameplayModes.Empty;
+int gameTypeFilter = 0;   // 0 = Show All, else 1-based index into gameplayModes.Modes
 EditableGameplay gameplayEdit = new(GameplayObjects.Empty);   // mutable editing view of the gameplay layer
 MaterialMap? materialMap = null;
 MaterialPainter? matPainter = null;
@@ -662,6 +673,7 @@ if (rfaList.Length > 0)
     so = lvl.StaticObjects;
     terrainTex = lvl.Terrain;
     gameplay = lvl.Gameplay;
+    gameplayModes = ScanArchiveGameModes();
     gameplayEdit = new EditableGameplay(gameplay);
     materialMap = lvl.Material;
     growth = lvl.Growth;
@@ -695,6 +707,7 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     soPath = Find("StaticObjects.con");
     so = StaticObjectsFile.Load(soPath);
     gameplay = GameplayObjects.LoadFolder(levelDir);
+    gameplayModes = GameplayModes.FromFolder(levelDir);
     gameplayEdit = new EditableGameplay(gameplay);
     var matFile = Directory.EnumerateFiles(levelDir, "MaterialMap.raw", SearchOption.AllDirectories).FirstOrDefault();
     if (matFile is not null) materialMap = MaterialMap.LoadForMaterialSize(matFile, cfg.MaterialSize);
@@ -923,6 +936,10 @@ uint terrainProg = 0, markerProg = 0, terrainVao = 0, terrainVbo = 0, markerVao 
 uint previewVao = 0, previewVbo = 0;   // single point showing where a placement will land
 uint gizmoVao = 0, gizmoVbo = 0;       // 3 axis handles (drawn as GL_LINES via the marker shader)
 uint collisionVao = 0, collisionVbo = 0; int collisionLineCount = 0; bool collisionDirty = true;  // .sm collision wireframe overlay (RE'd DShape)
+// Battlecraft's object view modes (guide figure 17): 0 = textured (this editor's normal view), 1 = flat colour
+// ("detail mesh"), 2 = bounding box, 3 = wireframe. Collision mesh is the existing separate Layers toggle.
+int objectView = 0;
+uint bboxVao = 0, bboxVbo = 0; int bboxLineCount = 0; bool bboxDirty = true; int bboxSig = -1;
 int collisionSig = -1;   // cheap change-detector so the collision overlay re-bakes when objects/vehicle-spawns/showVehicles change
 uint collisionProg = 0; int uCMvp = -1, uCCam = -1, uCColor = -1, uCFogStart = -1, uCFogEnd = -1;  // fog-faded collision shader
 uint ringVao = 0, ringVbo = 0;         // 3 rotation rings (drawn as GL_LINE_LOOP)
@@ -938,6 +955,7 @@ int terrainIndexCount = 0;
 GpKind gpKind = GpKind.ControlPoint;                          // kind of the selected gameplay handle
 int gpIndex = -1;                                             // selected gameplay handle (-1 = none)
 bool gpDragging = false; Vector3 gpDragStart = default;       // ground-plane drag-move of a handle
+bool gpNudge = false; Vector3 gpNudgeGround = default;        // Nudge tool driving a handle: gentler, keeps its height
 Vector3 gpInsPos = default; float gpInsRad = 0f;             // inspector numeric fields for the selected handle
 Vector3 gpInsRot = default;                                   // inspector rotation (Euler: X=yaw, Y=pitch, Z=roll)
 string gpNameBuf = "";                                        // inspector name field buffer
@@ -976,16 +994,35 @@ int ecpOsId = 0, ecpTimeGet = 9999, ecpTimeLose = 9999, ecpDisEnemy = 0, ecpDisL
 Vector3 ecpPos = default;
 // "Edit Object Spawn" (vehicle) + "Edit Soldier Spawn" Battlecraft-style dialogs: working copies of the selected handle.
 bool editVehRequest = false; int evIndex = -1; string evName = ""; Vector3 evPos = default, evRot = default; int evTeam = 0, evOsId = 1;
+// Battlecraft "Edit Object Spawn Template" fields (guide figure 24) - they live on the shared ObjectSpawner template.
+int evMinDelay = 20, evMaxDelay = 20, evDelayStart = 0, evTtl = 120, evDist = 200, evDmgLost = 10, evMaxSpawned = 1;
+string evVeh1 = "", evVeh2 = "";
 bool editSolRequest = false; int esIndex = -1; string esName = ""; Vector3 esPos = default, esRot = default; int esGroup = 0, esSpawnId = 0; bool esPara = false;
 double gpLastClickTime = -1; GpKind gpLastClickKind = GpKind.ControlPoint; int gpLastClickIndex = -1;   // double-click-to-edit a gameplay handle
 bool showHelp = false; string? helpText = null;             // Help > User Guide window (loads USER_GUIDE.md next to the exe)
 bool gpRotDragging = false; float gpRotStartYaw = 0f, gpRotStartMouseX = 0f;  // Rotate-tool yaw drag on a spawn
 bool showTerrain = true, showObjects = true, showVehicles = true, showControlPoints = true, showSpawns = true;
+// LOCKED OBJECTS (Battlecraft's lock/unlock buttons): a locked object can still be selected and inspected, but not
+// moved, rotated, dropped or deleted - the guard against nudging a finished piece of a map while working around it.
+// Keyed by the object's stable Id, so locks survive undo/redo, re-sorts and marker rebuilds (indices do not).
+HashSet<string> lockedObjectIds = new(StringComparer.OrdinalIgnoreCase);
+// Object clipboard (Battlecraft guide 10.E: Ctrl+C, then Ctrl+V over the spot you want). Offsets are stored
+// RELATIVE to the copied selection, so pasting a group keeps its arrangement instead of collapsing to a point.
+List<(string Template, Vec3 Offset, Vec3 Rot, float Scale)> objClipboard = new();
+// Gameplay handles (vehicle spawners, control points, soldier spawns) lock the same way static objects do. They
+// have no Id, so the key is kind + name - stable across undo and reordering, which raw indices are not.
+HashSet<string> lockedGameplayKeys = new(StringComparer.OrdinalIgnoreCase);
+// Terrain view mode, Battlecraft's J/K/L: 0 = textured, 1 = wireframe, 2 = textured + wireframe.
+int terrainView = 0;
 bool showSpawnLinks = true;                                   // lines from each vehicle/soldier spawn to its owning control point
 bool showSounds = true;                                      // sound emitters: marker + audible-radius (minDistance) ring
 bool playSounds = false;                                     // play placed LOOPING sounds while the camera is inside their ring
 SoundPlayback? soundPlayback = null;                         // NAudio mixer for the placed-sound preview (lazy on first enable)
 List<string>? soundWavArchives = null;                       // cached .rfa(s) searched for a level's / mod's .wav (lazy)
+// Locked objects tint red. With everything locked on load that would paint the ENTIRE map red, which is noise
+// rather than information - so the tint is off by default and is there for when locking is used selectively.
+// The lock itself is always in force; this only controls whether it is shown.
+bool showLockedTint = false;
 bool showCollision = false;                                  // .sm collision-mesh wireframe overlay (off by default)
 bool expCollision = false;                                   // .obj export: include an experimental (empty-BSP) collision section
 bool showFoliage = false;                                    // overgrowth-trees overlay: instance the .wst geometry on the map (a VIEW; never saved)
@@ -1033,6 +1070,10 @@ string toastText = ""; float toastT = 0f;                    // transient status
 MaterialStroke? matStroke = null;
 // terrain TEXTURE painting (paints the visible atlas with a tiled surface texture; saved back to txCxR.dds).
 AtlasPaintStroke? atlasStroke = null;
+// Surface-painter brush (Battlecraft guide figure 19): 0 = paint the chosen texture (what this editor already did),
+// then darken / lighten / blend / flat colour, which adjust the terrain image instead of stamping onto it.
+int surfaceOp = 0;
+Vector3 surfacePaintColor = new(0.85f, 0.78f, 0.62f);
 byte activeTexture = 1;              // which surface texture (indexes texPalette)
 float texIntensity = 0.85f;         // 0..1 blend strength of the texture brush (the Intensity slider)
 float texTileMeters = 8f;           // world metres per texture repeat
@@ -1238,7 +1279,14 @@ uint terrainTexId = 0;   // baked GPU terrain atlas (0 = none ÃƒÂ¢Ã¢â‚�
 
 uint objProg = 0;
 int uMvpO = -1, uModelO = -1, uColorO = -1, uLightO = -1, uUseTexO = -1, uAlphaTestO = -1, uAlphaEnableO = -1, uTintO = -1;
+int uAmbLightT = -1, uDifLightT = -1, uAmbLightO = -1, uDifLightO = -1;   // level lighting -> terrain + object shaders
 GlObjects? glObjects = null;
+// Editable lighting (Init.con renderer.globalAmbientColor / ambientColor / diffuseColor / specularColor), seeded
+// from the level and written back on save. lightPreview shades the viewport with them.
+Vector3 lightGlobalAmb = new(0.16f, 0.15f, 0.17f), lightAmb = new(0.12f, 0.10f, 0.08f);
+Vector3 lightDiffuse = new(0.975f, 1f, 0.95f), lightSpecular = new(0.9f, 0.9f, 0.7f);
+bool lightPreview = true;      // shade the editor with the level's light colours
+bool lightingDirty = false;    // user touched the lighting -> patch Init.con on save
 // Editable fog state (seeded from the level's Init.con; tweaked live in the Environment panel).
 bool fogEnabled = false; Vector3 fogColor = new(0.72f, 0.83f, 0.83f); float fogStart = 100f, fogEnd = 450f;
 float waterLevelLoaded = 30f; bool waterLevelEdited = false;   // live Water Level slider: original for Reset + dirty flag for save
@@ -1288,7 +1336,7 @@ string? ffmpegPath = null;   // cached FFmpeg location ("" = looked, not found)
 
 // ---- editor UI state (Dear ImGui) ----
 ImGuiController imgui = null!;
-string[] toolNames = { "Select", "Move", "Rotate", "Scale", "Place", "Paint", "Sculpt", "Smooth", "AIPath" };
+string[] toolNames = { "Select", "Move", "Rotate", "Scale", "Place", "Paint", "Sculpt", "Smooth", "AIPath", "Nudge" };
 int tool = 1;                 // default: Move (within the Object mapper)
 // Top-level "mapper" mode (Battlecraft-style): drives the underlying tool + paint layer below, so every
 // existing input handler keeps working. 0 Terrain(sculpt+smooth) | 1 Material | 2 Object | 3 Surface | 4 Growth | 5 AI Path.
@@ -1316,6 +1364,8 @@ bool gameIsBf1942 = false;    // target game: false = Battlefield Vietnam (defau
                               // Drives team names (Axis/Allies vs NVA/US) + gates BFV-only features (overgrowth, tunnels).
 uint sliderEditId = 0;        // the slider currently being typed into (0 = none); right-click a slider to type a value
 bool sliderEditStart = false; // focus the input on the first frame of editing
+bool showLevelTree = true;   // Battlecraft-style Level Tree: everything PLACED in the level, selectable by name
+string levelTreeFilter = "";
 bool showLog = false;         // in-app Log / Errors window (captures console output; auto-pops on load warnings)
 bool logErrorsOnly = false;   // filter the Log window to just error/warning lines
 Vector2D<int> appliedFbSize = default;   // last framebuffer size the GL viewport/aspect were synced to (initial maximize fix)
@@ -1323,7 +1373,11 @@ bool squareBrush = true;      // square (box) footprint for the terrain + materi
 // UI layout metrics, hoisted so the 3D overlay (DrawGameplay labels) can clip world-space labels to the
 // central viewport instead of painting them over the side/menu/status panels. uiMenuH is refreshed by BuildUi.
 float uiMenuH = 0f;
-const float uiStatusH = 30f, uiLeftW = 300f, uiRightW = 384f;   // Inspector wide enough for its labels
+float uiStatusH = 30f, uiLeftW = 300f, uiRightW = 384f;   // Inspector wide enough for its labels
+// UI scale. A 4K panel makes 16 px text and a 300 px panel unreadably small, so the whole interface doubles
+// there and is left alone at ordinary resolutions. Everything is scaled together - font, ImGui metrics and the
+// panel widths - because scaling only the font would overflow the panels it sits in.
+float uiScale = 1f;
 float uiToolH = 78f;   // top toolbar height; measured each frame from the actual content (mapper bar + per-mapper sub-toolbar) so it never clips
 string searchText = "";
 // New Map dialog state (the app's first ImGui modal). Used only inside the BuildUi local functions.
@@ -1406,6 +1460,13 @@ int dragAxis = -1, hoverAxis = -1;
 Vec3 gizmoStartPos = default; float gizmoStartT = 0f;
 // free terrain-drag of the selected static object(s): grab the body (not an axis) and slide along the ground.
 bool freeDragging = false; Vector3 freeDragGround = default;
+bool nudgeFine = false;        // Nudge tool grabbed with Ctrl held: move at a quarter speed
+bool nudgeDrag = false;        // this drag came from the Nudge tool: keep the object's own height, do not re-ground it
+// Battlecraft splits move and rotate into per-axis buttons: -1 = the free gizmo this editor already had, else 0/1/2
+// for world X / Y / Z. With an axis picked you just grab the object anywhere - no need to hit a thin gizmo handle.
+int axisLock = -1;
+int rotAxisDrag = -1; float rotAxisStartY = 0f;   // vertical-drag rotation about the locked axis
+HashSet<int> lockedIdxScratch = new();   // reused per frame; top-level locals cannot be readonly
 // rotate-gizmo drag state
 int rotDragChannel = -1, rotHover = -1;
 Vec3 rotStartEuler = default; float rotLastAngle = 0f, rotAccumDeg = 0f;
@@ -1494,8 +1555,25 @@ void OnLoad()
                 var fbg = window.FramebufferSize;
                 var rg = Picking.ScreenToRay(cam, pos.X, pos.Y, fbg.X, fbg.Y);
                 if (terrainPick.Raycast(rg, out var hp))
-                    gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(hp.X, hp.Y, hp.Z)));
-                if (gpKind == GpKind.Vehicle) collisionDirty = true;   // live-update the vehicle collision overlay
+                {
+                    if (gpNudge)
+                    {
+                        // Same feel as nudging a static object: a fraction of cursor speed, and the handle keeps
+                        // the height it had rather than being dropped onto the ground.
+                        float k3 = nudgeFine ? 0.12f : 0.4f;
+                        float ndx = (hp.X - gpNudgeGround.X) * k3, ndz = (hp.Z - gpNudgeGround.Z) * k3;
+                        gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(gpDragStart.X + ndx, gpDragStart.Y, gpDragStart.Z + ndz)));
+                    }
+                    // A vehicle spawn keeps the height it was authored at. Its Y is where the vehicle actually
+                    // APPEARS, not a decoration sitting on the ground, so re-dropping it onto the terrain every
+                    // time it is dragged buries it in a slope or leaves it hanging over a dip. Dragging a vehicle
+                    // moves it on X/Z only; the Y gizmo is how you change its height deliberately. Control points
+                    // and soldier spawns still follow the ground, which is what you want for those.
+                    else if (gpKind == GpKind.Vehicle)
+                        gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(hp.X, gpDragStart.Y, hp.Z)));
+                    else gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(hp.X, hp.Y, hp.Z)));
+                }
+                if (gpKind == GpKind.Vehicle) { collisionDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
                 return;
             }
             // Free terrain-drag of selected static object(s): slide each by the ground delta under the cursor.
@@ -1508,11 +1586,16 @@ void OnLoad()
                     // Move on X/Z only (no free vertical drift); snap each object's Y to the terrain so it
                     // stays stuck to the ground. Lifting is done with the Y gizmo axis, not the free-drag.
                     float dx = g.X - freeDragGround.X, dz = g.Z - freeDragGround.Z;
+                    // The Nudge tool is a placement tool, not a drop tool: it moves at a gentler rate than the
+                    // cursor (Ctrl finer still) and leaves the object at ITS OWN height - re-grounding it would
+                    // undo any careful vertical placement the moment you slid it sideways.
+                    if (nudgeDrag) { float k2 = nudgeFine ? 0.12f : 0.4f; dx *= k2; dz *= k2; }
                     foreach (var (idx, p0, _, _) in dragSnap)
                         if ((uint)idx < (uint)so.Objects.Count)
                         {
                             float nx = Snap1(p0.X + dx), nz = Snap1(p0.Z + dz);   // grid-snap when Snap is on
-                            so.Objects[idx].Position = new Vec3(nx, terrainPick.HeightAt(nx, nz), nz);
+                            float ny = nudgeDrag ? p0.Y : terrainPick.HeightAt(nx, nz);
+                            so.Objects[idx].Position = new Vec3(nx, ny, nz);
                         }
                     SyncTransformEdit();
                 }
@@ -1522,7 +1605,7 @@ void OnLoad()
             if (gpRotDragging && gpIndex >= 0 && mouse!.IsButtonPressed(MouseButton.Left))
             {
                 gameplayEdit.SetYaw(gpKind, gpIndex, gpRotStartYaw + (pos.X - gpRotStartMouseX) * 0.5f);
-                if (gpKind == GpKind.Vehicle) collisionDirty = true;   // live-update the vehicle collision overlay
+                if (gpKind == GpKind.Vehicle) { collisionDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
                 return;
             }
             // Dragging a gizmo axis: slide the object along that world axis (continues even over a panel).
@@ -1536,6 +1619,23 @@ void OnLoad()
                 var dv = axis * delta;
                 foreach (var (idx, p, _, _) in dragSnap)
                     so.Objects[idx].Position = SnapXZ(new Vec3(p.X + dv.X, p.Y + dv.Y, p.Z + dv.Z));
+                SyncTransformEdit();
+                return;
+            }
+            // Vertical-drag rotation about the locked axis: 2 px = 1 degree, from each object's own start angle.
+            if (rotAxisDrag >= 0 && so is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            {
+                float deg = (rotAxisStartY - pos.Y) * 0.5f;
+                foreach (var (idx, _, r0, _) in dragSnap)
+                {
+                    if ((uint)idx >= (uint)so.Objects.Count) continue;
+                    so.Objects[idx].Rotation = rotAxisDrag switch
+                    {
+                        0 => new Vec3(r0.X + deg, r0.Y, r0.Z),
+                        1 => new Vec3(r0.X, r0.Y + deg, r0.Z),
+                        _ => new Vec3(r0.X, r0.Y, r0.Z + deg),
+                    };
+                }
                 SyncTransformEdit();
                 return;
             }
@@ -1628,7 +1728,7 @@ void OnLoad()
                 var ray = Picking.ScreenToRay(cam, pos.X, pos.Y, fb.X, fb.Y);
                 if (terrainPick.Raycast(ray, out var thit) && SurfPaintTex() is Texture2D tx)
                 {
-                    atlasStroke.Dab(tx, thit.X, thit.Z, brushRadius, matHardness, texIntensity, squareBrush, SurfPaintTile(), surfUseAlpha);
+                    SurfaceDab(atlasStroke, tx, thit.X, thit.Z);
                     if (atlasStroke.LastW > 0) UploadAtlasRect(atlasStroke.LastX, atlasStroke.LastY, atlasStroke.LastW, atlasStroke.LastH);
                 }
                 return;
@@ -1658,7 +1758,7 @@ void OnLoad()
             // Finish a gameplay-handle drag: reset to the start, then push one move command (captures from->to).
             if (gpDragging)
             {
-                gpDragging = false;
+                gpDragging = false; gpNudge = false; nudgeFine = false;
                 if (gpIndex >= 0 && hist is not null)
                 {
                     var cur = gameplayEdit.GetPos(gpKind, gpIndex);
@@ -1730,7 +1830,7 @@ void OnLoad()
             }
             if (freeDragging)
             {
-                freeDragging = false;
+                freeDragging = false; nudgeFine = false; nudgeDrag = false;
                 if (so is null || hist is null) { dragSnap.Clear(); return; }
                 var cmds = new List<IEditCommand>();
                 foreach (var (idx, pos, _, _) in dragSnap)
@@ -1755,6 +1855,21 @@ void OnLoad()
                     var final = so.Objects[idx].Position;
                     so.Objects[idx].Position = pos;                 // revert so the command captures the pre-drag origin
                     cmds.Add(new MoveObject(so.Objects[idx].Id, final));
+                }
+                if (cmds.Count > 0) hist.Do(new CompositeCommand(cmds));
+                dragSnap.Clear(); SyncTransformEdit();
+            }
+            else if (rotAxisDrag >= 0)
+            {
+                rotAxisDrag = -1;
+                if (so is null || hist is null) { dragSnap.Clear(); return; }
+                var cmds = new List<IEditCommand>();
+                foreach (var (idx, _, rot, _) in dragSnap)
+                {
+                    if (idx < 0 || idx >= so.Objects.Count) continue;
+                    var final = so.Objects[idx].Rotation;
+                    so.Objects[idx].Rotation = rot;                 // revert so the command captures the pre-drag angle
+                    cmds.Add(new RotateObject(so.Objects[idx].Id, final));
                 }
                 if (cmds.Count > 0) hist.Do(new CompositeCommand(cmds));
                 dragSnap.Clear(); SyncTransformEdit();
@@ -1897,7 +2012,7 @@ void OnLoad()
                 && terrainPick is not null && terrainPick.Raycast(ray, out var thit2) && SurfPaintTex() is Texture2D tx0)
             {
                 atlasStroke = new AtlasPaintStroke(atlasCpu, cfg.WorldSize);
-                atlasStroke.Dab(tx0, thit2.X, thit2.Z, brushRadius, matHardness, texIntensity, squareBrush, SurfPaintTile(), surfUseAlpha);
+                SurfaceDab(atlasStroke, tx0, thit2.X, thit2.Z);
                 if (atlasStroke.LastW > 0) UploadAtlasRect(atlasStroke.LastX, atlasStroke.LastY, atlasStroke.LastW, atlasStroke.LastH);
                 return;
             }
@@ -1927,23 +2042,77 @@ void OnLoad()
             if (toolNames[tool] == "Move" && selected >= 0 && so is not null)
             {
                 var gp = SelPos(); float len = GizmoLen(gp);
-                int ax = Gizmo.PickAxis(ray, gp, len, len * 0.18f);
+                int ax = IsObjectLocked(selected) ? -1 : Gizmo.PickAxis(ray, gp, len, len * 0.18f);   // locked = no drag handle
                 if (ax >= 0)
                 {
+                    if (CaptureDragSnapshot() == 0) return;
                     dragAxis = ax;
                     gizmoStartPos = so.Objects[selected].Position;
                     gizmoStartT = Gizmo.ClosestAxisParam(ray, gp, Gizmo.Axis(ax));
-                    CaptureDragSnapshot();
+                    return;
+                }
+                // Battlecraft's per-axis move buttons: with X, Y or Z picked you drag the object BODY and it slides
+                // along that world axis only - no need to hit a thin gizmo handle. Same maths as the handle drag.
+                int bodyHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+                if (axisLock >= 0 && (bodyHit == selected || (bodyHit >= 0 && multi.Contains(bodyHit))))
+                {
+                    if (CaptureDragSnapshot() == 0) return;
+                    dragAxis = axisLock;
+                    gizmoStartPos = so.Objects[selected].Position;
+                    gizmoStartT = Gizmo.ClosestAxisParam(ray, gp, Gizmo.Axis(axisLock));
                     return;
                 }
                 // No axis grabbed: if the click lands on the selected object's mesh, start a free ground-drag.
-                int rayHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+                int rayHit = bodyHit;
                 bool onSelected = rayHit == selected || (rayHit >= 0 && multi.Contains(rayHit));
                 if (onSelected && terrainPick is not null && terrainPick.Raycast(ray, out var fg))
                 {
+                    if (CaptureDragSnapshot() == 0) return;
                     freeDragging = true;
                     freeDragGround = new Vector3(fg.X, fg.Y, fg.Z);   // ground point under the cursor at grab time
-                    CaptureDragSnapshot();
+                    return;
+                }
+            }
+
+            // NUDGE tool (Battlecraft): click ANY object and drag it along the ground - no selecting first, no
+            // gizmo handles to hit. Ctrl scales the movement down for fine placement (guide section 8.G.3).
+            // Nudge works on gameplay handles as well - a vehicle spawner should nudge like anything else.
+            if (toolNames[tool] == "Nudge" && terrainPick is not null && gameplayEdit.Count > 0
+                && TryPickGameplay(lastMouse, out var nk, out var ni) && terrainPick.Raycast(ray, out var ngp))
+            {
+                gpKind = nk; gpIndex = ni; selected = -1; multi.Clear();
+                if (GameplayEditBlocked()) return;
+                var p0 = gameplayEdit.GetPos(nk, ni);
+                gpDragging = true; gpNudge = true;
+                gpDragStart = new Vector3(p0.X, p0.Y, p0.Z);
+                gpNudgeGround = new Vector3(ngp.X, ngp.Y, ngp.Z);
+                nudgeFine = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight));
+                return;
+            }
+            if (toolNames[tool] == "Nudge" && so is not null && terrainPick is not null)
+            {
+                int nHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+                if (nHit >= 0 && terrainPick.Raycast(ray, out var ng))
+                {
+                    if (!multi.Contains(nHit)) { multi.Clear(); multi.Add(nHit); selected = nHit; SyncTransformEdit(); }
+                    if (CaptureDragSnapshot() == 0) return;
+                    freeDragging = true; nudgeDrag = true;
+                    nudgeFine = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight));
+                    freeDragGround = new Vector3(ng.X, ng.Y, ng.Z);
+                    return;
+                }
+            }
+
+            // Battlecraft's per-axis rotate buttons: pick X, Y or Z, then hold the left button and move the mouse
+            // up or down (guide 8.G.3). No ring to hit, and it works on the whole selection.
+            if (toolNames[tool] == "Rotate" && axisLock >= 0 && selected >= 0 && so is not null)
+            {
+                int rHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+                if (rHit == selected || (rHit >= 0 && multi.Contains(rHit)))
+                {
+                    if (CaptureDragSnapshot() == 0) return;
+                    rotAxisDrag = axisLock;
+                    rotAxisStartY = lastMouse.Y;
                     return;
                 }
             }
@@ -1955,11 +2124,11 @@ void OnLoad()
                 int rc = Gizmo.PickRing(ray, gp, len, len * 0.14f);
                 if (rc >= 0 && Gizmo.RayPlaneHit(ray, gp, Gizmo.RingFrame(rc).axis, out var rhit, out float _hitT))
                 {
+                    if (CaptureDragSnapshot() == 0) return;
                     rotDragChannel = rc;
                     rotStartEuler = so.Objects[selected].Rotation;
                     rotLastAngle = Gizmo.RingAngle(rhit, gp, rc);
                     rotAccumDeg = 0f;
-                    CaptureDragSnapshot();
                     return;
                 }
             }
@@ -1970,10 +2139,10 @@ void OnLoad()
                 var sp = Gizmo.Project(SelPos(), cam.ViewProjection, fb.X, fb.Y);
                 if (!float.IsNaN(sp.X) && Vector2.Distance(sp, lastMouse) <= 22f)
                 {
+                    if (CaptureDragSnapshot() == 0) return;
                     scaleDragging = true;
                     scaleStartScale = so.Objects[selected].Scale ?? 1f;
                     scaleStartDist = MathF.Max(8f, Vector2.Distance(sp, lastMouse));
-                    CaptureDragSnapshot();
                     return;
                 }
             }
@@ -1983,7 +2152,8 @@ void OnLoad()
                 && TryPickGameplay(lastMouse, out var rk, out var ri))
             {
                 gpKind = rk; gpIndex = ri; selected = -1; multi.Clear();
-                if (rk != GpKind.ControlPoint) { gpRotDragging = true; gpRotStartYaw = gameplayEdit.GetYaw(rk, ri); gpRotStartMouseX = lastMouse.X; }
+                if (rk != GpKind.ControlPoint && !GameplayEditBlocked())
+                { gpRotDragging = true; gpRotStartYaw = gameplayEdit.GetYaw(rk, ri); gpRotStartMouseX = lastMouse.X; }
                 return;
             }
 
@@ -1997,7 +2167,7 @@ void OnLoad()
                 bool gpDbl = (appClock - gpLastClickTime) < 0.35 && gpLastClickKind == gk && gpLastClickIndex == gi;
                 gpLastClickTime = appClock; gpLastClickKind = gk; gpLastClickIndex = gi;
                 if (gpDbl) { OpenGpEditor(gk, gi); return; }
-                if (toolNames[tool] == "Move" && terrainPick is not null)
+                if (toolNames[tool] == "Move" && terrainPick is not null && !GameplayEditBlocked())
                 {
                     var gp0 = gameplayEdit.GetPos(gk, gi);
                     gpDragging = true; gpDragStart = new Vector3(gp0.X, gp0.Y, gp0.Z);
@@ -2010,9 +2180,12 @@ void OnLoad()
             if (markers.Length == 0) return;
             // Pick on the object's actual geometry (ray vs each mesh's transformed bounding box) - clicks
             // land on what you see. Fall back to a screen-space marker pick, then a world-space ray sphere.
+            // Geometry first. The fallbacks are for objects whose mesh did not resolve (they draw as markers), so
+            // they stay DELIBERATELY tight - a 3-cell world radius reached ~12 m on a 2 km map, which is why objects
+            // selected themselves from far away and neighbours were hard to tell apart.
             int hit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
-            if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, 18f);
-            if (hit < 0) hit = Picking.PickNearest(ray, markers, cfg.HorizontalSpacing * 3f);
+            if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, 10f);
+            if (hit < 0) hit = Picking.PickNearest(ray, markers, MathF.Min(cfg.HorizontalSpacing, 3f));
             bool shift = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
             if (hit < 0)
             {
@@ -2040,13 +2213,23 @@ void OnLoad()
     // When a non-English UI language is active, build the font atlas from a CJK-capable Windows font with the
     // Japanese glyph ranges - ImGui's built-in font is ASCII-only, so Japanese would otherwise draw as blank
     // boxes. The font atlas is baked once here, which is why switching language restarts the editor.
+    // 4K and beyond gets a 2x interface. Measured from the actual framebuffer rather than any DPI setting, since
+    // that is what the panels are laid out in; 2560-wide and below is unchanged.
+    var fb0 = window.FramebufferSize;
+    uiScale = fb0.X >= 3000 || fb0.Y >= 1700 ? 1.25f : 1f;
+    if (uiScale > 1f)
+    {
+        uiStatusH *= uiScale; uiLeftW *= uiScale; uiRightW *= uiScale; uiToolH *= uiScale;
+        Console.WriteLine($"UI scale: {uiScale:0.#}x for a {fb0.X}x{fb0.Y} framebuffer.");
+    }
+
     var uiFont = Loc.FindUiFont();
     if (uiFont is not null)
     {
         try
         {
             imgui = new ImGuiController(gl, window, input,
-                new ImGuiFontConfig(uiFont, 16, io => io.Fonts.GetGlyphRangesJapanese()));
+                new ImGuiFontConfig(uiFont, (int)(16 * uiScale), io => io.Fonts.GetGlyphRangesJapanese()));
             Console.WriteLine($"UI font: {Path.GetFileName(uiFont)} (Japanese glyph ranges) for language '{Loc.Current}'.");
         }
         catch (Exception ex)
@@ -2056,6 +2239,14 @@ void OnLoad()
         }
     }
     else imgui = new ImGuiController(gl, window, input);
+    if (uiScale > 1f)
+    {
+        // Padding, spacing, scrollbars, rounding: all in pixels, so they scale with everything else.
+        ImGui.GetStyle().ScaleAllSizes(uiScale);
+        // The built-in font cannot be re-baked at a larger size here, so it is magnified instead. A font file was
+        // loaded above whenever one was available, which is the crisp path.
+        if (uiFont is null) ImGui.GetIO().FontGlobalScale = uiScale;
+    }
     ImGui.GetIO().ConfigWindowsMoveFromTitleBarOnly = true;   // body-drags (model-viewer orbit, minimap click) don't move the window; the title bar still does
     try { ClipboardBridge.Install(); } catch { }   // Ctrl+C/V in text boxes -> OS clipboard (e.g. paste a collab IP)
     ApplyTheme();
@@ -2066,6 +2257,11 @@ void OnLoad()
         fogEnabled = env.FogEnabled;
         fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
         fogStart = env.FogStart; fogEnd = env.FogEnd;
+        lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
+        lightAmb = new Vector3(env.AmbientColor.X, env.AmbientColor.Y, env.AmbientColor.Z);
+        lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
+        lightSpecular = new Vector3(env.SpecularColor.X, env.SpecularColor.Y, env.SpecularColor.Z);
+        lightingDirty = false;
         waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);   // the level's water.color
         deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);       // the level's water.deepcolor
         waterAlpha = env.WaterAlpha;
@@ -2073,6 +2269,20 @@ void OnLoad()
     waterLevelLoaded = cfg.WaterLevel;   // remember for the Water Level "Reset" button
     // Build the library catalog: objects + a draggable Gameplay category + a Prefabs category (if any).
     RebuildCatalog();
+
+    // Everything a level ships arrives LOCKED, the way Battlecraft does it (guide 10.E: "All objects are locked
+    // upon being placed... unlock it in order to move/rotate it"). It makes the accident - dragging a finished
+    // piece of someone else's map while working near it - impossible by default. Object > Unlock All lifts it, or
+    // Unlock Selected for one. Objects YOU place afterwards are not locked, so you can still position what you
+    // just dropped without unlocking it first.
+    if (so is not null)
+    {
+        foreach (var o in so.Objects) lockedObjectIds.Add(o.Id);
+        for (int i = 0; i < gameplayEdit.VehicleSpawns.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.Vehicle, i));
+        for (int i = 0; i < gameplayEdit.ControlPoints.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.ControlPoint, i));
+        for (int i = 0; i < gameplayEdit.SoldierSpawns.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.Soldier, i));
+        Console.WriteLine($"Locked {lockedObjectIds.Count} object(s) and {lockedGameplayKeys.Count} gameplay handle(s) on load (Object > Unlock All to edit).");
+    }
 
     // One-time diagnostic: list placed objects that can't resolve a mesh (they render as amber diamonds), and
     // WHY - distinguishes a genuinely missing asset (load the right .rfa) from a .sm we can't parse.
@@ -2109,6 +2319,8 @@ void OnLoad()
     uCFogEnd = gl.GetUniformLocation(collisionProg, "uFogEnd");
     uMvp = gl.GetUniformLocation(terrainProg, "uMVP");
     uLight = gl.GetUniformLocation(terrainProg, "uLightDir");
+    uAmbLightT = gl.GetUniformLocation(terrainProg, "uAmbLight");
+    uDifLightT = gl.GetUniformLocation(terrainProg, "uDifLight");
     uWater = gl.GetUniformLocation(terrainProg, "uWater");
     uMaxH = gl.GetUniformLocation(terrainProg, "uMaxH");
     uDeepColor = gl.GetUniformLocation(terrainProg, "uDeepColor");
@@ -2195,6 +2407,13 @@ void OnLoad()
     gl.BindBuffer(BufferTargetARB.ArrayBuffer, gizmoVbo);
     unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0); }
     gl.EnableVertexAttribArray(0);
+
+    bboxVao = gl.GenVertexArray();
+    bboxVbo = gl.GenBuffer();
+    gl.BindVertexArray(bboxVao);
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, bboxVbo);
+    gl.EnableVertexAttribArray(0);
+    unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), (void*)0); }
 
     collisionVao = gl.GenVertexArray();
     gl.BindVertexArray(collisionVao);
@@ -2395,6 +2614,8 @@ void OnLoad()
         uModelO = gl.GetUniformLocation(objProg, "uModel");
         uColorO = gl.GetUniformLocation(objProg, "uColor");
         uLightO = gl.GetUniformLocation(objProg, "uLightDir");
+        uAmbLightO = gl.GetUniformLocation(objProg, "uAmbLight");
+        uDifLightO = gl.GetUniformLocation(objProg, "uDifLight");
         uUseTexO = gl.GetUniformLocation(objProg, "uUseTex");
         uAlphaTestO = gl.GetUniformLocation(objProg, "uAlphaTest");
         uAlphaEnableO = gl.GetUniformLocation(objProg, "uAlphaEnable");
@@ -2486,8 +2707,19 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.F5: SetMapper(4); return;
         case Key.F6: SetMapper(5); return;
         case Key.F7: SetGroundCam(!groundCam); return;   // fly <-> Battlecraft-style ground camera
+        // Battlecraft's camera buttons: On Terrain (I), Fly (O), Top-Down (P).
+        case Key.I: if (ctrl) break; SetGroundCam(true); Toast(Loc.T("Camera: on terrain")); return;
+        case Key.O: if (ctrl) break; SetGroundCam(false); Toast(Loc.T("Camera: fly")); return;
+        case Key.P: if (ctrl) break; TopDownCamera(); return;
+        // Battlecraft's terrain view modes: wireframe (J), textured (K), textured wireframe (L).
+        case Key.J: if (ctrl) break; terrainView = 1; Toast(Loc.T("Terrain: wireframe")); return;
+        case Key.K: if (ctrl) break; terrainView = 0; Toast(Loc.T("Terrain: textured")); return;
+        // TAB hides the objects so you can see the ground you are painting, exactly as Battlecraft does.
+        case Key.Tab: showObjects = !showObjects; Toast(showObjects ? Loc.T("Objects shown") : Loc.T("Objects hidden")); return;
         case Key.S: if (ctrl) { DoSave(); return; } break;
-        case Key.L: if (ctrl) { DoTestLevel(); return; } break;
+        case Key.L:
+            if (ctrl) { DoTestLevel(); return; }
+            terrainView = 2; Toast(Loc.T("Terrain: textured wireframe")); return;
     }
     // Camera bookmarks: Ctrl+1..9 saves the current view to a slot; 1..9 (no Ctrl) flies back to it. Works any time.
     int bmSlot = key switch { Key.Number1 => 0, Key.Number2 => 1, Key.Number3 => 2, Key.Number4 => 3, Key.Number5 => 4,
@@ -2514,21 +2746,24 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.Delete:
             if (gpIndex >= 0 && hist is not null)   // a gameplay handle is selected
             {
+                if (GameplayEditBlocked()) break;
+                lockedGameplayKeys.Remove(GpLockKey(gpKind, gpIndex));
                 hist.Do(new GameplayDeleteCommand(gameplayEdit, gpKind, gpIndex, null));
                 gpIndex = -1;
                 break;
             }
             if (multi.Count > 0)
             {
-                var dels = multi.Where(i => i >= 0 && i < so.Objects.Count)
-                                .Select(i => (IEditCommand)new DeleteObject(so.Objects[i].Id)).ToList();
+                var dels = EditableSelection().Select(i => (IEditCommand)new DeleteObject(so.Objects[i].Id)).ToList();
                 if (dels.Count > 0) hist.Do(new CompositeCommand(dels));
                 multi.Clear(); selected = -1; SyncMarkers(); RebuildObjects(); UploadMarkers();
             }
             break;
         case Key.Z: DoUndo(); break;
         case Key.Y: DoRedo(); break;
-        case Key.D: if (k.IsKeyPressed(Key.ControlLeft) || k.IsKeyPressed(Key.ControlRight)) DuplicateSelected(); break;
+        case Key.D: if (ctrl) DuplicateSelected(); break;
+        case Key.C: if (ctrl) CopySelected(); break;
+        case Key.V: if (ctrl) PasteClipboard(); break;
         case Key.G: DropSelectedToGround(); break;
         case Key.Escape:
             if (roadMode) { if (roadPts.Count > 0) { roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; } else roadMode = false; }
@@ -2560,7 +2795,9 @@ bool TryPickGameplay(Vector2 px, out GpKind kind, out int index)
     // Can't capture the out-params in the nested local function (CS1628); track in locals and assign back.
     var bestKind = GpKind.ControlPoint; int bestIndex = -1;
     var fb = window.FramebufferSize;
-    float best = 28f;                                   // generous pixel threshold (was 16)
+    // Tight on purpose. A generous threshold made handles jump to the cursor from far away and turned two spawns
+    // near each other into a coin toss. The mesh tests above are what should catch the normal case.
+    float best = 12f;
     // Test a spawn by projecting several points along its body height so a click anywhere on the mesh hits.
     void Test(GpKind k, int count, bool show, float bodyHeight)
     {
@@ -2575,9 +2812,32 @@ bool TryPickGameplay(Vector2 px, out GpKind kind, out int index)
                 if (float.IsNaN(s.X)) continue;
                 dmin = MathF.Min(dmin, Vector2.Distance(s, px));
             }
+            if (!GpVisible(k, i)) continue;   // hidden by the game-type filter -> not clickable either
             if (dmin < best) { best = dmin; bestKind = k; bestIndex = i; }
         }
     }
+    // A vehicle spawner should be selectable by clicking THE VEHICLE, not a marker near its middle. Ray-test the
+    // drawn mesh first; a hit wins outright, because a real geometry hit is always a better answer than "something
+    // was within N pixels".
+    if (showVehicles && glObjects is not null && meshLib is not null)
+    {
+        var vray = Picking.ScreenToRay(cam, px.X, px.Y, fb.X, fb.Y);
+        float bestT = float.MaxValue; int bestV = -1;
+        for (int i = 0; i < gameplayEdit.VehicleSpawns.Count; i++)
+        {
+            if (!GpVisible(GpKind.Vehicle, i)) continue;
+            var v = gameplayEdit.VehicleSpawns[i];
+            string veh = SpawnVehicleName(v);
+            if (string.IsNullOrWhiteSpace(veh)) continue;
+            var w = Matrix4x4.CreateFromYawPitchRoll(
+                        v.Rotation.X * MathF.PI / 180f, v.Rotation.Y * MathF.PI / 180f, v.Rotation.Z * MathF.PI / 180f)
+                  * Matrix4x4.CreateTranslation(v.Position.X, v.Position.Y, v.Position.Z);
+            if (glObjects.RaycastTemplate($"veh::{veh}", w, vray.Origin, vray.Dir, out float th) && th < bestT)
+            { bestT = th; bestV = i; }
+        }
+        if (bestV >= 0) { kind = GpKind.Vehicle; index = bestV; return true; }
+    }
+
     Test(GpKind.ControlPoint, gameplayEdit.ControlPoints.Count, showControlPoints, 6f);   // flagpole is tall
     Test(GpKind.Vehicle, gameplayEdit.VehicleSpawns.Count, showVehicles, 3f);             // vehicle body height
     Test(GpKind.Soldier, gameplayEdit.SoldierSpawns.Count, showSpawns, 1f);
@@ -2658,9 +2918,11 @@ void DrawDrapedBrushOutline(float cx, float cz, float radius, bool square)
 }
 
 // Draw the draped grid as depth-tested lines (occluded by hills/objects in front), in a subtle cool grey.
-void DrawGrid()
+// `force` is the textured-wireframe terrain view (Battlecraft L): the draped grid IS this editor's wireframe
+// overlay, so that view turns it on for the frame without touching the user's own Grid toggle.
+void DrawGrid(bool force = false)
 {
-    if (!gridOn || gridVertCount <= 0) return;
+    if ((!gridOn && !force) || gridVertCount <= 0) return;
     gl.UseProgram(markerProg);
     gl.UniformMatrix4(uMvpM, 1, false, ToFloats(cam.ViewProjection));
     gl.Uniform3(uColor, gridColor.X, gridColor.Y, gridColor.Z);
@@ -2865,7 +3127,10 @@ string ValidateMap()
 // on the grid, never baked into the terrain.
 void DrawGridLabels()
 {
-    if (!gridOn || !gridLabels || terrainPick is null) return;
+    // Battlecraft's Material Mapper can show each cell's material as TEXT instead of colour, and that view is not
+    // tied to a grid being drawn - so in the Material mapper the Labels box works on its own.
+    bool matText = gridLabels && mapper == 1;
+    if ((!gridOn && !matText) || !gridLabels || terrainPick is null) return;
     float ws = cfg.WorldSize;
     if (ws <= 0f) return;
     var fb = window.FramebufferSize;
@@ -3042,6 +3307,7 @@ void DrawGameplay()
         if (showVehicles)
             foreach (var v in gameplayEdit.VehicleSpawns)
             {
+                if (!GpVisible(GpKind.Vehicle, gameplayEdit.VehicleSpawns.IndexOf(v))) continue;   // game-type filter
                 var vp = new Vector3(v.Position.X, v.Position.Y, v.Position.Z);
                 if (FogCulled(vp)) continue;                                  // its marker is culled too, so drop the line
                 int ci = GameplayObjects.OwningControlPointIndex(cps, v.Position, v.OsId, true);
@@ -3051,6 +3317,7 @@ void DrawGameplay()
         if (showSpawns)
             foreach (var s in gameplayEdit.SoldierSpawns)
             {
+                if (!GpVisible(GpKind.Soldier, gameplayEdit.SoldierSpawns.IndexOf(s))) continue;   // game-type filter
                 var sp = new Vector3(s.Position.X, s.Position.Y, s.Position.Z);
                 if (FogCulled(sp)) continue;
                 int ci = GameplayObjects.OwningControlPointIndex(cps, s.Position, s.Group, false);
@@ -3066,6 +3333,7 @@ void DrawGameplay()
         gl.BindVertexArray(brushRingVao);
         foreach (var cp in gameplayEdit.ControlPoints)
         {
+            if (!GpVisible(GpKind.ControlPoint, gameplayEdit.ControlPoints.IndexOf(cp))) continue;   // game-type filter
             var cpw = new Vector3(cp.Position.X, cp.Position.Y, cp.Position.Z);
             if (FogCulled(cpw)) continue;
             var m = Matrix4x4.CreateScale(cp.Radius) * Matrix4x4.CreateTranslation(cpw.X, cpw.Y, cpw.Z);
@@ -3085,6 +3353,7 @@ void DrawGameplay()
         var solDots = new System.Collections.Generic.List<Vector3>();
         foreach (var s in gameplayEdit.SoldierSpawns)
         {
+            if (!GpVisible(GpKind.Soldier, gameplayEdit.SoldierSpawns.IndexOf(s))) continue;   // game-type filter
             var c = new Vector3(s.Position.X, s.Position.Y + 0.15f, s.Position.Z);
             if (FogCulled(c)) continue;
             solDots.Add(c);
@@ -3259,6 +3528,7 @@ void BuildCollisionLines()
     if (showVehicles)
         foreach (var v in gameplayEdit.VehicleSpawns)
         {
+            if (!GpVisible(GpKind.Vehicle, gameplayEdit.VehicleSpawns.IndexOf(v))) continue;   // game-type filter
             var veh = SpawnVehicleName(v);   // collision matches the team-correct rendered vehicle
             if (string.IsNullOrWhiteSpace(veh) || !meshLib.TryGetRenderCollision(veh, out var vparts)) continue;
             var spawnWorld = Matrix4x4.CreateFromYawPitchRoll(
@@ -3276,13 +3546,67 @@ void BuildCollisionLines()
 
 // Collision overlay: bright green wireframe of the real .sm collision meshes, drawn through the solid geometry
 // (depth off) so you can inspect what's actually solid in-game. Toggle: Layers -> Collision.
+// Battlecraft's "View as Bounding Box": each placed object's template box, transformed to where it stands. This is
+// the view for spotting objects that intersect each other, which the textured view hides.
+void BuildBBoxLines()
+{
+    bboxDirty = false; bboxLineCount = 0;
+    if (glObjects is null) return;
+    var pts = new System.Collections.Generic.List<float>();
+    foreach (var (tmpl, world, _) in glObjects.Placements)
+    {
+        if (!glObjects.TryGetTemplateBounds(tmpl, out var mn, out var mx)) continue;
+        // the 8 corners, transformed, then the 12 edges between them
+        var c = new Vector3[8];
+        for (int i = 0; i < 8; i++)
+            c[i] = Vector3.Transform(new Vector3((i & 1) == 0 ? mn.X : mx.X,
+                                                 (i & 2) == 0 ? mn.Y : mx.Y,
+                                                 (i & 4) == 0 ? mn.Z : mx.Z), world);
+        void Edge(int a, int b)
+        { pts.Add(c[a].X); pts.Add(c[a].Y); pts.Add(c[a].Z); pts.Add(c[b].X); pts.Add(c[b].Y); pts.Add(c[b].Z); }
+        Edge(0, 1); Edge(1, 3); Edge(3, 2); Edge(2, 0);     // bottom face
+        Edge(4, 5); Edge(5, 7); Edge(7, 6); Edge(6, 4);     // top face
+        Edge(0, 4); Edge(1, 5); Edge(2, 6); Edge(3, 7);     // uprights
+    }
+    if (pts.Count == 0) return;
+    bboxLineCount = pts.Count / 3;
+    gl.BindVertexArray(bboxVao);
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, bboxVbo);
+    unsafe
+    {
+        fixed (float* p = pts.ToArray())
+            gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(pts.Count * sizeof(float)), p, BufferUsageARB.DynamicDraw);
+    }
+}
+
+void DrawBBoxes()
+{
+    if (objectView != 2 || glObjects is null || so is null) return;
+    int sig = so.Objects.Count * 397 ^ glObjects.Placements.Count * 31;
+    if (sig != bboxSig) { bboxSig = sig; bboxDirty = true; }
+    if (bboxDirty) BuildBBoxLines();
+    if (bboxLineCount == 0) return;
+    float fogS = fogEnabled ? fogStart : 1e9f;
+    float fogE = fogEnabled ? MathF.Max(fogEnd, fogStart + 1f) : 1e9f + 1f;
+    gl.UseProgram(collisionProg);                       // same fog-faded line shader as the collision overlay
+    gl.UniformMatrix4(uCMvp, 1, false, ToFloats(cam.ViewProjection));
+    gl.Uniform3(uCCam, cam.Position.X, cam.Position.Y, cam.Position.Z);
+    gl.Uniform3(uCColor, 1f, 0.85f, 0.25f);
+    gl.Uniform1(uCFogStart, fogS); gl.Uniform1(uCFogEnd, fogE);
+    gl.Enable(EnableCap.Blend);
+    gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+    gl.BindVertexArray(bboxVao);
+    gl.DrawArrays(PrimitiveType.Lines, 0, (uint)bboxLineCount);
+    gl.Disable(EnableCap.Blend);
+}
+
 void DrawCollision()
 {
     if (!showCollision || so is null || meshLib is null) return;
     // Re-bake if the object set, the vehicle-spawn set, or the vehicle-visibility toggle changed (the overlay now
     // includes vehicle-spawn collision). Per-object transform edits already set collisionDirty elsewhere.
     int sig = so.Objects.Count * 397 ^ gameplayEdit.VehicleSpawns.Count * 31 ^ (showVehicles ? 1 : 0);
-    if (sig != collisionSig) { collisionSig = sig; collisionDirty = true; }
+    if (sig != collisionSig) { collisionSig = sig; collisionDirty = true; bboxDirty = true; }
     if (collisionDirty) BuildCollisionLines();
     if (collisionLineCount == 0) return;
     // Fog-faded shader: only draw as far as the user can see. With fog on, dissolve across fogStart..fogEnd so the
@@ -3856,6 +4180,7 @@ void DoSaveCore()
         if (DetailDdsBytes() is { } detd) { try { var tdir = texturesDir ?? System.IO.Path.Combine(levelDir, "Textures"); System.IO.Directory.CreateDirectory(tdir); System.IO.File.WriteAllBytes(System.IO.Path.Combine(tdir, detd.Name), detd.Bytes); Console.WriteLine("   Wrote Textures/detail.dds (imported detail texture)."); } catch (Exception ex) { Console.WriteLine($"   detail.dds save failed: {ex.Message}"); } }
         ApplyWeatherToLevel();   // write Effects/RF_Weather.con + texture + Init run-include if weather is enabled
         SaveCloudsFolder();      // patch the animated-cloud block into SkyAndSun.con if clouds were edited
+        SaveLightingFolder();    // patch the renderer light colours into Init.con if the lighting was edited
         // Write every vehicle whose navmap was painted (each buffer is held independently in aiNavBufs - no
         // save-first / no reseed loss). Each buffer carries its own side, robust to a mid-session map resize.
         // Target the level's REAL Pathfinding dir (it may sit in a sub-folder) so the edits land where the engine
@@ -3916,6 +4241,7 @@ void DoSaveCore()
         foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
+        if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // baked object lightmaps -> upsert (override existing OR add new)
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides: same-named .dds / override .rs (+ .bik copied beside the game)
 
@@ -3983,6 +4309,7 @@ void DoSavePatch(bool serverSideOnly = false)
         foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
+        if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
         if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
@@ -4526,14 +4853,26 @@ float Snap1(float v) => snapOn && snapStep > 0f ? MathF.Round(v / snapStep) * sn
 // Snap a world position's X/Z to the grid (Y is left to the terrain), used by object move/place.
 Vec3 SnapXZ(Vec3 p) => snapOn ? new Vec3(Snap1(p.X), p.Y, Snap1(p.Z)) : p;
 
-// Snapshot every selected object's transform at the start of a gizmo drag (for group edits).
-void CaptureDragSnapshot()
+// Snapshot every selected object's transform at the start of a gizmo drag (for group edits). LOCKED objects are
+// left out, and the count comes back so a drag that would move nothing never starts - this is the single chokepoint
+// every drag path goes through (axis gizmo, free ground-drag, rotate ring, scale handle), which is why locking is
+// enforced here rather than in four separate places.
+int CaptureDragSnapshot()
 {
     dragSnap.Clear();
-    if (so is null) return;
+    if (so is null) return 0;
+    int locked = 0;
     foreach (var i in multi)
-        if (i >= 0 && i < so.Objects.Count)
-        { var o = so.Objects[i]; dragSnap.Add((i, o.Position, o.Rotation, o.Scale ?? 1f)); }
+    {
+        if (i < 0 || i >= so.Objects.Count) continue;
+        if (IsObjectLocked(i)) { locked++; continue; }
+        var o = so.Objects[i];
+        dragSnap.Add((i, o.Position, o.Rotation, o.Scale ?? 1f));
+    }
+    if (dragSnap.Count == 0 && locked > 0)
+        Toast(locked == 1 ? Loc.T("That object is locked (Object > Unlock Selected).")
+                          : string.Format(Loc.T("{0} selected objects are locked (Object > Unlock Selected)."), locked));
+    return dragSnap.Count;
 }
 
 // Re-derive the terrain mesh from the (edited) heightmap and re-upload the terrain VBO in place.
@@ -5264,6 +5603,24 @@ TerrainBrush MakeBrush()
 }
 
 // The material/foliage paint brush: shares the brush Shape selector + Square toggle with the terrain tools.
+// Battlecraft's "Fill With Material" (guide figure 14). Battlecraft fills the marquee, or the whole map when
+// nothing is marked out; this editor has no marquee, so it fills the whole map. One brush dab wide enough to cover
+// everything, which means it lands on the undo stack like any other paint stroke and Z puts it straight back.
+void FillActiveMap()
+{
+    var painter = ActivePainter();
+    var tgt = ActivePaintMap();
+    if (painter is null || tgt is null) { Toast(Loc.T("Generate or load a material map first.")); return; }
+    var stroke = painter.BeginStroke();
+    float half = cfg.WorldSize * 0.5f;
+    stroke.Dab(half, half, new MaterialBrush(ActivePaintValue(), cfg.WorldSize, 1f, BrushFalloff.Smooth, null, true));
+    var edit = stroke.Finish();
+    if (edit is null) { Toast(Loc.T("Nothing to fill.")); return; }
+    if (hist is not null) hist.Do(new MaterialStrokeCommand(edit, tgt, UploadActivePaintTexture));
+    else UploadActivePaintTexture();
+    Toast(Loc.T("Filled the whole map (Z undoes it)."));
+}
+
 MaterialBrush MakeMatBrush()
 {
     var shape = brushShapes[Math.Clamp(brushShapeIdx, 0, brushShapes.Count - 1)].Mask;
@@ -5285,13 +5642,97 @@ string[] VehicleChoices()
 }
 
 // Geometry is unchanged by a move, so just recompute the placement matrices (cheap, no re-upload).
+// ---- Object locking (Battlecraft's Lock/Unlock Selected + Lock/Unlock All) ----------------------------------
+string GpLockKey(GpKind kind, int idx) => kind.ToString() + ":" + gameplayEdit.GetName(kind, idx);
+bool IsGameplayLocked(GpKind kind, int idx) =>
+    idx >= 0 && lockedGameplayKeys.Contains(GpLockKey(kind, idx));
+
+/// <summary>The selected gameplay handle refuses to move while locked - reported, never silent.</summary>
+bool GameplayEditBlocked()
+{
+    if (gpIndex < 0 || !IsGameplayLocked(gpKind, gpIndex)) return false;
+    Toast(Loc.T("That object is locked (Object > Unlock Selected)."));
+    return true;
+}
+
+bool IsObjectLocked(int idx) =>
+    so is not null && idx >= 0 && idx < so.Objects.Count && lockedObjectIds.Contains(so.Objects[idx].Id);
+
+/// <summary>The selected indices that may actually be edited. Reports the skipped ones once, so a locked object
+/// never silently swallows an edit.</summary>
+List<int> EditableSelection()
+{
+    var outp = new List<int>();
+    int blocked = 0;
+    foreach (var i in multi)
+    {
+        if (i < 0 || so is null || i >= so.Objects.Count) continue;
+        if (IsObjectLocked(i)) { blocked++; continue; }
+        outp.Add(i);
+    }
+    if (blocked > 0 && outp.Count == 0)
+        Toast(blocked == 1 ? Loc.T("That object is locked (Object > Unlock Selected).")
+                           : string.Format(Loc.T("{0} selected objects are locked (Object > Unlock Selected)."), blocked));
+    return outp;
+}
+
+void SetSelectionLocked(bool locked)
+{
+    // A gameplay handle (vehicle spawner, flag, soldier spawn) is selected on its own, not via multi.
+    if (gpIndex >= 0)
+    {
+        var key = GpLockKey(gpKind, gpIndex);
+        bool changed = locked ? lockedGameplayKeys.Add(key) : lockedGameplayKeys.Remove(key);
+        Toast(string.Format(locked ? Loc.T("Locked {0} object(s).") : Loc.T("Unlocked {0} object(s)."), changed ? 1 : 0));
+        return;
+    }
+    if (so is null || multi.Count == 0) return;
+    int n = 0;
+    foreach (var i in multi)
+    {
+        if (i < 0 || i >= so.Objects.Count) continue;
+        if (locked ? lockedObjectIds.Add(so.Objects[i].Id) : lockedObjectIds.Remove(so.Objects[i].Id)) n++;
+    }
+    Toast(string.Format(locked ? Loc.T("Locked {0} object(s).") : Loc.T("Unlocked {0} object(s)."), n));
+}
+
+// Locked object Ids -> the indices the renderer works in. Rebuilt per frame, but only while something is actually
+// locked, so the common case costs nothing.
+IReadOnlySet<int>? LockedIndices()
+{
+    if (!showLockedTint || so is null || lockedObjectIds.Count == 0) return null;
+    lockedIdxScratch.Clear();
+    for (int i = 0; i < so.Objects.Count; i++)
+        if (lockedObjectIds.Contains(so.Objects[i].Id)) lockedIdxScratch.Add(i);
+    return lockedIdxScratch;
+}
+
+void SetAllLocked(bool locked)
+{
+    if (so is null) return;
+    if (locked)
+    {
+        foreach (var o in so.Objects) lockedObjectIds.Add(o.Id);
+        // Vehicle spawners and the other gameplay handles lock too - all should mean all.
+        for (int i = 0; i < gameplayEdit.VehicleSpawns.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.Vehicle, i));
+        for (int i = 0; i < gameplayEdit.ControlPoints.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.ControlPoint, i));
+        for (int i = 0; i < gameplayEdit.SoldierSpawns.Count; i++) lockedGameplayKeys.Add(GpLockKey(GpKind.Soldier, i));
+        Toast(string.Format(Loc.T("Locked all {0} objects."), so.Objects.Count + lockedGameplayKeys.Count));
+    }
+    else
+    {
+        int n = lockedObjectIds.Count + lockedGameplayKeys.Count;
+        lockedObjectIds.Clear(); lockedGameplayKeys.Clear();
+        Toast(string.Format(Loc.T("Unlocked all {0} objects."), n));
+    }
+}
+
 void NudgeSelected(float dx, float dy, float dz)
 {
     if (so is null || hist is null || multi.Count == 0) return;
     var cmds = new List<IEditCommand>();
-    foreach (var i in multi)
+    foreach (var i in EditableSelection())
     {
-        if (i < 0 || i >= so.Objects.Count) continue;
         var o = so.Objects[i];
         cmds.Add(new MoveObject(o.Id, new Vec3(o.Position.X + dx, o.Position.Y + dy, o.Position.Z + dz)));
     }
@@ -5306,9 +5747,8 @@ void RotateSelectedYaw(float deg)
 {
     if (so is null || hist is null || multi.Count == 0) return;
     var cmds = new List<IEditCommand>();
-    foreach (var i in multi)
+    foreach (var i in EditableSelection())
     {
-        if (i < 0 || i >= so.Objects.Count) continue;
         var o = so.Objects[i];
         cmds.Add(new RotateObject(o.Id, new Vec3(o.Rotation.X + deg, o.Rotation.Y, o.Rotation.Z)));
     }
@@ -5319,6 +5759,48 @@ void RotateSelectedYaw(float deg)
 }
 
 // Clone the selected object(s) a few metres away (same template/rotation/scale), one undo step; select the clones.
+// Battlecraft Ctrl+C: remember the selection, each object's position taken relative to the primary one.
+void CopySelected()
+{
+    if (so is null || multi.Count == 0) return;
+    int anchor = selected >= 0 && selected < so.Objects.Count ? selected : multi.First();
+    var a = so.Objects[anchor].Position;
+    objClipboard.Clear();
+    foreach (var i in multi)
+    {
+        if (i < 0 || i >= so.Objects.Count) continue;
+        var o = so.Objects[i];
+        objClipboard.Add((o.Template, new Vec3(o.Position.X - a.X, o.Position.Y - a.Y, o.Position.Z - a.Z),
+                          o.Rotation, o.Scale ?? 1f));
+    }
+    Toast(string.Format(Loc.T("Copied {0} object(s)."), objClipboard.Count));
+}
+
+// Battlecraft Ctrl+V: drop the clipboard where the cursor is pointing at the ground, keeping the arrangement.
+// One undo step, and the pasted copies end up selected so they can be nudged straight away.
+void PasteClipboard()
+{
+    if (so is null || hist is null || objClipboard.Count == 0) { Toast(Loc.T("Nothing copied yet.")); return; }
+    Vec3 at;
+    var fbp = window.FramebufferSize;
+    var pray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbp.X, fbp.Y);
+    if (terrainPick is not null && terrainPick.Raycast(pray, out var ph)) at = SnapXZ(new Vec3(ph.X, ph.Y, ph.Z));
+    else { var c = cam.Position + cam.Forward * 30f; at = SnapXZ(new Vec3(c.X, c.Y, c.Z)); }
+    var cmds = new List<IEditCommand>(); var newIds = new List<string>();
+    foreach (var (tmpl, off, rot, sc) in objClipboard)
+    {
+        var id = Guid.NewGuid().ToString("N"); newIds.Add(id);
+        cmds.Add(new AddObject(id, tmpl, new Vec3(at.X + off.X, at.Y + off.Y, at.Z + off.Z), rot));
+        if (MathF.Abs(sc - 1f) > 1e-3f) cmds.Add(new ScaleObject(id, sc));
+    }
+    if (cmds.Count == 0) return;
+    hist.Do(new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
+    multi.Clear(); selected = -1; gpIndex = -1;
+    foreach (var id in newIds) { int idx = so.Objects.FindIndex(x => x.Id == id); if (idx >= 0) { multi.Add(idx); selected = idx; } }
+    Toast(string.Format(Loc.T("Pasted {0} object(s)."), newIds.Count));
+}
+
 void DuplicateSelected()
 {
     if (so is null || hist is null || multi.Count == 0) return;
@@ -5343,9 +5825,8 @@ void DropSelectedToGround()
 {
     if (so is null || hist is null || terrainPick is null || multi.Count == 0) return;
     var cmds = new List<IEditCommand>();
-    foreach (var i in multi)
+    foreach (var i in EditableSelection())
     {
-        if (i < 0 || i >= so.Objects.Count) continue;
         var o = so.Objects[i];
         cmds.Add(new MoveObject(o.Id, new Vec3(o.Position.X, terrainPick.HeightAt(o.Position.X, o.Position.Z), o.Position.Z)));
     }
@@ -5361,7 +5842,7 @@ void RebuildObjects()
     if (glObjects is null) glObjects = GlObjects.Build(gl, so, meshLib);
     else glObjects.Rebuild(gl, so, meshLib);
     if (objectLightmapsLoaded) glObjects.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);   // re-match (only if already loaded)
-    collisionDirty = true;   // object set/placement changed -> rebuild the collision overlay next time it's shown
+    collisionDirty = true; bboxDirty = true;   // object set/placement changed -> rebuild the collision overlay next time it's shown
     shadowMapDirty = true;   // object moved/added/deleted -> re-render the sun shadow map
 }
 
@@ -5540,6 +6021,7 @@ void OnRender(double dt)
         gl.UseProgram(terrainProg);
         gl.UniformMatrix4(uMvp, 1, false, mvp);
         gl.Uniform3(uLight, ld.X, ld.Y, ld.Z);
+        SetLightUniforms(uAmbLightT, uDifLightT);
         gl.Uniform1(uWater, cfg.WaterLevel);
         gl.Uniform1(uMaxH, maxH);
         gl.Uniform3(uDeepColor, deepColor.X, deepColor.Y, deepColor.Z);
@@ -5556,15 +6038,22 @@ void OnRender(double dt)
         if (showPaint) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, matTexId); gl.ActiveTexture(TextureUnit.Texture0); }
         else if (showNav) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, aiNavTexId); gl.ActiveTexture(TextureUnit.Texture0); }
         gl.BindVertexArray(terrainVao);
+        // Terrain view mode (Battlecraft J/K/L): 1 draws the mesh as lines only; 0 and 2 draw it solid, and 2 adds
+        // the draped grid below as its overlay.
+        if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
         unsafe { gl.DrawElements(PrimitiveType.Triangles, (uint)terrainIndexCount, DrawElementsType.UnsignedInt, (void*)0); }
+        if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Fill);
     }
 
-    DrawGrid();   // draped world-grid overlay (depth-tested, on the ground), if enabled
+    // Draped world-grid overlay. Wireframe already draws the mesh as lines, so the grid is suppressed there (it
+    // would sit on top and ignore the Grid checkbox); textured-wireframe forces it on as its overlay.
+    if (terrainView != 1) DrawGrid(terrainView == 2);
 
     // Texture transparency: blend object + foliage alpha (the shader's alpha-test discard does the hard cutout,
     // blending softens the edges). Opaque parts output alpha=1.0 so they're unaffected.
     if (alphaTransparency) { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
     gl.UseProgram(objProg); gl.Uniform1(uAlphaEnableO, alphaTransparency ? 1 : 0);   // toggle off -> no discard + opaque output (objects revert to solid)
+    SetLightUniforms(uAmbLightO, uDifLightO);   // one set covers every object pass this frame (uniforms are per-program state)
 
     // Real object geometry (GPU). Selected object is tinted via the highlight colour.
     if (glObjects is not null && showObjects && !painting)
@@ -5577,11 +6066,15 @@ void OnRender(double dt)
         if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
         // Baked object lighting unless you're driving the sun manually - then objects light DYNAMICALLY (N-L + the
         // real-time shadow map) so they respond to the sun in real time (a static baked lightmap can't move with it).
+        // Wireframe object view: line polygons for every object drawn in this pass (statics, vehicle spawners,
+        // flags, spawn markers). Flat shading comes with it so the lines are the material colour, not texture.
+        if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
         bool wantLm = showObjectLightmaps && !sunOverride;
         if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
         glObjects.ShowLightmaps = wantLm;
+        glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
         glObjects.Draw(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                       cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f));
+                       cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f), LockedIndices());
 
         // Continuously-rotating object parts (BF1942 RotationalBundle: windmill blades, watermill wheel, mod fans/rotors).
         // These are kept OUT of the static flattened mesh, so they're drawn here (always — else the part vanishes when
@@ -5616,6 +6109,7 @@ void OnRender(double dt)
             SetFogUniforms(objProg);
             foreach (var v in gameplayEdit.VehicleSpawns)
             {
+                if (!GpVisible(GpKind.Vehicle, gameplayEdit.VehicleSpawns.IndexOf(v))) continue;   // game-type filter
                 // Show the spawner's owning-team vehicle (SpawnVehicleName), not the team-2-preferred display fallback,
                 // so enemy-team spawners render their real vehicle. NO tint — render exactly as a placed object (the
                 // distinct team models are the faction cue; a colour cast looked wrong on the vehicle textures).
@@ -5626,8 +6120,17 @@ void OnRender(double dt)
                 var spawnWorld = Matrix4x4.CreateFromYawPitchRoll(
                                      v.Rotation.X * MathF.PI / 180f, v.Rotation.Y * MathF.PI / 180f, v.Rotation.Z * MathF.PI / 180f)
                                * Matrix4x4.CreateTranslation(v.Position.X, v.Position.Y, v.Position.Z);
+                // Same tint rules as a static object, so a vehicle spawner reads the same way: selected is the
+                // amber highlight, locked is red, and locked-AND-selected is the lighter red - otherwise you
+                // could not tell which of several locked spawners you had picked.
+                int vIdx = gameplayEdit.VehicleSpawns.IndexOf(v);
+                if (!GpVisible(GpKind.Vehicle, vIdx)) continue;   // game-type filter
+                bool vSel = gpKind == GpKind.Vehicle && gpIndex == vIdx && vIdx >= 0;
+                bool vLocked = showLockedTint && vIdx >= 0 && IsGameplayLocked(GpKind.Vehicle, vIdx);
+                var vTint = vLocked ? (vSel ? new Vector3(2.1f, 0.72f, 0.62f) : new Vector3(1.6f, 0.42f, 0.38f))
+                          : vSel ? new Vector3(1.5f, 1.4f, 0.4f) : Vector3.One;
                 glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                   cam.ViewProjection, $"veh::{veh}", vmesh, spawnWorld, Vector3.One);
+                                   cam.ViewProjection, $"veh::{veh}", vmesh, spawnWorld, vTint);
             }
         }
 
@@ -5654,6 +6157,7 @@ void OnRender(double dt)
             if (showControlPoints)
                 foreach (var cp in gameplayEdit.ControlPoints)
                 {
+                    if (!GpVisible(GpKind.ControlPoint, gameplayEdit.ControlPoints.IndexOf(cp))) continue;   // game-type filter
                     var poleName = string.IsNullOrEmpty(cp.PoleGeometry) ? "flagbase_m1" : cp.PoleGeometry;
                     if (meshLib.TryGet(poleName, out var pole) && pole is not null)
                         DrawGp($"gp::cp::{poleName}", pole, cp.Position, Vec3.Zero);
@@ -5675,9 +6179,10 @@ void OnRender(double dt)
                             Vector3 flo = fpos0[0], fhi = fpos0[0];
                             foreach (var p in fpos0) { flo = Vector3.Min(flo, p); fhi = Vector3.Max(fhi, p); }
                             const float hoistInset = 0.05f;   // forward: hoist edge sits just in front of the pole
+                            const float poleGap = 0.08f;      // the cloth sits just off the pole: 1 ft out, then 0.75 ft back so it is not floating free
                             const float flagLateral = 0.4f;   // "right": shift the flag laterally (Z) to line up with the pole (flip sign if it goes the wrong way)
-                            const float flagRise = 0.8f;      // lift the cloth ~2.5 ft up the pole (user request)
-                            var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
+                            const float flagRise = 0.1f;      // cloth height: 1 m down from the old 0.8, then a foot back up
+                            var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset + poleGap, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
                             DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f), cp.Team == 0 ? new Vector3(0.9f, 0.9f, 0.9f) : (Vector3?)null);   // neutral CP -> white flag
                         }
                     }
@@ -5945,7 +6450,9 @@ void OnRender(double dt)
 
     if (!painting) DrawGameplay();
     if (!painting) DrawSounds();
+    if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Fill);   // back to solid for the overlays below
     if (!painting) DrawCollision();
+    DrawBBoxes();
     DrawWeather();   // weather preview particles (depth-tested so terrain occludes them)
     DrawEffects();   // the level's particle effects (waterfalls/lava/fire/smoke), billboards, depth-tested
     DrawGridLabels();
@@ -5956,8 +6463,10 @@ void OnRender(double dt)
     fpsFrames++; fpsTimer += dt;
     if (fpsTimer >= 0.5)
     {
+        // A project folder is named by whoever extracted it, so prefer the project's own map name -
+        // otherwise the title reads as a different level from the one you opened.
         window.Title = levelDir is null ? "RefractorForge"
-            : $"RefractorForge  -  {System.IO.Path.GetFileNameWithoutExtension(levelDir.TrimEnd('\\', '/'))}";
+            : $"RefractorForge  -  {activeRfProject?.Name ?? System.IO.Path.GetFileNameWithoutExtension(levelDir.TrimEnd((char)92, (char)47))}";
         fpsFrames = 0; fpsTimer = 0;
     }
 
@@ -6163,6 +6672,76 @@ void GiPlace(ImDrawListPtr dl, Vector2 c, float r, uint col)
 }
 // (GiPaint/GiSculpt/GiSmooth glyphs removed with the old flat tool row; the mapper bar uses text labels.)
 
+// ---- Battlecraft-style toolbar glyphs: terrain view modes, camera presets, object locks ----------------------
+void GiWire(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    dl.AddRect(new Vector2(c.X - r, c.Y - r), new Vector2(c.X + r, c.Y + r), col, 0f, ImDrawFlags.None, 1.4f);
+    dl.AddLine(new Vector2(c.X, c.Y - r), new Vector2(c.X, c.Y + r), col, 1.2f);
+    dl.AddLine(new Vector2(c.X - r, c.Y), new Vector2(c.X + r, c.Y), col, 1.2f);
+    dl.AddLine(new Vector2(c.X - r, c.Y - r), new Vector2(c.X + r, c.Y + r), col, 1.2f);   // the mesh diagonal
+}
+void GiTextured(ImDrawListPtr dl, Vector2 c, float r, uint col)
+    => dl.AddRectFilled(new Vector2(c.X - r, c.Y - r), new Vector2(c.X + r, c.Y + r), col);
+void GiTexWire(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    dl.AddRectFilled(new Vector2(c.X - r, c.Y - r), new Vector2(c.X + r, c.Y + r), col & 0x60FFFFFF);
+    GiWire(dl, c, r, col);
+}
+void GiCamGround(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    dl.AddLine(new Vector2(c.X - r, c.Y + r * 0.6f), new Vector2(c.X + r, c.Y + r * 0.6f), col, 1.6f);   // horizon
+    dl.AddRectFilled(new Vector2(c.X - r * 0.5f, c.Y - r * 0.1f), new Vector2(c.X + r * 0.3f, c.Y + r * 0.45f), col);
+    dl.AddTriangleFilled(new Vector2(c.X + r * 0.3f, c.Y + r * 0.1f), new Vector2(c.X + r, c.Y - r * 0.15f), new Vector2(c.X + r, c.Y + r * 0.4f), col);
+}
+void GiCamFly(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    dl.AddRectFilled(new Vector2(c.X - r * 0.7f, c.Y - r * 0.55f), new Vector2(c.X + r * 0.1f, c.Y), col);
+    dl.AddTriangleFilled(new Vector2(c.X + r * 0.1f, c.Y - r * 0.45f), new Vector2(c.X + r * 0.75f, c.Y - r * 0.7f), new Vector2(c.X + r * 0.75f, c.Y - r * 0.05f), col);
+    dl.AddLine(new Vector2(c.X - r * 0.6f, c.Y + r * 0.35f), new Vector2(c.X + r * 0.8f, c.Y + r * 0.8f), col, 1.4f);   // ground, obliquely
+}
+void GiCamTop(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    dl.AddRect(new Vector2(c.X - r, c.Y + r * 0.15f), new Vector2(c.X + r, c.Y + r), col, 0f, ImDrawFlags.None, 1.4f);
+    dl.AddLine(new Vector2(c.X, c.Y - r), new Vector2(c.X, c.Y - r * 0.05f), col, 1.6f);                 // looking down
+    dl.AddTriangleFilled(new Vector2(c.X, c.Y + r * 0.1f), new Vector2(c.X - r * 0.4f, c.Y - r * 0.35f), new Vector2(c.X + r * 0.4f, c.Y - r * 0.35f), col);
+}
+void Padlock(ImDrawListPtr dl, Vector2 c, float r, uint col, bool open)
+{
+    dl.AddRectFilled(new Vector2(c.X - r * 0.7f, c.Y - r * 0.05f), new Vector2(c.X + r * 0.7f, c.Y + r * 0.85f), col, 2f);
+    // shackle: closed sits centred, open is hinged off to the right
+    float sx = open ? c.X + r * 0.45f : c.X;
+    dl.PathArcTo(new Vector2(sx, c.Y - r * 0.1f), r * 0.45f, 3.14159f, 6.28318f, 12);
+    dl.PathStroke(col, ImDrawFlags.None, 1.8f);
+}
+void GiLock(ImDrawListPtr dl, Vector2 c, float r, uint col) => Padlock(dl, c, r, col, false);
+void GiUnlock(ImDrawListPtr dl, Vector2 c, float r, uint col) => Padlock(dl, c, r, col, true);
+
+/// <summary>A square icon button that is NOT tied to the tool index (unlike IconTool): its own id, its own
+/// active state. Used for the Battlecraft view / camera / lock buttons.</summary>
+bool IconBtn(string id, System.Action<ImDrawListPtr, Vector2, float, uint> glyph, bool active, string tip, bool enabled = true)
+{
+    const float sz = 30f;
+    if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+    if (!enabled) ImGui.BeginDisabled();
+    bool clicked = ImGui.Button("##" + id, new Vector2(sz, sz));
+    if (!enabled) ImGui.EndDisabled();
+    if (active) ImGui.PopStyleColor();
+    var mn = ImGui.GetItemRectMin(); var mx = ImGui.GetItemRectMax();
+    var ctr = new Vector2((mn.X + mx.X) * 0.5f, (mn.Y + mx.Y) * 0.5f);
+    uint col = ImGui.GetColorU32(enabled ? ImGuiCol.Text : ImGuiCol.TextDisabled);
+    glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - 8f, col);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
+    return clicked && enabled;
+}
+
+void GiNudge(ImDrawListPtr dl, Vector2 c, float r, uint col)
+{
+    // a hand-ish grab: a small box being pushed, with a short motion trail
+    dl.AddRect(new Vector2(c.X - r * 0.15f, c.Y - r * 0.5f), new Vector2(c.X + r * 0.85f, c.Y + r * 0.4f), col, 0f, ImDrawFlags.None, 1.6f);
+    dl.AddLine(new Vector2(c.X - r, c.Y - r * 0.05f), new Vector2(c.X - r * 0.35f, c.Y - r * 0.05f), col, 1.6f);
+    dl.AddTriangleFilled(new Vector2(c.X - r * 0.15f, c.Y - r * 0.05f), new Vector2(c.X - r * 0.6f, c.Y - r * 0.4f), new Vector2(c.X - r * 0.6f, c.Y + r * 0.3f), col);
+}
+
 // One square icon tool button: draws the frame, overlays the glyph, shows a tooltip, selects on click.
 bool IconTool(int idx, System.Action<ImDrawListPtr, Vector2, float, uint> glyph, string tip)
 {
@@ -6233,7 +6812,102 @@ void MapperSubToolbar()
         IconTool(1, GiMove,   "Move");   ImGui.SameLine();
         IconTool(2, GiRotate, "Rotate"); ImGui.SameLine();
         IconTool(3, GiScale,  "Scale");  ImGui.SameLine();
-        IconTool(4, GiPlace,  "Place");
+        IconTool(4, GiPlace,  "Place"); ImGui.SameLine();
+        IconTool(9, GiNudge,  "Nudge: drag any object along the ground (hold Ctrl for fine movement)");
+        // Battlecraft's game-type dropdown (guide figure 21): show the gameplay of one mode, or all of them.
+        if (gameplayModes.Modes.Count > 0)
+        {
+            ImGui.SameLine(); Sep();
+            var gtLabels = new string[gameplayModes.Modes.Count + 1];
+            gtLabels[0] = Loc.T("Show All");
+            for (int i = 0; i < gameplayModes.Modes.Count; i++) gtLabels[i + 1] = gameplayModes.Modes[i];
+            ImGui.SetNextItemWidth(130f);
+            ImGui.Combo(Loc.TL("Game type"), ref gameTypeFilter, gtLabels, gtLabels.Length);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing still applies to the mode the level was loaded from."));
+            ImGui.SameLine();
+        }
+
+        // Battlecraft's object VIEW buttons (guide figure 17): textured / flat colour / bounding box. The collision
+        // mesh is the existing Layers toggle, so it is not duplicated here.
+        ImGui.SameLine(); Sep();
+        ImGui.TextDisabled(Loc.T("View:")); ImGui.SameLine();
+        string[] ovLabels = { "Textured", "Flat", "Boxes", "Wire" };
+        string[] ovTips =
+        {
+            "Objects with their textures (normal view).",
+            "Objects in flat material colour - easier to read how they sit relative to each other.",
+            "Each object's bounding box - the view for spotting objects that intersect.",
+            "Objects and vehicles as wireframe - see through them to what is behind.",
+        };
+        for (int v = 0; v < ovLabels.Length; v++)
+        {
+            bool on = objectView == v;
+            if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+            if (ImGui.Button($"{Loc.T(ovLabels[v])}###objview{v}")) objectView = v;
+            if (on) ImGui.PopStyleColor();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(ovTips[v]));
+            ImGui.SameLine();
+        }
+        ImGui.NewLine();
+
+        // Battlecraft's per-axis move / rotate buttons. "Free" is this editor's own gizmo, kept as the default.
+        if (toolNames[tool] is "Move" or "Rotate")
+        {
+            ImGui.SameLine(); Sep();
+            bool rot = toolNames[tool] == "Rotate";
+            ImGui.TextDisabled(Loc.T(rot ? "Rotate axis:" : "Move axis:")); ImGui.SameLine();
+            string[] axisLabels = { "Free", "X", "Y", "Z" };
+            for (int a = -1; a <= 2; a++)
+            {
+                bool on = axisLock == a;
+                if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+                if (ImGui.Button($"{Loc.T(axisLabels[a + 1])}###axis{a}")) axisLock = a;
+                if (on) ImGui.PopStyleColor();
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(Loc.T(a < 0 ? "Free: use the gizmo handles (this editor's own way)."
+                                                 : rot ? "Grab the object and drag up/down to spin it about this axis."
+                                                       : "Grab the object and drag to slide it along this axis only."));
+                ImGui.SameLine();
+            }
+            ImGui.NewLine();
+        }
+    }
+    else if (mapper == 1 || mapper == 4)
+    {
+        // Battlecraft's Fill With Material button (guide figure 14).
+        if (ImGui.Button(Loc.TL("Fill map"))) FillActiveMap();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Fill the WHOLE map with the selected material. Undoable with Z."));
+        ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Radius##mat"), ref brushRadius, 1f, 200f, "%.0f");
+        ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Square brush##mat"), ref squareBrush);
+        ImGui.SameLine(); ImGui.TextDisabled(Loc.T("palette in the inspector ->"));
+    }
+    else if (mapper == 3)
+    {
+        // Battlecraft's surface-painter row (guide figure 19): the texture brush this editor already had, then
+        // darken / lighten / blend / flat colour, and the colour swatch those last ones use.
+        string[] ops = { "Texture", "Darken", "Lighten", "Blend", "Colour" };
+        string[] tips =
+        {
+            "Paint the selected surface texture (the brush this editor has always had).",
+            "Darken the terrain image under the brush.",
+            "Lighten the terrain image under the brush.",
+            "Blend the terrain image under the brush (blurs the pixels together).",
+            "Paint a flat colour onto the terrain image - pick it with the swatch.",
+        };
+        for (int i = 0; i < ops.Length; i++)
+        {
+            bool on = surfaceOp == i;
+            if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+            if (ImGui.Button($"{Loc.T(ops[i])}###surfop{i}")) surfaceOp = i;
+            if (on) ImGui.PopStyleColor();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tips[i]));
+            ImGui.SameLine();
+        }
+        ImGui.ColorEdit3("##surfcol", ref surfacePaintColor, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoLabel);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Colour used by the Colour brush."));
+        ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Radius##surf"), ref brushRadius, 1f, 200f, "%.0f");
+        ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Intensity##surf"), ref texIntensity, 0.02f, 1f, "%.2f");
     }
     else if (mapper == 5)
     {
@@ -6274,6 +6948,26 @@ void ToolButtons()
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Snap grid step (m): placed/moved objects round to this."));
     }
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Map"), ref showMinimap);
+    ImGui.SameLine(); Sep();
+    // Battlecraft's terrain-view, camera and lock buttons (guide figures 4, 5 and 18).
+    if (IconBtn("tvwire", GiWire, terrainView == 1, "Terrain: wireframe (J)")) terrainView = 1;
+    ImGui.SameLine(); if (IconBtn("tvtex", GiTextured, terrainView == 0, "Terrain: textured (K)")) terrainView = 0;
+    ImGui.SameLine(); if (IconBtn("tvboth", GiTexWire, terrainView == 2, "Terrain: textured wireframe (L)")) terrainView = 2;
+    ImGui.SameLine(); Sep();
+    if (IconBtn("camgnd", GiCamGround, groundCam, "Camera: on terrain (I)")) SetGroundCam(true);
+    ImGui.SameLine(); if (IconBtn("camfly", GiCamFly, !groundCam, "Camera: fly (O)")) SetGroundCam(false);
+    ImGui.SameLine(); if (IconBtn("camtop", GiCamTop, false, "Camera: top-down from here (P)")) TopDownCamera();
+    ImGui.SameLine(); Sep();
+    bool anySel = multi.Count > 0;
+    if (IconBtn("lockSel", GiLock, false, "Lock selected object(s)", anySel)) SetSelectionLocked(true);
+    ImGui.SameLine(); if (IconBtn("unlockSel", GiUnlock, false, "Unlock selected object(s)", anySel)) SetSelectionLocked(false);
+    ImGui.SameLine(); if (IconBtn("lockAll", GiLock, false, "Lock ALL objects", so is not null && so.Objects.Count > 0)) SetAllLocked(true);
+    ImGui.SameLine(); if (IconBtn("unlockAll", GiUnlock, false, "Unlock ALL objects", lockedObjectIds.Count > 0)) SetAllLocked(false);
+    if (lockedObjectIds.Count > 0)
+    {
+        ImGui.SameLine();
+        ImGui.TextDisabled(string.Format(Loc.T("{0} locked"), lockedObjectIds.Count));
+    }
     MapperSubToolbar();
 }
 
@@ -6663,6 +7357,9 @@ void Inspector()
                 editVehRequest = true; evIndex = gpIndex; evName = v.Name;
                 evPos = new Vector3(v.Position.X, v.Position.Y, v.Position.Z); evRot = new Vector3(v.Rotation.X, v.Rotation.Y, v.Rotation.Z);
                 evTeam = v.Team; evOsId = v.OsId;
+                evMinDelay = v.MinSpawnDelay; evMaxDelay = v.MaxSpawnDelay; evDelayStart = v.SpawnDelayAtStart;
+                evTtl = v.TimeToLive; evDist = v.Distance; evDmgLost = v.DamageWhenLost; evMaxSpawned = v.MaxNrOfObjectSpawned;
+                evVeh1 = v.Vehicle1; evVeh2 = v.Vehicle2;
             }
             if (gpKind == GpKind.Soldier && ImGui.Button(Loc.TL("Edit Soldier Spawn...")))
             {
@@ -6708,6 +7405,14 @@ void Inspector()
     }
 
     ImGui.TextDisabled(Loc.T("TRANSFORM"));
+    // A locked object is locked against typing coordinates too, not just dragging - otherwise the lock would only
+    // cover half the ways this editor can move something.
+    bool selLocked = IsObjectLocked(selected);
+    if (selLocked)
+    {
+        ImGui.TextColored(new Vector4(0.95f, 0.75f, 0.25f, 1f), Loc.T("LOCKED - unlock it to edit (Object menu)"));
+        ImGui.BeginDisabled();
+    }
     ImGui.PushItemWidth(-80f);   // fields fill the row but leave room for the Position/Rotation/Scale labels (not -1, which clips them)
 
     if (ImGui.DragFloat3(Loc.TL("Position"), ref insPos, 0.25f, 0f, 0f))
@@ -6729,6 +7434,7 @@ void Inspector()
     { var to = insScale; o.Scale = dragFromScale; hist.Do(new ScaleObject(o.Id, to)); SyncTransformEdit(); }
 
     ImGui.PopItemWidth();
+    if (selLocked) ImGui.EndDisabled();   // pairs with the BeginDisabled above the transform fields
 
     // Sound emitter: edit the .ssc script this object loads (shared by every placement of the template).
     if (sounds.IsSound(o.Template))
@@ -6905,7 +7611,9 @@ void LayersPanel()
     ImGui.Checkbox(Loc.TL("Static Objects"), ref showObjects);
     ImGui.Checkbox(Loc.TL("Texture transparency"), ref alphaTransparency);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
-    if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) collisionDirty = true;
+    if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
+    ImGui.Checkbox(Loc.TL("Tint locked objects red"), ref showLockedTint);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Everything a level ships is locked on load, so this is off by default - turn it on once you have unlocked what you are working on."));
     ImGui.Checkbox(string.Format(Loc.T("Vehicles ({0})"), gameplayEdit.VehicleSpawns.Count) + "###vehLayer", ref showVehicles);
     ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
     ImGui.Checkbox(string.Format(Loc.T("Spawn Points ({0})"), gameplayEdit.SoldierSpawns.Count) + "###spawnLayer", ref showSpawns);
@@ -7195,6 +7903,82 @@ void ImportCloudMesh()
     catch { return null; }
 }
 
+// Split the level's lighting into the ambient and diffuse terms the shaders want. The engine adds
+// globalAmbientColor and the light's own ambientColor together, so we do too; the pair is then normalised to sum to
+// 1.0 in luminance, which is exactly the editor's old flat 0.4/0.6 exposure. So the level's numbers decide the
+// COLOUR and the ambient/key BALANCE and never make the viewport darker or brighter overall - El Alamein lands on a
+// warm 0.39/0.70, close to where it already was. Ambient also keeps a readability floor: Operation_Irving's .1
+// ambient against a full-strength sun would otherwise put every shadowed face near black.
+(Vector3 Amb, Vector3 Dif) SceneLight()
+{
+    if (!lightPreview) return (new Vector3(0.4f), new Vector3(0.6f));
+    static float Lum(Vector3 c) => 0.299f * c.X + 0.587f * c.Y + 0.114f * c.Z;
+    var amb = lightGlobalAmb + lightAmb;
+    var dif = lightDiffuse;
+    float total = Lum(amb) + Lum(dif);
+    if (total < 1e-3f) return (new Vector3(0.4f), new Vector3(0.6f));
+    amb /= total; dif /= total;
+    float al = Lum(amb);
+    if (al < 0.22f) amb *= 0.22f / MathF.Max(al, 1e-3f);   // shadow-readability floor
+    return (amb, dif);
+}
+
+void SetLightUniforms(int ambLoc, int difLoc)
+{
+    var (a, d) = SceneLight();
+    if (ambLoc >= 0) gl.Uniform3(ambLoc, a.X, a.Y, a.Z);
+    if (difLoc >= 0) gl.Uniform3(difLoc, d.X, d.Y, d.Z);
+}
+
+// Copy the edited lighting back onto the EnvironmentSettings, flagging each key as declared so the patcher writes it.
+void SaveLightingToEnv()
+{
+    if (env is null) return;
+    env.GlobalAmbientColor = new Vec3(lightGlobalAmb.X, lightGlobalAmb.Y, lightGlobalAmb.Z);
+    env.AmbientColor = new Vec3(lightAmb.X, lightAmb.Y, lightAmb.Z);
+    env.DiffuseColor = new Vec3(lightDiffuse.X, lightDiffuse.Y, lightDiffuse.Z);
+    env.SpecularColor = new Vec3(lightSpecular.X, lightSpecular.Y, lightSpecular.Z);
+    env.HasGlobalAmbient = env.HasAmbient = env.HasDiffuse = env.HasSpecular = true;
+}
+
+// Patch the lighting into the level's Init.con on a FOLDER save. Init.con is real gameplay, so only the four
+// renderer lines are rewritten and everything else is passed through untouched.
+void SaveLightingFolder()
+{
+    if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
+    SaveLightingToEnv();
+    try
+    {
+        var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
+                       .OrderBy(f => f.Count(c => c == System.IO.Path.DirectorySeparatorChar)).FirstOrDefault();
+        if (initPath is null) { Toast(Loc.T("No Init.con to write lighting into.")); return; }
+        System.IO.File.WriteAllLines(initPath, env.PatchInitConLines(System.IO.File.ReadAllLines(initPath)));
+        lightingDirty = false;
+        Toast(Loc.T("Lighting written to Init.con."));
+    }
+    catch (Exception ex) { Toast(Loc.T("Lighting save failed: ") + ex.Message); }
+}
+
+// The same patch as an .rfa entry, for the archive save paths. A level carries several Init.con files (per menu /
+// per game mode); the shallowest one is the level's own.
+(string Name, byte[] Bytes)? LightingRfaExtra(string baseRfa)
+{
+    if (!lightingDirty || env is null) return null;
+    SaveLightingToEnv();
+    try
+    {
+        var arch = new RefractorFlatArchive(baseRfa);
+        var e = arch.Entries.Where(x => x.Name.EndsWith("Init.con", StringComparison.OrdinalIgnoreCase))
+                            .OrderBy(x => x.Name.Count(c => c == '/')).FirstOrDefault();
+        if (e is null) return null;
+        var text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
+        var lines = text.Replace("\r\n", "\n").Split("\n"[0]);
+        var patched = string.Join("\r\n", env.PatchInitConLines(lines)) + "\r\n";
+        return ("Init.con", System.Text.Encoding.Latin1.GetBytes(patched));
+    }
+    catch { return null; }
+}
+
 // Environment editor: distance fog (and room for more sky/lighting settings later). Live-applied to the
 // terrain + object shaders; seeded from the level's Init.con (renderer.vertexFog* / fog start-end).
 void EnvironmentPanel()
@@ -7255,6 +8039,30 @@ void EnvironmentPanel()
             shadowMapDirty = true;
         }
     }
+
+    ImGui.Separator();
+    // Battlecraft's light settings: the four renderer.* colours in Init.con. Editing them relights the editor
+    // immediately, and the values are written back into Init.con on save.
+    ImGui.TextDisabled(Loc.T("LIGHTING"));
+    ImGui.Checkbox(Loc.TL("Preview lighting"), ref lightPreview);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Shade the editor with the level's light colours.\nOff = neutral white light (the old look)."));
+    if (ImGui.ColorEdit3(Loc.TL("Global ambient"), ref lightGlobalAmb)) lightingDirty = true;
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.globalAmbientColor - scene-wide fill added to everything."));
+    if (ImGui.ColorEdit3(Loc.TL("Ambient"), ref lightAmb)) lightingDirty = true;
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.ambientColor - the sun light's own ambient term."));
+    if (ImGui.ColorEdit3(Loc.TL("Sun diffuse"), ref lightDiffuse)) lightingDirty = true;
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.diffuseColor - the key light colour. This is what\nmakes a level read warm or cold."));
+    if (ImGui.ColorEdit3(Loc.TL("Specular"), ref lightSpecular)) lightingDirty = true;
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.specularColor - highlight colour on shiny surfaces.\nWritten to Init.con; not previewed in the editor."));
+    if (ImGui.Button(Loc.TL("Reset lighting to level")) && env is not null)
+    {
+        lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
+        lightAmb = new Vector3(env.AmbientColor.X, env.AmbientColor.Y, env.AmbientColor.Z);
+        lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
+        lightSpecular = new Vector3(env.SpecularColor.X, env.SpecularColor.Y, env.SpecularColor.Z);
+        lightingDirty = false;
+    }
+    if (lightingDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
 
     ImGui.Separator();
     // Terrain paint alignment: move/zoom the ground texture until it sits on the terrain it belongs to.
@@ -8252,6 +9060,22 @@ void CollabDrain()
     }
 }
 
+// One-click AI bridge: the same relay the Collab host uses, bound to LOOPBACK so it is reachable only from this
+// machine. The MCP server (RefractorForge.Mcp) connects to it as an ordinary peer, which is why an AI can place
+// objects that show up in this viewport the same frame - no separate protocol, no polling, no reload.
+void DoAiBridge()
+{
+    if (so is null) { Toast(Loc.T("Load a level first.")); return; }
+    if (collab is not null) return;
+    try
+    {
+        collab = CollabSession.StartHost(so, collabPort, "Editor", null, BuildHostWorld(), System.Net.IPAddress.Loopback);
+        Toast(string.Format(Loc.T("AI Bridge listening on 127.0.0.1:{0}"), collab.Port));
+        Console.WriteLine($"AI Bridge: relay on 127.0.0.1:{collab.Port}. Point the RefractorForge MCP server at it with attach_editor.");
+    }
+    catch (Exception ex) { Toast(Loc.T("AI Bridge failed: ") + ex.Message); }
+}
+
 void DoCollabHost()
 {
     collabError = "";
@@ -8397,6 +9221,7 @@ unsafe void RenderMeshPreview()
     gl.Uniform1(gl.GetUniformLocation(objProg, "uFogEnable"), 0);   // isolated preview: kill the leftover scene fog
     var ld = Vector3.Normalize(new Vector3(0.4f, 0.85f, 0.45f));    // (else fog saturates to grey over the whole mesh)
     gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
+    SetLightUniforms(uAmbLightO, uDifLightO);
     glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO, mvViewProj, "mv::" + meshViewerTemplate, m, model, Vector3.One);
 
     gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
@@ -8740,9 +9565,33 @@ void BuildUi()
         }
         if (ImGui.BeginMenu(Loc.TL("Object")))
         {
+            if (ImGui.MenuItem(Loc.TL("Copy"), "Ctrl+C", false, multi.Count > 0)) CopySelected();
+            if (ImGui.MenuItem(Loc.TL("Paste (at the cursor)"), "Ctrl+V", false, objClipboard.Count > 0)) PasteClipboard();
             if (ImGui.MenuItem(Loc.TL("Duplicate"), "Ctrl+D", false, multi.Count > 0)) DuplicateSelected();
             if (ImGui.MenuItem(Loc.TL("Drop to ground"), "G", false, multi.Count > 0)) DropSelectedToGround();
             if (ImGui.MenuItem(Loc.TL("Delete"), "Del", false, multi.Count > 0 || gpIndex >= 0)) OnKeyDown(kb!, Key.Delete, 0);
+            ImGui.Separator();
+            // Battlecraft's lock buttons. A locked object still selects and inspects; it just cannot be moved,
+            // rotated, dropped or deleted - so you can work around a finished area without disturbing it.
+            if (ImGui.MenuItem(Loc.TL("Lock Selected"), null, false, multi.Count > 0)) SetSelectionLocked(true);
+            if (ImGui.MenuItem(Loc.TL("Unlock Selected"), null, false, multi.Count > 0)) SetSelectionLocked(false);
+            if (ImGui.MenuItem(Loc.TL("Lock All Objects"), null, false, so is not null && so.Objects.Count > 0)) SetAllLocked(true);
+            if (ImGui.MenuItem(Loc.TL("Unlock All Objects"), null, false, lockedObjectIds.Count > 0)) SetAllLocked(false);
+            ImGui.EndMenu();
+        }
+        if (ImGui.BeginMenu(Loc.TL("Terrain View")))
+        {
+            // Battlecraft's J/K/L terrain view buttons.
+            if (ImGui.MenuItem(Loc.TL("Wireframe"), "J", terrainView == 1)) terrainView = 1;
+            if (ImGui.MenuItem(Loc.TL("Textured"), "K", terrainView == 0)) terrainView = 0;
+            if (ImGui.MenuItem(Loc.TL("Textured wireframe"), "L", terrainView == 2)) terrainView = 2;
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Hide objects"), "Tab", !showObjects)) showObjects = !showObjects;
+            ImGui.Separator();
+            // Battlecraft's three camera buttons.
+            if (ImGui.MenuItem(Loc.TL("Camera: on terrain"), "I", groundCam)) SetGroundCam(true);
+            if (ImGui.MenuItem(Loc.TL("Camera: fly"), "O", !groundCam)) SetGroundCam(false);
+            if (ImGui.MenuItem(Loc.TL("Camera: top-down"), "P")) TopDownCamera();
             ImGui.EndMenu();
         }
         if (ImGui.BeginMenu(Loc.TL("Tools")))
@@ -8779,6 +9628,8 @@ void BuildUi()
             if (collab is null)
             {
                 if (ImGui.MenuItem(Loc.TL("Collaborate..."))) { collabError = ""; collabRequest = true; }
+                if (ImGui.MenuItem(Loc.TL("AI Bridge"))) DoAiBridge();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Let an AI assistant edit this level with you, through the\nRefractorForge MCP server. Listens on 127.0.0.1 only - this\nmachine, not the network. Objects it places appear here live."));
             }
             else
             {
@@ -8806,6 +9657,7 @@ void BuildUi()
         }
         if (ImGui.BeginMenu(Loc.TL("View")))
         {
+            ImGui.MenuItem(Loc.TL("Level Tree"), null, ref showLevelTree);
             ImGui.MenuItem(Loc.TL("Log / Errors"), null, ref showLog);
             ImGui.Separator();
             // How a level is ASSEMBLED. Both pull in content the opened .rfa doesn't itself contain, which is what
@@ -8847,7 +9699,7 @@ void BuildUi()
     if (menuH <= 0) menuH = ImGui.GetFrameHeight();
     uiMenuH = menuH;   // hand the menu-bar height to the 3D overlay so it can clip labels below the menu
 
-    const float statusH = uiStatusH, leftW = uiLeftW, rightW = uiRightW;
+    float statusH = uiStatusH, leftW = uiLeftW, rightW = uiRightW;   // not const: these follow uiScale
     float top = menuH;
     const ImGuiWindowFlags fixedFlags = ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse
                                       | ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoSavedSettings;
@@ -8871,6 +9723,9 @@ void BuildUi()
         ImGui.InputTextWithHint("##search", Loc.T("Search objects..."), ref searchText, 64);
         ImGui.PopItemWidth();
         ImGui.Separator();
+        // The library scrolls in its own region so the Level Tree below it keeps a fixed share of the panel
+        // instead of being pushed off the bottom by a few hundred templates.
+        ImGui.BeginChild("##libbody", new Vector2(0, showLevelTree ? bodyH * 0.45f : 0f));
         string filter = searchText.Trim();
         for (int ci = 0; ci < catalog.Count; ci++)
         {
@@ -8909,6 +9764,8 @@ void BuildUi()
                 ImGui.TreePop();
             }
         }
+        ImGui.EndChild();
+        if (showLevelTree) { ImGui.Separator(); LevelTreePanel(); }
     }
     ImGui.End();
 
@@ -9031,6 +9888,110 @@ void BuildUi()
     PathmapPreviewWindow();
 }
 
+// Battlecraft's Level Tree (guide figure 20): everything PLACED in the level, listed by name. The 3D view can only
+// ever select what you can see and click - this reaches control points buried inside buildings, spawns stacked on top
+// of each other, and any of the hundreds of static objects, by name. Click selects, double-click opens that item's
+// editor, and each row can be locked or unlocked on the spot (everything arrives locked, so this is where you free
+// the piece you actually want to move).
+void LevelTreePanel()
+{
+    ImGui.TextUnformatted(Loc.T("Level Tree"));
+    ImGui.SetNextItemWidth(-1f);
+    ImGui.InputTextWithHint("##treefilter", Loc.T("Filter by name..."), ref levelTreeFilter, 64u);
+    bool Match(string name) => levelTreeFilter.Length == 0
+        || name.Contains(levelTreeFilter, StringComparison.OrdinalIgnoreCase);
+    ImGui.Separator();
+    ImGui.BeginChild("treebody", new Vector2(0, 0));
+
+    // Selecting by name is only useful if it takes you there, so a plain click flies the camera to the row.
+    void Focus(Vec3 at)
+    {
+        var t = new Vector3(at.X, at.Y, at.Z);
+        cam.Position = t + new Vector3(0f, 25f, 55f);
+        cam.LookAt(t);
+    }
+
+    // One gameplay section (control points / vehicle spawners / soldier spawns).
+    void GpSection(string label, GpKind kind, int count)
+    {
+        if (count == 0) return;
+        if (!ImGui.TreeNodeEx($"{Loc.T(label)} ({count})###tree{kind}", ImGuiTreeNodeFlags.DefaultOpen)) return;
+        for (int i = 0; i < count; i++)
+        {
+            if (!GpVisible(kind, i)) continue;            // honour the game-type filter
+            string nm = gameplayEdit.GetName(kind, i);
+            if (!Match(nm)) continue;
+            bool locked = IsGameplayLocked(kind, i);
+            bool sel = gpKind == kind && gpIndex == i;
+            if (locked) ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.62f, 0.55f, 1f));
+            if (ImGui.Selectable($"{(locked ? "[L] " : "")}{nm}###tr{kind}{i}", sel))
+            { gpKind = kind; gpIndex = i; selected = -1; multi.Clear(); Focus(gameplayEdit.GetPos(kind, i)); }
+            if (locked) ImGui.PopStyleColor();
+            if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) OpenGpEditor(kind, i);
+            if (ImGui.BeginPopupContextItem($"##trctx{kind}{i}"))
+            {
+                if (ImGui.MenuItem(Loc.TL("Go to"))) Focus(gameplayEdit.GetPos(kind, i));
+                if (ImGui.MenuItem(locked ? Loc.TL("Unlock") : Loc.TL("Lock")))
+                {
+                    var key = GpLockKey(kind, i);
+                    if (locked) lockedGameplayKeys.Remove(key); else lockedGameplayKeys.Add(key);
+                }
+                if (ImGui.MenuItem(Loc.TL("Edit..."))) OpenGpEditor(kind, i);
+                ImGui.EndPopup();
+            }
+        }
+        ImGui.TreePop();
+    }
+
+    GpSection("Control Points", GpKind.ControlPoint, gameplayEdit.ControlPoints.Count);
+    GpSection("Vehicle Spawns", GpKind.Vehicle, gameplayEdit.VehicleSpawns.Count);
+    GpSection("Soldier Spawns", GpKind.Soldier, gameplayEdit.SoldierSpawns.Count);
+
+    // Static objects, grouped by template. A level runs to hundreds of them, so the groups are COLLAPSED by default -
+    // only an opened group builds rows, which keeps the window cheap on a big map.
+    if (so is not null && so.Objects.Count > 0)
+    {
+        var groups = new SortedDictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < so.Objects.Count; i++)
+        {
+            var t = so.Objects[i].Template;
+            // With a filter typed, match either the template or this instance's own name.
+            if (levelTreeFilter.Length > 0 && !Match(t)) continue;
+            if (!groups.TryGetValue(t, out var l)) groups[t] = l = new List<int>();
+            l.Add(i);
+        }
+        if (ImGui.TreeNodeEx($"{Loc.T("Static Objects")} ({so.Objects.Count})###treeStatics", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            foreach (var (tmpl, idxs) in groups)
+            {
+                if (!ImGui.TreeNodeEx($"{tmpl} ({idxs.Count})###trg{tmpl}")) continue;
+                foreach (var i in idxs)
+                {
+                    var o = so.Objects[i];
+                    bool locked = IsObjectLocked(i);
+                    bool sel = multi.Contains(i);
+                    if (locked) ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.62f, 0.55f, 1f));
+                    if (ImGui.Selectable($"{(locked ? "[L] " : "")}#{i}  {o.Position.X:0}, {o.Position.Z:0}###tro{i}", sel))
+                    { multi.Clear(); multi.Add(i); selected = i; gpIndex = -1; SyncTransformEdit(); Focus(o.Position); }
+                    if (locked) ImGui.PopStyleColor();
+                    if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) Focus(o.Position);
+                    if (ImGui.BeginPopupContextItem($"##troc{i}"))
+                    {
+                        if (ImGui.MenuItem(Loc.TL("Go to"))) Focus(o.Position);
+                        if (ImGui.MenuItem(locked ? Loc.TL("Unlock") : Loc.TL("Lock")))
+                        { if (locked) lockedObjectIds.Remove(o.Id); else lockedObjectIds.Add(o.Id); }
+                        ImGui.EndPopup();
+                    }
+                }
+                ImGui.TreePop();
+            }
+            ImGui.TreePop();
+        }
+    }
+
+    ImGui.EndChild();
+}
+
 // In-app Log / Errors window: shows captured console output (errors highlighted). Auto-pops after a level load that
 // produced warnings (missing meshes etc.) - the equivalent of Battlecraft's "Load Errors" box - and is reopenable
 // from View -> Log / Errors. Replaces hunting through the background CMD window.
@@ -9101,6 +10062,9 @@ void OpenGpEditor(GpKind kind, int idx)
         editVehRequest = true; evIndex = idx; evName = v.Name;
         evPos = new Vector3(v.Position.X, v.Position.Y, v.Position.Z); evRot = new Vector3(v.Rotation.X, v.Rotation.Y, v.Rotation.Z);
         evTeam = v.Team; evOsId = v.OsId;
+        evMinDelay = v.MinSpawnDelay; evMaxDelay = v.MaxSpawnDelay; evDelayStart = v.SpawnDelayAtStart;
+        evTtl = v.TimeToLive; evDist = v.Distance; evDmgLost = v.DamageWhenLost; evMaxSpawned = v.MaxNrOfObjectSpawned;
+        evVeh1 = v.Vehicle1; evVeh2 = v.Vehicle2;
     }
     else
     {
@@ -9193,20 +10157,44 @@ void EditVehModal()
     ImGui.DragFloat3(Loc.TL("Position"), ref evPos, 0.25f);
     ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
     ImGui.InputInt(Loc.TL("OS id"), ref evOsId);
-    string[] vteams = gameIsBf1942
-        ? new[] { Loc.T("Neutral (0)"), Loc.T("Axis (1)"), Loc.T("Allies (2)") }
-        : new[] { Loc.T("Neutral (0)"), Loc.T("Vietcong / NVA (1)"), Loc.T("US Army (2)") };
+    string[] vteams = TeamLabels();
     int vteamIdx = Math.Clamp(evTeam, 0, 2);
     if (ImGui.Combo(Loc.TL("Team"), ref vteamIdx, vteams, vteams.Length)) evTeam = vteamIdx;
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("OS id links the spawner to its control point."));
+
+    // Battlecraft's Edit Object Spawn TEMPLATE fields. These belong to the shared ObjectSpawner template, so every
+    // spawn point using it changes together - say so rather than letting it look per-placement.
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("TEMPLATE (shared by every spawn using it)"));
+    ImGui.InputText(Loc.TL("Team 1 object"), ref evVeh1, 64u);
+    ImGui.InputText(Loc.TL("Team 2 object"), ref evVeh2, 64u);
+    ImGui.InputInt(Loc.TL("Min spawn delay (s)"), ref evMinDelay);
+    ImGui.InputInt(Loc.TL("Max spawn delay (s)"), ref evMaxDelay);
+    ImGui.InputInt(Loc.TL("Spawn delay at start (s)"), ref evDelayStart);
+    ImGui.InputInt(Loc.TL("Time to live (s)"), ref evTtl);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How long an abandoned vehicle survives before it starts taking damage."));
+    ImGui.InputInt(Loc.TL("Distance (m)"), ref evDist);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far from its spawn the vehicle must be before Time to live counts down."));
+    ImGui.InputInt(Loc.TL("Damage when lost"), ref evDmgLost);
+    ImGui.InputInt(Loc.TL("Max spawned at once"), ref evMaxSpawned);
+    ImGui.TextDisabled(Loc.T("Only fields the level already declares are written back."));
     ImGui.Separator();
     if (ImGui.Button(Loc.TL("OK"), new Vector2(150, 0)))
     {
         if (hist is not null)
         {
             var cur = (VehicleSpawnDef)gameplayEdit.GetItem(GpKind.Vehicle, evIndex);
-            var nu = cur with { Name = evName, Position = new Vec3(evPos.X, evPos.Y, evPos.Z), Rotation = new Vec3(evRot.X, evRot.Y, evRot.Z), OsId = evOsId, Team = Math.Clamp(evTeam, 0, 2) };
+            var nu = cur with
+            {
+                Name = evName, Position = new Vec3(evPos.X, evPos.Y, evPos.Z), Rotation = new Vec3(evRot.X, evRot.Y, evRot.Z),
+                OsId = evOsId, Team = Math.Clamp(evTeam, 0, 2),
+                Vehicle1 = evVeh1, Vehicle2 = evVeh2,
+                MinSpawnDelay = Math.Max(0, evMinDelay), MaxSpawnDelay = Math.Max(0, evMaxDelay),
+                SpawnDelayAtStart = Math.Max(0, evDelayStart), TimeToLive = Math.Max(0, evTtl),
+                Distance = Math.Max(0, evDist), DamageWhenLost = Math.Max(0, evDmgLost),
+                MaxNrOfObjectSpawned = Math.Max(1, evMaxSpawned),
+            };
             hist.Do(new GameplaySetItemCommand(gameplayEdit, GpKind.Vehicle, evIndex, nu, null));
         }
         ImGui.CloseCurrentPopup();
@@ -9797,6 +10785,62 @@ string[] TeamLabels()
 /// <summary>Every copy of a named .con in the level, shallowest path first (patch archives before the base, so an
 /// override wins). Shared by the start-camera and team-name readers - a level carries several Init.con files and
 /// only the root one is the level's own.</summary>
+/// <summary>Read each game mode's gameplay files out of the level .rfa so the game-type filter works on packed
+/// levels too. A mode is any archive folder that carries one of the three gameplay files; later archives (patches)
+/// win, matching how the engine mounts them.</summary>
+GameplayModes ScanArchiveGameModes()
+{
+    var per = new Dictionary<string, (string[]? Cp, string[]? Veh, string[]? Sol)>(StringComparer.OrdinalIgnoreCase);
+    try
+    {
+        for (int i = 0; i < rfaList.Length; i++)
+        {
+            if (!System.IO.File.Exists(rfaList[i])) continue;
+            var arc = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rfaList[i]);
+            foreach (var e in arc.Entries)
+            {
+                var norm = e.Name.Replace((char)92, '/');
+                int slash = norm.LastIndexOf('/');
+                if (slash <= 0) continue;
+                var file = norm[(slash + 1)..];
+                bool isCp = file.Equals("ControlPoints.con", StringComparison.OrdinalIgnoreCase);
+                bool isVeh = file.Equals("ObjectSpawns.con", StringComparison.OrdinalIgnoreCase);
+                bool isSol = file.Equals("SoldierSpawns.con", StringComparison.OrdinalIgnoreCase);
+                if (!isCp && !isVeh && !isSol) continue;
+                var dir = norm[..slash];
+                var mode = dir[(dir.LastIndexOf('/') + 1)..];
+                if (mode.Length == 0) continue;
+                string[] lines;
+                try { lines = System.Text.Encoding.Latin1.GetString(arc.Read(e)).Split((char)10); } catch { continue; }
+                per.TryGetValue(mode, out var cur);
+                per[mode] = (isCp ? lines : cur.Cp, isVeh ? lines : cur.Veh, isSol ? lines : cur.Sol);
+            }
+        }
+    }
+    catch { return GameplayModes.Empty; }
+    return GameplayModes.Scan(per.Select(kv => (kv.Key, (IEnumerable<string>?)kv.Value.Cp,
+                                                        (IEnumerable<string>?)kv.Value.Veh,
+                                                        (IEnumerable<string>?)kv.Value.Sol)));
+}
+
+/// <summary>The mode the game-type dropdown is showing, or null for "Show All".</summary>
+string? ActiveGameMode() =>
+    gameTypeFilter > 0 && gameTypeFilter <= gameplayModes.Modes.Count ? gameplayModes.Modes[gameTypeFilter - 1] : null;
+
+/// <summary>Should this gameplay handle be shown / clickable under the current game-type filter?</summary>
+bool GpVisible(GpKind kind, int idx)
+{
+    var mode = ActiveGameMode();
+    if (mode is null || idx < 0) return true;
+    var k = kind switch
+    {
+        GpKind.ControlPoint => GameplayModes.Kind.ControlPoint,
+        GpKind.Vehicle => GameplayModes.Kind.Vehicle,
+        _ => GameplayModes.Kind.Soldier,
+    };
+    return gameplayModes.InMode(k, gameplayEdit.GetName(kind, idx), mode);
+}
+
 IEnumerable<byte[]> LevelConCandidates(string fileName)
 {
     var outp = new List<byte[]>();
@@ -9872,6 +10916,20 @@ void ApplyTerrainUv()
 
 /// Switch camera mode. Position and orientation are untouched, so the toggle never moves the view - only how
 /// W/S is interpreted changes (true view vector vs flattened onto XZ).
+// Battlecraft's Top-Down camera (P): look straight down from WHERE THE CAMERA ALREADY IS, so it frames the piece of
+// map you are working on rather than jumping away to the whole world. Only the aim changes, never the position -
+// except to lift clear of the ground if you were down among the objects.
+void TopDownCamera()
+{
+    SetGroundCam(false);                       // a straight-down view is a fly view, not a terrain-hugging one
+    float ground = terrainPick?.HeightAt(cam.Position.X, cam.Position.Z) ?? minH;
+    float minAbove = ground + 40f;             // enough to see the surroundings if you were standing on the deck
+    if (cam.Position.Y < minAbove) cam.Position = cam.Position with { Y = minAbove };
+    cam.Pitch = -1.55f;                        // just shy of -90: exactly vertical degenerates the look-at basis
+    cam.Yaw = 0f;                              // +Z (north) up the screen, matching the minimap
+    Toast(Loc.T("Camera: top-down"));
+}
+
 void SetGroundCam(bool on)
 {
     groundCam = on;
@@ -10050,6 +11108,19 @@ unsafe void UploadPaintTexture(MaterialMap? m)
 }
 
 // Active paint target (Material / Undergrowth / Overgrowth) - painter, map, brush value, and overlay.
+// One brush stamp for the surface painter: either the texture stamp this editor already had (op 0) or one of
+// Battlecraft's adjust brushes. Both share the stroke, so undo and the live upload rect work the same either way.
+void SurfaceDab(AtlasPaintStroke stroke, Texture2D? tex, float wx, float wz)
+{
+    if (surfaceOp == 0)
+    {
+        if (tex is not null) stroke.Dab(tex, wx, wz, brushRadius, matHardness, texIntensity, squareBrush, SurfPaintTile(), surfUseAlpha);
+        return;
+    }
+    var mode = surfaceOp switch { 1 => AtlasAdjust.Darken, 2 => AtlasAdjust.Lighten, 3 => AtlasAdjust.Blur, _ => AtlasAdjust.Color };
+    stroke.DabAdjust(mode, surfacePaintColor, wx, wz, brushRadius, matHardness, texIntensity, squareBrush);
+}
+
 MaterialPainter? ActivePainter() => paintLayer == 1 ? underPainter : paintLayer == 2 ? overPainter : matPainter;
 MaterialMap? ActivePaintMap() => paintLayer == 1 ? growth?.Under : paintLayer == 2 ? growth?.Over : materialMap;
 byte ActivePaintValue() => paintLayer == 0 ? activeMaterial : activeFoliage;

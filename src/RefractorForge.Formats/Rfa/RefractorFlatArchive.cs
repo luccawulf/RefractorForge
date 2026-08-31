@@ -46,6 +46,13 @@ public sealed class RefractorFlatArchive
 
     private readonly string? _path;   // set when constructed via Open(string)
     private readonly Dictionary<string, string>? _looseFiles;   // folder-backed: entry name -> file on disk
+    // The source archive's own container bytes, kept verbatim so a repack can reproduce them rather than
+    // substituting our own. Porting work on a real BFV map showed how little slack the container has: a rebuilt
+    // archive that changed these is where three "the map crashes" reports came from. Preserving them also makes a
+    // no-op repack byte-identical, which is a far stronger gate than "the entries still decode".
+    private readonly byte[]? _descriptor;                       // the 143-byte blob + its trailing byte
+    private readonly Dictionary<string, byte[]>? _entryTrailers; // entry name -> its 12 TOC trailer bytes
+    private readonly byte[]? _tocTail;                           // the 4 bytes after the entry table
 
     public IReadOnlyList<RefractorFlatArchiveEntry> Entries { get; }
 
@@ -63,9 +70,12 @@ public sealed class RefractorFlatArchive
     public RefractorFlatArchive(string path)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var (isV11, isCompressed, xpackId, entries) = ReadFrom(fs);
+        var (isV11, isCompressed, xpackId, entries, descriptor, trailers, tail) = ReadFrom(fs);
         _path = path;
         Entries = entries;
+        _descriptor = descriptor;
+        _entryTrailers = trailers;
+        _tocTail = tail;
         IsCompressed = isCompressed;
         IsV11Format = isV11;
         XPackId = xpackId;
@@ -114,7 +124,8 @@ public sealed class RefractorFlatArchive
 
     // ── Shared header + TOC reader ────────────────────────────────────────────
 
-    private static (bool IsV11, bool Compressed, XPackId XPackId, List<RefractorFlatArchiveEntry> Entries) ReadFrom(Stream s)
+    private static (bool IsV11, bool Compressed, XPackId XPackId, List<RefractorFlatArchiveEntry> Entries,
+                    byte[]? Descriptor, Dictionary<string, byte[]> Trailers, byte[]? Tail) ReadFrom(Stream s)
     {
         Span<byte> u4 = stackalloc byte[4];
         Span<byte> sig = stackalloc byte[28];
@@ -127,12 +138,16 @@ public sealed class RefractorFlatArchive
         s.ReadExactly(u4); bool compressed = BinaryPrimitives.ReadUInt32LittleEndian(u4) == 1;
 
         XPackId xpackId = XPackId.Default;
+        byte[]? descriptor = null;
         if (!isV11)
         {
             // 143-byte descriptor → checksum for XPack ID, then 1 unknown byte, then encrypted ID.
             Span<byte> desc = stackalloc byte[143];
             s.ReadExactly(desc);
-            s.ReadByte();
+            int descTail = s.ReadByte();
+            descriptor = new byte[144];
+            desc.CopyTo(descriptor);
+            descriptor[143] = (byte)(descTail < 0 ? 0 : descTail);
             uint sum = 0; foreach (var b in desc) sum += b;
             s.ReadExactly(u4);
             xpackId = (XPackId)(BinaryPrimitives.ReadUInt32LittleEndian(u4) - sum);
@@ -143,6 +158,7 @@ public sealed class RefractorFlatArchive
         int count = (int)BinaryPrimitives.ReadUInt32LittleEndian(u4);
 
         var list = new List<RefractorFlatArchiveEntry>(count);
+        var trailers = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         Span<byte> rec = stackalloc byte[24];
         for (int i = 0; i < count; i++)
         {
@@ -150,14 +166,22 @@ public sealed class RefractorFlatArchive
             var nameBytes = new byte[(int)BinaryPrimitives.ReadUInt32LittleEndian(u4)];
             s.ReadExactly(nameBytes);
             s.ReadExactly(rec);
+            var entryName = Encoding.Latin1.GetString(nameBytes);
             list.Add(new RefractorFlatArchiveEntry(
-                Name: Encoding.Latin1.GetString(nameBytes),
+                Name: entryName,
                 BlockSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec),
                 UncompressedSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(4)),
                 Offset: BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(8))));
+            trailers[entryName] = rec.Slice(12).ToArray();   // the 12 bytes after the offset
         }
 
-        return (isV11, compressed, xpackId, list);
+        // SOME archives carry four more bytes after the table and some end right there - Kharkov has them,
+        // Font.rfa does not. Read them only if they exist, and write back only what we read, or a repack gains or
+        // loses 4 bytes. The no-op selftest caught this in both directions.
+        byte[]? tail = null;
+        try { var t = new byte[4]; s.ReadExactly(t); tail = t; } catch { tail = null; }
+
+        return (isV11, compressed, xpackId, list, descriptor, trailers, tail);
     }
 
     // ── Reading ──────────────────────────────────────────────────────────────
@@ -282,7 +306,10 @@ public sealed class RefractorFlatArchive
         Func<int, string> name,
         Func<int, (byte[] Region, int Unc)> getRegion,
         bool compress,
-        XPackId xPackId)
+        XPackId xPackId,
+        byte[]? sourceDescriptor = null,
+        Func<int, byte[]?>? sourceTrailer = null,
+        byte[]? tocTail = null)
     {
         if (!output.CanSeek)
             throw new ArgumentException("Writing an RFA requires a seekable stream (tocOffset is back-patched).", nameof(output));
@@ -293,11 +320,19 @@ public sealed class RefractorFlatArchive
         WriteU32(output, 0);                              // tocOffset placeholder — patched below
         WriteU32(output, compress ? 1u : 0u);
 
-        // 143-byte descriptor: any bytes work for the engine's checksum.
+        // 143-byte descriptor: any bytes work for the engine's checksum. When repacking we write the SOURCE's
+        // bytes back rather than our own, so the container comes out exactly as it went in; a brand-new archive
+        // (a patch) still gets the RefractorForge stamp that WasWrittenByRefractorForge looks for.
         byte[] descriptor = new byte[143];
-        "RefractorForge"u8.CopyTo(descriptor);
+        byte descriptorTail = 0;
+        if (sourceDescriptor is { Length: >= 143 })
+        {
+            Array.Copy(sourceDescriptor, descriptor, 143);
+            if (sourceDescriptor.Length >= 144) descriptorTail = sourceDescriptor[143];
+        }
+        else "RefractorForge"u8.CopyTo(descriptor);
         output.Write(descriptor, 0, 143);
-        output.WriteByte(0);
+        output.WriteByte(descriptorTail);
 
         // Encrypted XPack ID: stored as (actual_id + Σ descriptor_bytes) mod 2^32.
         uint descriptorSum = 0;
@@ -333,8 +368,17 @@ public sealed class RefractorFlatArchive
             WriteU32(output, (uint)blockSizes[i]);
             WriteU32(output, (uint)uncs[i]);
             WriteU32(output, (uint)offsets[i]);
-            WriteU32(output, 0); WriteU32(output, 0); WriteU32(output, 0);   // reserved
+            // The 12-byte trailer is opaque and NOT a constant: retail archives carry both 0x001321E0 (Bocage,
+            // BFV Crossroads) and plain zeros (Wake_003), and both ship and load. Preserve the source bytes when
+            // repacking; zeros for a new archive, which retail itself does.
+            var trailer = sourceTrailer?.Invoke(i);
+            if (trailer is { Length: 12 }) output.Write(trailer, 0, 12);
+            else { WriteU32(output, 0); WriteU32(output, 0); WriteU32(output, 0); }
         }
+
+        // The four bytes that close the table, when the source had them (see ReadFrom). A brand-new archive gets
+        // none, matching the retail archives that end at the table.
+        if (tocTail is { Length: 4 }) output.Write(tocTail, 0, 4);
 
         // ── Patch tocOffset ───────────────────────────────────────────────────
         long end = output.Position;
@@ -382,7 +426,10 @@ public sealed class RefractorFlatArchive
                         ? (BuildRegion(rep, original.IsCompressed), rep.Length)
                         : (original.RawRegion(ents[i]), ents[i].UncompressedSize),
                     original.IsCompressed,
-                    original.XPackId
+                    original.XPackId,
+                    original._descriptor,
+                    i => original._entryTrailers is { } t && t.TryGetValue(ents[i].Name, out var tr) ? tr : null,
+                    original._tocTail
                 );
             File.Move(tmp, path, overwrite: true);
         }

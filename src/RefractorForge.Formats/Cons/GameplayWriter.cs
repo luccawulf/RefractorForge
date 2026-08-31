@@ -243,6 +243,59 @@ public static class GameplayWriter
         return sb.ToString();
     }
 
+    /// <summary>Rewrite the editable ObjectSpawner template fields Battlecraft exposes (guide figure 24): the two
+    /// per-team vehicles and the spawn timing. Only lines that ALREADY EXIST are rewritten - a template that never
+    /// declared, say, DamageWhenLost keeps its silence rather than gaining a value the level never had. Everything
+    /// else is preserved verbatim, exactly like PatchSoldierSpawnTemplates.</summary>
+    public static string PatchVehicleSpawnTemplates(IEnumerable<string> templateLines, IReadOnlyList<VehicleSpawnDef> spawns)
+    {
+        var byName = new Dictionary<string, VehicleSpawnDef>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var s in spawns) byName[s.Name] = s;
+        var sb = new StringBuilder();
+        VehicleSpawnDef? cur = null;
+        foreach (var raw in templateLines)
+        {
+            var line = raw.Replace(((char)13).ToString(), "").Replace(((char)10).ToString(), "");
+            var trimmed = line.TrimStart();
+            var sp = trimmed.Split(new[] { ' ', (char)9 }, System.StringSplitOptions.RemoveEmptyEntries);
+            var key = sp.Length > 0 ? sp[0].ToLowerInvariant() : "";
+            if (key == "objecttemplate.create")
+            {
+                string? name = sp.Length >= 3 ? sp[2] : (sp.Length >= 2 ? sp[1] : null);   // "create ObjectSpawner <name>"
+                cur = name is not null && byName.TryGetValue(name, out var v) ? v : null;
+            }
+            else if (cur is VehicleSpawnDef vs)
+            {
+                string N(int v) => v.ToString(CultureInfo.InvariantCulture);
+                string? repl = key switch
+                {
+                    "objecttemplate.setobjecttemplate" when sp.Length >= 3 && sp[1] == "1" && vs.Vehicle1.Length > 0
+                        => "ObjectTemplate.setObjectTemplate 1 " + vs.Vehicle1,
+                    "objecttemplate.setobjecttemplate" when sp.Length >= 3 && sp[1] == "2" && vs.Vehicle2.Length > 0
+                        => "ObjectTemplate.setObjectTemplate 2 " + vs.Vehicle2,
+                    "objecttemplate.minspawndelay" => "ObjectTemplate.MinSpawnDelay " + N(vs.MinSpawnDelay),
+                    "objecttemplate.maxspawndelay" => "ObjectTemplate.MaxSpawnDelay " + N(vs.MaxSpawnDelay),
+                    // A level with the single SpawnDelay form keeps that form; min is what the editor shows for it.
+                    "objecttemplate.spawndelay" => "ObjectTemplate.SpawnDelay " + N(vs.MinSpawnDelay),
+                    "objecttemplate.spawndelayatstart" => "ObjectTemplate.SpawnDelayAtStart " + N(vs.SpawnDelayAtStart),
+                    "objecttemplate.timetolive" => "ObjectTemplate.TimeToLive " + N(vs.TimeToLive),
+                    "objecttemplate.distance" => "ObjectTemplate.Distance " + N(vs.Distance),
+                    "objecttemplate.damagewhenlost" => "ObjectTemplate.DamageWhenLost " + N(vs.DamageWhenLost),
+                    "objecttemplate.maxnrofobjectspawned" => "ObjectTemplate.MaxNrOfObjectSpawned " + N(vs.MaxNrOfObjectSpawned),
+                    _ => null,
+                };
+                if (repl is not null)
+                {
+                    int indent = line.Length - trimmed.Length;
+                    sb.Append(line, 0, indent).Append(repl).Append(NL);
+                    continue;
+                }
+            }
+            sb.Append(line).Append(NL);
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Surgically rewrite the editable soldier-spawn template fields (setGroup / setSpawnId /
     /// spawnAsParaTrooper) for each SpawnPoint template whose name matches an edited soldier spawn. Only EXISTING
     /// lines are rewritten; every other line is preserved verbatim (mirrors <see cref="PatchControlPointRadii"/>).</summary>

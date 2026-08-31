@@ -1,0 +1,214 @@
+using System.Globalization;
+using RefractorForge.Formats;
+using RefractorForge.Formats.Con;
+using RefractorForge.Formats.Editing;
+using RefractorForge.Formats.Geometry;
+using RefractorForge.Formats.Terrain;
+using RefractorForge.Render;
+
+namespace RefractorForge.Mcp;
+
+/// <summary>
+/// The MCP server's in-memory editing document: one loaded level plus an undo history, driven entirely through the
+/// existing <see cref="IEditCommand"/> ops so it stays byte-compatible with the editor and (Phase 2) the collab
+/// wire. The "headless core" the plan calls for — tools mutate this, then it saves via <see cref="LevelSaver"/>.
+/// </summary>
+public sealed class EditSession
+{
+    public string SourceRfa { get; }
+    public string Name { get; }
+    public LevelArchive.Loaded Level { get; }
+
+    /// <summary>The object document being edited. Once attached to a running editor this is the EDITOR's live
+    /// document (streamed over the collab relay), so listing, placing and generating all operate on what the user
+    /// is actually looking at rather than on a stale copy from disk.</summary>
+    public StaticObjectsFile So => _live?.Doc ?? Level.StaticObjects;
+
+    /// <summary>The attached editor, when running in live mode.</summary>
+    public LiveBridge? Live => _live;
+    public bool IsLive => _live is not null;
+    public TerrainConfig Cfg => Level.Config;
+    public Heightmap Hm => Level.Heightmap;
+    public MaterialMap? Material => Level.Material;
+
+    private readonly EditHistory _history;
+    private int _addCounter;
+    private LiveBridge? _live;
+
+    // Only write back what actually changed (a city edit shouldn't rewrite the heightmap or gameplay).
+    public bool ObjectsDirty { get; private set; }
+    public bool ConfigDirty { get; private set; }
+    public bool HeightDirty { get; private set; }
+
+    private EditSession(string rfa, LevelArchive.Loaded level)
+    {
+        SourceRfa = rfa;
+        Level = level;
+        Name = Path.GetFileNameWithoutExtension(rfa);
+        _history = new EditHistory(level.StaticObjects);
+
+        // Give every pre-existing object a stable id so it can be addressed by move/rotate/delete. Ids are not
+        // written to StaticObjects.con, so this never changes the saved file — it only makes the doc editable.
+        for (int i = 0; i < So.Objects.Count; i++)
+            if (string.IsNullOrEmpty(So.Objects[i].Id)) So.Objects[i].Id = $"obj-{i}";
+    }
+
+    /// <summary>True when this session was opened from an extracted level FOLDER rather than a packed archive.
+    /// Saving follows the form it was opened in, so a project keeps its loose files and an archive stays packed.</summary>
+    public bool IsFolder => Directory.Exists(SourceRfa);
+
+    /// <summary>Open a level from a packed <c>.rfa</c>, an extracted level folder, or a base plus patch archives.</summary>
+    public static EditSession OpenRfa(params string[] rfaPaths)
+        => new(rfaPaths[0], LevelArchive.FromRfa(rfaPaths));
+
+    /// <summary>Attach to a running editor. From here on every edit is sent to it live instead of being applied to
+    /// the local copy — but the level opened from disk is kept, because the terrain it carries is what scatter and
+    /// city generation sample heights from (the relay streams objects, never the heightmap).</summary>
+    public void AttachLive(LiveBridge bridge) { _live?.Dispose(); _live = bridge; }
+
+    public void DetachLive() { _live?.Dispose(); _live = null; }
+
+    /// <summary>How much of the live document is built from templates this level also has on disk. A low overlap
+    /// almost always means the editor has a DIFFERENT level open, which would silently put generated objects at
+    /// heights sampled from the wrong terrain — so the attach reports it rather than letting it pass.</summary>
+    public double LiveTemplateOverlap()
+    {
+        if (_live is null) return 1.0;
+        var mine = Level.StaticObjects.Objects.Select(o => o.Template).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var live = _live.Snapshot().Select(o => o.Template).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (live.Count == 0) return 1.0;
+        return live.Count(t => mine.Contains(t)) / (double)live.Count;
+    }
+
+    /// <summary>Terrain height (metres) at world (x,z), matching the editor's nearest-sample convention.</summary>
+    public float HeightAt(float x, float z)
+    {
+        float sp = Cfg.HorizontalSpacing <= 0 ? 1f : Cfg.HorizontalSpacing;
+        int gx = Math.Clamp((int)(x / sp), 0, Hm.Width - 1);
+        int gz = Math.Clamp((int)(z / sp), 0, Hm.Height - 1);
+        return Cfg.HeightToMeters(Hm[gx, gz]);
+    }
+
+    // ---- Object edits (all reversible via the shared history) ----
+
+    public string PlaceObject(string template, float x, float z, float? y, Vec3 rot)
+    {
+        float yy = y ?? HeightAt(x, z);
+        if (_live is not null) return _live.Add(template, new Vec3(x, yy, z), rot);
+        string id = $"mcp-{++_addCounter}";
+        _history.Do(new AddObject(id, template, new Vec3(x, yy, z), rot));
+        ObjectsDirty = true;
+        return id;
+    }
+
+    public bool Move(string id, Vec3 to) => _live is not null ? _live.Move(id, to) : Edit(id, () => _history.Do(new MoveObject(id, to)));
+    public bool Rotate(string id, Vec3 to) => _live is not null ? _live.Rotate(id, to) : Edit(id, () => _history.Do(new RotateObject(id, to)));
+    public bool ScaleObj(string id, float to) => _live is not null ? _live.Scale(id, to) : Edit(id, () => _history.Do(new ScaleObject(id, to)));
+    public bool Delete(string id) => _live is not null ? _live.Delete(id) : Edit(id, () => _history.Do(new DeleteObject(id)));
+
+    private bool Edit(string id, Action act)
+    {
+        if (So.FindById(id) is null) return false;
+        act(); ObjectsDirty = true; return true;
+    }
+
+    /// <summary>Random scatter over the whole map (vegetation, props…). Area-targeted density is what
+    /// <see cref="GenerateCity"/> is for; an area-bounded scatter overload can follow if needed.</summary>
+    public int Scatter(IReadOnlyList<string> templates, int count, float minSlope, float maxSlope,
+        bool avoidWater, float waterClearance, float spacing, int seed, float edgeMargin, float minScale, float maxScale)
+    {
+        var placed = ObjectScatter.Scatter(templates, Cfg, HeightAt, count, minSlope, maxSlope,
+            avoidWater, waterClearance, spacing, seed, edgeMargin, minScale, maxScale);
+        ApplyBatch(placed);
+        return placed.Count;
+    }
+
+    /// <summary>Procedurally build a grid city in the given world-space area; returns the layout (buildings already
+    /// applied as objects, plus the street centerlines the Render layer can later texture).</summary>
+    public CityLayout GenerateCity(float minX, float minZ, float maxX, float maxZ,
+        IReadOnlyList<string> palette, int seed, float blockSize, float roadWidth, float setback,
+        float lotWidth, float spacing, float maxSlope, bool avoidWater, float waterClearance, float minScale, float maxScale)
+    {
+        var layout = CityGenerator.Generate(minX, minZ, maxX, maxZ, Cfg, HeightAt, palette, seed,
+            blockSize, roadWidth, setback, lotWidth, spacing, maxSlope, avoidWater, waterClearance, minScale, maxScale);
+        ApplyBatch(layout.Buildings);
+        return layout;
+    }
+
+    /// <summary>Apply a whole generated batch as ONE history entry. A city is hundreds of placements, and pushing
+    /// them individually meant "undo" walked back a building at a time - the user asked for a city, so a city is the
+    /// unit they get to take back. <see cref="CompositeCommand"/> already applies and reverses in the right order,
+    /// and collab sees a single grouped op rather than a storm of them.</summary>
+    private void ApplyBatch(IReadOnlyList<ScatterPlacement> placements)
+    {
+        if (placements.Count == 0) return;
+        if (_live is not null)
+        {
+            _live.AddMany(placements.Select(p => (p.Template, p.Position, new Vec3(p.Yaw, 0f, 0f), p.Scale)));
+            return;
+        }
+        var cmds = new List<IEditCommand>(placements.Count);
+        foreach (var p in placements)
+        {
+            string id = $"mcp-{++_addCounter}";
+            cmds.Add(new AddObject(id, p.Template, p.Position, new Vec3(p.Yaw, 0f, 0f)));
+            if (MathF.Abs(p.Scale - 1f) > 1e-4f) cmds.Add(new ScaleObject(id, p.Scale));
+        }
+        _history.Do(new CompositeCommand(cmds));
+        ObjectsDirty = true;
+    }
+
+    /// <summary>Raise a mountain into the terrain. When attached to a running editor the changed heightmap rect is
+    /// shipped as a collab TERRAIN op, so the ground rises in the viewport straight away; otherwise it is written
+    /// into the local heightmap and saved with the level.</summary>
+    public (float Peak, int Cells) RaiseMountain(float cx, float cz, float radius, float peak, int seed,
+                                                 float roughness, int ridges)
+    {
+        var (x0, y0, w, h) = MountainGenerator.Raise(Hm, Cfg, cx, cz, radius, peak, seed, roughness, ridges);
+        if (w == 0 || h == 0) throw new ArgumentException("the mountain lands entirely outside the map");
+
+        float top = MountainGenerator.PeakHeight(Hm, Cfg, x0, y0, w, h);
+        if (_live is not null) _live.SendWorldOp($"TERRAIN {x0} {y0} {w} {h} {MountainGenerator.EncodeRect(Hm, x0, y0, w, h)}");
+        else HeightDirty = true;
+        return (top, w * h);
+    }
+
+    public void SetWaterLevel(float meters)
+    {
+        Cfg.WaterLevel = meters;
+        // The relay carries water level as a world op, so a live change moves the editor's water plane too.
+        if (_live is not null) { _live.SendWorldOp("WATER " + meters.ToString("0.######", CultureInfo.InvariantCulture)); return; }
+        ConfigDirty = true;
+    }
+
+    public bool Undo() { if (_live is not null) return _live.Undo() >= 0; bool ok = _history.Undo(); if (ok) ObjectsDirty = true; return ok; }
+    public bool Redo() { if (_live is not null) return _live.Redo() >= 0; bool ok = _history.Redo(); if (ok) ObjectsDirty = true; return ok; }
+    public int UndoDepth => _live?.UndoDepth ?? _history.UndoDepth;
+    public int RedoDepth => _live?.RedoDepth ?? _history.RedoDepth;
+
+    public IReadOnlyList<string> PlacedTemplates()
+        => So.Objects.Select(o => o.Template).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+    /// <summary>Save the edits, writing back only what actually changed (objects / terrain scalars). A level opened
+    /// from a folder is written IN PLACE as loose files - that is what the editor and the game both read from a
+    /// project - while an archive is repacked to <paramref name="outPath"/> leaving the base untouched. Passing a
+    /// path for a folder session is an error rather than a silent no-op, because the two are not interchangeable.</summary>
+    public List<string> Save(string? outPath)
+    {
+        // In live mode the editor owns the document and the file on disk; saving from here would race it and write
+        // a copy that the editor would then overwrite. Ctrl+S in the editor is the save.
+        if (_live is not null)
+            throw new InvalidOperationException("attached to a running editor - save from the editor (Ctrl+S); it owns the file");
+
+        if (IsFolder)
+            return LevelSaver.SaveFolder(SourceRfa,
+                ObjectsDirty ? So : null, null, HeightDirty ? Hm : null, null, null,
+                terrainConfig: ConfigDirty ? Cfg : null);
+
+        if (string.IsNullOrWhiteSpace(outPath))
+            throw new ArgumentException("saving an .rfa needs an output path (the base archive is never overwritten)");
+        return LevelSaver.RepackToRfa(SourceRfa, outPath,
+            ObjectsDirty ? So : null, HeightDirty ? Hm : null, null, null,
+            terrainConfig: ConfigDirty ? Cfg : null);
+    }
+}

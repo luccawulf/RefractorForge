@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
@@ -17,5 +17,6 @@
     <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
     <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
     <ProjectReference Include="..\RefractorForge.Collab\RefractorForge.Collab.csproj" />
+    <ProjectReference Include="..\RefractorForge.Mcp\RefractorForge.Mcp.csproj" />
   </ItemGroup>
 </Project>

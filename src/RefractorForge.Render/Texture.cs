@@ -484,7 +484,12 @@ public sealed class TerrainTexture
         int maxCol = -1, maxRow = -1;
         foreach (var f in Directory.EnumerateFiles(texturesDir, "tx*.dds"))
         {
-            var m = System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(f), @"^tx(\d+)x(\d+)$");
+            // Case-INSENSITIVE: the files ship as Tx00x00.dds with a capital T. The enumeration glob above is
+            // case-insensitive on Windows so it finds them, but a case-sensitive parse rejected every one, leaving a
+            // level opened from an extracted FOLDER with no terrain texture at all (it worked from .rfa, which
+            // matches entries elsewhere).
+            var m = System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(f), @"^tx(\d+)x(\d+)$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             if (!m.Success) continue;
             int col = int.Parse(m.Groups[1].Value), row = int.Parse(m.Groups[2].Value);
             paths[(col, row)] = f; maxCol = Math.Max(maxCol, col); maxRow = Math.Max(maxRow, row);

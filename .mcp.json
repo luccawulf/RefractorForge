@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "refractorforge": {
+      "command": "dotnet",
+      "args": ["src/RefractorForge.Mcp/bin/Release/net8.0/RefractorForge.Mcp.dll"]
+    }
+  }
+}

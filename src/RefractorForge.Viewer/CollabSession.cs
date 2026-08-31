@@ -54,12 +54,15 @@ sealed class CollabSession
     { ClientId = clientId; Name = name; IsHost = isHost; }
 
     /// <summary>Start hosting: stand up the relay seeded with the current document, listen on <paramref name="port"/>,
-    /// and join our own session through a GL-thread-queued endpoint.</summary>
-    public static CollabSession StartHost(StaticObjectsFile doc, int port, string name, string? password = null, CollabWorldState? world = null)
+    /// and join our own session through a GL-thread-queued endpoint. <paramref name="bind"/> defaults to every
+    /// interface, which is what collaborating over a network needs; the AI bridge passes loopback instead so that
+    /// turning it on does not also publish the map to the LAN.</summary>
+    public static CollabSession StartHost(StaticObjectsFile doc, int port, string name, string? password = null,
+                                          CollabWorldState? world = null, IPAddress? bind = null)
     {
         var s = new CollabSession(NewId(), name, true);
         s._relay = new RelayServer(doc, world, password);
-        s._tcpHost = new TcpRelayHost(s._relay, IPAddress.Any, port);
+        s._tcpHost = new TcpRelayHost(s._relay, bind ?? IPAddress.Any, port);
         s._tcpHost.Start();
         s.Port = s._tcpHost.Port;
         s._running = true;
