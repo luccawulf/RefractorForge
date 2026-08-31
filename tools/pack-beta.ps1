@@ -53,6 +53,20 @@ foreach ($doc in @("LICENSE.txt", "README.md", "USER_GUIDE.md")) {
     else { throw "missing from the repo root: $doc" }
 }
 
+# The MCP server, so an AI assistant can drive the editor straight out of the download. It is a SEPARATE exe (an
+# MCP client spawns it and talks stdio), and it is published self-contained for the same reason the editor is: a
+# modder should not have to install a .NET runtime. Without this the release's headline feature would only be
+# usable by people who build from source.
+Write-Host "== publishing the MCP server =="
+$mcpPub = Join-Path $repo "src\RefractorForge.Mcp\bin\Publish\Beta"
+if (Test-Path $mcpPub) { Remove-Item $mcpPub -Recurse -Force }
+dotnet publish "src\RefractorForge.Mcp" -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o $mcpPub --nologo | Out-Null
+$mcpExe = Join-Path $mcpPub "RefractorForge.Mcp.exe"
+if (-not (Test-Path $mcpExe)) { throw "the MCP server did not publish" }
+Copy-Item $mcpExe $stage -Force
+Copy-Item (Join-Path $repo "docs\MCP_SERVER.md") $stage -Force
+
 if ($IncludeFfmpeg) {
     if (-not (Test-Path (Join-Path $FfmpegFrom "ffmpeg.exe"))) { throw "no ffmpeg.exe under $FfmpegFrom" }
     # Copy the CONTENTS, not the folder: publish already created ffmpeg\ (for the notice), and Copy-Item -Recurse
@@ -73,6 +87,9 @@ $expect = Get-ChildItem $devDir -Recurse -File | Where-Object {
 
 $missing = @()
 foreach ($rel in $expect) { if (-not (Test-Path (Join-Path $stage $rel))) { $missing += $rel } }
+foreach ($must in @("RefractorForge.Mcp.exe", "MCP_SERVER.md")) {
+    if (-not (Test-Path (Join-Path $stage $must))) { $missing += $must }
+}
 if ($missing.Count -gt 0) {
     Write-Host "MISSING $($missing.Count) file(s):" -ForegroundColor Red
     $missing | Select-Object -First 20 | ForEach-Object { Write-Host "   $_" }
