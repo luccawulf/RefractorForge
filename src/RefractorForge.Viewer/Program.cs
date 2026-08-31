@@ -8145,14 +8145,14 @@ void EnvironmentPanel()
 
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("SUN"));
-    if (ImGui.Checkbox(Loc.TL("Control sun manually"), ref sunOverride)) shadowMapDirty = true;
+    if (ImGui.Checkbox(Loc.TL("Control sun manually"), ref sunOverride)) { shadowMapDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Override the level's SkyAndSun.con direction with the sliders below.\nMoving the sun relights terrain + objects and recasts real-time shadows live."));
     if (sunOverride)
     {
         ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Sun azimuth"), ref sunAzimuthDeg, -180f, 180f, "%.0f deg")) shadowMapDirty = true;
+        if (SldF(Loc.TL("Sun azimuth"), ref sunAzimuthDeg, -180f, 180f, "%.0f deg")) { shadowMapDirty = true; BroadcastLight(); }
         ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Sun elevation"), ref sunElevationDeg, 2f, 89f, "%.0f deg")) shadowMapDirty = true;
+        if (SldF(Loc.TL("Sun elevation"), ref sunElevationDeg, 2f, 89f, "%.0f deg")) { shadowMapDirty = true; BroadcastLight(); }
         if (ImGui.Button(Loc.TL("Reset sun to level")) && env is not null)
         {
             sunOverride = false;
@@ -8160,6 +8160,7 @@ void EnvironmentPanel()
             sunElevationDeg = MathF.Asin(Math.Clamp(s.Y, -1f, 1f)) * 180f / MathF.PI;
             sunAzimuthDeg = MathF.Atan2(s.X, s.Z) * 180f / MathF.PI;
             shadowMapDirty = true;
+            BroadcastLight();
         }
     }
 
@@ -8169,13 +8170,13 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("LIGHTING"));
     ImGui.Checkbox(Loc.TL("Preview lighting"), ref lightPreview);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Shade the editor with the level's light colours.\nOff = neutral white light (the old look)."));
-    if (ImGui.ColorEdit3(Loc.TL("Global ambient"), ref lightGlobalAmb)) lightingDirty = true;
+    if (ImGui.ColorEdit3(Loc.TL("Global ambient"), ref lightGlobalAmb)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.globalAmbientColor - scene-wide fill added to everything."));
-    if (ImGui.ColorEdit3(Loc.TL("Ambient"), ref lightAmb)) lightingDirty = true;
+    if (ImGui.ColorEdit3(Loc.TL("Ambient"), ref lightAmb)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.ambientColor - the sun light's own ambient term."));
-    if (ImGui.ColorEdit3(Loc.TL("Sun diffuse"), ref lightDiffuse)) lightingDirty = true;
+    if (ImGui.ColorEdit3(Loc.TL("Sun diffuse"), ref lightDiffuse)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.diffuseColor - the key light colour. This is what\nmakes a level read warm or cold."));
-    if (ImGui.ColorEdit3(Loc.TL("Specular"), ref lightSpecular)) lightingDirty = true;
+    if (ImGui.ColorEdit3(Loc.TL("Specular"), ref lightSpecular)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.specularColor - highlight colour on shiny surfaces.\nWritten to Init.con; not previewed in the editor."));
     if (ImGui.Button(Loc.TL("Reset lighting to level")) && env is not null)
     {
@@ -8184,6 +8185,7 @@ void EnvironmentPanel()
         lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
         lightSpecular = new Vector3(env.SpecularColor.X, env.SpecularColor.Y, env.SpecularColor.Z);
         lightingDirty = false;
+        BroadcastLight();   // a reset is an edit as far as everyone else is concerned
     }
     if (lightingDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
 
@@ -9110,6 +9112,32 @@ void ApplyRemoteOvergrowth(string payload)
     }
 }
 
+// ---- Light settings over collab. The four renderer.* colours are patched into Init.con on save, so they are map
+// data, not a personal view preference: if two people light the same map and only one of them syncs, whoever saves
+// last silently discards the other's work. The sun angle rides along because it decides what a shadow bake writes.
+string LightWire() =>
+    $"LIGHT {Inv(sunAzimuthDeg)} {Inv(sunElevationDeg)} {(sunOverride ? 1 : 0)} " +
+    $"{Inv(lightGlobalAmb.X)} {Inv(lightGlobalAmb.Y)} {Inv(lightGlobalAmb.Z)} " +
+    $"{Inv(lightAmb.X)} {Inv(lightAmb.Y)} {Inv(lightAmb.Z)} " +
+    $"{Inv(lightDiffuse.X)} {Inv(lightDiffuse.Y)} {Inv(lightDiffuse.Z)} " +
+    $"{Inv(lightSpecular.X)} {Inv(lightSpecular.Y)} {Inv(lightSpecular.Z)}";
+void BroadcastLight() => collab?.SendOp(LightWire());
+void ApplyRemoteLight(string payload)
+{
+    var p = payload.Split(' ');
+    if (p.Length < 16) return;   // verb + az + el + override + four RGB triples
+    float F(int i, float dflt) => float.TryParse(p[i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : dflt;
+    sunAzimuthDeg = F(1, sunAzimuthDeg);
+    sunElevationDeg = F(2, sunElevationDeg);
+    sunOverride = p[3] != "0";
+    lightGlobalAmb = new Vector3(F(4, lightGlobalAmb.X), F(5, lightGlobalAmb.Y), F(6, lightGlobalAmb.Z));
+    lightAmb = new Vector3(F(7, lightAmb.X), F(8, lightAmb.Y), F(9, lightAmb.Z));
+    lightDiffuse = new Vector3(F(10, lightDiffuse.X), F(11, lightDiffuse.Y), F(12, lightDiffuse.Z));
+    lightSpecular = new Vector3(F(13, lightSpecular.X), F(14, lightSpecular.Y), F(15, lightSpecular.Z));
+    lightingDirty = true;    // the receiver must write these out too, or their save would undo the edit
+    shadowMapDirty = true;   // the sun moved: recast
+}
+
 // ---- Imported .obj meshes shared over collab: ship the resolved render geometry (positions + uvs + per-part
 // colour, textures dropped) so a peer renders objects placed from an import even though it never saw the .obj file.
 string? ObjMeshWire(string name)
@@ -9176,6 +9204,7 @@ void SeedWorld()
     collab.SendOp("GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gameplayEdit))));
     BroadcastWater();
     BroadcastOvergrowth();
+    BroadcastLight();
     foreach (var name in importedObjs.Keys.Concat(remoteMeshNames).Distinct(StringComparer.OrdinalIgnoreCase))
         BroadcastObjMesh(name);
 }
@@ -9221,6 +9250,7 @@ void CollabDrain()
                 else if (pverb == "GAMEPLAY") { try { ApplyRemoteGameplay(payload); } catch { } }
                 else if (pverb == "WATER") { try { ApplyRemoteWater(payload); } catch { } }
                 else if (pverb == "OVERGROWTH") { try { ApplyRemoteOvergrowth(payload); } catch { } }
+                else if (pverb == "LIGHT") { try { ApplyRemoteLight(payload); } catch { } }
                 else if (pverb == "OBJMESH") { try { ApplyRemoteObjMesh(payload); changed = true; } catch { } }
                 else if (so is not null)
                 {

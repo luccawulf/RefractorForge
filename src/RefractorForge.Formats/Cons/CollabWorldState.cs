@@ -23,11 +23,15 @@ public sealed class CollabWorldState
     public string? Gameplay { get; set; }         // GameplaySync.Serialize(...) text (decoded, not base64)
     public float? Water { get; set; }             // env water level (Terrain.con waterLevel): synced live + seeded to joiners
     public string? Overgrowth { get; set; }       // overgrowth-tree overlay settings wire ("OVERGROWTH show spacing density")
+    /// <summary>Light settings wire, verbatim: sun angle + the four renderer.* colours. These are MAP DATA — the
+    /// colours are patched into Init.con on save — so an unsynced edit means whoever saves last silently overwrites
+    /// the other person's lighting.</summary>
+    public string? Light { get; set; }
     /// <summary>Imported .obj meshes shared over the wire: template name -> the verbatim "OBJMESH name b64" op that
     /// recreates the render mesh on a peer. Stored so late joiners get imports too.</summary>
     public Dictionary<string, string> ObjMeshes { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || Water is not null || !string.IsNullOrEmpty(Overgrowth) || ObjMeshes.Count > 0;
+    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || Water is not null || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0;
 
     /// <summary>Apply one streamed op (TERRAIN/MATERIAL/GAMEPLAY) to the canonical state. Returns true if it was a
     /// recognised non-object op (so the caller knows not to treat it as an object edit). Terrain/material rects are
@@ -88,6 +92,11 @@ public sealed class CollabWorldState
                 Overgrowth = payload;   // store the whole op verbatim; the editor parses show/spacing/density on apply
                 return true;
             }
+            case "LIGHT":
+            {
+                Light = payload;        // verbatim, same as OVERGROWTH: the editor parses the fields on apply
+                return true;
+            }
             case "OBJMESH":
             {
                 // OBJMESH <name> <b64 geometry blob> — keyed by name so re-imports of the same template replace.
@@ -119,6 +128,8 @@ public sealed class CollabWorldState
             yield return op;
         if (!string.IsNullOrEmpty(Overgrowth))
             yield return Overgrowth;
+        if (!string.IsNullOrEmpty(Light))
+            yield return Light;
     }
 
     /// <summary>Persist the maps + gameplay into a state directory (the relay's own resume format).</summary>
@@ -132,6 +143,7 @@ public sealed class CollabWorldState
         if (!string.IsNullOrEmpty(Gameplay)) File.WriteAllText(Path.Combine(dir, "gameplay.sync"), Gameplay);
         if (Water is float wv) File.WriteAllText(Path.Combine(dir, "water.txt"), wv.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if (!string.IsNullOrEmpty(Overgrowth)) File.WriteAllText(Path.Combine(dir, "overgrowth.txt"), Overgrowth);
+        if (!string.IsNullOrEmpty(Light)) File.WriteAllText(Path.Combine(dir, "light.txt"), Light);
         if (ObjMeshes.Count > 0) File.WriteAllLines(Path.Combine(dir, "objmeshes.txt"), ObjMeshes.Values);   // one "OBJMESH ..." op per line
     }
 
@@ -152,6 +164,8 @@ public sealed class CollabWorldState
         if (File.Exists(wf) && float.TryParse(File.ReadAllText(wf), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var wl)) w.Water = wl;
         var of = Path.Combine(dir, "overgrowth.txt");
         if (File.Exists(of)) { var t = File.ReadAllText(of).Trim(); if (t.StartsWith("OVERGROWTH", StringComparison.Ordinal)) w.Overgrowth = t; }
+        var lf = Path.Combine(dir, "light.txt");
+        if (File.Exists(lf)) { var t = File.ReadAllText(lf).Trim(); if (t.StartsWith("LIGHT", StringComparison.Ordinal)) w.Light = t; }
         var omf = Path.Combine(dir, "objmeshes.txt");
         if (File.Exists(omf))
             foreach (var line in File.ReadAllLines(omf))

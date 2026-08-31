@@ -37,6 +37,56 @@ public class TerrainEditorTests
         Assert.True(ce < ge - 20f, "Constant vs Gaussian clearly differ at edge");
     }
 
+    /// <summary>
+    /// The Point tool: one vertex at a time, the way Battlecraft does it. Two things matter beyond "the height
+    /// changed" — auto-smooth must leave a slope rather than a spike, and the finished edit's RECT must cover the
+    /// whole smoothed footprint. The rect is what the editor re-reads and broadcasts, so a rect that covered only
+    /// the moved vertex would send collaborators a spike where this machine has a slope.
+    /// </summary>
+    [Fact]
+    public void Point_edits_move_one_vertex_and_report_the_whole_smoothed_rect()
+    {
+        var cfg = new TerrainConfig { MaterialSize = 128, WorldSize = 512, YScale = 0.5f };
+        var hm = HeightmapGenerator.Flat(cfg.MaterialSize, cfg.MetersToRaw(50f));
+        var ed = new TerrainEditor(hm, cfg);
+
+        // A single vertex, no smoothing: exactly one cell moves and the rect is 1x1.
+        var s1 = ed.BeginStroke();
+        s1.SetVertex(40, 40, 70f);
+        var e1 = s1.Finish();
+        Assert.NotNull(e1);
+        Assert.Equal(1, e1!.W);
+        Assert.Equal(1, e1.H);
+        Assert.True(MathF.Abs(cfg.HeightToMeters(hm[40, 40]) - 70f) < 0.3f,
+            $"the vertex went to the asked-for height (got {cfg.HeightToMeters(hm[40, 40]):0.0})");
+        Assert.Equal(50f, cfg.HeightToMeters(hm[41, 40]), 1);   // neighbour untouched without auto-smooth
+
+        // With auto-smooth: the neighbours are pulled toward it, and the rect grows to cover them.
+        var s2 = ed.BeginStroke();
+        s2.SetVertex(80, 80, 70f);
+        s2.SmoothAround(80, 80, 3);
+        var e2 = s2.Finish();
+        Assert.NotNull(e2);
+        Assert.True(e2!.W >= 7 && e2.H >= 7,
+            $"the rect covers the auto-smooth footprint, not just the point (got {e2.W}x{e2.H})");
+        Assert.True(e2.X0 <= 77 && e2.Y0 <= 77, $"the rect starts at the footprint's corner (got {e2.X0},{e2.Y0})");
+
+        float peak = cfg.HeightToMeters(hm[80, 80]);
+        float ring1 = cfg.HeightToMeters(hm[81, 80]);
+        float ring3 = cfg.HeightToMeters(hm[83, 80]);
+        Assert.True(MathF.Abs(peak - 70f) < 0.3f, "the moved vertex still gets exactly what was asked for");
+        Assert.True(ring1 > 50.5f, $"the ring next to it was pulled up, so this is a slope not a spike (got {ring1:0.0})");
+        Assert.True(ring1 < peak, $"the ring stays below the peak (ring {ring1:0.0} vs peak {peak:0.0})");
+        Assert.True(ring3 < ring1, $"the slope falls off outward ({ring3:0.0} vs {ring1:0.0})");
+
+        // Nudging is relative, and reads back what it wrote.
+        var s3 = ed.BeginStroke();
+        s3.NudgeVertex(10, 10, 5f);
+        s3.Finish();
+        Assert.True(MathF.Abs(cfg.HeightToMeters(hm[10, 10]) - 55f) < 0.3f,
+            $"nudge moved the vertex by the step (got {cfg.HeightToMeters(hm[10, 10]):0.0})");
+    }
+
     [Fact]
     public void Brush_shapes_mask_vs_radial_and_square()
     {

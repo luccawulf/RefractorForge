@@ -271,4 +271,19 @@ public static class EditWire
             _ => throw new FormatException($"Unknown command '{p[0]}'"),
         };
     }
+
+    /// <summary>
+    /// Whether a wire line is an OBJECT edit — the only kind <see cref="Parse"/> understands. The same session also
+    /// carries world ops (TERRAIN, MATERIAL, GAMEPLAY, WATER, OVERGROWTH, OBJMESH, ATLAS) which belong to the world
+    /// state rather than the object document, so anything reading a live stream must ask this before parsing.
+    /// Getting it wrong is not a parse error you can shrug off: it throws out of the socket read loop and takes the
+    /// whole connection down with it.
+    /// </summary>
+    public static bool IsObjectOp(string line)
+    {
+        if (string.IsNullOrEmpty(line)) return false;
+        int sp = line.IndexOf(' ');
+        var verb = sp < 0 ? line : line[..sp];
+        return verb is "MOVE" or "ROT" or "SCALE" or "ADD" or "DEL";
+    }
 }
