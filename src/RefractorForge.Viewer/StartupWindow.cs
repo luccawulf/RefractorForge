@@ -1,4 +1,4 @@
-﻿using System.Drawing;
+using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
@@ -168,6 +168,74 @@ internal static class StartupWindow
             var gsz = g.MeasureString(r.Game, name); g.DrawString(r.Game, name, gb, e.Bounds.Right - gsz.Width - 12, e.Bounds.Top + 12);
         };
         list.DoubleClick += (_, _) => { if (list.SelectedIndex >= 0 && list.SelectedIndex < recents.Count) Choose(new StartupChoice(StartupAction.OpenProject, recents[list.SelectedIndex].ProjectPath)); };
+
+        // Right-click a recent entry to get rid of it. Two SEPARATE actions, deliberately: "Remove from list" just
+        // forgets the entry, while deleting the files is a different and irreversible thing that has to be asked for
+        // by name and confirmed. Del on the keyboard maps to the safe one.
+        void RemoveAt(int i, bool deleteFiles)
+        {
+            if (i < 0 || i >= recents.Count) return;
+            var r = recents[i];
+            if (deleteFiles)
+            {
+                var dir = Path.GetDirectoryName(r.ProjectPath);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                {
+                    MessageBox.Show(Loc.T("The project folder is already gone; removing it from the list."),
+                                    "RefractorForge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    // Spell out exactly what is about to be destroyed, and how much of it. A project folder holds the
+                    // EXTRACTED level - heightmap, objects, textures - not just the .rfproj.
+                    long bytes = 0; int files = 0;
+                    try
+                    {
+                        foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                        { files++; try { bytes += new FileInfo(f).Length; } catch { } }
+                    }
+                    catch { }
+                    var msg = string.Format(
+                        Loc.T("Permanently delete the project folder and everything in it?{0}{0}{1}{0}{2} file(s), {3:N0} MB{0}{0}This deletes the extracted level itself, not just the project file. It cannot be undone. The original .rfa in your game folder is not touched."),
+                        Environment.NewLine, dir, files, bytes / 1048576.0);
+                    if (MessageBox.Show(msg, Loc.T("Delete project"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                                        MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                    try { Directory.Delete(dir, recursive: true); }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(string.Format(Loc.T("Could not delete it: {0}"), ex.Message),
+                                        "RefractorForge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+            }
+            RecentProjects.Forget(r.ProjectPath);
+            if (string.Equals(ActiveProject.Get(), r.ProjectPath, StringComparison.OrdinalIgnoreCase)) ActiveProject.Clear();
+            recents.RemoveAt(i);
+            list.Items.RemoveAt(i);
+        }
+
+        var menu = new ContextMenuStrip();
+        menu.Items.Add(Loc.T("Remove from list"), null, (_, _) => RemoveAt(list.SelectedIndex, false));
+        menu.Items.Add(Loc.T("Open folder"), null, (_, _) =>
+        {
+            int i = list.SelectedIndex; if (i < 0 || i >= recents.Count) return;
+            var dir = Path.GetDirectoryName(recents[i].ProjectPath);
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true }); } catch { }
+        });
+        menu.Items.Add(new ToolStripSeparator());
+        var del = menu.Items.Add(Loc.T("Delete project from disk..."), null, (_, _) => RemoveAt(list.SelectedIndex, true));
+        del.ForeColor = Color.FromArgb(210, 90, 80);
+        // Right-click selects the row under the cursor first, so the menu always acts on what was clicked.
+        list.MouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            int i = list.IndexFromPoint(e.Location);
+            if (i >= 0 && i < recents.Count) { list.SelectedIndex = i; menu.Show(list, e.Location); }
+        };
+        list.KeyDown += (_, e) => { if (e.KeyCode == Keys.Delete) { RemoveAt(list.SelectedIndex, false); e.Handled = true; } };
+
         form.Controls.Add(list);
         if (recents.Count == 0)
         {

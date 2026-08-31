@@ -24,6 +24,19 @@ public static class RecentProjects
         catch { return new(); }
     }
 
+    /// <summary>Drop one project from the list. This forgets it, it does NOT touch the project on disk - removing a
+    /// stale entry and deleting someone's level are very different acts and must not share a code path.</summary>
+    public static void Forget(string projectPath)
+    {
+        try
+        {
+            var list = Load().Where(r => !string.Equals(r.ProjectPath, projectPath, StringComparison.OrdinalIgnoreCase)).ToList();
+            Directory.CreateDirectory(Dir);
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
     /// <summary>Record a project as most-recently-opened (de-duped by path, capped at 12, missing files dropped).</summary>
     public static void Touch(RfProject p)
     {

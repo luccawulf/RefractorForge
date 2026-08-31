@@ -17,8 +17,32 @@ internal static class ConsoleLog
     private static readonly List<string> _lines = new();
     private const int Cap = 4000;
 
+    /// <summary>Where this run's log is written. Kept beside the other per-user state so it survives a reinstall
+    /// and is easy to hand to someone.</summary>
+    public static string FilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge", "log.txt");
+
+    private static StreamWriter? _file;
+
     public static void Install()
     {
+        // Also write to a FILE. The editor is a WinExe, so unless it was started from a terminal its output goes
+        // nowhere the user can reach - which makes "it did not load" impossible to diagnose after the fact, because
+        // the in-app Log window dies with the process. The previous run is kept as log.prev.txt so a crash-and-
+        // relaunch does not destroy the evidence.
+        try
+        {
+            var dir = Path.GetDirectoryName(FilePath)!;
+            Directory.CreateDirectory(dir);
+            var prev = Path.Combine(dir, "log.prev.txt");
+            if (File.Exists(FilePath)) { try { File.Copy(FilePath, prev, overwrite: true); } catch { } }
+            _file = new StreamWriter(new FileStream(FilePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+            { AutoFlush = true };
+            _file.WriteLine($"RefractorForge log - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            _file.WriteLine($"{Environment.OSVersion} | .NET {Environment.Version} | {Environment.ProcessorCount} cores");
+        }
+        catch { _file = null; }
+
         try { Console.SetOut(new TeeWriter(Console.Out)); } catch { }
     }
 
@@ -31,7 +55,11 @@ internal static class ConsoleLog
 
     private static void Add(string line)
     {
-        lock (_gate) { _lines.Add(line); if (_lines.Count > Cap) _lines.RemoveRange(0, _lines.Count - Cap); }
+        lock (_gate)
+        {
+            _lines.Add(line); if (_lines.Count > Cap) _lines.RemoveRange(0, _lines.Count - Cap);
+            if (_file is not null) try { _file.WriteLine(line); } catch { }
+        }
     }
 
     /// <summary>Current line count — used as a marker to find the lines produced by a level load.</summary>
