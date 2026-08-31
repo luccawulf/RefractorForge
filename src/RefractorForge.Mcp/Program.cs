@@ -227,6 +227,40 @@ internal static class Program
                        $"({layout.Roads.Count} streets) from {palette.Count} templates. Streets are generated as data; road texturing is a follow-up.";
             }));
 
+        s.Add(new McpTool("paint_road",
+            "Paint a road into the terrain's ground texture along a curve through the given points. Uses the editor's own centripetal Catmull-Rom spline, so it bends the way the Road tool would, with soft shoulders that blend into the ground. Needs attach_editor: the road appears in the viewport immediately and is written into the terrain tiles when the editor saves. Anyone who joins the session LATER will not see it until they reload.",
+            Schema(("points", "string", "The centreline as \"x,z\" pairs, e.g. [\"1760,1705\", \"1200,1200\", \"400,420\"]. At least two.", true),
+                   ("width", "number", "Road width in metres (default 8)", false),
+                   ("color", "string", "Road colour as \"r,g,b\" 0-255 (default a pale dirt track)", false),
+                   ("seed", "number", "Varies the surface grain (default 1)", false)),
+            a =>
+            {
+                var s2 = Need();
+                var pts = new List<(float X, float Z)>();
+                foreach (var raw in Arr(a, "points"))
+                {
+                    var bits = raw.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                    if (bits.Length < 2) continue;
+                    if (float.TryParse(bits[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var px)
+                     && float.TryParse(bits[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pz))
+                        pts.Add((px, pz));
+                }
+                if (pts.Count < 2) throw new ArgumentException("points needs at least two \"x,z\" entries");
+
+                (byte, byte, byte) col = (196, 176, 140);   // pale dirt, close to worn desert track
+                var cs = S(a, "color");
+                if (cs.Length > 0)
+                {
+                    var cb = cs.Split(',', StringSplitOptions.TrimEntries);
+                    if (cb.Length >= 3 && byte.TryParse(cb[0], out var cr) && byte.TryParse(cb[1], out var cg) && byte.TryParse(cb[2], out var cbl))
+                        col = (cr, cg, cbl);
+                }
+
+                var (n, len, pw, ph) = s2.PaintRoad(pts, F(a, "width", 8f), col, I(a, "seed", 1));
+                return $"painted a {len:0} m road through {pts.Count} point(s) ({n} curve samples, {pw}x{ph} patch). "
+                     + "It is in the editor now and will be written into the terrain tiles on save.";
+            }));
+
         s.Add(new McpTool("raise_mountain",
             "Sculpt a mountain into the terrain, centred on a world position. It is ADDITIVE - the existing ground is kept and the mountain laid on top, fading to nothing at the rim so it blends in. Ridges and fractal detail make it read as rock rather than as a cone. Applies live when attached to a running editor.",
             Schema(("x", "number", "Centre X in world metres", true),

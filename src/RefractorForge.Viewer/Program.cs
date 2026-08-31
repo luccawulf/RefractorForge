@@ -8949,6 +8949,63 @@ void ApplyRemoteTerrain(string payload)
     terrainDirty = true;   // OnRender re-uploads the terrain mesh
 }
 
+// Ground-texture paint arriving over collab (the AI bridge's roads). The patch is described in WORLD METRES
+// rather than atlas texels on purpose: the atlas resolution depends on the level's tile set, so a sender would
+// otherwise have to know our size to land it in the right place. Alpha is coverage, so a road blends into the
+// ground at its shoulders instead of stamping a rectangle.
+//
+// Note this is NOT stored in the relay's world state - an 8192 atlas is 268 MB, far too much to keep for replay -
+// so everyone connected sees it immediately but a LATE joiner will not until they reload. It does save correctly:
+// atlasPainted makes Ctrl+S re-emit the txCxR.dds tiles.
+void ApplyRemoteAtlas(string payload)
+{
+    if (atlasCpu is null || terrainTex is null) return;
+    var p = payload.Split(' ');
+    if (p.Length < 8) return;
+    var ci = System.Globalization.CultureInfo.InvariantCulture;
+    float wx = float.Parse(p[1], ci), wz = float.Parse(p[2], ci);
+    float ww = float.Parse(p[3], ci), wh = float.Parse(p[4], ci);
+    int pw = int.Parse(p[5], ci), ph = int.Parse(p[6], ci);
+    var buf = Convert.FromBase64String(p[7]);
+    if (pw <= 0 || ph <= 0 || buf.Length < pw * ph * 4) return;
+
+    float ws = cfg.WorldSize <= 0 ? 1f : cfg.WorldSize;
+    int aw = atlasCpu.Width, ah = atlasCpu.Height;
+    // Atlas texel (x,y) covers world (x/aw*ws, y/ah*ws) - the same mapping BakeAtlas uses.
+    int ax0 = Math.Clamp((int)MathF.Floor(wx / ws * aw), 0, aw - 1);
+    int az0 = Math.Clamp((int)MathF.Floor(wz / ws * ah), 0, ah - 1);
+    int ax1 = Math.Clamp((int)MathF.Ceiling((wx + ww) / ws * aw), 0, aw);
+    int az1 = Math.Clamp((int)MathF.Ceiling((wz + wh) / ws * ah), 0, ah);
+    if (ax1 <= ax0 || az1 <= az0) return;
+
+    var dst = atlasCpu.Rgba;
+    for (int ay = az0; ay < az1; ay++)
+    {
+        float worldZ = (ay + 0.5f) / ah * ws;
+        float v = (worldZ - wz) / wh;
+        if (v < 0f || v >= 1f) continue;
+        int sy = Math.Clamp((int)(v * ph), 0, ph - 1);
+        for (int ax = ax0; ax < ax1; ax++)
+        {
+            float worldX = (ax + 0.5f) / aw * ws;
+            float u = (worldX - wx) / ww;
+            if (u < 0f || u >= 1f) continue;
+            int sx = Math.Clamp((int)(u * pw), 0, pw - 1);
+
+            int so = (sy * pw + sx) * 4;
+            float a = buf[so + 3] / 255f;
+            if (a <= 0f) continue;
+            int doff = (ay * aw + ax) * 4;
+            dst[doff] = (byte)(dst[doff] * (1 - a) + buf[so] * a);
+            dst[doff + 1] = (byte)(dst[doff + 1] * (1 - a) + buf[so + 1] * a);
+            dst[doff + 2] = (byte)(dst[doff + 2] * (1 - a) + buf[so + 2] * a);
+        }
+    }
+    atlasPainted = true;   // so Ctrl+S re-emits the terrain tiles with the road baked in
+    UploadAtlasRectMips(ax0, az0, ax1 - ax0, az1 - az0);
+    Console.WriteLine($"Ground paint received: {ww:0}x{wh:0} m at {wx:0}/{wz:0} -> atlas rect {ax1 - ax0}x{az1 - az0}.");
+}
+
 void ApplyRemoteMaterial(string payload)
 {
     var p = payload.Split(' ');
@@ -9108,6 +9165,7 @@ void CollabDrain()
                 int pv = payload.IndexOf(' ');
                 var pverb = pv < 0 ? payload : payload[..pv];
                 if (pverb == "TERRAIN") { try { ApplyRemoteTerrain(payload); } catch { } }
+                else if (pverb == "ATLAS") { try { ApplyRemoteAtlas(payload); } catch { } }
                 else if (pverb == "MATERIAL") { try { ApplyRemoteMaterial(payload); } catch { } }
                 else if (pverb == "GAMEPLAY") { try { ApplyRemoteGameplay(payload); } catch { } }
                 else if (pverb == "WATER") { try { ApplyRemoteWater(payload); } catch { } }

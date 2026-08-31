@@ -319,6 +319,31 @@ public sealed class EditSession
     public byte[] RenderMap(int size, IEnumerable<Vec3>? highlight = null, bool grid = true)
         => PngWriter.Encode(MapView.Render(size, Hm, Cfg, Level.Terrain, Material, So.Objects, highlight, grid));
 
+    /// <summary>Paint a road along a centreline into the terrain's ground texture. The curve is the editor's own
+    /// centripetal Catmull-Rom, so it matches what the Road tool would draw. When attached the patch goes out as an
+    /// ATLAS op and appears live; headlessly there is no atlas to paint, so it reports that instead of pretending.
+    /// </summary>
+    public (int Samples, float Length, int PatchW, int PatchH) PaintRoad(
+        IReadOnlyList<(float X, float Z)> points, float width, (byte R, byte G, byte B) colour, int seed)
+    {
+        if (points.Count < 2) throw new ArgumentException("a road needs at least two points");
+        float half = MathF.Max(width, 0.5f) * 0.5f;
+
+        var ctrl = points.Select(p => (p.X, HeightAt(p.X, p.Z), p.Z, half)).ToList();
+        var samples = RoadSpline.Resample(ctrl, MathF.Max(half * 0.5f, 1f));
+        if (samples.Count == 0) throw new InvalidOperationException("the road curve came out empty");
+
+        var patch = RoadRaster.Paint(samples, colour, pixelsPerMetre: 2f, seed: seed, worldSize: Cfg.WorldSize);
+        if (_live is null)
+            throw new InvalidOperationException(
+                "painting the ground needs a running editor - attach_editor first. The atlas is built by the " +
+                "editor from the level's terrain tiles, so there is nothing to paint into headlessly.");
+
+        _live.SendWorldOp(RoadRaster.ToWire(patch));
+        float len = samples[^1].ArcLen;
+        return (samples.Count, len, patch.Width, patch.Height);
+    }
+
     public void SetWaterLevel(float meters)
     {
         Cfg.WaterLevel = meters;
