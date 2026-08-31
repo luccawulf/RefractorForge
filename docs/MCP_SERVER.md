@@ -22,7 +22,7 @@ dotnet build -c Release
 To register it elsewhere (or from another directory), the command is:
 
 ```bash
-claude mcp add refractorforge -- dotnet "C:/path/to/RefractorForge/src/RefractorForge.Mcp/bin/Release/net8.0/RefractorForge.Mcp.dll"
+claude mcp add refractorforge -- dotnet "C:/path/to/RefractorForge/src/RefractorForge.Mcp/bin/Release/net10.0/RefractorForge.Mcp.dll"
 ```
 
 ## Live editing
