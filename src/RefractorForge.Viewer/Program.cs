@@ -1480,7 +1480,29 @@ List<(int idx, Vec3 pos, Vec3 rot, float scale)> dragSnap = new();
 
 window.Load += OnLoad;
 window.Update += OnUpdate;
-window.Render += OnRender;
+// The render loop reports for itself. Without this an exception in OnRender leaves a window that loaded a level
+// perfectly and then simply never draws - the log stops at "Editor ready" and there is nothing to go on, because
+// the in-app Log box cannot be seen either when nothing renders. Catching also keeps ONE bad frame (a texture that
+// failed to upload, a null in a draw path) from taking the whole editor down. Logged once, so a fault that repeats
+// every frame does not fill the file.
+bool firstFrameLogged = false, steadyLogged = false, renderErrLogged = false;
+int renderedFrames = 0;
+window.Render += dt =>
+{
+    try
+    {
+        OnRender(dt);
+        renderedFrames++;
+        // These two lines are what tell a hang apart from a throw apart from a healthy loop: neither = it never
+        // finished a frame, first only = it died after one, both = rendering is fine and the fault is elsewhere.
+        if (!firstFrameLogged) { firstFrameLogged = true; Console.WriteLine("First frame rendered."); }
+        else if (!steadyLogged && renderedFrames >= 300) { steadyLogged = true; Console.WriteLine($"Rendering steadily ({renderedFrames} frames)."); }
+    }
+    catch (Exception ex)
+    {
+        if (!renderErrLogged) { renderErrLogged = true; Console.WriteLine("Render loop error (frames are being dropped): " + ex); }
+    }
+};
 window.FramebufferResize += sz => { gl.Viewport(0, 0, (uint)sz.X, (uint)sz.Y); cam.Aspect = sz.X / (float)Math.Max(1, sz.Y); appliedFbSize = sz; };
 window.Run();
 return;
@@ -2633,6 +2655,8 @@ void OnLoad()
         // Object lightmaps are matched lazily (EnsureObjectLightmaps) the first time the layer is enabled - keeps load fast.
         SyncMarkers(); // recompute mesh-less markers now that the library is known
         Console.WriteLine($"Object meshes: {glObjects.TemplateCount} templates, {glObjects.InstanceCount} instances, {glObjects.TextureCount} textures; {pointMarkers.Length} mesh-less markers.");
+        Console.WriteLine($"Object texture memory: {glObjects.TextureBytes / 1048576} MB"
+                          + (glObjects.TextureBytesSaved > 0 ? $" (saved {glObjects.TextureBytesSaved / 1048576} MB by downscaling oversized art to {1024}px)" : ""));
     }
     LoadOvergrowthSettings();   // restore the per-map overgrowth overlay config (spacing + on/off), if saved
     RefreshTextureLibrary();    // scan the bundled/user Texture Library folder for the Surface painter + Layer Tool
@@ -5924,6 +5948,9 @@ void OnRender(double dt)
     // collapses to 0x0, which makes the GL viewport / aspect-ratio math degenerate and crashes. Skip the frame.
     var fbSize = window.FramebufferSize;
     if (fbSize.X <= 0 || fbSize.Y <= 0) return;
+    // Stage trace for the first few frames only, so a report of "it loaded but never drew" says WHERE it stopped
+    // instead of just that it did. Costs one int comparison a frame afterwards.
+    void Stage(string what) { if (renderedFrames < 3) Console.WriteLine($"  [frame {renderedFrames}] {what}"); }
     // Sync the GL viewport + camera aspect to the live framebuffer size when it changes. The initial Maximized open
     // doesn't reliably fire FramebufferResize, so without this the first frames render at the old 1280x800 size
     // (content in the lower-left, rest uncleared) until you minimize/maximize. Apply-on-change covers that.
@@ -5938,7 +5965,9 @@ void OnRender(double dt)
     if (pathmapPreviewT > 0f) { pathmapPreviewT -= (float)dt; if (pathmapPreviewT <= 0f) pathmapPreviewOpen = false; }   // auto-close the post-save pathmap preview
     appClock += dt;              // advance the water-ripple animation
     if (meshViewerOpen && meshViewerAutoRotate) meshViewerYaw += (float)dt * 0.6f;   // spin the model viewer
+    Stage("ui: imgui.Update");
     imgui.Update((float)dt);     // begin a new ImGui frame
+    Stage("ui: BuildUi");
     BuildUi();                   // record the editor panels' draw data
 
     // 3D scene. ImGui's previous Render() leaves blend on / depth off / scissor set, so re-assert.
@@ -5951,6 +5980,7 @@ void OnRender(double dt)
     // underwater Sky_Bocage_0N) > the real skybox MESH (when the level doesn't override via cubemap faces) > procedural.
     // The cubemap wins over the mesh because a map that ships AltTex faces intends THOSE, not the base mesh's own
     // (daytime) textures. Drawn first with depth off so all geometry overpaints it.
+    Stage("sky");
     if (showSky && skyMeshOk && skyMeshProg != 0 && !(skyCubeTex != 0 && skyUseCubemap))
     {
         DrawSkyMesh(skyMeshVao, skyMeshParts, Vector2.Zero, opaque: true);
@@ -6005,6 +6035,7 @@ void OnRender(double dt)
 
     // Real-time sun shadow map: re-render terrain + nearby objects from the sun, centred on the camera's view, when the
     // sun, geometry, or the focus/zoom changed enough (camera panning across the map keeps the sharp area under you).
+    Stage("shadow map");
     bool shadowsOn = showShadows && heightmap is not null;
     if (shadowsOn)
     {
@@ -6019,6 +6050,7 @@ void OnRender(double dt)
     gridPrevOn = gridOn;
     if (gridOn && gridDirty && terrainPick is not null) { BuildGrid(); gridDirty = false; }
 
+    Stage("terrain");
     if (showTerrain)
     {
         gl.UseProgram(terrainProg);
@@ -6050,6 +6082,7 @@ void OnRender(double dt)
 
     // Draped world-grid overlay. Wireframe already draws the mesh as lines, so the grid is suppressed there (it
     // would sit on top and ignore the Grid checkbox); textured-wireframe forces it on as its overlay.
+    Stage("grid");
     if (terrainView != 1) DrawGrid(terrainView == 2);
 
     // Texture transparency: blend object + foliage alpha (the shader's alpha-test discard does the hard cutout,
@@ -6059,6 +6092,7 @@ void OnRender(double dt)
     SetLightUniforms(uAmbLightO, uDifLightO);   // one set covers every object pass this frame (uniforms are per-program state)
 
     // Real object geometry (GPU). Selected object is tinted via the highlight colour.
+    Stage("objects");
     if (glObjects is not null && showObjects && !painting)
     {
         gl.UseProgram(objProg);
@@ -6195,6 +6229,7 @@ void OnRender(double dt)
 
     // Overgrowth foliage overlay (a VIEW of the .wst trees; ephemeral, never saved). Distance-culled so a dense
     // map stays interactive. Rebuilt lazily when toggled on / the spacing changed (foliageDirty).
+    Stage("foliage");
     if (glObjects is not null && showFoliage && !painting)
     {
         if (foliageDirty) BuildOvergrowthFoliage();
@@ -6474,6 +6509,7 @@ void OnRender(double dt)
     }
 
     RenderMeshPreview();   // draw the model-viewer mesh into its FBO before ImGui samples it (restores the viewport)
+    Stage("imgui.Render");
     imgui.Render();   // editor panels, drawn over the 3D viewport
 }
 
