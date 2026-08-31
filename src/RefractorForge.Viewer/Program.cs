@@ -761,6 +761,9 @@ if (growth?.Over is not null)
     overPainter = new MaterialPainter(growth.Over, new TerrainConfig { MaterialSize = growth.OverSide, WorldSize = cfg.WorldSize, YScale = cfg.YScale, WaterLevel = cfg.WaterLevel });
 
 CollabSession? collab = null;   // the collaboration session (set via the Collab menu); null when offline
+// Set while an inbound edit is being pushed onto the undo stack. The push fires hist.OnDo, which is what normally
+// broadcasts an edit - and broadcasting an edit we just received would echo it straight back to the sender.
+bool applyingRemote = false;
 var hist = so is not null ? new EditHistory(so) : null;
 // (the hist.OnDo collaboration hook is wired in OnLoad, where all the captured editor state is assigned)
 
@@ -8756,7 +8759,7 @@ void SavePrefabModal()
 // per-object ops; non-object commands (terrain/material/gameplay) are skipped (object sync only for now).
 void OnLocalEdit(IEditCommand cmd)
 {
-    if (collab is null) return;
+    if (collab is null || applyingRemote) return;   // an inbound edit must not be echoed back out
     var wire = cmd.ToWire();
     int v = wire.IndexOf(' ');
     var verb = v < 0 ? wire : wire[..v];
@@ -9001,6 +9004,10 @@ void CollabDrain()
 {
     if (collab is null) return;
     bool changed = false;
+    // Object edits that arrived as live OPs. They are collected rather than applied one at a time so a burst -
+    // an assistant placing a village, or another mapper pasting a row of hedges - lands as ONE undo step instead
+    // of as several hundred, which is what makes Ctrl+Z usable against it.
+    var remoteEdits = new List<IEditCommand>();
     while (collab is not null && collab.Inbound.TryDequeue(out var line))
     {
         Message m;
@@ -9022,7 +9029,20 @@ void CollabDrain()
                 else if (pverb == "WATER") { try { ApplyRemoteWater(payload); } catch { } }
                 else if (pverb == "OVERGROWTH") { try { ApplyRemoteOvergrowth(payload); } catch { } }
                 else if (pverb == "OBJMESH") { try { ApplyRemoteObjMesh(payload); changed = true; } catch { } }
-                else if (so is not null) { try { EditWire.Parse(payload).Apply(so); changed = true; } catch { } }
+                else if (so is not null)
+                {
+                    try
+                    {
+                        var rcmd = EditWire.Parse(payload);
+                        // A live OP is an edit somebody made, so it belongs on the undo stack - that is what lets
+                        // Ctrl+Z take back what the AI bridge (or another mapper) just did. A SYNCOBJ is the
+                        // initial adoption of the host's document, not an edit, and must NOT be undoable.
+                        if (m.Type == MsgType.Op && hist is not null) remoteEdits.Add(rcmd);
+                        else rcmd.Apply(so);
+                        changed = true;
+                    }
+                    catch { }
+                }
                 break;
             }
             case MsgType.SyncEnd: changed = true; break;
@@ -9051,6 +9071,12 @@ void CollabDrain()
             case MsgType.Leave: collab.Peers.Remove(m.Args[0]); break;
             case MsgType.Error: collab.Stop(); collab = null; changed = true; break;          // socket dropped
         }
+    }
+    if (remoteEdits.Count > 0 && hist is not null)
+    {
+        applyingRemote = true;
+        try { hist.Do(remoteEdits.Count == 1 ? remoteEdits[0] : new CompositeCommand(remoteEdits)); }
+        finally { applyingRemote = false; }
     }
     if (changed && so is not null)
     {
