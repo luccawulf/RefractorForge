@@ -44,6 +44,12 @@ public sealed class LiveBridge : IServerEndpoint, IDisposable
     /// <summary>The editor's live object document, kept current by the relay stream. Read under <see cref="Gate"/>.</summary>
     public StaticObjectsFile Doc => _client.Doc;
 
+    /// <summary>The editor's gameplay layer as last received, or null if none has arrived. Gameplay syncs as FULL
+    /// STATE, so anything sent REPLACES the whole layer - which makes knowing the current contents the difference
+    /// between adding a control point and deleting everyone else's. The relay replays it on connect, and every
+    /// later edit by anyone updates it.</summary>
+    public string? GameplayText { get; private set; }
+
     public bool Connected => _running && _sock.Connected;
     public bool Synced => _synced.IsSet;
     /// <summary>Why the read loop stopped, when it stopped for a reason worth reporting (ERROR from the relay, a
@@ -109,7 +115,7 @@ public sealed class LiveBridge : IServerEndpoint, IDisposable
             string? line;
             while (_running && (line = _reader.ReadLine()) != null)
             {
-                if (IsWorldOp(line)) continue;                  // not ours, and fatal to CollabClient
+                if (IsWorldOp(line)) { CaptureWorld(line); continue; }   // not ours, and fatal to CollabClient
 
                 if (line.StartsWith("ERROR ", StringComparison.Ordinal))
                 {
@@ -129,6 +135,22 @@ public sealed class LiveBridge : IServerEndpoint, IDisposable
         }
         catch (Exception ex) { Stop(ex.Message); }
         finally { _synced.Set(); }                              // never leave WaitSynced hanging on a dead socket
+    }
+
+    /// <summary>Keep what we can use out of a world op before dropping it. Gameplay is the one we must track: it
+    /// is full-state, so sending an edit without knowing the current layer would wipe everyone else's work.</summary>
+    private void CaptureWorld(string line)
+    {
+        try
+        {
+            int i = line.IndexOf("GAMEPLAY ", StringComparison.Ordinal);
+            if (i < 0) return;
+            var b64 = line[(i + "GAMEPLAY ".Length)..].Trim();
+            if (b64.Length == 0) return;
+            var text = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+            lock (Gate) GameplayText = text;
+        }
+        catch { }
     }
 
     /// <summary>True for a relay line whose payload is a world op rather than an object op.</summary>

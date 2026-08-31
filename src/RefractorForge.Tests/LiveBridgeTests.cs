@@ -226,6 +226,63 @@ public class LiveBridgeTests : IDisposable
     }
 
     [Fact]
+    public void The_bridge_learns_the_gameplay_layer_instead_of_discarding_it()
+    {
+        using var b = Connect();
+
+        // Gameplay is FULL STATE: whatever is sent replaces the layer everywhere. So the bridge has to know what is
+        // there before it can add anything - otherwise its first edit deletes the human's flags and spawns. It used
+        // to drop these lines entirely (they are among the verbs CollabClient cannot parse).
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.ControlPoint, new ControlPointDef("US_base", new Vec3(100, 5, 200), 30f, 2, Team: 1, ObjectSpawnerId: 7));
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("Sp", new Vec3(120, 5, 210), new Vec3(90, 0, 0), "Sherman", 7,
+                                                   Vehicle1: "Willy", Vehicle2: "Sherman", Team: 2));
+        gp.Add(GpKind.Soldier, new SoldierSpawnDef("sp1", new Vec3(105, 5, 205), Vec3.Zero, Group: 2));
+        var wire = "GAMEPLAY " + Convert.ToBase64String(
+            System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gp)));
+
+        var human = new TcpClientConnection("127.0.0.1", _host.Port);
+        var hc = new CollabClient("human", "Mapper", human);
+        human.Attach(hc);
+        Assert.True(Wait(() => hc.Doc.Objects.Count == 2), "human synced");
+        human.Receive("human", Message.Op(0, "human", 1, wire).Encode());
+
+        Assert.True(Wait(() => b.GameplayText is not null), "the bridge never picked up the gameplay layer");
+
+        // And it arrived INTACT - the fields that tie spawns to flags are the whole point of tracking it.
+        var got = new EditableGameplay(GameplayObjects.Empty);
+        GameplaySync.Apply(got, b.GameplayText!);
+        Assert.Single(got.ControlPoints);
+        Assert.Equal(7, got.ControlPoints[0].ObjectSpawnerId);
+        Assert.Equal("Willy", got.VehicleSpawns[0].Vehicle1);
+        Assert.Equal(2, got.VehicleSpawns[0].Team);
+        Assert.Equal(2, got.SoldierSpawns[0].Group);
+
+        Assert.Null(b.Disconnected);
+        human.Dispose();
+    }
+
+    [Fact]
+    public void A_gameplay_op_still_does_not_disturb_the_object_document()
+    {
+        using var b = Connect();
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.ControlPoint, new ControlPointDef("cp", new Vec3(1, 2, 3), 10f, 0));
+        var wire = "GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gp)));
+
+        var human = new TcpClientConnection("127.0.0.1", _host.Port);
+        var hc = new CollabClient("human", "Mapper", human);
+        human.Attach(hc);
+        Assert.True(Wait(() => hc.Doc.Objects.Count == 2));
+        human.Receive("human", Message.Op(0, "human", 1, wire).Encode());
+        Assert.True(Wait(() => b.GameplayText is not null));
+
+        Assert.Equal(2, b.Doc.Objects.Count);   // the seeded objects, untouched
+        Assert.True(b.Connected);
+        human.Dispose();
+    }
+
+    [Fact]
     public void A_template_with_a_space_is_refused_instead_of_corrupting_the_wire()
     {
         using var b = Connect();

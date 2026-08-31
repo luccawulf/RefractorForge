@@ -380,6 +380,105 @@ public sealed class EditSession
         return w * h;
     }
 
+    // ---- Gameplay (control points, vehicle spawners, soldier spawns) ----
+    //
+    // The protocol syncs gameplay as FULL STATE: whatever is sent REPLACES the layer on every peer. So every edit
+    // here is a read-modify-write against the newest layer the editor has sent us, never against a copy we built
+    // ourselves - building our own would delete whatever the human had done. The read is taken as late as possible
+    // to keep the window small; a human editing gameplay in the same instant can still lose that one edit, which
+    // is inherent to a last-writer-wins full-state channel rather than something this can paper over.
+
+    /// <summary>The gameplay layer as the editor last reported it. Live mode only.</summary>
+    private EditableGameplay LiveGameplay()
+    {
+        if (_live is null)
+            throw new InvalidOperationException("editing gameplay needs a running editor - attach_editor first");
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        var text = _live.GameplayText;
+        if (text is null)
+            throw new InvalidOperationException(
+                "the editor has not sent its gameplay layer yet. It is replayed on connect, so re-run attach_editor; " +
+                "if it still does not arrive the level may genuinely have no gameplay objects.");
+        GameplaySync.Apply(gp, text);
+        return gp;
+    }
+
+    private void ShipGameplay(EditableGameplay gp)
+    {
+        var text = GameplaySync.Serialize(gp);
+        _live!.SendWorldOp("GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(text)));
+    }
+
+    /// <summary>What is in the gameplay layer right now.</summary>
+    public (List<ControlPointDef> Cps, List<VehicleSpawnDef> Vss, List<SoldierSpawnDef> Sss) Gameplay()
+    {
+        var gp = LiveGameplay();
+        return (gp.ControlPoints.ToList(), gp.VehicleSpawns.ToList(), gp.SoldierSpawns.ToList());
+    }
+
+    public int AddControlPoint(string name, float x, float z, float radius, int team, int spawnGroupId,
+                               int objectSpawnerId, string controlPointName)
+    {
+        var gp = LiveGameplay();
+        int i = gp.Add(GpKind.ControlPoint, new ControlPointDef(
+            name, new Vec3(x, HeightAt(x, z), z), radius, spawnGroupId,
+            Team: team, AreaValue: 25, ConversionTime: 40,
+            ControlPointName: controlPointName.Length > 0 ? controlPointName : name,
+            ObjectSpawnerId: objectSpawnerId));
+        ShipGameplay(gp);
+        return i;
+    }
+
+    public int AddVehicleSpawn(string name, float x, float z, float yaw, string vehicle, int team, int osId)
+    {
+        var gp = LiveGameplay();
+        int i = gp.Add(GpKind.Vehicle, new VehicleSpawnDef(
+            name, new Vec3(x, HeightAt(x, z), z), new Vec3(yaw, 0f, 0f), vehicle, osId,
+            Vehicle1: vehicle, Vehicle2: vehicle, Team: team));
+        ShipGameplay(gp);
+        return i;
+    }
+
+    public int AddSoldierSpawn(string name, float x, float z, float yaw, int group)
+    {
+        var gp = LiveGameplay();
+        int i = gp.Add(GpKind.Soldier, new SoldierSpawnDef(
+            name, new Vec3(x, HeightAt(x, z), z), new Vec3(yaw, 0f, 0f), Group: group));
+        ShipGameplay(gp);
+        return i;
+    }
+
+    public void MoveGameplay(GpKind kind, int index, float x, float z, float? y)
+    {
+        var gp = LiveGameplay();
+        if (index < 0 || index >= gp.CountOf(kind)) throw new ArgumentException($"no {kind} at index {index}");
+        gp.SetPos(kind, index, new Vec3(x, y ?? HeightAt(x, z), z));
+        ShipGameplay(gp);
+    }
+
+    public void RotateGameplay(GpKind kind, int index, float yaw)
+    {
+        var gp = LiveGameplay();
+        if (index < 0 || index >= gp.CountOf(kind)) throw new ArgumentException($"no {kind} at index {index}");
+        gp.SetRotation(kind, index, new Vec3(yaw, 0f, 0f));
+        ShipGameplay(gp);
+    }
+
+    public void DeleteGameplay(GpKind kind, int index)
+    {
+        var gp = LiveGameplay();
+        if (index < 0 || index >= gp.CountOf(kind)) throw new ArgumentException($"no {kind} at index {index}");
+        var cps = gp.ControlPoints.ToList(); var vss = gp.VehicleSpawns.ToList(); var sss = gp.SoldierSpawns.ToList();
+        switch (kind)
+        {
+            case GpKind.ControlPoint: cps.RemoveAt(index); break;
+            case GpKind.Vehicle: vss.RemoveAt(index); break;
+            default: sss.RemoveAt(index); break;
+        }
+        gp.ReplaceAll(cps, vss, sss);
+        ShipGameplay(gp);
+    }
+
     public void SetWaterLevel(float meters)
     {
         Cfg.WaterLevel = meters;

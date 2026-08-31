@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RefractorForge.Formats.Geometry;
+using RefractorForge.Formats.Con;
 using RefractorForge.Formats.Terrain;
 
 namespace RefractorForge.Mcp;
@@ -405,6 +406,114 @@ internal static class Program
                     $"{s2.Name}, {ws:0} m across, {s2.So.Objects.Count} objects. North (+Z) is up, east (+X) is right; " +
                     $"grid lines every 256 m, so the image spans 0..{ws:0} on both axes. Water line {s2.Cfg.WaterLevel:0.#} m.",
                     png);
+            }));
+
+        s.Add(new McpTool("list_gameplay",
+            "List the level's gameplay: control points (capture flags), vehicle spawners and soldier spawn points, with the ids that tie them together. A soldier spawn belongs to the control point whose spawnGroupId matches its group; a vehicle spawner belongs to the one whose objectSpawnerId matches its osId. Needs attach_editor.",
+            Schema(), _ =>
+            {
+                var s2 = Need();
+                var (cps, vss, sss) = s2.Gameplay();
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"{cps.Count} control point(s), {vss.Count} vehicle spawner(s), {sss.Count} soldier spawn(s):");
+                for (int i = 0; i < cps.Count; i++)
+                    sb.AppendLine($"  CP  [{i}] {cps[i].Name}  {cps[i].Position.X:0}/{cps[i].Position.Z:0}  team {cps[i].Team}, radius {cps[i].Radius:0}, spawnGroup {cps[i].SpawnGroupId}, objectSpawner {cps[i].ObjectSpawnerId}");
+                for (int i = 0; i < vss.Count; i++)
+                    sb.AppendLine($"  VEH [{i}] {vss[i].Name}  {vss[i].Position.X:0}/{vss[i].Position.Z:0}  team {vss[i].Team}, osId {vss[i].OsId}, {vss[i].Vehicle}"
+                                  + (vss[i].Vehicle1.Length > 0 || vss[i].Vehicle2.Length > 0 ? $" (t1 {vss[i].Vehicle1}, t2 {vss[i].Vehicle2})" : ""));
+                for (int i = 0; i < sss.Count; i++)
+                    sb.AppendLine($"  SPN [{i}] {sss[i].Name}  {sss[i].Position.X:0}/{sss[i].Position.Z:0}  group {sss[i].Group}");
+                return sb.ToString();
+            }));
+
+        s.Add(new McpTool("place_control_point",
+            "Add a capture flag. spawnGroupId owns the soldier spawns that share it, and objectSpawnerId owns the vehicle spawners whose osId matches - so give a flag its own numbers and use them on the spawns you want it to control. Needs attach_editor.",
+            Schema(("name", "string", "Object name for the control point", true),
+                   ("x", "number", "World X in metres", true),
+                   ("z", "number", "World Z in metres", true),
+                   ("team", "number", "Owning team: 0 neutral, 1 or 2 (default 0)", false),
+                   ("radius", "number", "Capture radius in metres (default 30)", false),
+                   ("spawnGroupId", "number", "Soldier spawns with this group belong to this flag (default 0)", false),
+                   ("objectSpawnerId", "number", "Vehicle spawners with this osId belong to this flag (default 0)", false),
+                   ("controlPointName", "string", "In-game display name (defaults to name)", false)),
+            a =>
+            {
+                var s2 = Need();
+                string nm = S(a, "name");
+                if (nm.Length == 0) throw new ArgumentException("name is required");
+                int i = s2.AddControlPoint(nm, F(a, "x"), F(a, "z"), F(a, "radius", 30f), I(a, "team", 0),
+                                           I(a, "spawnGroupId", 0), I(a, "objectSpawnerId", 0), S(a, "controlPointName"));
+                return $"added control point [{i}] {nm} at {F(a, "x"):0}/{F(a, "z"):0} for team {I(a, "team", 0)}";
+            }));
+
+        s.Add(new McpTool("place_vehicle_spawn",
+            "Add a vehicle spawner. Set osId to the objectSpawnerId of the control point that should own it. The vehicle template is used for both teams unless the level overrides it. Pick the template from list_catalog. Needs attach_editor.",
+            Schema(("name", "string", "Object name for the spawner", true),
+                   ("x", "number", "World X in metres", true),
+                   ("z", "number", "World Z in metres", true),
+                   ("vehicle", "string", "Vehicle template, e.g. Sherman", true),
+                   ("team", "number", "Owning team: 0, 1 or 2 (default 0)", false),
+                   ("yaw", "number", "Facing, degrees (default 0)", false),
+                   ("osId", "number", "The owning control point's objectSpawnerId (default 0)", false)),
+            a =>
+            {
+                var s2 = Need();
+                string nm = S(a, "name"), veh = S(a, "vehicle");
+                if (nm.Length == 0 || veh.Length == 0) throw new ArgumentException("name and vehicle are required");
+                int i = s2.AddVehicleSpawn(nm, F(a, "x"), F(a, "z"), F(a, "yaw"), veh, I(a, "team", 0), I(a, "osId", 0));
+                return $"added vehicle spawner [{i}] {nm} ({veh}) at {F(a, "x"):0}/{F(a, "z"):0} for team {I(a, "team", 0)}";
+            }));
+
+        s.Add(new McpTool("place_soldier_spawn",
+            "Add an infantry spawn point. Set group to the spawnGroupId of the control point players should spawn at when it is held - a spawn whose group matches nothing is one nobody ever uses. Needs attach_editor.",
+            Schema(("name", "string", "Object name for the spawn", true),
+                   ("x", "number", "World X in metres", true),
+                   ("z", "number", "World Z in metres", true),
+                   ("group", "number", "The owning control point's spawnGroupId (default 0)", false),
+                   ("yaw", "number", "Facing, degrees (default 0)", false)),
+            a =>
+            {
+                var s2 = Need();
+                string nm = S(a, "name");
+                if (nm.Length == 0) throw new ArgumentException("name is required");
+                int i = s2.AddSoldierSpawn(nm, F(a, "x"), F(a, "z"), F(a, "yaw"), I(a, "group", 0));
+                return $"added soldier spawn [{i}] {nm} at {F(a, "x"):0}/{F(a, "z"):0} in group {I(a, "group", 0)}";
+            }));
+
+        s.Add(new McpTool("edit_gameplay",
+            "Move, turn or delete one gameplay handle by its kind and index from list_gameplay. Indices shift when something is deleted, so re-list after deleting.",
+            Schema(("kind", "string", "controlpoint | vehicle | soldier", true),
+                   ("index", "number", "Index from list_gameplay", true),
+                   ("action", "string", "move | rotate | delete", true),
+                   ("x", "number", "For move: world X", false),
+                   ("z", "number", "For move: world Z", false),
+                   ("y", "number", "For move: world Y; omit to snap to terrain", false),
+                   ("yaw", "number", "For rotate: degrees", false)),
+            a =>
+            {
+                var s2 = Need();
+                var kind = S(a, "kind").ToLowerInvariant() switch
+                {
+                    "controlpoint" or "cp" or "flag" => GpKind.ControlPoint,
+                    "vehicle" or "veh" => GpKind.Vehicle,
+                    "soldier" or "spawn" => GpKind.Soldier,
+                    _ => throw new ArgumentException("kind must be controlpoint, vehicle or soldier"),
+                };
+                int idx = I(a, "index", -1);
+                switch (S(a, "action").ToLowerInvariant())
+                {
+                    case "move":
+                        s2.MoveGameplay(kind, idx, F(a, "x"), F(a, "z"), Has(a, "y") ? F(a, "y") : null);
+                        return $"moved {kind} [{idx}] to {F(a, "x"):0}/{F(a, "z"):0}";
+                    case "rotate":
+                        s2.RotateGameplay(kind, idx, F(a, "yaw"));
+                        return $"turned {kind} [{idx}] to {F(a, "yaw"):0} deg";
+                    case "delete":
+                        s2.DeleteGameplay(kind, idx);
+                        return $"deleted {kind} [{idx}] - indices after it have shifted, so re-list before editing again";
+                    default:
+                        throw new ArgumentException("action must be move, rotate or delete");
+                }
             }));
 
         s.Add(new McpTool("flatten_area",
