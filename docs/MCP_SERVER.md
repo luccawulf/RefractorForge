@@ -46,6 +46,19 @@ they look like different maps, rather than quietly generating a village that flo
 
 ## Tools
 
+### Looking before placing
+
+These three are what stop the assistant guessing. Use them first.
+
+| Tool | What it does |
+| --- | --- |
+| `render_map` | A top-down **image** of the level — terrain colour, hill shading, a dot per object, a 256 m grid. The fastest way to see where the open ground, water and settlements are |
+| `find_flat_area` | Ground flat and dry enough to build on, ranked. Reports **height spread** (what decides whether a village comes out terraced) and what fraction of the patch is steep. If nothing meets the limits it returns the flattest ground anyway rather than just "no" |
+| `terrain_at` | Height, slope, under-water depth and material at one position |
+| `list_catalog` | **Every** template the mod can place, by category — not just the ones this level already uses |
+
+### Editing
+
 | Tool | What it does |
 | --- | --- |
 | `open_level` | Open a `.rfa`, an extracted level folder, or a base plus patch archives |
@@ -63,9 +76,12 @@ they look like different maps, rather than quietly generating a village that flo
 
 ## Notes and limits
 
-- **Ask for templates the level already has.** `list_templates` is the reliable palette. The protocol accepts any
-  template name without validation, so an invented one enters the document and gets saved, but the editor will not
-  find a mesh for it and it will not draw.
+- **Pick templates from `list_catalog`.** It lists everything the mod can place, resolved through the same mount
+  chain the editor uses (FHSW -> FH -> bf1942), so it works on modded installs. `list_templates` is the narrower
+  "what this level already uses" list. Any name is accepted and saved without validation, so an invented one enters
+  the document but will not draw - the editor can only render a template it can resolve a mesh for.
+- **The catalog needs the level to live inside a mod tree** (`<game>/Mods/<mod>/Archives/...`), because that is
+  what makes the mod's object archives findable. A level opened from somewhere else falls back to `list_templates`.
 - **Template names cannot contain spaces.** The collab wire is space-delimited with fixed field positions. The
   bridge rejects such names rather than sending a corrupt op.
 - **Live undo is a compensating edit, not a rewind.** Undoing an add sends a delete, which everyone in the session

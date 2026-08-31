@@ -6,7 +6,14 @@ namespace RefractorForge.Mcp;
 
 /// <summary>One callable tool: its name, human description, JSON-Schema for arguments, and the handler that runs it
 /// (returning a text result; throwing maps to an MCP tool error).</summary>
-public sealed record McpTool(string Name, string Description, JsonObject InputSchema, Func<JsonElement, string> Handler);
+/// <summary>What a tool call produced: text, and optionally a PNG to go with it. The implicit conversion from
+/// string is what lets the great majority of tools stay plain "return a sentence" lambdas.</summary>
+public readonly record struct ToolResult(string Text, byte[]? Png = null)
+{
+    public static implicit operator ToolResult(string text) => new(text, null);
+}
+
+public sealed record McpTool(string Name, string Description, JsonObject InputSchema, Func<JsonElement, ToolResult> Handler);
 
 /// <summary>
 /// A minimal, dependency-free Model Context Protocol server speaking JSON-RPC 2.0 over stdio (newline-delimited, the
@@ -95,11 +102,20 @@ public sealed class McpServer
                     using var argsDoc = argsNode is null ? null : JsonDocument.Parse(argsNode.ToJsonString());
                     JsonElement args = argsDoc?.RootElement ?? default;
 
-                    string text; bool isErr = false;
-                    try { text = tool.Handler(args); }
-                    catch (Exception ex) { text = $"ERROR: {ex.Message}"; isErr = true; }
+                    ToolResult res; bool isErr = false;
+                    try { res = tool.Handler(args); }
+                    catch (Exception ex) { res = $"ERROR: {ex.Message}"; isErr = true; }
 
-                    var content = new JsonArray { new JsonObject { ["type"] = "text", ["text"] = text } };
+                    var content = new JsonArray { new JsonObject { ["type"] = "text", ["text"] = res.Text } };
+                    // A tool that produced a picture attaches it, so a client that can display images shows the
+                    // map rather than a paragraph describing it.
+                    if (res.Png is { Length: > 0 } png)
+                        content.Add(new JsonObject
+                        {
+                            ["type"] = "image",
+                            ["data"] = Convert.ToBase64String(png),
+                            ["mimeType"] = "image/png",
+                        });
                     return Ok(idNode, new JsonObject { ["content"] = content, ["isError"] = isErr });
                 }
                 default:

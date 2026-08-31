@@ -34,6 +34,8 @@ public sealed class EditSession
     private readonly EditHistory _history;
     private int _addCounter;
     private LiveBridge? _live;
+    private MeshLibrary? _catalog;
+    private bool _catalogTried;
 
     // Only write back what actually changed (a city edit shouldn't rewrite the heightmap or gameplay).
     public bool ObjectsDirty { get; private set; }
@@ -172,6 +174,52 @@ public sealed class EditSession
         else HeightDirty = true;
         return (top, w * h);
     }
+
+    /// <summary>Every template the mounted mod can actually place, not just the ones already in the level.
+    /// Discovered from the level's own path: a level lives at &lt;mod&gt;/Archives/&lt;game&gt;/levels/x.rfa, so the mod
+    /// is walkable from there, and <see cref="ModChain"/> resolves its inherited mounts (FHSW -> FH -> bf1942)
+    /// the same way the editor does. Null when the level did not come from inside a mod tree.</summary>
+    public MeshLibrary? Catalog
+    {
+        get
+        {
+            if (_catalogTried) return _catalog;
+            _catalogTried = true;
+            try
+            {
+                var root = ModChain.FindGameRoot(SourceRfa);
+                if (root is null) return null;
+                // .../Mods/<mod>/Archives/<game>/levels/<x>.rfa - walk up to the mod folder.
+                var dir = new DirectoryInfo(Directory.Exists(SourceRfa) ? SourceRfa : Path.GetDirectoryName(SourceRfa)!);
+                DirectoryInfo? mod = null;
+                for (var d = dir; d is not null; d = d.Parent)
+                    if (d.Parent is not null && d.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { mod = d; break; }
+                if (mod is null) return null;
+
+                var chain = ModChain.Resolve(root, mod.FullName);
+                var (mesh, _) = ModChain.CollectArchives(chain);
+                if (mesh.Length == 0) return null;
+                _catalog = MeshLibrary.Open(mesh);
+            }
+            catch { _catalog = null; }
+            return _catalog;
+        }
+    }
+
+    /// <summary>What the ground is doing at a world position.</summary>
+    public TerrainProbe Probe(float x, float z) => SiteFinder.Probe(Hm, Cfg, x, z, Material);
+
+    /// <summary>Patches of ground flat and dry enough to build on, best first.</summary>
+    public List<BuildSite> FindSites(float radius, float maxSlope, float maxSpread, bool avoidWater,
+                                     float waterClearance, int max, bool clearOfObjects,
+                                     float minX, float minZ, float maxX, float maxZ, float maxSteepFraction)
+        => SiteFinder.Find(Hm, Cfg, radius, maxSlope, maxSpread, avoidWater, waterClearance, max,
+                           clearOfObjects ? So.Objects.Select(o => (o.Position.X, o.Position.Z)) : null,
+                           clearOfObjects ? radius : 0f, minX, minZ, maxX, maxZ, maxSteepFraction);
+
+    /// <summary>A top-down PNG of the level - ground, relief, object dots and a coordinate grid.</summary>
+    public byte[] RenderMap(int size, IEnumerable<Vec3>? highlight = null, bool grid = true)
+        => PngWriter.Encode(MapView.Render(size, Hm, Cfg, Level.Terrain, Material, So.Objects, highlight, grid));
 
     public void SetWaterLevel(float meters)
     {

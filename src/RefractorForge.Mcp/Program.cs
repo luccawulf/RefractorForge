@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RefractorForge.Formats.Geometry;
+using RefractorForge.Formats.Terrain;
 
 namespace RefractorForge.Mcp;
 
@@ -229,6 +230,129 @@ internal static class Program
                        (s2.IsLive ? ". The editor's terrain has been updated." : ".");
             }));
 
+        s.Add(new McpTool("list_catalog",
+            "List EVERY object template the mod can place - not just the ones already in this level. This is the palette to choose from; list_templates only shows what the level already uses. Filter by name and/or category (categories come from the archive folders, e.g. 'Land Vehicles', 'Buildings'). Always check here before inventing a template name.",
+            Schema(("filter", "string", "Case-insensitive substring of the template name", false),
+                   ("category", "string", "Case-insensitive substring of the category", false),
+                   ("max", "number", "Maximum entries to return (default 200)", false)),
+            a =>
+            {
+                var s2 = Need();
+                var lib = s2.Catalog;
+                if (lib is null)
+                    return "no catalog available - the level was not opened from inside a mod tree " +
+                           "(<game>/Mods/<mod>/Archives/...), so the mod's object archives could not be found. " +
+                           "list_templates still shows what this level already places.";
+
+                string nameF = S(a, "filter"), catF = S(a, "category");
+                int max = Math.Clamp(I(a, "max", 200), 1, 2000);
+                var cats = lib.CategoryOf;
+
+                string Cat(string t) => cats.TryGetValue(StripLod(t).ToLowerInvariant(), out var c) ? c : "Other";
+
+                var names = lib.AssembledTemplateNames
+                    .Concat(lib.MeshBaseNames.Select(StripMesh))
+                    .Where(n => n.Length > 0)
+                    .Distinct(StringComparer.OrdinalIgnoreCase);
+
+                var rows = names
+                    .Select(n => (Name: n, Category: Cat(n)))
+                    .Where(r => (nameF.Length == 0 || r.Name.Contains(nameF, StringComparison.OrdinalIgnoreCase))
+                             && (catF.Length == 0 || r.Category.Contains(catF, StringComparison.OrdinalIgnoreCase)))
+                    .OrderBy(r => r.Category, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (rows.Count == 0) return "nothing in the catalog matches that filter";
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"{rows.Count} template(s) available" + (rows.Count > max ? $", showing {max}" : "") + ":");
+                foreach (var g in rows.Take(max).GroupBy(r => r.Category))
+                {
+                    sb.AppendLine($"  [{g.Key}]");
+                    foreach (var r in g) sb.AppendLine($"     {r.Name}");
+                }
+                if (rows.Count > max) sb.AppendLine($"  ... {rows.Count - max} more (narrow it with filter/category)");
+                return sb.ToString();
+            }));
+
+        s.Add(new McpTool("terrain_at",
+            "What the ground is doing at a world position: height, slope, whether it is under water, and the painted material. Use this before placing anything that cares about the ground.",
+            Schema(("x", "number", "World X in metres", true),
+                   ("z", "number", "World Z in metres", true)),
+            a =>
+            {
+                var s2 = Need();
+                float x = F(a, "x"), z = F(a, "z");
+                var t = s2.Probe(x, z);
+                return $"{x:0}/{z:0}: ground {t.Height:0.#} m, slope {t.SlopeDeg:0.#} deg, " +
+                       (t.UnderWater ? $"UNDER WATER by {t.DepthBelowWater:0.#} m" : "dry") +
+                       (t.Material >= 0 ? $", material {t.Material}" : "") +
+                       $" (water line {s2.Cfg.WaterLevel:0.#} m)";
+            }));
+
+        s.Add(new McpTool("find_flat_area",
+            "Find ground flat and dry enough to build on, best first. Use this to choose WHERE to put a village or a base - placing without it is guesswork, and a settlement generated across a hillside comes out terraced. Height spread is the number that matters: it is how far the ground rises and falls across the patch.",
+            Schema(("radius", "number", "How much flat ground is needed, in metres (default 100)", false),
+                   ("maxSlope", "number", "What counts as steep, degrees (default 12)", false),
+                   ("maxSteepFraction", "number", "How much of the patch may be steeper than maxSlope and still pass, 0-1 (default 0.05). A field crossed by one ditch or hedgerow bank scores near zero; judging by the single steepest cell would reject it.", false),
+                   ("maxSpread", "number", "Largest height difference tolerated across the patch, metres (default 6)", false),
+                   ("avoidWater", "boolean", "Reject anything under or near the water line (default true)", false),
+                   ("waterClearance", "number", "Metres of clearance above the water line (default 1)", false),
+                   ("clearOfObjects", "boolean", "Keep away from objects already placed (default true)", false),
+                   ("max", "number", "How many sites to return (default 6)", false),
+                   ("minX", "number", "Restrict the search area", false),
+                   ("minZ", "number", "Restrict the search area", false),
+                   ("maxX", "number", "Restrict the search area", false),
+                   ("maxZ", "number", "Restrict the search area", false)),
+            a =>
+            {
+                var s2 = Need();
+                float radius = F(a, "radius", 100f);
+                if (radius <= 0f) throw new ArgumentException("radius must be positive");
+                float slopeLim = F(a, "maxSlope", 12f), spreadLim = F(a, "maxSpread", 6f);
+                float steepLim = Math.Clamp(F(a, "maxSteepFraction", 0.05f), 0f, 1f);
+                var sites = s2.FindSites(radius, slopeLim, spreadLim,
+                    B(a, "avoidWater", true), F(a, "waterClearance", 1f), Math.Clamp(I(a, "max", 6), 1, 50),
+                    B(a, "clearOfObjects", true),
+                    F(a, "minX", 0f), F(a, "minZ", 0f), F(a, "maxX", s2.Cfg.WorldSize), F(a, "maxZ", s2.Cfg.WorldSize),
+                    steepLim);
+
+                if (sites.Count == 0)
+                    return $"nowhere on this map has {radius:0} m of dry ground in one piece" +
+                           (B(a, "clearOfObjects", true) ? " clear of what is already placed" : "") +
+                           ". Try a smaller radius, or clearOfObjects false.";
+
+                bool anyPass = sites.Any(b => SiteFinder.Meets(b, spreadLim, steepLim));
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine(anyPass
+                    ? $"{sites.Count} site(s), flattest first (radius {radius:0} m):"
+                    : $"NOTHING meets those limits (spread <= {spreadLim:0.#} m, at most {steepLim:P0} steeper than " +
+                      $"{slopeLim:0.#} deg). The flattest ground of radius {radius:0} m is below - decide whether it " +
+                      "is good enough, or search a smaller radius:");
+                foreach (var b in sites)
+                    sb.AppendLine($"   {b.X:0}/{b.Z:0}  ground {b.Height:0.#} m, spread {b.HeightSpread:0.#} m, "
+                                  + $"{b.SteepFraction:P0} steep (worst {b.MaxSlopeDeg:0.#} deg)"
+                                  + (SiteFinder.Meets(b, spreadLim, steepLim) ? "" : "   (over the limit)"));
+                return sb.ToString();
+            }));
+
+        s.Add(new McpTool("render_map",
+            "Render the level top-down as an image: terrain colour, hill shading, a dot for every placed object, and a 256 m coordinate grid. LOOK at this before deciding where to build - it shows where the open ground, water and existing settlements are in a way no list of coordinates does.",
+            Schema(("size", "number", "Image edge in pixels, 256-2048 (default 768)", false),
+                   ("grid", "boolean", "Draw the coordinate grid (default true)", false)),
+            a =>
+            {
+                var s2 = Need();
+                int size = Math.Clamp(I(a, "size", 768), 256, 2048);
+                var png = s2.RenderMap(size, null, B(a, "grid", true));
+                float ws = s2.Cfg.WorldSize;
+                return new ToolResult(
+                    $"{s2.Name}, {ws:0} m across, {s2.So.Objects.Count} objects. North (+Z) is up, east (+X) is right; " +
+                    $"grid lines every 256 m, so the image spans 0..{ws:0} on both axes. Water line {s2.Cfg.WaterLevel:0.#} m.",
+                    png);
+            }));
+
         s.Add(new McpTool("set_water_level", "Set the level's water level (metres). Saved by patching Terrain.con.",
             Schema(("meters", "number", "Water level in metres", true)),
             a => { var s2 = Need(); float m = F(a, "meters"); s2.SetWaterLevel(m); return $"water level set to {m:0.##} m"; }));
@@ -255,6 +379,23 @@ internal static class Program
                 var names = s2.Save(path);
                 return $"saved {names.Count} edited file(s) into {path}";
             }));
+    }
+
+    /// <summary>"sheridan_m1.sm" -> "sheridan_m1". The catalog wants template names, not file names.</summary>
+    private static string StripMesh(string meshFile)
+    {
+        var n = meshFile;
+        int dot = n.LastIndexOf('.');
+        if (dot > 0) n = n[..dot];
+        return n;
+    }
+
+    /// <summary>Drop a trailing LOD suffix so a name matches the category index, which is keyed LOD-stripped.</summary>
+    private static string StripLod(string name)
+    {
+        for (int i = 1; i <= 3; i++)
+            if (name.EndsWith("_m" + i, StringComparison.OrdinalIgnoreCase)) return name[..^3];
+        return name;
     }
 
     private static string Info(EditSession s)
