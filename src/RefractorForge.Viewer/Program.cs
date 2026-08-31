@@ -1564,6 +1564,19 @@ void OnLoad()
         }
     }
     gl = window.CreateOpenGL();
+    // Say which GPU actually got the context. On a laptop or a desktop with an iGPU this is the difference between
+    // a card with its own VRAM and one carving textures out of system RAM, which decides whether a texture-heavy
+    // map draws at all - and Windows can silently hand the app the integrated one. Printing it means "which GPU am
+    // I on" is answered by the log instead of guessed at.
+    unsafe
+    {
+        string GlStr(StringName n) { var p2 = gl.GetString(n); return p2 is null ? "?" : System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)p2) ?? "?"; }
+        Span<int> maxTex = stackalloc int[1]; gl.GetInteger(GLEnum.MaxTextureSize, maxTex);
+        Console.WriteLine($"GPU: {GlStr(StringName.Renderer)}  |  {GlStr(StringName.Vendor)}  |  GL {GlStr(StringName.Version)}  |  max texture {maxTex[0]}px");
+    }
+
+    // Object texture ceiling, from preferences (0 = the map's own resolution).
+    GlObjects.MaxObjectTexture = AppPrefs.ObjectTextureCap;
     SetAppIcon();
     input = window.CreateInput();
     kb = input.Keyboards.Count > 0 ? input.Keyboards[0] : null;
@@ -2656,7 +2669,9 @@ void OnLoad()
         SyncMarkers(); // recompute mesh-less markers now that the library is known
         Console.WriteLine($"Object meshes: {glObjects.TemplateCount} templates, {glObjects.InstanceCount} instances, {glObjects.TextureCount} textures; {pointMarkers.Length} mesh-less markers.");
         Console.WriteLine($"Object texture memory: {glObjects.TextureBytes / 1048576} MB"
-                          + (glObjects.TextureBytesSaved > 0 ? $" (saved {glObjects.TextureBytesSaved / 1048576} MB by downscaling oversized art to {1024}px)" : ""));
+                          + (GlObjects.MaxObjectTexture > 0
+                             ? $" (capped at {GlObjects.MaxObjectTexture}px, saved {glObjects.TextureBytesSaved / 1048576} MB)"
+                             : " at the map's own resolution (Environment > Object texture detail lowers it)"));
     }
     LoadOvergrowthSettings();   // restore the per-map overgrowth overlay config (spacing + on/off), if saved
     RefreshTextureLibrary();    // scan the bundled/user Texture Library folder for the Surface painter + Layer Tool
@@ -8120,6 +8135,21 @@ void EnvironmentPanel()
         lightingDirty = false;
     }
     if (lightingDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+
+    ImGui.Separator();
+    // Object textures are the largest thing the editor uploads, so this is the dial that decides whether a
+    // texture-heavy map draws on a GPU that shares system memory. Full is the default - a remastered map's art is
+    // usually the reason for opening it - and the load log always states what it cost.
+    ImGui.TextDisabled(Loc.T("PERFORMANCE"));
+    int texIdx = AppPrefs.ObjectTextureCap switch { 512 => 3, 1024 => 2, 2048 => 1, _ => 0 };
+    ImGui.SetNextItemWidth(150f);
+    if (ImGui.Combo(Loc.TL("Object texture detail"), ref texIdx, "Full (map's own)\0" + "2048\0" + "1024\0" + "512\0"))
+    {
+        AppPrefs.ObjectTextureCap = texIdx switch { 3 => 512, 2 => 1024, 1 => 2048, _ => 0 };
+        AppPrefs.Save();
+        Toast(Loc.T("Applies next time a level is loaded."));
+    }
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Largest object texture handed to the GPU. Full keeps the map's own art.\nLower it if a texture-heavy map fails to draw - a few hundred 2048-4096\ntextures run to several GB, and a GPU sharing system memory can run out.\nNothing on disk is changed. Applies on the next level load."));
 
     ImGui.Separator();
     // Terrain paint alignment: move/zoom the ground texture until it sits on the terrain it belongs to.

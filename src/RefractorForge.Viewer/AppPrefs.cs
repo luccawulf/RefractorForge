@@ -26,10 +26,18 @@ public static class AppPrefs
     /// flying free. Off = the original fly camera. Remembered because it is a matter of taste, not of the level.</summary>
     public static bool GroundCamera { get; set; } = false;
 
+    /// <summary>Largest object texture handed to the GPU, or 0 for the map's own resolution. Full is the default
+    /// because a remastered map's art is the point of opening it in an editor - but object textures are by far the
+    /// biggest thing the editor uploads, and on a GPU that shares system memory a couple of hundred 2048-4096
+    /// textures can exhaust the driver mid-frame. Lower it when a map will not draw; the load log states the cost
+    /// either way so the number is never a guess.</summary>
+    public static int ObjectTextureCap { get; set; } = 0;
+
     private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge");
     private static string FilePath => Path.Combine(Dir, "prefs.json");
 
-    private sealed record Data(bool? ResolveInheritedMods, bool? LayerBaseMap, bool? GroundCamera = null);
+    private sealed record Data(bool? ResolveInheritedMods, bool? LayerBaseMap, bool? GroundCamera = null,
+                               int? ObjectTextureCap = null);
 
     /// <summary>Load persisted preferences. Call once at startup, BEFORE the level load block reads them.</summary>
     public static void Load()
@@ -41,6 +49,7 @@ public static class AppPrefs
             if (d.ResolveInheritedMods is bool a) ResolveInheritedMods = a;
             if (d.LayerBaseMap is bool b) LayerBaseMap = b;
             if (d.GroundCamera is bool c) GroundCamera = c;
+            if (d.ObjectTextureCap is int t) ObjectTextureCap = t;
         }
         catch { /* a corrupt prefs file must never stop the editor starting */ }
     }
@@ -50,7 +59,7 @@ public static class AppPrefs
         try
         {
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera),
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera, ObjectTextureCap),
                 new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }

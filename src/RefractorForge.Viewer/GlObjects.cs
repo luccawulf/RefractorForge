@@ -452,12 +452,11 @@ sealed class GlObjects
         }
     }
 
-    // Biggest object texture we will hand the GPU. Remastered maps ship 2048 and 4096 art, and a level with a
-    // couple of hundred distinct textures then wants several GB once mip chains are added - which on an integrated
-    // GPU comes out of system RAM and eventually leaves the driver unable to service an allocation at all. At
-    // editor viewing distances 1024 is already generous (stock BF1942 art is 256-512), so oversized textures are
-    // downscaled on the way in. Nothing on disk is touched; this only affects what is uploaded.
-    private const int MaxObjectTexture = 1024;
+    /// <summary>Largest object texture uploaded, or 0 to use the map's own resolution (the default). Object
+    /// textures are the biggest thing the editor hands the GPU - a couple of hundred distinct 2048-4096 textures
+    /// runs to several GB with mip chains - so on a GPU sharing system memory this is the dial that decides whether
+    /// a remastered map draws at all. Nothing on disk is touched; this only affects what is uploaded.</summary>
+    public static int MaxObjectTexture { get; set; } = 0;
 
     /// <summary>Box-filter a texture down so its longest side is <paramref name="max"/>.</summary>
     private static Texture2D Downscale(Texture2D s, int max)
@@ -484,7 +483,8 @@ sealed class GlObjects
         if (_glTextures.TryGetValue(key, out var id)) return id;
 
         long native = (long)t.Width * t.Height * 4;
-        if (t.Width > MaxObjectTexture || t.Height > MaxObjectTexture) t = Downscale(t, MaxObjectTexture);
+        if (MaxObjectTexture > 0 && (t.Width > MaxObjectTexture || t.Height > MaxObjectTexture))
+            t = Downscale(t, MaxObjectTexture);
         long used = (long)t.Width * t.Height * 4;
         // Mip chains add about a third on top; alpha-tested foliage skips them (see below).
         TextureBytes += alphaTest ? used : used * 4 / 3;
