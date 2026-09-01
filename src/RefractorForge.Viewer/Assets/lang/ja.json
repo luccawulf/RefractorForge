@@ -38,6 +38,7 @@
  "Also auto-place one at map centre": "マップ中央にも自動配置する",
  "Also import into this slot": "このスロットにも読み込む",
  "Also mount dependencies the mod's init.con doesn't list (recommended)": "init.con に記載されていない依存 MOD もマウントする（推奨）",
+ "Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport.": "ライトを選択した状態で PageUp / PageDown （Ctrl で微調整）、\nまたはビュー上で Shift+ドラッグでも変更できます。",
  "Alt-click picks the material under the cursor.": "Alt+クリックでカーソル下のマテリアルを取得。",
  "Alt-click picks the surface under the cursor.": "Alt+クリックでカーソル下のサーフェスを取得。",
  "Ambient": "環境光",

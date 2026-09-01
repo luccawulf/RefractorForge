@@ -1813,9 +1813,11 @@ void OnLoad()
                 var l = lightRig.Lights[selLight];
                 if (lightDragVertical)
                 {
+                    // `d` is this frame's mouse delta. Do NOT recompute it from pos - lastMouse: the handler
+                    // reassigns lastMouse on its first line, so that difference is always zero.
                     float perPixel = 0.15f;
                     if (kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight))) perPixel *= 0.25f;
-                    l.Position = new Vec3(l.Position.X, l.Position.Y - (pos.Y - lastMouse.Y) * perPixel, l.Position.Z);
+                    l.Position = new Vec3(l.Position.X, l.Position.Y - d.Y * perPixel, l.Position.Z);
                 }
                 else if (terrainPick is not null)
                 {
@@ -2965,10 +2967,12 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.PageUp:
             if (toolNames[tool] == "Point" && vertGx >= 0)
             { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, vertNudgeStep)); vertHeightField += vertNudgeStep; }
+            else NudgeLightHeight(+1f);
             break;
         case Key.PageDown:
             if (toolNames[tool] == "Point" && vertGx >= 0)
             { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, -vertNudgeStep)); vertHeightField -= vertNudgeStep; }
+            else NudgeLightHeight(-1f);
             break;
         case Key.Z: DoUndo(); break;
         case Key.Y: DoRedo(); break;
@@ -10412,6 +10416,15 @@ void LevelTreePanel()
     ImGui.EndChild();
 }
 
+// Raise or lower the selected light. Ctrl makes it fine, matching the Point tool's modifier.
+void NudgeLightHeight(float dir)
+{
+    if (selLight < 0 || selLight >= lightRig.Lights.Count) return;
+    float step = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight)) ? 0.25f : 1f;
+    var l = lightRig.Lights[selLight];
+    l.Position = new Vec3(l.Position.X, l.Position.Y + dir * step, l.Position.Z);
+}
+
 // Ground height under a world position, sampled the way the rest of the file does.
 float GroundUnder(float wx, float wz)
 {
@@ -10673,7 +10686,14 @@ void LightsPanel()
 
         float gnd = GroundUnder(l.Position.X, l.Position.Z);
         float above = l.Position.Y - gnd;
-        ImGui.TextDisabled(string.Format(Loc.T("{0:0.#} m above the ground"), above));
+
+        // Height above the GROUND rather than absolute Y: that is the number that decides whether the light
+        // reaches anything, and it is the one a mapper actually thinks in ("a lamp is 4 m up").
+        float aboveEdit = above;
+        ImGui.SetNextItemWidth(150f);
+        if (ImGui.DragFloat(Loc.TL("Height above ground"), ref aboveEdit, 0.1f, -50f, 400f, "%.1f m"))
+            l.Position = new Vec3(l.Position.X, gnd + aboveEdit, l.Position.Z);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport."));
 
         // The failure that looks like a broken feature: a light further above the ground than its own reach
         // lights nothing at all, and from a floating marker there is no way to tell. Say so, and offer the fix.
