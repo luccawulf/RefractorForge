@@ -284,6 +284,9 @@ public static class LevelSaver
         if (ext is ".rfproj" or ".rfatmp" or ".bak") return true;
         return leaf.Equals("refractorforge.game", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("refractorforge.json", System.StringComparison.OrdinalIgnoreCase)
+            // Placed lights are authoring data. The engine has no concept of them - they reach the game only
+            // once baked into the lightmaps - so the sidecar must never be packed.
+            || leaf.Equals(Terrain.LightRig.FileName, System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("sound_debug.log", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("imgui.ini", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("Thumbs.db", System.StringComparison.OrdinalIgnoreCase)

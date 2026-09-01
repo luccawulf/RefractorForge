@@ -121,6 +121,37 @@ uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpac
 // The level's lighting (Init.con renderer.ambientColor / diffuseColor), balanced so the pair sums to the editor's
 // old flat 0.4/0.6 exposure - the level tints the light, it does not change how bright the editor is.
 uniform vec3 uAmbLight; uniform vec3 uDifLight;
+// ---- Placed lights -------------------------------------------------------------------------------
+// Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
+// DIRECTIONAL lights and zero point lights), so these exist to AIM a rig that is then baked into the
+// lightmaps the engine does read. The falloff below is the same curve as PointLight.Attenuation on the
+// C# side: shape by exponent, windowed to reach exactly zero at the radius so a light does not end on a
+// visible circle.
+const int MAXPL = 24;
+uniform int uPlCount;
+uniform vec3 uPlPos[MAXPL];      // world position
+uniform vec3 uPlColor[MAXPL];    // colour premultiplied by intensity
+uniform vec2 uPlParam[MAXPL];    // x = radius (m), y = falloff exponent
+uniform float uNight;            // 0 = daylight, 1 = only moon ambient + placed lights
+uniform vec3 uNightAmb;
+vec3 placedLights(vec3 wp, vec3 nrm){
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < uPlCount; i++){
+        vec3 dv = wp - uPlPos[i];
+        float dist = length(dv);
+        float r = uPlParam[i].x;
+        if (dist >= r || r <= 0.0) continue;
+        float t = dist / r;
+        float w = 1.0 - t*t; w *= w;
+        float atten = pow(1.0 - t, max(uPlParam[i].y, 0.1)) * w;
+        float ndl = max(dot(nrm, normalize(-dv)), 0.0);
+        // A little wrap: a bare lamp in the open lights the ground around it rather than only the facing
+        // half, and without this a flat surface under a light reads as a hard disc.
+        ndl = ndl * 0.85 + 0.15;
+        sum += uPlColor[i] * atten * ndl;
+    }
+    return sum;
+}
 out vec4 frag;
 // Project a world point into the sun's light space and PCF-sample the depth map: 1 = lit, 0 = in cast shadow.
 float shadowVis(vec3 wp, vec3 nrm){
@@ -156,7 +187,8 @@ void main(){
     vec3 n = normalize(vN);
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
     vec3 d = uAmbLight + uDifLight*max(0.0, dot(n, normalize(uLightDir)))*vis;
-    vec3 c = baseCol * d;
+    d = mix(d, uNightAmb, uNight);                 // night pulls the sun down toward moonlight
+    vec3 c = baseCol * (d + placedLights(vWorld, n));
     if (vH < uWater) {                              // shallow shows the riverbed, deep reads as water
         float depth = clamp((uWater - vH)/8.0, 0.0, 1.0);
         c = mix(c, uDeepColor, 0.45 + 0.45*depth);
@@ -391,6 +423,38 @@ uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform s
 uniform float uAlphaRef;   // 0 = this material never discards
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
 uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
+// ---- Placed lights -------------------------------------------------------------------------------
+// Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
+// DIRECTIONAL lights and zero point lights), so these exist to AIM a rig that is then baked into the
+// lightmaps the engine does read. The falloff below is the same curve as PointLight.Attenuation on the
+// C# side: shape by exponent, windowed to reach exactly zero at the radius so a light does not end on a
+// visible circle.
+const int MAXPL = 24;
+uniform int uPlCount;
+uniform vec3 uPlPos[MAXPL];      // world position
+uniform vec3 uPlColor[MAXPL];    // colour premultiplied by intensity
+uniform vec2 uPlParam[MAXPL];    // x = radius (m), y = falloff exponent
+uniform float uNight;            // 0 = daylight, 1 = only moon ambient + placed lights
+uniform vec3 uNightAmb;
+vec3 placedLights(vec3 wp, vec3 nrm){
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < uPlCount; i++){
+        vec3 dv = wp - uPlPos[i];
+        float dist = length(dv);
+        float r = uPlParam[i].x;
+        if (dist >= r || r <= 0.0) continue;
+        float t = dist / r;
+        float w = 1.0 - t*t; w *= w;
+        float atten = pow(1.0 - t, max(uPlParam[i].y, 0.1)) * w;
+        float ndl = max(dot(nrm, normalize(-dv)), 0.0);
+        // A little wrap: a bare lamp in the open lights the ground around it rather than only the facing
+        // half, and without this a flat surface under a light reads as a hard disc.
+        ndl = ndl * 0.85 + 0.15;
+        sum += uPlColor[i] * atten * ndl;
+    }
+    return sum;
+}
+
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
 out vec4 frag;
@@ -464,6 +528,15 @@ void main(){}";
 //   2. saved selections from a previous run (refractorforge.json beside the exe);
 //   3. native folder/file pickers (GUI) - first run, or whenever --pick is passed.
 string? levelDir = null;
+// Placed lights. Authoring data: Refractor renders no dynamic point lights, so these light the viewport and
+// are baked into the lightmaps the engine does read. Declared here because the load block assigns it.
+LightRig lightRig = new();
+// Uniform locations for the placed-light arrays, per shader program. Declared up here rather than beside the
+// function that fills it: this file is top-level statements, so anything touched by straight-line code must be
+// declared textually before it.
+Dictionary<uint, int[]> plLocs = new();
+int selLight = -1;              // index into lightRig.Lights, -1 = none
+bool showLightGizmos = true;
 string[] levelArchives = Array.Empty<string>();   // all level .rfa (base + patches); empty when the level is a FOLDER
 string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa + patches - no limit
 string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (their folders are also scanned for siblings)
@@ -713,6 +786,7 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     if (matFile is not null) materialMap = MaterialMap.LoadForMaterialSize(matFile, cfg.MaterialSize);
     growth = GrowthMaps.LoadFolder(levelDir);
     env = EnvironmentSettings.LoadFolder(levelDir);
+    lightRig = LightRig.Load(levelDir);   // sidecar; never packed (LevelSaver.IsEditorOnlyFile)
     sounds = SoundLibrary.LoadFolder(levelDir);   // recognise + edit placed sound emitters (.ssc)
     loadedShadowBits = LightmapShadowBits.TryLoadFolder(levelDir);   // the level's baked terrain sun-shadow, if present
     // object lightmaps loaded lazily (EnsureObjectLightmaps) - see the .rfa branch note above.
@@ -6122,7 +6196,7 @@ void OnRender(double dt)
         gl.UseProgram(terrainProg);
         gl.UniformMatrix4(uMvp, 1, false, mvp);
         gl.Uniform3(uLight, ld.X, ld.Y, ld.Z);
-        SetLightUniforms(uAmbLightT, uDifLightT);
+        SetLightUniforms(uAmbLightT, uDifLightT, terrainProg);
         gl.Uniform1(uWater, cfg.WaterLevel);
         gl.Uniform1(uMaxH, maxH);
         gl.Uniform3(uDeepColor, deepColor.X, deepColor.Y, deepColor.Z);
@@ -6155,7 +6229,7 @@ void OnRender(double dt)
     // blending softens the edges). Opaque parts output alpha=1.0 so they're unaffected.
     if (alphaTransparency) { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
     gl.UseProgram(objProg); gl.Uniform1(uAlphaEnableO, alphaTransparency ? 1 : 0);   // toggle off -> no discard + opaque output (objects revert to solid)
-    SetLightUniforms(uAmbLightO, uDifLightO);   // one set covers every object pass this frame (uniforms are per-program state)
+    SetLightUniforms(uAmbLightO, uDifLightO, objProg);   // one set covers every object pass this frame (uniforms are per-program state)
 
     // Real object geometry (GPU). Selected object is tinted via the highlight colour.
     Stage("objects");
@@ -8046,11 +8120,54 @@ void ImportCloudMesh()
     return (amb, dif);
 }
 
-void SetLightUniforms(int ambLoc, int difLoc)
+void SetLightUniforms(int ambLoc, int difLoc, uint prog = 0)
 {
     var (a, d) = SceneLight();
     if (ambLoc >= 0) gl.Uniform3(ambLoc, a.X, a.Y, a.Z);
     if (difLoc >= 0) gl.Uniform3(difLoc, d.X, d.Y, d.Z);
+    if (prog != 0) UploadPlacedLights(prog);
+}
+
+/// <summary>
+/// Hand the shader the lights nearest the camera.
+///
+/// Only a fixed number fit, so the rig is sorted by distance to each light's REACH rather than to its centre -
+/// a large lamp further away can matter more than a small one close by, and sorting by centre distance drops
+/// exactly the wrong one first.
+/// </summary>
+void UploadPlacedLights(uint prog)
+{
+    const int MaxPl = 24;
+    if (!plLocs.TryGetValue(prog, out var loc))
+    {
+        loc = new[]
+        {
+            gl.GetUniformLocation(prog, "uPlCount"),
+            gl.GetUniformLocation(prog, "uPlPos"),
+            gl.GetUniformLocation(prog, "uPlColor"),
+            gl.GetUniformLocation(prog, "uPlParam"),
+            gl.GetUniformLocation(prog, "uNight"),
+            gl.GetUniformLocation(prog, "uNightAmb"),
+        };
+        plLocs[prog] = loc;
+    }
+    if (loc[0] < 0) return;   // shader without the block (markers, sky, water)
+
+    var near = lightRig.Lights.Count == 0
+        ? new List<PointLight>()
+        : lightRig.Nearest(cam.Position.X, cam.Position.Y, cam.Position.Z, MaxPl);
+
+    gl.Uniform1(loc[0], near.Count);
+    for (int i = 0; i < near.Count; i++)
+    {
+        var l = near[i];
+        if (loc[1] >= 0) gl.Uniform3(gl.GetUniformLocation(prog, $"uPlPos[{i}]"), l.Position.X, l.Position.Y, l.Position.Z);
+        if (loc[2] >= 0) gl.Uniform3(gl.GetUniformLocation(prog, $"uPlColor[{i}]"),
+            l.ColorR * l.Intensity, l.ColorG * l.Intensity, l.ColorB * l.Intensity);
+        if (loc[3] >= 0) gl.Uniform2(gl.GetUniformLocation(prog, $"uPlParam[{i}]"), l.Radius, l.Falloff);
+    }
+    if (loc[4] >= 0) gl.Uniform1(loc[4], lightRig.NightAmount);
+    if (loc[5] >= 0) gl.Uniform3(loc[5], lightRig.NightR, lightRig.NightG, lightRig.NightB);
 }
 
 // Copy the edited lighting back onto the EnvironmentSettings, flagging each key as declared so the patcher writes it.
@@ -8070,6 +8187,7 @@ void SaveLightingFolder()
 {
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveLightingToEnv();
+    if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
     try
     {
         var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
@@ -8088,6 +8206,7 @@ void SaveLightingFolder()
 {
     if (!lightingDirty || env is null) return null;
     SaveLightingToEnv();
+    if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
     try
     {
         var arch = new RefractorFlatArchive(baseRfa);
@@ -8188,6 +8307,8 @@ void EnvironmentPanel()
         BroadcastLight();   // a reset is an edit as far as everyone else is concerned
     }
     if (lightingDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+
+    LightsPanel();
 
     ImGui.Separator();
     // Object textures are the largest thing the editor uploads, so this is the dial that decides whether a
@@ -9470,7 +9591,7 @@ unsafe void RenderMeshPreview()
     gl.Uniform1(gl.GetUniformLocation(objProg, "uFogEnable"), 0);   // isolated preview: kill the leftover scene fog
     var ld = Vector3.Normalize(new Vector3(0.4f, 0.85f, 0.45f));    // (else fog saturates to grey over the whole mesh)
     gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
-    SetLightUniforms(uAmbLightO, uDifLightO);
+    SetLightUniforms(uAmbLightO, uDifLightO, objProg);
     glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO, mvViewProj, "mv::" + meshViewerTemplate, m, model, Vector3.One);
 
     gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
@@ -10130,6 +10251,7 @@ void BuildUi()
     HelpWindow();
     ValidateModal();
     PointToolOverlay();
+    LightGizmos();
     LogWindow();
     TextureLibraryWindow();
     LayerToolWindow();
@@ -10240,6 +10362,170 @@ void LevelTreePanel()
     }
 
     ImGui.EndChild();
+}
+
+// Draw a marker and a reach ring for every placed light, so a rig can be aimed rather than guessed at. Uses the
+// ImGui draw list rather than new GL buffers: these are a handful of circles, and the projection helper the
+// gizmos already use is enough.
+void LightGizmos()
+{
+    if (!showLightGizmos || lightRig.Lights.Count == 0) return;
+    var fb = window.FramebufferSize;
+    var vp = cam.ViewProjection;
+    var dl = ImGui.GetBackgroundDrawList();
+
+    for (int i = 0; i < lightRig.Lights.Count; i++)
+    {
+        var l = lightRig.Lights[i];
+        var wpos = new Vector3(l.Position.X, l.Position.Y, l.Position.Z);
+        if (Vector3.Distance(wpos, cam.Position) > 2500f) continue;      // far enough to be noise
+
+        var scr = Gizmo.Project(wpos, vp, fb.X, fb.Y);
+        if (scr.X < -200 || scr.Y < -200 || scr.X > fb.X + 200 || scr.Y > fb.Y + 200) continue;
+
+        // The bulb, in the light's own colour so a rig reads at a glance.
+        var col = new Vector4(l.ColorR, l.ColorG, l.ColorB, l.Enabled ? 1f : 0.35f);
+        uint c = ImGui.GetColorU32(col);
+        bool sel = i == selLight;
+        dl.AddCircleFilled(scr, (sel ? 8f : 5f) * uiScale, c);
+        dl.AddCircle(scr, (sel ? 11f : 7f) * uiScale,
+            ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.85f)), 0, 2f);
+
+        // The reach, drawn as a horizontal ring at the light's height: the radius is where the light reaches
+        // zero, which is the number you are actually tuning.
+        if (sel || showLightGizmos)
+        {
+            const int seg = 40;
+            Vector2 prev = default;
+            bool have = false;
+            for (int k = 0; k <= seg; k++)
+            {
+                float a = k / (float)seg * MathF.Tau;
+                var wp = wpos + new Vector3(MathF.Cos(a) * l.Radius, 0f, MathF.Sin(a) * l.Radius);
+                var sp = Gizmo.Project(wp, vp, fb.X, fb.Y);
+                if (have) dl.AddLine(prev, sp, ImGui.GetColorU32(new Vector4(l.ColorR, l.ColorG, l.ColorB, sel ? 0.75f : 0.28f)), sel ? 2f : 1f);
+                prev = sp; have = true;
+            }
+        }
+        if (sel) dl.AddText(scr + new Vector2(12f, -6f), ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)), l.Name);
+    }
+}
+
+// The Lights panel. Placed lights do not exist in the engine - see LightRig - so this is about aiming a rig
+// that then gets baked.
+void LightsPanel()
+{
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("PLACED LIGHTS"));
+
+    if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(Loc.T("Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads."));
+
+    ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);
+
+    float night = lightRig.NightAmount;
+    ImGui.SetNextItemWidth(150f);
+    if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Editor-side only: pulls the sun down toward moonlight so the placed\nlights are visible. It does NOT change the level - use Night preset\nfor that, which writes the renderer colours the game reads."));
+
+    if (ImGui.Button(Loc.TL("Apply night preset to level")))
+    {
+        // The values a real night map uses. DC_Basrah_Nights ships almost exactly this: a near-black ambient,
+        // a dim cool diffuse and tight fog. These are written to Init.con on save, so unlike the preview
+        // slider this is what the game will actually show.
+        lightGlobalAmb = new Vector3(0.080f, 0.082f, 0.085f);
+        lightAmb = new Vector3(0.080f, 0.082f, 0.085f);
+        lightDiffuse = new Vector3(0.18f, 0.20f, 0.22f);
+        lightSpecular = new Vector3(0.40f, 0.50f, 0.60f);
+        lightingDirty = true;
+        fogEnabled = true;
+        fogColor = new Vector3(0.09f, 0.10f, 0.11f);
+        fogStart = 85f; fogEnd = 130f;
+        BroadcastLight();
+        Toast(Loc.T("Night lighting applied - written to Init.con on save."));
+    }
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sets the level's renderer ambient/diffuse/fog to night values\n(the same recipe DC_Basrah_Nights uses). Written to Init.con on save."));
+
+    if (ImGui.Button(Loc.TL("Add light here")))
+    {
+        // At the camera, dropped to just above the ground so it lights something immediately.
+        var pos = cam.Position;
+        if (heightmap is not null)
+        {
+            // Drop it near the ground if the camera is high up or underground, so a new light lands somewhere
+            // it actually lights something instead of in the sky.
+            float sp2 = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+            int gx = Math.Clamp((int)MathF.Round(pos.X / sp2), 0, heightmap.Width - 1);
+            int gz = Math.Clamp((int)MathF.Round(pos.Z / sp2), 0, heightmap.Height - 1);
+            float g = cfg.HeightToMeters(heightmap[gx, gz]);
+            if (pos.Y > g + 60f || pos.Y < g) pos.Y = g + 6f;
+        }
+        lightRig.Lights.Add(new PointLight
+        {
+            Name = $"Light {lightRig.Lights.Count + 1}",
+            Position = new Vec3(pos.X, pos.Y, pos.Z),
+            Radius = 25f, Intensity = 1.2f,
+        });
+        selLight = lightRig.Lights.Count - 1;
+    }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Delete light")) && selLight >= 0 && selLight < lightRig.Lights.Count)
+    {
+        lightRig.Lights.RemoveAt(selLight);
+        selLight = -1;
+    }
+
+    if (lightRig.Lights.Count > 0)
+    {
+        ImGui.SetNextItemWidth(220f);
+        if (ImGui.BeginListBox("##lightlist", new Vector2(220f, Math.Min(6, lightRig.Lights.Count) * 18f + 6f)))
+        {
+            for (int i = 0; i < lightRig.Lights.Count; i++)
+            {
+                var l = lightRig.Lights[i];
+                if (ImGui.Selectable($"{(l.Enabled ? "" : "(off) ")}{l.Name}##L{i}", i == selLight))
+                    selLight = i;
+            }
+            ImGui.EndListBox();
+        }
+    }
+
+    if (selLight >= 0 && selLight < lightRig.Lights.Count)
+    {
+        var l = lightRig.Lights[selLight];
+        bool on = l.Enabled;
+        if (ImGui.Checkbox(Loc.TL("Enabled"), ref on)) l.Enabled = on;
+        ImGui.SameLine();
+        bool sh = l.CastsShadows;
+        if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) l.CastsShadows = sh;
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bake traces terrain occlusion for this light. Off is much faster and\nis right for a fill light that only lifts the ambient."));
+
+        var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
+        if (ImGui.ColorEdit3(Loc.TL("Colour"), ref colv))
+        { l.ColorR = colv.X; l.ColorG = colv.Y; l.ColorB = colv.Z; }
+
+        float inten = l.Intensity, rad = l.Radius, fall = l.Falloff;
+        ImGui.SetNextItemWidth(150f);
+        if (SldF(Loc.TL("Intensity"), ref inten, 0f, 5f, "%.2f")) l.Intensity = inten;
+        ImGui.SetNextItemWidth(150f);
+        if (SldF(Loc.TL("Radius (m)"), ref rad, 1f, 400f, "%.0f")) l.Radius = rad;
+        ImGui.SetNextItemWidth(150f);
+        if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 6f, "%.2f")) l.Falloff = fall;
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("2 is physically correct inverse-square. Lower is flatter and easier\nto light a scene with."));
+
+        var pv = new Vector3(l.Position.X, l.Position.Y, l.Position.Z);
+        ImGui.SetNextItemWidth(220f);
+        if (ImGui.DragFloat3(Loc.TL("Position"), ref pv, 0.25f))
+            l.Position = new Vec3(pv.X, pv.Y, pv.Z);
+
+        if (ImGui.Button(Loc.TL("Move to camera")))
+            l.Position = new Vec3(cam.Position.X, cam.Position.Y, cam.Position.Z);
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Go to light")))
+            cam.Position = new Vector3(l.Position.X, l.Position.Y + 8f, l.Position.Z + 14f);
+    }
+
+    ImGui.TextDisabled($"{lightRig.Lights.Count} light(s)");
 }
 
 // Point tool: draw the heightmap lattice near the camera and highlight the selected vertex, plus a small panel
