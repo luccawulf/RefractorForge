@@ -287,6 +287,9 @@ public static class LevelSaver
             // Placed lights are authoring data. The engine has no concept of them - they reach the game only
             // once baked into the lightmaps - so the sidecar must never be packed.
             || leaf.Equals(Terrain.LightRig.FileName, System.StringComparison.OrdinalIgnoreCase)
+            // Object groups and review notes are editor-side too: the engine has no notion of either.
+            || leaf.Equals(Editing.ObjectGroups.FileName, System.StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals(Editing.Annotations.FileName, System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("sound_debug.log", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("imgui.ini", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("Thumbs.db", System.StringComparison.OrdinalIgnoreCase)

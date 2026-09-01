@@ -27,6 +27,9 @@ public sealed class CollabWorldState
     /// colours are patched into Init.con on save — so an unsynced edit means whoever saves last silently overwrites
     /// the other person's lighting.</summary>
     public string? Light { get; set; }
+    /// <summary>Review notes, verbatim <c>ANNOT &lt;b64 json&gt;</c>. Full-state like gameplay, so peers can never
+    /// hold two different lists.</summary>
+    public string? Annotations { get; set; }
     /// <summary>Imported .obj meshes shared over the wire: template name -> the verbatim "OBJMESH name b64" op that
     /// recreates the render mesh on a peer. Stored so late joiners get imports too.</summary>
     public Dictionary<string, string> ObjMeshes { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -97,6 +100,11 @@ public sealed class CollabWorldState
                 Light = payload;        // verbatim, same as OVERGROWTH: the editor parses the fields on apply
                 return true;
             }
+            case "ANNOT":
+            {
+                Annotations = payload;
+                return true;
+            }
             case "OBJMESH":
             {
                 // OBJMESH <name> <b64 geometry blob> — keyed by name so re-imports of the same template replace.
@@ -130,6 +138,8 @@ public sealed class CollabWorldState
             yield return Overgrowth;
         if (!string.IsNullOrEmpty(Light))
             yield return Light;
+        if (!string.IsNullOrEmpty(Annotations))
+            yield return Annotations;
     }
 
     /// <summary>Persist the maps + gameplay into a state directory (the relay's own resume format).</summary>
@@ -144,6 +154,7 @@ public sealed class CollabWorldState
         if (Water is float wv) File.WriteAllText(Path.Combine(dir, "water.txt"), wv.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if (!string.IsNullOrEmpty(Overgrowth)) File.WriteAllText(Path.Combine(dir, "overgrowth.txt"), Overgrowth);
         if (!string.IsNullOrEmpty(Light)) File.WriteAllText(Path.Combine(dir, "light.txt"), Light);
+        if (!string.IsNullOrEmpty(Annotations)) File.WriteAllText(Path.Combine(dir, "annotations.txt"), Annotations);
         if (ObjMeshes.Count > 0) File.WriteAllLines(Path.Combine(dir, "objmeshes.txt"), ObjMeshes.Values);   // one "OBJMESH ..." op per line
     }
 
@@ -166,6 +177,8 @@ public sealed class CollabWorldState
         if (File.Exists(of)) { var t = File.ReadAllText(of).Trim(); if (t.StartsWith("OVERGROWTH", StringComparison.Ordinal)) w.Overgrowth = t; }
         var lf = Path.Combine(dir, "light.txt");
         if (File.Exists(lf)) { var t = File.ReadAllText(lf).Trim(); if (t.StartsWith("LIGHT", StringComparison.Ordinal)) w.Light = t; }
+        var af = Path.Combine(dir, "annotations.txt");
+        if (File.Exists(af)) { var t = File.ReadAllText(af).Trim(); if (t.StartsWith("ANNOT", StringComparison.Ordinal)) w.Annotations = t; }
         var omf = Path.Combine(dir, "objmeshes.txt");
         if (File.Exists(omf))
             foreach (var line in File.ReadAllLines(omf))

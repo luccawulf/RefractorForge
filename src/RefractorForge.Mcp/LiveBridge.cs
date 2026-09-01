@@ -65,7 +65,7 @@ public sealed class LiveBridge : IServerEndpoint, IDisposable
 
     // The six verbs CollabClient cannot parse. They belong to the relay's CollabWorldState, not to the object
     // document, and reach us only because the relay broadcasts everything to everyone.
-    private static readonly string[] WorldVerbs = { "TERRAIN", "MATERIAL", "GAMEPLAY", "WATER", "OVERGROWTH", "OBJMESH", "LIGHT", "ATLAS" };
+    private static readonly string[] WorldVerbs = { "TERRAIN", "MATERIAL", "GAMEPLAY", "WATER", "OVERGROWTH", "OBJMESH", "LIGHT", "ATLAS", "ANNOT" };
 
     // One undo entry: the ops that reverse a single tool call, newest-first. A generated city is hundreds of adds
     // and exactly one entry, matching the editor's own grouping.

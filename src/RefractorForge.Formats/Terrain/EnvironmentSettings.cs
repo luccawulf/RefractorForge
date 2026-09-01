@@ -72,6 +72,11 @@ public sealed class EnvironmentSettings
     /// <summary>Game.ViewDistance (far clip-ish), metres; informational.</summary>
     public float ViewDistance { get; set; } = 550f;
 
+    /// <summary><c>game.setActiveCombatArea</c>, when the level declares one. Offsets then sizes - see
+    /// <see cref="Validation.CombatArea"/> for why the order matters.</summary>
+    public Validation.CombatArea? CombatArea { get; set; }
+    public bool HasCombatArea => CombatArea is not null;
+
     // Water surface look (from Init.con: water.color / water.waterShallowAlpha).
     /// <summary>Water surface colour, RGB 0..1 (water.color).</summary>
     public Vec3 WaterColor { get; set; } = new(0.10f, 0.22f, 0.30f);
@@ -202,6 +207,7 @@ public sealed class EnvironmentSettings
                     case "renderer.fogend": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fe)) e.FogEnd = fe; break;
                     case "game.viewdistance":
                     case "game.setviewdistance": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var vd)) e.ViewDistance = vd; break;
+                    case "game.setactivecombatarea": if (Validation.CombatArea.TryParse(line, out var caA)) e.CombatArea = caA; break;
                     case "water.color": if (TryVec(val, out var wcl)) e.WaterColor = wcl; break;
                     case "water.deepcolor": if (TryVec(val, out var wdc)) e.DeepColor = wdc; break;
                     case "water.watershallowalpha": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var wal)) e.WaterAlpha = Math.Clamp(wal, 0.08f, 1f); break;
@@ -350,6 +356,12 @@ public sealed class EnvironmentSettings
     /// every other line untouched. Init.con carries real gameplay (kits, spawns, the run chain), so this rewrites
     /// rather than regenerates. Keys the level never declared are only added once the editor has a value for them,
     /// and go in right after the last existing <c>renderer.</c> line so they keep the file's own grouping.</summary>
+    /// <summary>Set by a time-of-day preset: the fog and view-distance lines are written too, so the preset
+    /// is what the game shows and not only what the editor shows. Off by default so an ordinary lighting edit
+    /// does not start rewriting fog it never touched.</summary>
+    public bool WriteFog { get; set; }
+    public bool WriteViewDistance { get; set; }
+
     public List<string> PatchInitConLines(IEnumerable<string> existing)
     {
         var wanted = new (string Key, string Line, bool Want)[]
@@ -358,6 +370,12 @@ public sealed class EnvironmentSettings
             ("renderer.ambientcolor",       $"renderer.ambientColor {V(AmbientColor)}",             HasAmbient),
             ("renderer.diffusecolor",       $"renderer.diffuseColor {V(DiffuseColor)}",             HasDiffuse),
             ("renderer.specularcolor",      $"renderer.specularColor {V(SpecularColor)}",           HasSpecular),
+            ("renderer.vertexfogenable",    $"renderer.vertexFogEnable {(FogEnabled ? 1 : 0)}",     WriteFog),
+            ("renderer.fogcolorvec",        $"renderer.fogColorVec {V(FogColor)}",                  WriteFog),
+            ("renderer.fogstart",           $"renderer.fogstart {F(FogStart)}",                     WriteFog),
+            ("renderer.fogend",             $"renderer.fogend {F(FogEnd)}",                         WriteFog),
+            ("game.setviewdistance",        $"Game.setViewDistance {F(ViewDistance)}",              WriteViewDistance),
+            ("game.setactivecombatarea",    CombatArea?.ToConLine() ?? "",                          HasCombatArea),
         };
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var outLines = new List<string>();
