@@ -18,7 +18,7 @@ public static class ObjectLightmapBaker
     /// returns null otherwise. <paramref name="world"/> places the mesh in world space. Intensity = ambient + (1-ambient)·
     /// N·L · shadow.</summary>
     public static Texture2D? Bake(MeshLibrary.Mesh mesh, Matrix4x4 world, Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
-        int size = 256, float ambient = 0.4f)
+        int size = 256, float ambient = 0.4f, LightRig? rig = null)
     {
         var lm = mesh.LightmapUvs;
         if (lm is null || lm.Length == 0 || size < 4) return null;
@@ -51,7 +51,29 @@ public static class ObjectLightmapBaker
                     if (cover[o]) return;                              // first triangle wins (atlas overlaps are rare)
                     var wp = w0 * wa + w1 * wb + w2 * wc;
                     bool lit = TerrainShadow.PointLit(wp.X, wp.Y, wp.Z, sunDir, hm, cfg, maxH);
-                    inten[o] = ambient + (1f - ambient) * ndl * (lit ? 1f : 0f);
+                    float v = ambient + (1f - ambient) * ndl * (lit ? 1f : 0f);
+
+                    // Placed lights add on top of the sun, as INTENSITY. Every shipped object lightmap checked
+                    // across retail levels is a grey-palette TGA, so the format carries brightness and the
+                    // engine is never handed a hue here: a coloured lamp brightens an object without tinting
+                    // it, and the colour lives in the ground texture instead.
+                    if (rig is not null && rig.Lights.Count > 0)
+                    {
+                        float add = LightBake.Intensity(wp.X, wp.Y, wp.Z, rig, hm, cfg);
+                        // Angle still matters - a face turned away from a lamp should not brighten - but with
+                        // the same soft wrap the viewport preview uses, so the bake matches what was aimed.
+                        float lndl = 0f;
+                        foreach (var l in rig.Lights)
+                        {
+                            if (!l.Enabled) continue;
+                            var toL = new Vector3(l.Position.X - wp.X, l.Position.Y - wp.Y, l.Position.Z - wp.Z);
+                            if (toL.LengthSquared() < 1e-8f) { lndl = 1f; break; }
+                            lndl = MathF.Max(lndl, MathF.Max(0f, Vector3.Dot(fn, Vector3.Normalize(toL))));
+                        }
+                        v += add * (lndl * 0.85f + 0.15f);
+                    }
+
+                    inten[o] = MathF.Min(v, 1f);
                     cover[o] = true;
                 });
             }

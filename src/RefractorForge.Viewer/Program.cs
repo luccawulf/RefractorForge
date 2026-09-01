@@ -6029,7 +6029,8 @@ void BakeObjectLightmaps()
     if (jobs.Count == 0) { Toast(Loc.T("No placed objects with bakeable lightmap UVs on this map.")); return; }
     var results = new Texture2D?[jobs.Count];
     System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
-        results[i] = ObjectLightmapBaker.Bake(jobs[i].Mesh, LevelScene.MeshWorld(jobs[i].O), heightmap, cfg, sunV, 256));
+        results[i] = ObjectLightmapBaker.Bake(jobs[i].Mesh, LevelScene.MeshWorld(jobs[i].O), heightmap, cfg, sunV, 256,
+            rig: lightRig.Lights.Count > 0 ? lightRig : null));
     var olm = new ObjectLightmaps();
     bakedObjectLightmaps.Clear();
     int baked = 0;
@@ -9974,6 +9975,9 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps (from sun)"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+            if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false,
+                    heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey-palette and carry brightness only.\nThis edits the terrain texture, so keep a backup or use Undo before saving."));
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bake each building/object's lighting (sun + terrain shadow) into its lightmap from the\ncurrent sun, then Save to ship them to the game. Pair with File > 'Write LightmapShadowBits.lsb'\nfor the terrain shadow. Set the sun first in the Environment > Sun panel."));
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Convert TGA -> DDS..."))) DoConvertTgaToDds();
@@ -10362,6 +10366,43 @@ void LevelTreePanel()
     }
 
     ImGui.EndChild();
+}
+
+// Burn the placed lights into the ground texture.
+//
+// This is the half of the bake that carries COLOUR. It works the way DC_Basrah_Nights does: the ground art
+// itself holds the pools, and the scene's near-black night ambient then modulates everything, so a pool reads
+// by its RATIO to the surrounding ground rather than by absolute brightness.
+void BakeLightsToGround()
+{
+    if (heightmap is null || atlasCpu is null || lightRig.Lights.Count == 0) return;
+
+    var enabled = lightRig.Lights.Count(l => l.Enabled && l.Intensity > 0f && l.Radius > 0f);
+    if (enabled == 0) { Toast(Loc.T("No enabled lights to bake.")); return; }
+
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    try
+    {
+        // Bake at the atlas resolution, capped: the ray-march is per texel per light, and beyond this the
+        // extra detail is finer than the heightmap the occlusion is traced against anyway.
+        int size = Math.Min(atlasCpu.Width, 2048);
+        var ground = LightBake.BakeGround(heightmap, cfg, lightRig, size);
+        LightBake.BurnIntoAtlas(atlasCpu, ground, 1f);
+
+        // Same bookkeeping the road paint does: mark the atlas painted so a save re-emits the terrain tiles
+        // with the light baked in, and push the whole thing back to the GPU so it is visible at once.
+        atlasPainted = true;
+        UploadAtlasRectMips(0, 0, atlasCpu.Width, atlasCpu.Height);
+
+        Toast(string.Format(Loc.T("Baked {0} light(s) into the ground texture in {1:0.0}s - save to write it out."),
+            enabled, sw.Elapsed.TotalSeconds));
+        Console.WriteLine($"Ground light bake: {enabled} light(s) at {size}x{size} in {sw.Elapsed.TotalSeconds:0.0}s.");
+    }
+    catch (Exception ex)
+    {
+        Toast(Loc.T("Ground light bake failed: ") + ex.Message);
+        Console.WriteLine("BakeLightsToGround: " + ex);
+    }
 }
 
 // Draw a marker and a reach ring for every placed light, so a rig can be aimed rather than guessed at. Uses the
