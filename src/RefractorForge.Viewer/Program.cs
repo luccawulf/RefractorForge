@@ -538,6 +538,46 @@ string? levelDir = null;
 // Placed lights. Authoring data: Refractor renders no dynamic point lights, so these light the viewport and
 // are baked into the lightmaps the engine does read. Declared here because the load block assigns it.
 LightRig lightRig = new();
+// The map report: whichever check ran last. One window shows every kind of finding, so a new check only has
+// to produce LevelIssues and the listing, jump-to and select-object come for free.
+RefractorForge.Formats.Validation.LevelReport? mapReport = null;
+// Object groups (Battlecraft's layers). Loaded with the level from a sidecar the packer never ships.
+RefractorForge.Formats.Editing.ObjectGroups objGroups = new();
+// Review notes pinned in the world, synced over collab as full state (ANNOT).
+RefractorForge.Formats.Editing.Annotations notes = new();
+bool showNotes = true;
+int selNote = -1;
+string noteDraft = "";
+bool placingNote = false;
+// Level-local files created in-session (decal objects) that a save must carry: written straight into the
+// folder on a folder save, upserted into the .rfa on an archive save.
+List<(string RelPath, byte[] Bytes)> pendingLevelFiles = new();
+// Decal dialog.
+bool showDecalDialog = false;
+string decalName = "poster1";
+string decalImagePath = "";
+float decalW = 2f, decalH = 1.5f;
+bool decalFlat = false;
+// Erosion + river.
+int erodeIterations = 40; float erodeTalus = 1.2f; bool erodeHydraulic = true; float erodeRadius = 60f;
+float riverWidth = 24f, riverDepth = 4f, riverBank = 6f; int riverBankMat = 3, riverBedMat = 4;
+// Packaging wizard.
+bool showPackage = false;
+string pkgAuthor = "", pkgVersion = "1.0", pkgDesc = "";
+bool pkgServer = true, pkgMinimap = true;
+HashSet<int> hiddenIdxScratch = new();      // group-hidden objects as INDICES, rebuilt when groups change
+bool groupsDirty = true;
+string newGroupName = "Group";
+int selGroup = -1;
+// Combat area editing: drag the corners of the rectangle in the viewport.
+bool showCombatArea = true;
+int combatDragCorner = -1;                  // 0 = min corner, 1 = max corner, 2 = whole box
+Vector2 combatDragStart;
+RefractorForge.Formats.Validation.CombatArea combatDragOrig = default;   // assigned before use, but straight-line code cannot prove it
+bool combatAreaDirty = false;
+bool showMapReport = false;
+int mapReportSel = -1;
+RefractorForge.Formats.Validation.IssueSeverity mapReportMin = RefractorForge.Formats.Validation.IssueSeverity.Info;
 // Uniform locations for the placed-light arrays, per shader program. Declared up here rather than beside the
 // function that fills it: this file is top-level statements, so anything touched by straight-line code must be
 // declared textually before it.
@@ -797,6 +837,10 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     growth = GrowthMaps.LoadFolder(levelDir);
     env = EnvironmentSettings.LoadFolder(levelDir);
     lightRig = LightRig.Load(levelDir);   // sidecar; never packed (LevelSaver.IsEditorOnlyFile)
+    objGroups = RefractorForge.Formats.Editing.ObjectGroups.Load(levelDir);
+    groupsDirty = true;
+    notes = RefractorForge.Formats.Editing.Annotations.Load(levelDir);
+    pendingLevelFiles.Clear();
     sounds = SoundLibrary.LoadFolder(levelDir);   // recognise + edit placed sound emitters (.ssc)
     loadedShadowBits = LightmapShadowBits.TryLoadFolder(levelDir);   // the level's baked terrain sun-shadow, if present
     // object lightmaps loaded lazily (EnsureObjectLightmaps) - see the .rfa branch note above.
@@ -1813,6 +1857,23 @@ void OnLoad()
                 }
                 return;
             }
+            // Dragging a combat-area corner across the ground.
+            if (combatDragCorner >= 0 && env is not null && terrainPick is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            {
+                var cray = Picking.ScreenToRay(cam, pos.X, pos.Y, window.FramebufferSize.X, window.FramebufferSize.Y);
+                if (terrainPick.Raycast(cray, out var cg))
+                {
+                    var o = combatDragOrig;
+                    float gx = Math.Clamp(cg.X, 0f, cfg.WorldSize), gz = Math.Clamp(cg.Z, 0f, cfg.WorldSize);
+                    env.CombatArea = combatDragCorner == 0
+                        ? new RefractorForge.Formats.Validation.CombatArea(MathF.Min(gx, o.X1 - 16f), MathF.Min(gz, o.Z1 - 16f),
+                            o.X1 - MathF.Min(gx, o.X1 - 16f), o.Z1 - MathF.Min(gz, o.Z1 - 16f))
+                        : new RefractorForge.Formats.Validation.CombatArea(o.X, o.Z, MathF.Max(gx - o.X, 16f), MathF.Max(gz - o.Z, 16f));
+                    combatAreaDirty = true; lightingDirty = true;
+                }
+                return;
+            }
+
             // Dragging a light. Across the ground it keeps the height it had, so a street lamp stays a street
             // lamp as it moves over a slope; Shift-drag raises and lowers it instead.
             if (lightDragging && selLight >= 0 && selLight < lightRig.Lights.Count
@@ -1954,6 +2015,7 @@ void OnLoad()
             }
             // Finish a terrain stroke: coalesce into one edit and push it onto the shared undo stack.
             lightDragging = false;
+            combatDragCorner = -1;
             if (stroke is not null)
             {
                 vertDragging = false;
@@ -2093,6 +2155,31 @@ void OnLoad()
                 return;
             }
             if (btn != MouseButton.Left) return;
+
+            // Placing a note: the next click on the ground drops it there.
+            if (placingNote && terrainPick is not null && terrainPick.Raycast(ray, out var noteHit))
+            {
+                notes.Add(new Vec3(noteHit.X, noteHit.Y, noteHit.Z), noteDraft.Trim(), collab?.Name ?? Environment.UserName);
+                selNote = notes.Notes.Count - 1; noteDraft = ""; placingNote = false;
+                BroadcastNotes();
+                return;
+            }
+            if (toolNames[tool] is "Select" or "Move")
+            {
+                int nh = PickNote(new Vector2(lastMouse.X, lastMouse.Y));
+                if (nh >= 0) { selNote = nh; return; }
+            }
+
+            // Combat-area corner handles, when the Select or Move tool is active.
+            if (toolNames[tool] is "Select" or "Move" && env?.CombatArea is { } caHit)
+            {
+                int hnd = PickCombatHandle(new Vector2(lastMouse.X, lastMouse.Y));
+                if (hnd >= 0)
+                {
+                    combatDragCorner = hnd; combatDragOrig = caHit; combatDragStart = new Vector2(lastMouse.X, lastMouse.Y);
+                    return;
+                }
+            }
 
             // A placed light behaves like any other object you can grab: Select, Move and Nudge all pick it and
             // start a drag. Tested before the object/terrain picks so a lamp standing in front of a building is
@@ -4387,6 +4474,7 @@ void DoSaveCore()
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
         var written = RefractorForge.Formats.LevelSaver.SaveFolder(levelDir, so, soPath, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null);
+        WritePendingLevelFiles(levelDir, written);
         Console.WriteLine($"Saved level to {levelDir} ({written.Count} files):");
         foreach (var w in written) Console.WriteLine("   " + w);
         SaveTextureTiles();
@@ -4469,6 +4557,7 @@ void DoSaveCore()
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // baked object lightmaps -> upsert (override existing OR add new)
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides: same-named .dds / override .rs (+ .bik copied beside the game)
+        foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
 
         string outPatch = RefractorForge.Formats.LevelSaver.NextPatchPath(baseRfa);
         var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPatch, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
@@ -4536,6 +4625,7 @@ void DoSavePatch(bool serverSideOnly = false)
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
+        foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
         var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
         if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
         if (names.Count == 0) { Toast(Loc.T("Nothing edited yet -- no patch written.")); return; }
@@ -5927,6 +6017,12 @@ IReadOnlySet<int>? LockedIndices()
 {
     if (so is null || lockedObjectIds.Count == 0) return null;
     lockedIdxScratch.Clear();
+    // A locked GROUP locks its members exactly as an individual lock does, and shows the same red.
+    if (so is not null && objGroups.Groups.Any(g => g.Locked))
+    {
+        var gl = objGroups.LockedIds();
+        for (int i = 0; i < so.Objects.Count; i++) if (gl.Contains(so.Objects[i].Id)) lockedIdxScratch.Add(i);
+    }
     for (int i = 0; i < so.Objects.Count; i++)
         if (lockedObjectIds.Contains(so.Objects[i].Id)) lockedIdxScratch.Add(i);
     return lockedIdxScratch;
@@ -6311,6 +6407,7 @@ void OnRender(double dt)
         if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
         glObjects.ShowLightmaps = wantLm;
         glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
+        glObjects.HiddenIndices = HiddenIndexSet();
         glObjects.Draw(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
                        cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f), LockedIndices());
 
@@ -7845,6 +7942,7 @@ void DoBakeOvergrowthToCon()
 
 void LayersPanel()
 {
+    GroupsPanel();
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("LAYERS"));
     ImGui.Checkbox(Loc.TL("Terrain"), ref showTerrain);
@@ -8246,7 +8344,7 @@ void SaveLightingFolder()
 {
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveLightingToEnv();
-    if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
+    if (levelDir is not null) { lightRig.Save(levelDir); objGroups.Save(levelDir); notes.Save(levelDir); }   // sidecars, never packed
     try
     {
         var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
@@ -8368,6 +8466,10 @@ void EnvironmentPanel()
     if (lightingDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
 
     LightsPanel();
+    CombatAreaPanel();
+    NotesPanel();
+    ErosionPanel();
+    RiverPanel();
 
     ImGui.Separator();
     // Object textures are the largest thing the editor uploads, so this is the dial that decides whether a
@@ -9385,6 +9487,7 @@ void SeedWorld()
     BroadcastWater();
     BroadcastOvergrowth();
     BroadcastLight();
+    BroadcastNotes();
     foreach (var name in importedObjs.Keys.Concat(remoteMeshNames).Distinct(StringComparer.OrdinalIgnoreCase))
         BroadcastObjMesh(name);
 }
@@ -9431,6 +9534,7 @@ void CollabDrain()
                 else if (pverb == "WATER") { try { ApplyRemoteWater(payload); } catch { } }
                 else if (pverb == "OVERGROWTH") { try { ApplyRemoteOvergrowth(payload); } catch { } }
                 else if (pverb == "LIGHT") { try { ApplyRemoteLight(payload); } catch { } }
+                else if (pverb == "ANNOT") { try { if (RefractorForge.Formats.Editing.Annotations.TryParseWire(payload, out var aj)) notes.ApplyText(aj); } catch { } }
                 else if (pverb == "OBJMESH") { try { ApplyRemoteObjMesh(payload); changed = true; } catch { } }
                 else if (so is not null)
                 {
@@ -10032,7 +10136,36 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
             if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.Separator();
+            if (ImGui.BeginMenu(Loc.TL("Arrange Selection")))
+            {
+                SelectionToolsMenu();
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps (from sun)"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+            ImGui.Separator();
+            if (ImGui.BeginMenu(Loc.TL("Check Map")))
+            {
+                if (ImGui.MenuItem(Loc.TL("Validate Map"), null, false, so is not null)) RunMapValidation();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Floating and buried objects, missing templates, flags with no spawns,\nspawns outside the combat area, vehicle spawners with nothing to spawn."));
+                if (ImGui.MenuItem(Loc.TL("Bot Reachability"), null, false, heightmap is not null)) RunReachability();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Flood-fills the navmap from every spawn and reports control points\nbots cannot walk to - without launching the game."));
+                if (ImGui.MenuItem(Loc.TL("Performance Budget"), null, false, so is not null)) RunPerformanceBudget();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Triangles, objects and texture memory per 256 m cell,\nso the report points at the corner that needs thinning."));
+                if (ImGui.MenuItem(Loc.TL("Dependencies"), null, false, so is not null)) RunDependencyCheck();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Templates, vehicles and textures the level uses that the LOADED mod chain\ndoes not provide - the invisible-building check."));
+                if (ImGui.MenuItem(Loc.TL("Server / Client Files"), null, false, levelDir is not null)) RunServerClientSplit();
+                if (ImGui.MenuItem(Loc.TL("Compare With Another Version..."), null, false, so is not null)) RunLevelDiff();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick an older StaticObjects.con or level .rfa and see what was added,\nremoved, moved or rotated since."));
+                ImGui.EndMenu();
+            }
+            if (ImGui.MenuItem(Loc.TL("Map Report"), null, showMapReport, mapReport is not null)) showMapReport = !showMapReport;
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
+            if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
+            ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false,
                     heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey-palette and carry brightness only.\nThis edits the terrain texture, so keep a backup or use Undo before saving."));
@@ -10314,6 +10447,11 @@ void BuildUi()
     ValidateModal();
     PointToolOverlay();
     LightGizmos();
+    CombatAreaOverlay();
+    NotesOverlay();
+    MapReportWindow();
+    DecalDialog();
+    PackageDialog();
     LogWindow();
     TextureLibraryWindow();
     LayerToolWindow();
@@ -10466,6 +10604,844 @@ int PickLight(Vector2 mouse)
     return best;
 }
 
+// ---- Level-local files -----------------------------------------------------------------------------------------
+
+void WritePendingLevelFiles(string dir, List<string> written)
+{
+    foreach (var (rel, bytes) in pendingLevelFiles)
+    {
+        try
+        {
+            var full = System.IO.Path.Combine(dir, rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full)!);
+            System.IO.File.WriteAllBytes(full, bytes);
+            written.Add(full);
+        }
+        catch (Exception ex) { Console.WriteLine($"level file {rel}: {ex.Message}"); }
+    }
+    pendingLevelFiles.Clear();
+}
+
+// ---- Decal objects ---------------------------------------------------------------------------------------------
+
+string LevelNameForCon() => System.IO.Path.GetFileNameWithoutExtension(levelDir ?? "level");
+
+void DecalDialog()
+{
+    if (!showDecalDialog) return;
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Create Decal Object") + "###decaldlg", ref showDecalDialog, ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        ImGui.TextWrapped(Loc.T("Refractor has no decal primitive: posters, signs and scorch marks in retail maps are ordinary objects with a flat mesh. This makes one from your image and registers it as a level-local object, so it ships inside the map and needs nothing from the mod."));
+        ImGui.Spacing();
+        ImGui.SetNextItemWidth(220f * uiScale);
+        ImGui.InputText(Loc.TL("Template name"), ref decalName, 40);
+        ImGui.SetNextItemWidth(300f * uiScale);
+        ImGui.InputText(Loc.TL("Image"), ref decalImagePath, 260);
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Browse...")))
+        {
+            var pth = Picker.File("Pick the decal image", "Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.dds|All files|*.*", levelDir);
+            if (pth is not null) decalImagePath = pth;
+        }
+        ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Width (m)"), ref decalW, 0.1f, 40f, "%.2f");
+        ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Height (m)"), ref decalH, 0.1f, 40f, "%.2f");
+        ImGui.Checkbox(Loc.TL("Lay flat on the ground (scorch mark) instead of standing up (poster)"), ref decalFlat);
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Create and place")))
+        {
+            if (CreateDecalObject()) showDecalDialog = false;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Cancel"))) showDecalDialog = false;
+    }
+    ImGui.End();
+}
+
+bool CreateDecalObject()
+{
+    if (so is null || meshLib is null || levelDir is null) return false;
+    if (!System.IO.File.Exists(decalImagePath)) { Toast(Loc.T("Pick an image first.")); return false; }
+    try
+    {
+        var tex = LoadImageAsTexture(decalImagePath);
+        if (tex is null) { Toast(Loc.T("Could not load that image.")); return false; }
+
+        string name = RefractorForge.Formats.Con.DecalObject.Sanitize(decalName);
+        string texName = RefractorForge.Formats.Con.DecalObject.Sanitize("decal_" + name);
+        // Uncompressed BGRA DDS: the same encoder the minimap ships through, which the engine is known to read.
+        var dds = DdsTexture.EncodeUncompressed(tex);
+        var built = RefractorForge.Formats.Con.DecalObject.Build(LevelNameForCon(), name, decalW, decalH, texName, dds, decalFlat, true);
+
+        // Queue every file for the save, then the two registration patches.
+        foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        string ocPath = System.IO.Path.Combine(levelDir, "Objects", "objects.con");
+        string? ocExisting = System.IO.File.Exists(ocPath) ? System.IO.File.ReadAllText(ocPath) : null;
+        ocExisting ??= pendingLevelFiles.Where(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase))
+                                        .Select(f => System.Text.Encoding.Latin1.GetString(f.Bytes)).LastOrDefault();
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine))));
+
+        var initPath = System.IO.Directory.Exists(levelDir)
+            ? System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
+                .OrderBy(f => f.Count(c => c == System.IO.Path.DirectorySeparatorChar)).FirstOrDefault()
+            : null;
+        if (initPath is not null)
+        {
+            string patched = RefractorForge.Formats.Con.DecalObject.PatchInitCon(System.IO.File.ReadAllText(initPath), LevelNameForCon());
+            pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+            pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(patched)));
+        }
+
+        // Show it now: register the render mesh under the template name, exactly as an imported .obj is.
+        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, tex)));
+        importedObjs[built.Template] = built.Mesh;
+        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (texName, texName, Vector3.One) };
+        BroadcastObjMesh(built.Template);
+        RebuildCatalog();
+        browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
+        Toast(string.Format(Loc.T("Decal '{0}' ready - click to place it. {1} file(s) will be written on save."), built.Template, built.Files.Count + 2));
+        return true;
+    }
+    catch (Exception ex) { Toast(Loc.T("Decal failed: ") + ex.Message); return false; }
+}
+
+// ---- Annotations -----------------------------------------------------------------------------------------------
+
+void BroadcastNotes() => collab?.SendOp(notes.ToWire());
+
+void NotesOverlay()
+{
+    if (!showNotes || notes.Notes.Count == 0) return;
+    var fb = window.FramebufferSize; var vp = cam.ViewProjection;
+    var dl = ImGui.GetBackgroundDrawList();
+    for (int i = 0; i < notes.Notes.Count; i++)
+    {
+        var n = notes.Notes[i];
+        var wp = new Vector3(n.Position.X, n.Position.Y, n.Position.Z);
+        if (Vector3.Distance(wp, cam.Position) > 1500f) continue;
+        var sp = Gizmo.Project(wp + new Vector3(0, 1.5f, 0), vp, fb.X, fb.Y);
+        if (float.IsNaN(sp.X) || sp.X < -50 || sp.Y < -50 || sp.X > fb.X + 50 || sp.Y > fb.Y + 50) continue;
+        var foot = Gizmo.Project(wp, vp, fb.X, fb.Y);
+        uint col = ImGui.GetColorU32(n.Resolved ? new Vector4(0.5f, 0.8f, 0.5f, 0.8f) : new Vector4(n.ColorR, n.ColorG, n.ColorB, 1f));
+        if (!float.IsNaN(foot.X)) dl.AddLine(foot, sp, col, 2f);
+        bool sel = i == selNote;
+        // A pin: a flag shape, with the first words beside it so a review reads without opening anything.
+        dl.AddRectFilled(sp, sp + new Vector2(14f, 10f) * uiScale, col);
+        dl.AddRect(sp - new Vector2(1, 1), sp + new Vector2(15f, 11f) * uiScale, ImGui.GetColorU32(new Vector4(0, 0, 0, 0.8f)), 0, 0, sel ? 2.5f : 1f);
+        string txt = n.Text.Length > 36 ? n.Text[..36] + "..." : n.Text;
+        dl.AddText(sp + new Vector2(18f * uiScale, -2f), ImGui.GetColorU32(new Vector4(0, 0, 0, 0.9f)), txt);
+        dl.AddText(sp + new Vector2(17f * uiScale, -3f), ImGui.GetColorU32(new Vector4(1, 1, 1, 0.95f)), txt);
+    }
+}
+
+int PickNote(Vector2 mouse)
+{
+    if (!showNotes) return -1;
+    var fb = window.FramebufferSize; var vp = cam.ViewProjection;
+    for (int i = 0; i < notes.Notes.Count; i++)
+    {
+        var n = notes.Notes[i];
+        var sp = Gizmo.Project(new Vector3(n.Position.X, n.Position.Y + 1.5f, n.Position.Z), vp, fb.X, fb.Y);
+        if (float.IsNaN(sp.X)) continue;
+        if (mouse.X >= sp.X - 4 && mouse.X <= sp.X + 16f * uiScale && mouse.Y >= sp.Y - 4 && mouse.Y <= sp.Y + 12f * uiScale) return i;
+    }
+    return -1;
+}
+
+void NotesPanel()
+{
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("NOTES"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Review notes pinned in the world, shared with everyone in the session.\nPlace one, then click the ground where it belongs."));
+    ImGui.Checkbox(Loc.TL("Show notes"), ref showNotes);
+    ImGui.SetNextItemWidth(220f * uiScale);
+    ImGui.InputText("##notedraft", ref noteDraft, 200);
+    ImGui.SameLine();
+    if (!placingNote)
+    {
+        if (ImGui.Button(Loc.TL("Place note")) && noteDraft.Trim().Length > 0) placingNote = true;
+    }
+    else
+    {
+        ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), Loc.T("Click the ground..."));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("Cancel##note"))) placingNote = false;
+    }
+    if (notes.Notes.Count > 0)
+    {
+        ImGui.TextDisabled(string.Format(Loc.T("{0} open, {1} resolved"), notes.Open, notes.Notes.Count - notes.Open));
+        if (ImGui.BeginListBox("##notelist", new Vector2(260f * uiScale, Math.Min(6, notes.Notes.Count) * 18f + 6f)))
+        {
+            for (int i = 0; i < notes.Notes.Count; i++)
+            {
+                var n = notes.Notes[i];
+                string label = $"{(n.Resolved ? "[x] " : "")}{n.Text}##n{i}";
+                if (ImGui.Selectable(label, i == selNote)) selNote = i;
+                if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                { cam.Position = new Vector3(n.Position.X, n.Position.Y, n.Position.Z) + new Vector3(10f, 8f, 10f); cam.LookAt(new Vector3(n.Position.X, n.Position.Y, n.Position.Z)); }
+            }
+            ImGui.EndListBox();
+        }
+    }
+    if (selNote >= 0 && selNote < notes.Notes.Count)
+    {
+        var n = notes.Notes[selNote];
+        bool res = n.Resolved;
+        if (ImGui.Checkbox(Loc.TL("Resolved"), ref res)) { n.Resolved = res; BroadcastNotes(); }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Delete note"))) { notes.Notes.RemoveAt(selNote); selNote = -1; BroadcastNotes(); }
+        ImGui.TextDisabled($"{n.Author}  {n.Created.ToLocalTime():yyyy-MM-dd HH:mm}");
+    }
+}
+
+// ---- Erosion + river -------------------------------------------------------------------------------------------
+
+void ErosionPanel()
+{
+    if (heightmap is null || terrainEd is null) return;
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("EROSION"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Weathering for hand-sculpted ground: thermal erosion knocks steep faces into scree,\nhydraulic droplets cut gullies where water would run. Applied around the camera."));
+    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Area radius (m)"), ref erodeRadius, 10f, 400f, "%.0f");
+    ImGui.SetNextItemWidth(150f * uiScale); ImGui.SliderInt(Loc.TL("Iterations"), ref erodeIterations, 5, 200);
+    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Talus (m per cell)"), ref erodeTalus, 0.2f, 5f, "%.1f");
+    ImGui.Checkbox(Loc.TL("Hydraulic (gullies)"), ref erodeHydraulic);
+    if (ImGui.Button(Loc.TL("Erode around camera"))) RunErosion();
+}
+
+void RunErosion()
+{
+    if (heightmap is null || terrainEd is null || hist is null) return;
+    float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+    int cx = (int)MathF.Round(cam.Position.X / sp), cz = (int)MathF.Round(cam.Position.Z / sp);
+    int rc = Math.Max(3, (int)(erodeRadius / sp));
+    int x0 = Math.Clamp(cx - rc, 0, heightmap.Width - 3), y0 = Math.Clamp(cz - rc, 0, heightmap.Height - 3);
+    int w = Math.Clamp(rc * 2, 3, heightmap.Width - x0), h = Math.Clamp(rc * 2, 3, heightmap.Height - y0);
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var result = RefractorForge.Formats.Terrain.Erosion.Run(heightmap, cfg, x0, y0, w, h, new RefractorForge.Formats.Terrain.Erosion.Params
+    { Iterations = erodeIterations, TalusMeters = erodeTalus, Hydraulic = erodeHydraulic, Seed = Environment.TickCount });
+    // Through a stroke, so it is one undo step and one collaboration broadcast like any sculpt.
+    var st = terrainEd.BeginStroke();
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) st.SetVertex(x0 + x, y0 + y, result[y * w + x]);
+    var edit = st.Finish();
+    if (edit is not null) { hist.Do(new TerrainStrokeCommand(edit, heightmap, RebuildTerrain)); terrainDirty = true; }
+    Toast(string.Format(Loc.T("Eroded {0}x{1} cells in {2:0.0}s"), w, h, sw.Elapsed.TotalSeconds));
+}
+
+void RiverPanel()
+{
+    if (heightmap is null || terrainEd is null) return;
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("RIVER"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Uses the road tool's points as the centreline: carves a bed that never runs\nuphill, paints bed and banks, and sets the water level to fill it."));
+    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Width (m)"), ref riverWidth, 4f, 120f, "%.0f");
+    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Depth (m)"), ref riverDepth, 0.5f, 30f, "%.1f");
+    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Bank width (m)"), ref riverBank, 0f, 40f, "%.0f");
+    ImGui.SetNextItemWidth(100f * uiScale); ImGui.SliderInt(Loc.TL("Bank material"), ref riverBankMat, 0, 15);
+    ImGui.SetNextItemWidth(100f * uiScale); ImGui.SliderInt(Loc.TL("Bed material"), ref riverBedMat, 0, 15);
+    bool ready = roadPts.Count >= 2;
+    if (!ready) ImGui.TextDisabled(Loc.T("Lay at least two road points first (Road tool)."));
+    if (ImGui.Button(Loc.TL("Make river from road points")) && ready) RunRiver();
+}
+
+void RunRiver()
+{
+    if (heightmap is null || terrainEd is null || hist is null || roadPts.Count < 2) return;
+    var ctrl = roadPts.Select(p => (p.X, p.Y, p.Z, riverWidth * 0.5f)).ToList();
+    var samples = RoadSpline.Resample(ctrl, 4f);
+    var path = samples.Select(s2 => (s2.X, s2.Z)).ToList();
+
+    var before = heightmap.ToBytes();
+    var res = RefractorForge.Formats.Terrain.RiverTool.Build(heightmap, cfg, path, new RefractorForge.Formats.Terrain.RiverTool.Params
+    { Width = riverWidth, Depth = riverDepth, BankWidth = riverBank, BankMaterial = (byte)riverBankMat, BedMaterial = (byte)riverBedMat });
+
+    // The carve wrote straight into the heightmap; wrap the changed rect as one stroke for undo + collab by
+    // restoring the old bytes, then re-applying through the stroke.
+    var after = heightmap.ToBytes();
+    var restored = Heightmap.FromBytes(before, heightmap.Width, heightmap.Height);
+    heightmap.CopyFrom(restored);
+    var (rx, ry, rw, rh) = res.TerrainRect;
+    if (rw > 0 && rh > 0)
+    {
+        var target = Heightmap.FromBytes(after, heightmap.Width, heightmap.Height);
+        var st = terrainEd.BeginStroke();
+        for (int y = ry; y < ry + rh; y++) for (int x = rx; x < rx + rw; x++)
+            st.SetVertex(x, y, cfg.HeightToMeters(target[x, y]));
+        var edit = st.Finish();
+        if (edit is not null) { hist.Do(new TerrainStrokeCommand(edit, heightmap, RebuildTerrain)); terrainDirty = true; }
+    }
+
+    // Banks and bed through a material stroke.
+    if (matPainter is not null && materialMap is not null && res.Paint.Count > 0)
+    {
+        float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+        var ms = matPainter.BeginStroke();
+        foreach (var (gx, gy, mat) in res.Paint)
+            ms.Dab(gx * sp, gy * sp, new MaterialBrush(mat, sp * 0.7f, 1f, BrushFalloff.Constant));
+        var medit = ms.Finish();
+        if (medit is not null) hist.Do(new MaterialStrokeCommand(medit, materialMap, UploadActivePaintTexture));
+    }
+
+    cfg.WaterLevel = res.SuggestedWaterLevel; waterLevelEdited = true; BroadcastWater();
+    Toast(string.Format(Loc.T("River made: {0} bed/bank cells painted, water level {1:0.0} m"), res.Paint.Count, res.SuggestedWaterLevel));
+}
+
+// ---- Packaging -------------------------------------------------------------------------------------------------
+
+void PackageDialog()
+{
+    if (!showPackage) return;
+    ImGui.SetNextWindowSize(new Vector2(480f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Package Level") + "###pkgdlg", ref showPackage, ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        ImGui.TextWrapped(Loc.T("Everything a release needs in one zip: the map archive, a server-side copy with client content stripped, the minimap and thumbnail, and a readme that says where the files go."));
+        ImGui.SetNextItemWidth(240f * uiScale); ImGui.InputText(Loc.TL("Author"), ref pkgAuthor, 60);
+        ImGui.SetNextItemWidth(120f * uiScale); ImGui.InputText(Loc.TL("Version"), ref pkgVersion, 16);
+        ImGui.InputTextMultiline(Loc.TL("Description"), ref pkgDesc, 2000, new Vector2(420f * uiScale, 80f * uiScale));
+        ImGui.Checkbox(Loc.TL("Include server-side archive"), ref pkgServer);
+        ImGui.Checkbox(Loc.TL("Render minimap + thumbnail"), ref pkgMinimap);
+        if (ImGui.Button(Loc.TL("Build package..."))) { if (BuildPackage()) showPackage = false; }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Cancel##pkg"))) showPackage = false;
+    }
+    ImGui.End();
+}
+
+bool BuildPackage()
+{
+    if (levelDir is null || heightmap is null) return false;
+    string levelName = LevelNameForCon();
+    var zipPath = Picker.Save("Write the package zip", "Zip archives|*.zip", levelName + ".zip", levelDir);
+    if (zipPath is null) return false;
+    try
+    {
+        Cursor_Wait(true);
+        // 1. The client archive: pack the folder, or reuse the archive the level came from.
+        string tmpDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rfpkg_" + Guid.NewGuid().ToString("N")[..8]);
+        System.IO.Directory.CreateDirectory(tmpDir);
+        string clientRfa = System.IO.Path.Combine(tmpDir, levelName + ".rfa");
+        if (System.IO.Directory.Exists(levelDir))
+            RefractorForge.Formats.LevelSaver.PackFolder(levelDir, clientRfa, $"bf1942/levels/{levelName}");
+        else if (System.IO.File.Exists(levelDir)) System.IO.File.Copy(levelDir, clientRfa, true);
+        else { Toast(Loc.T("Save the level first.")); return false; }
+
+        // 2. Server-side copy: the same archive with client-only entries dropped.
+        string? serverRfa = null;
+        if (pkgServer)
+        {
+            var a = new RefractorFlatArchive(clientRfa);
+            var entries = a.ReadServerEntries();
+            serverRfa = System.IO.Path.Combine(tmpDir, levelName + "_ssm.rfa");
+            RefractorFlatArchive.WriteFile(serverRfa, entries, a.IsCompressed, a.XPackId);
+        }
+
+        // 3. Minimap + thumbnail from the terrain the editor is showing.
+        byte[]? mini = null, thumb = null;
+        if (pkgMinimap)
+        {
+            var m = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap);
+            mini = PngWriter.Encode(m);
+            thumb = PngWriter.Encode(Minimap.Render(256, heightmap, cfg, terrainTex, materialMap));
+        }
+
+        var inputs = new RefractorForge.Formats.Packaging.LevelPackager.Inputs
+        {
+            LevelName = levelName, ModName = activeRfProject?.Mod ?? "bf1942", Game = activeRfProject?.Game ?? "BF1942",
+            Author = pkgAuthor, Version = pkgVersion, Description = pkgDesc,
+            ClientRfaPath = clientRfa, ServerRfaPath = serverRfa, MinimapPng = mini, ThumbnailPng = thumb,
+        };
+        var written = RefractorForge.Formats.Packaging.LevelPackager.Write(inputs, zipPath);
+        try { System.IO.Directory.Delete(tmpDir, true); } catch { }
+        Toast(string.Format(Loc.T("Packaged {0} file(s) into {1}"), written.Count, System.IO.Path.GetFileName(zipPath)));
+        return true;
+    }
+    catch (Exception ex) { Toast(Loc.T("Package failed: ") + ex.Message); return false; }
+    finally { Cursor_Wait(false); }
+}
+
+void Cursor_Wait(bool on) { /* the GL window has no wait cursor; the toast reports completion */ }
+
+// ---- Groups --------------------------------------------------------------------------------------------------
+
+HashSet<int> HiddenIndexSet()
+{
+    if (!groupsDirty || so is null) return hiddenIdxScratch;
+    hiddenIdxScratch.Clear();
+    var hid = objGroups.HiddenIds();
+    if (hid.Count > 0)
+        for (int i = 0; i < so.Objects.Count; i++) if (hid.Contains(so.Objects[i].Id)) hiddenIdxScratch.Add(i);
+    groupsDirty = false;
+    return hiddenIdxScratch;
+}
+
+bool IsGroupLocked(int objIndex) =>
+    so is not null && objIndex >= 0 && objIndex < so.Objects.Count && objGroups.IsLocked(so.Objects[objIndex].Id);
+
+void GroupsPanel()
+{
+    if (so is null) return;
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("GROUPS"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Name a set of objects, then hide, lock or colour it as one.\nMembership is by object id, so a group survives sorting, undo and collaboration."));
+
+    ImGui.SetNextItemWidth(150f * uiScale);
+    ImGui.InputText("##newgroup", ref newGroupName, 48);
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("New from selection")) && multi.Count > 0)
+    {
+        var g = objGroups.Create(newGroupName.Trim().Length == 0 ? "Group" : newGroupName.Trim());
+        foreach (int i in multi) if (i >= 0 && i < so.Objects.Count) g.Ids.Add(so.Objects[i].Id);
+        selGroup = objGroups.Groups.Count - 1;
+        groupsDirty = true;
+    }
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Select some objects first, then press this."));
+
+    for (int gi = 0; gi < objGroups.Groups.Count; gi++)
+    {
+        var g = objGroups.Groups[gi];
+        ImGui.PushID(gi);
+        bool hid = g.Hidden, lck = g.Locked;
+        if (ImGui.Checkbox("##hid", ref hid)) { g.Hidden = hid; groupsDirty = true; }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Hidden"));
+        ImGui.SameLine();
+        if (ImGui.Checkbox("##lck", ref lck)) g.Locked = lck;
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Locked"));
+        ImGui.SameLine();
+        var col = new Vector3(g.ColorR, g.ColorG, g.ColorB);
+        ImGui.SetNextItemWidth(24f * uiScale);
+        if (ImGui.ColorEdit3("##col", ref col, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoLabel))
+        { g.ColorR = col.X; g.ColorG = col.Y; g.ColorB = col.Z; }
+        ImGui.SameLine();
+        if (ImGui.Selectable($"{g.Name} ({g.Ids.Count})", gi == selGroup)) selGroup = gi;
+        ImGui.PopID();
+    }
+
+    if (selGroup >= 0 && selGroup < objGroups.Groups.Count)
+    {
+        var g = objGroups.Groups[selGroup];
+        if (ImGui.Button(Loc.TL("Select members")))
+        {
+            multi.Clear(); selected = -1;
+            for (int i = 0; i < so.Objects.Count; i++) if (g.Ids.Contains(so.Objects[i].Id)) { multi.Add(i); if (selected < 0) selected = i; }
+            SyncTransformEdit();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Add selection")) && multi.Count > 0)
+        {
+            foreach (int i in multi) if (i >= 0 && i < so.Objects.Count) g.Ids.Add(so.Objects[i].Id);
+            groupsDirty = true;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Remove selection")) && multi.Count > 0)
+        {
+            foreach (int i in multi) if (i >= 0 && i < so.Objects.Count) g.Ids.Remove(so.Objects[i].Id);
+            groupsDirty = true;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Delete group")))
+        {
+            objGroups.Groups.RemoveAt(selGroup); selGroup = -1; groupsDirty = true;
+        }
+    }
+}
+
+// ---- Selection tools -----------------------------------------------------------------------------------------
+
+// Apply a list of new placements as ONE undo step. Each becomes a Move + Rotate through the shared history, so
+// it is undoable and reaches collaborators like a hand-made edit.
+void ApplyPlacements(IReadOnlyList<RefractorForge.Formats.Editing.SelectionOps.Placement> pl, string what)
+{
+    if (so is null || hist is null || pl.Count == 0) return;
+    var cmds = new List<IEditCommand>();
+    foreach (var p in pl)
+    {
+        var o = so.FindById(p.Id);
+        if (o is null) continue;
+        if (o.Position != p.Position) cmds.Add(new MoveObject(p.Id, p.Position));
+        if (o.Rotation != p.Rotation) cmds.Add(new RotateObject(p.Id, p.Rotation));
+    }
+    if (cmds.Count == 0) { Toast(Loc.T("Nothing to change.")); return; }
+    hist.Do(new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); SyncTransformEdit();
+    Toast(string.Format(Loc.T("{0}: {1} object(s)"), what, pl.Count));
+}
+
+List<StaticObject> SelectedObjectsInOrder()
+{
+    var list = new List<StaticObject>();
+    if (so is null) return list;
+    foreach (int i in multi) if (i >= 0 && i < so.Objects.Count && !IsLockedIndex(i)) list.Add(so.Objects[i]);
+    return list;
+}
+
+bool IsLockedIndex(int i) => so is not null && i >= 0 && i < so.Objects.Count &&
+    (lockedObjectIds.Contains(so.Objects[i].Id) || objGroups.IsLocked(so.Objects[i].Id));
+
+Vec3 TerrainNormalAt(float wx, float wz)
+{
+    if (heightmap is null) return new Vec3(0, 1, 0);
+    float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+    int gx = Math.Clamp((int)MathF.Round(wx / sp), 1, heightmap.Width - 2);
+    int gz = Math.Clamp((int)MathF.Round(wz / sp), 1, heightmap.Height - 2);
+    float hl = cfg.HeightToMeters(heightmap[gx - 1, gz]), hr = cfg.HeightToMeters(heightmap[gx + 1, gz]);
+    float hd = cfg.HeightToMeters(heightmap[gx, gz - 1]), hu = cfg.HeightToMeters(heightmap[gx, gz + 1]);
+    var n = Vector3.Normalize(new Vector3(-(hr - hl) / (2f * sp), 1f, -(hu - hd) / (2f * sp)));
+    return new Vec3(n.X, n.Y, n.Z);
+}
+
+void SelectionToolsMenu()
+{
+    bool have = multi.Count > 0 && so is not null;
+    if (ImGui.MenuItem(Loc.TL("Select All of Same Template"), null, false, have))
+    {
+        var tmpls = SelectedObjectsInOrder().Select(o => o.Template).Distinct();
+        var ids = RefractorForge.Formats.Editing.SelectionOps.SelectAllOfTemplate(so!, tmpls);
+        multi.Clear(); selected = -1;
+        for (int i = 0; i < so!.Objects.Count; i++) if (ids.Contains(so.Objects[i].Id)) { multi.Add(i); if (selected < 0) selected = i; }
+        SyncTransformEdit();
+        Toast(string.Format(Loc.T("Selected {0} object(s)"), multi.Count));
+    }
+    if (ImGui.MenuItem(Loc.TL("Distribute Evenly"), null, false, have && multi.Count >= 3))
+        ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.DistributeEvenly(SelectedObjectsInOrder()), Loc.T("Distributed"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Spaces the selection evenly between the first and last picked; the ends stay put."));
+    if (ImGui.MenuItem(Loc.TL("Mirror Across X"), null, false, have))
+        ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.Mirror(SelectedObjectsInOrder(), RefractorForge.Formats.Editing.SelectionOps.MirrorAxis.X), Loc.T("Mirrored"));
+    if (ImGui.MenuItem(Loc.TL("Mirror Across Z"), null, false, have))
+        ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.Mirror(SelectedObjectsInOrder(), RefractorForge.Formats.Editing.SelectionOps.MirrorAxis.Z), Loc.T("Mirrored"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Reflects the arrangement through its centre and flips each object's facing.\nMeshes themselves cannot mirror - what mirrors is where things stand."));
+    if (ImGui.MenuItem(Loc.TL("Align to Ground Slope"), null, false, have && heightmap is not null))
+        ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.AlignToGround(SelectedObjectsInOrder(), TerrainNormalAt, true,
+            (x, z) => GroundUnder(x, z)), Loc.T("Aligned"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Tilts each object to lie on the ground under it and drops it there. Facing is kept."));
+}
+
+// ---- Time of day ---------------------------------------------------------------------------------------------
+
+void ApplyTimeOfDay(RefractorForge.Formats.Terrain.TimeOfDayPreset p)
+{
+    sunOverride = true;
+    sunAzimuthDeg = p.SunAzimuthDeg; sunElevationDeg = p.SunElevationDeg; shadowMapDirty = true;
+    lightGlobalAmb = new Vector3(p.GlobalAmbient.X, p.GlobalAmbient.Y, p.GlobalAmbient.Z);
+    lightAmb = new Vector3(p.Ambient.X, p.Ambient.Y, p.Ambient.Z);
+    lightDiffuse = new Vector3(p.Diffuse.X, p.Diffuse.Y, p.Diffuse.Z);
+    lightSpecular = new Vector3(p.Specular.X, p.Specular.Y, p.Specular.Z);
+    lightingDirty = true;
+    fogEnabled = p.Fog;
+    fogColor = new Vector3(p.FogColor.X, p.FogColor.Y, p.FogColor.Z);
+    fogStart = p.FogStart; fogEnd = p.FogEnd;
+    cloudColor = new Vector3(p.SkyTint.X, p.SkyTint.Y, p.SkyTint.Z);
+    cloudsDirty = true;
+    lightRig.NightAmount = p.NightAmount;
+    // The preset is what the game shows, not only the editor: fog and view distance go to Init.con with the
+    // renderer colours on save.
+    if (env is not null)
+    {
+        env.FogEnabled = p.Fog; env.FogColor = p.FogColor; env.FogStart = p.FogStart; env.FogEnd = p.FogEnd;
+        env.ViewDistance = p.ViewDistance;
+        env.WriteFog = true; env.WriteViewDistance = true;
+    }
+    BroadcastLight();
+    Toast(string.Format(Loc.T("{0} applied - written to Init.con on save."), p.Name));
+}
+
+// ---- Combat area ---------------------------------------------------------------------------------------------
+
+void CombatAreaOverlay()
+{
+    if (!showCombatArea || env?.CombatArea is not { } ca || heightmap is null) return;
+    var fb = window.FramebufferSize;
+    var vp = cam.ViewProjection;
+    var dl = ImGui.GetBackgroundDrawList();
+    uint col = ImGui.GetColorU32(new Vector4(1f, 0.35f, 0.25f, 0.85f));
+    uint fill = ImGui.GetColorU32(new Vector4(1f, 0.35f, 0.25f, 0.06f));
+
+    // Four edges draped on the ground, sampled every few metres so they follow the terrain.
+    void Edge(float x0, float z0, float x1, float z1)
+    {
+        const int seg = 32;
+        Vector2 prev = default; bool have = false;
+        for (int k = 0; k <= seg; k++)
+        {
+            float t = k / (float)seg;
+            float wx = x0 + (x1 - x0) * t, wz = z0 + (z1 - z0) * t;
+            var sp2 = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.5f, wz), vp, fb.X, fb.Y);
+            if (float.IsNaN(sp2.X)) { have = false; continue; }
+            if (have) dl.AddLine(prev, sp2, col, 2.5f);
+            prev = sp2; have = true;
+        }
+    }
+    Edge(ca.X, ca.Z, ca.X1, ca.Z); Edge(ca.X1, ca.Z, ca.X1, ca.Z1); Edge(ca.X1, ca.Z1, ca.X, ca.Z1); Edge(ca.X, ca.Z1, ca.X, ca.Z);
+
+    // Corner handles: min corner and max corner are the two things you drag.
+    foreach (var (wx, wz, tag) in new[] { (ca.X, ca.Z, 0), (ca.X1, ca.Z1, 1) })
+    {
+        var sp2 = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.5f, wz), vp, fb.X, fb.Y);
+        if (float.IsNaN(sp2.X)) continue;
+        dl.AddCircleFilled(sp2, 7f * uiScale, col);
+        dl.AddCircle(sp2, 9f * uiScale, ImGui.GetColorU32(new Vector4(0, 0, 0, 0.8f)), 0, 2f);
+        if (tag == 1) dl.AddText(sp2 + new Vector2(12f, -6f), col, $"combat area {ca.Width:0} x {ca.Height:0} m");
+    }
+}
+
+// Which combat-area handle is under the mouse: 0 = min corner, 1 = max corner, -1 = none.
+int PickCombatHandle(Vector2 mouse)
+{
+    if (!showCombatArea || env?.CombatArea is not { } ca || heightmap is null) return -1;
+    var fb = window.FramebufferSize; var vp = cam.ViewProjection;
+    foreach (var (wx, wz, tag) in new[] { (ca.X, ca.Z, 0), (ca.X1, ca.Z1, 1) })
+    {
+        var sp2 = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.5f, wz), vp, fb.X, fb.Y);
+        if (float.IsNaN(sp2.X)) continue;
+        float dx = sp2.X - mouse.X, dy = sp2.Y - mouse.Y;
+        if (dx * dx + dy * dy <= 14f * 14f * uiScale * uiScale) return tag;
+    }
+    return -1;
+}
+
+void CombatAreaPanel()
+{
+    if (env is null || heightmap is null) return;
+    ImGui.Separator();
+    ImGui.TextDisabled(Loc.T("COMBAT AREA"));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("game.setActiveCombatArea: the square players may fight in and the overhead map covers.\nOffset then size, per the MDT. Drag the two corner handles in the viewport, or type it here."));
+    ImGui.Checkbox(Loc.TL("Show combat area"), ref showCombatArea);
+    var ca = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
+    var v = new Vector4(ca.X, ca.Z, ca.Width, ca.Height);
+    ImGui.SetNextItemWidth(260f * uiScale);
+    if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Size X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
+    {
+        env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(v.X, v.Y, MathF.Max(v.Z, 16f), MathF.Max(v.W, 16f));
+        combatAreaDirty = true; lightingDirty = true;
+    }
+    if (env.CombatArea is null)
+    {
+        ImGui.TextDisabled(Loc.T("Not declared - the whole world is playable."));
+        if (ImGui.Button(Loc.TL("Declare one")))
+        {
+            env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(cfg.WorldSize * 0.25f, cfg.WorldSize * 0.25f, cfg.WorldSize * 0.5f, cfg.WorldSize * 0.5f);
+            combatAreaDirty = true; lightingDirty = true;
+        }
+    }
+    else if (ImGui.Button(Loc.TL("Square it")))
+    {
+        // The engine treats the two sizes as one - all maps are square - so an author who dragged the corners
+        // into a rectangle gets what the game will actually use.
+        float sz = MathF.Max(ca.Width, ca.Height);
+        env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(ca.X, ca.Z, sz, sz);
+        combatAreaDirty = true; lightingDirty = true;
+    }
+    if (combatAreaDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+}
+
+// ---- Map checks --------------------------------------------------------------------------------------------
+
+void ShowReport(RefractorForge.Formats.Validation.LevelReport r)
+{
+    mapReport = r;
+    mapReportSel = -1;
+    showMapReport = true;
+    Toast(r.Summary);
+    Console.WriteLine(r.Summary);
+}
+
+// What the renderer knows, handed to the headless checks as delegates so they stay testable.
+(Vec3 Min, Vec3 Max)? TemplateBoundsOf(string tmpl)
+{
+    if (glObjects is not null && glObjects.TryGetTemplateBounds(tmpl, out var mn, out var mx))
+        return (new Vec3(mn.X, mn.Y, mn.Z), new Vec3(mx.X, mx.Y, mx.Z));
+    return null;
+}
+bool TemplateExistsAnywhere(string tmpl) =>
+    (meshLib is not null && (meshLib.TryGet(tmpl, out _) || meshLib.TryAssembleVehicle(tmpl, out _)))
+    || importedObjs.ContainsKey(tmpl);
+
+void RunMapValidation()
+{
+    if (so is null) return;
+    var r = RefractorForge.Formats.Validation.LevelValidator.Run(new RefractorForge.Formats.Validation.LevelValidator.Inputs
+    {
+        Objects = so, Gameplay = gameplayEdit, Heightmap = heightmap, Config = cfg,
+        CombatArea = env?.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize),
+        Bounds = TemplateBoundsOf,
+        TemplateExists = meshLib is null ? null : TemplateExistsAnywhere,
+    });
+    ShowReport(r);
+}
+
+void RunReachability()
+{
+    if (heightmap is null) return;
+    EnsureAiNav();
+    if (aiNav is null || aiNavSide <= 0) { Toast(Loc.T("No navmap available for this level.")); return; }
+    var p = RefractorForge.Formats.Terrain.SearchMapParams.Standard[Math.Clamp(aiPathVeh, 0, RefractorForge.Formats.Terrain.SearchMapParams.Standard.Count - 1)];
+    ShowReport(RefractorForge.Formats.Validation.Reachability.Check(aiNav, aiNavSide, cfg.WorldSize, gameplayEdit, p.Name));
+}
+
+void RunPerformanceBudget()
+{
+    if (so is null) return;
+    RefractorForge.Formats.Validation.PerformanceBudget.TemplateCost? Cost(string t)
+    {
+        if (meshLib is null || !meshLib.TryGet(t, out var m)) return null;
+        long tex = 0; var seen = new HashSet<Texture2D>();
+        foreach (var part in m.Parts) if (part.Texture is { } tx && seen.Add(tx)) tex += (long)tx.Width * tx.Height * 4;
+        return new RefractorForge.Formats.Validation.PerformanceBudget.TemplateCost(m.Triangles, tex, m.Parts.Length);
+    }
+    var (r, _) = RefractorForge.Formats.Validation.PerformanceBudget.Run(so, cfg.WorldSize, Cost);
+    ShowReport(r);
+}
+
+void RunDependencyCheck()
+{
+    if (so is null || meshLib is null) { Toast(Loc.T("Dependencies need a level with mesh archives loaded.")); return; }
+    IEnumerable<string> Unresolved(string t)
+    {
+        if (!meshLib.TryGet(t, out var m)) yield break;
+        foreach (var part in m.Parts)
+            if (part.Texture is null && !string.IsNullOrEmpty(part.TextureName)) yield return part.TextureName!;
+    }
+    var r = RefractorForge.Formats.Validation.DependencyCheck.Run(so, gameplayEdit, new RefractorForge.Formats.Validation.DependencyCheck.Resolvers
+    {
+        TemplateExists = TemplateExistsAnywhere,
+        UnresolvedTextures = Unresolved,
+        SourceOf = t => meshLib.CategoryOf.TryGetValue(t, out var c) ? c : (importedObjs.ContainsKey(t) ? "imported" : null),
+    });
+    ShowReport(r);
+}
+
+void RunServerClientSplit()
+{
+    if (levelDir is null) return;
+    var files = new List<(string, long)>();
+    try
+    {
+        if (System.IO.Directory.Exists(levelDir))
+        {
+            foreach (var f in System.IO.Directory.EnumerateFiles(levelDir, "*", System.IO.SearchOption.AllDirectories))
+            {
+                var rel = System.IO.Path.GetRelativePath(levelDir, f).Replace('\\', '/');
+                if (RefractorForge.Formats.LevelSaver.IsEditorOnlyFile(rel)) continue;
+                files.Add((rel, new System.IO.FileInfo(f).Length));
+            }
+        }
+        else if (System.IO.File.Exists(levelDir))
+        {
+            var a = new RefractorFlatArchive(levelDir);
+            foreach (var e in a.Entries) files.Add((e.Name, e.UncompressedSize));
+        }
+    }
+    catch (Exception ex) { Toast(ex.Message); return; }
+    ShowReport(RefractorForge.Formats.Validation.ServerClientSplit.Report(files));
+}
+
+void RunLevelDiff()
+{
+    if (so is null) return;
+    var path = Picker.File("Compare with an older version (StaticObjects.con or level .rfa)",
+        "Level versions|*.con;*.rfa|All files|*.*", levelDir);
+    if (path is null) return;
+    try
+    {
+        StaticObjectsFile before;
+        if (path.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase))
+        {
+            var a = new RefractorFlatArchive(path);
+            var e = a.Entries.Where(x => x.Name.EndsWith("StaticObjects.con", StringComparison.OrdinalIgnoreCase))
+                             .OrderBy(x => x.Name.Count(c => c == '/')).FirstOrDefault();
+            if (e is null) { Toast(Loc.T("That archive has no StaticObjects.con.")); return; }
+            before = StaticObjectsFile.Parse(System.Text.Encoding.Latin1.GetString(a.Read(e)).Replace("\r\n", "\n").Split((char)10));
+        }
+        else before = StaticObjectsFile.Load(path);
+
+        var d = RefractorForge.Formats.Validation.LevelDiff.Compare(before, so);
+        ShowReport(RefractorForge.Formats.Validation.LevelDiff.ToReport(d, System.IO.Path.GetFileName(path), "current"));
+    }
+    catch (Exception ex) { Toast(Loc.T("Compare failed: ") + ex.Message); }
+}
+
+// The report window. One list for every check; a row flies the camera to the finding and selects the object
+// it is about, which is what turns a list of complaints into a to-do list.
+void MapReportWindow()
+{
+    if (!showMapReport || mapReport is null) return;
+    var r = mapReport;
+    ImGui.SetNextWindowSize(new Vector2(680f * uiScale, 420f * uiScale), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Map Report") + "###maprep", ref showMapReport))
+    {
+        ImGui.TextWrapped(r.Summary);
+        ImGui.SameLine();
+        ImGui.TextDisabled(r.When.ToString("HH:mm:ss"));
+
+        int minLvl = (int)mapReportMin;
+        ImGui.SetNextItemWidth(160f * uiScale);
+        if (ImGui.Combo(Loc.TL("Show"), ref minLvl, "Everything\0Warnings and errors\0Errors only\0"))
+            mapReportMin = (RefractorForge.Formats.Validation.IssueSeverity)minLvl;
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Copy to clipboard")))
+            ImGui.SetClipboardText(r.Summary + "\n" + string.Join("\n", r.Issues.Select(i => i.ToString())));
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Run again")))
+        {
+            if (r.Title.StartsWith("Map check")) RunMapValidation();
+            else if (r.Title.StartsWith("Bot reach")) RunReachability();
+            else if (r.Title.StartsWith("Performance")) RunPerformanceBudget();
+            else if (r.Title.StartsWith("Dependencies")) RunDependencyCheck();
+            else if (r.Title.StartsWith("Server")) RunServerClientSplit();
+        }
+
+        if (ImGui.BeginTable("##issues", 3, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV))
+        {
+            ImGui.TableSetupScrollFreeze(0, 1);
+            ImGui.TableSetupColumn(Loc.T("Level"), ImGuiTableColumnFlags.WidthFixed, 70f * uiScale);
+            ImGui.TableSetupColumn(Loc.T("Kind"), ImGuiTableColumnFlags.WidthFixed, 130f * uiScale);
+            ImGui.TableSetupColumn(Loc.T("Finding"), ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+            for (int i = 0; i < r.Issues.Count; i++)
+            {
+                var it = r.Issues[i];
+                if (it.Severity < mapReportMin) continue;
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                var col = it.Severity switch
+                {
+                    RefractorForge.Formats.Validation.IssueSeverity.Error => new Vector4(1f, 0.45f, 0.4f, 1f),
+                    RefractorForge.Formats.Validation.IssueSeverity.Warning => new Vector4(1f, 0.82f, 0.35f, 1f),
+                    _ => new Vector4(0.7f, 0.8f, 1f, 1f),
+                };
+                ImGui.TextColored(col, it.Severity.ToString());
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(it.Category);
+                ImGui.TableNextColumn();
+                bool selRow = i == mapReportSel;
+                if (ImGui.Selectable($"{it.Message}##row{i}", selRow, ImGuiSelectableFlags.SpanAllColumns))
+                {
+                    mapReportSel = i;
+                    GoToIssue(it);
+                }
+            }
+            ImGui.EndTable();
+        }
+    }
+    ImGui.End();
+}
+
+void GoToIssue(RefractorForge.Formats.Validation.LevelIssue it)
+{
+    if (it.ObjectId is not null && so is not null)
+    {
+        int idx = so.Objects.FindIndex(o => string.Equals(o.Id, it.ObjectId, StringComparison.OrdinalIgnoreCase));
+        if (idx >= 0) { multi.Clear(); multi.Add(idx); selected = idx; SyncTransformEdit(); }
+    }
+    if (it.Position is { } p)
+    {
+        var t = new Vector3(p.X, p.Y, p.Z);
+        cam.Position = t + new Vector3(18f, 14f, 18f);
+        cam.LookAt(t);
+    }
+}
+
 // Burn the placed lights into the ground texture.
 //
 // This is the half of the bake that carries COLOUR. It works the way DC_Basrah_Nights does: the ground art
@@ -10605,6 +11581,15 @@ void LightsPanel()
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Editor-side only: pulls the sun down toward moonlight so the placed\nlights are visible. It does NOT change the level - use Night preset\nfor that, which writes the renderer colours the game reads."));
+
+    ImGui.TextDisabled(Loc.T("Time of day"));
+    foreach (var tod in RefractorForge.Formats.Terrain.TimeOfDayPreset.All)
+    {
+        if (ImGui.SmallButton(tod.Name + "##tod")) ApplyTimeOfDay(tod);
+        ImGui.SameLine();
+    }
+    ImGui.NewLine();
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sun, ambient, fog and sky moved together. Each is a set of the Init.con\nrenderer values a real level declares, so it is what the game will show once saved."));
 
     if (ImGui.Button(Loc.TL("Apply night preset to level")))
     {

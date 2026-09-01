@@ -48,6 +48,10 @@ sealed class GlObjects
     /// <summary>Every placed, mesh-resolvable object: its template, baked world matrix and object index.</summary>
     public readonly List<(string Tmpl, Matrix4x4 World, int ObjIndex)> Placements = new();
 
+    /// <summary>Object indices in a hidden group: skipped by Draw and by Raycast, so a hidden thing is neither
+    /// seen nor clickable. Set by the viewer when the groups change.</summary>
+    public HashSet<int>? HiddenIndices;
+
     /// <summary>Ephemeral overgrowth foliage instances (a VIEW of the .wst-generated trees; never saved), grouped
     /// by template so each VAO binds once. Independent of <see cref="Placements"/>, so Build/Rebuild don't clear it.</summary>
     private readonly Dictionary<string, List<Matrix4x4>> _foliage = new(StringComparer.OrdinalIgnoreCase);
@@ -188,6 +192,7 @@ sealed class GlObjects
         foreach (var (tmpl, world, objIndex) in Placements)
         {
             if (!_templates.TryGetValue(tmpl, out var t)) continue;
+            if (HiddenIndices is not null && HiddenIndices.Contains(objIndex)) continue;   // hidden = not clickable
             if (!Matrix4x4.Invert(world, out var inv)) continue;
             // Transform the ray into the object's local space and slab-test against the local AABB.
             var lo = Vector3.Transform(rayOrigin, inv);
@@ -261,6 +266,7 @@ sealed class GlObjects
         foreach (var (tmpl, world, objIndex) in Placements)
         {
             if (!_templates.TryGetValue(tmpl, out var t)) continue;
+            if (HiddenIndices is not null && HiddenIndices.Contains(objIndex)) continue;   // in a hidden group
             // Upload the matrices straight from their memory (Matrix4x4 is 16 sequential floats in MVP order)
             // — no per-object float[] allocation, which at hundreds of objects was the GC-stutter source.
             Matrix4x4 mvpM = world * viewProj, modelM = world;
