@@ -22,6 +22,7 @@ public sealed class ArchiveModel : IDisposable
         public required string Name { get; init; }              // full archive path, forward slashes
         public int UncompressedSize { get; set; }
         public int BlockSize { get; set; }                      // on-disk region; == uncompressed when stored raw
+        public uint Offset { get; set; }                        // where the region starts in the file
         public EntryState State { get; set; } = EntryState.Unchanged;
         public byte[]? Pending { get; set; }                    // replacement/new bytes, held until Save
 
@@ -62,6 +63,7 @@ public sealed class ArchiveModel : IDisposable
                 Name = e.Name.Replace('\\', '/'),
                 UncompressedSize = e.UncompressedSize,
                 BlockSize = e.BlockSize,
+                Offset = e.Offset,
             });
     }
 

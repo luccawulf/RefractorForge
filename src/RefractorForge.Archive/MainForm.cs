@@ -3,24 +3,30 @@ using RefractorForge.Formats.Rfa;
 namespace RefractorForge.Archive;
 
 /// <summary>
-/// The archive browser. A folder tree on the left, the files of the selected folder in the middle, and a preview
-/// underneath that renders textures, scripts and sounds without extracting anything by hand.
+/// The archive window, laid out the way BGA lays it out: ONE list holding folders and files together, with
+/// columns for size, packed size, ratio and offset, and the search box along the bottom.
 ///
-/// The list is virtual because a stock texture.rfa holds tens of thousands of entries and building that many
-/// ListViewItems up front is the difference between instant and a visible stall.
+/// That single-list shape is deliberate rather than incidental. A folder tree beside a separate file pane makes
+/// you click twice to see anything and hides how an archive is actually arranged; Refractor archives are broad
+/// and shallow (bf1942/levels/&lt;map&gt;/...), and seeing a folder together with its contents in one column is
+/// how you find your way around one.
+///
+/// The list is a virtual owner-drawn ListView rather than a real tree control: it has to hold tens of thousands
+/// of rows, and only a virtual list asks for them by index as it scrolls. The hierarchy is drawn into the first
+/// column - indent, expander, icon - over a flattened row array from <see cref="TreeModel"/>.
 /// </summary>
 public sealed class MainForm : Form
 {
     private readonly ArchiveModel _model = new();
+    private readonly TreeModel _tree = new();
     private readonly AudioPreview _audio = new();
+    private readonly ShellIcons _icons = new();
 
-    private readonly TreeView _tree = new();
     private readonly ListView _list = new();
     private readonly ToolStripStatusLabel _status = new();
     private readonly ToolStripStatusLabel _statusRight = new();
-    private readonly ToolStripTextBox _search = new();
+    private readonly TextBox _search = new();
 
-    // Preview surface: exactly one of these is visible at a time.
     private readonly Panel _previewHost = new();
     private readonly PictureBox _picture = new();
     private readonly TextBox _text = new();
@@ -29,23 +35,23 @@ public sealed class MainForm : Form
     private readonly Label _audioInfo = new();
     private readonly Label _previewCaption = new();
 
-    private List<ArchiveModel.Item> _visible = new();   // what the virtual list is showing
-    private string _folder = string.Empty;              // selected folder ("" = root, null-ish sentinel below)
-    private bool _showAllFiles;                         // search mode ignores the folder selection
     private byte[]? _currentBytes;
     private ArchiveModel.Item? _current;
 
-    // Mesh orbit. Kept on the form rather than inside the renderer so the angle survives re-renders while the
-    // user drags, and reset per file so a new model always arrives framed the same way.
     private float _meshYaw = 35f, _meshPitch = 20f, _meshZoom = 1f;
     private bool _meshDragging;
     private Point _meshLast;
 
+    // Column 0 geometry: indent per level, then the expander, then the icon, then the name.
+    private const int IndentPerLevel = 19;
+    private const int GlyphWidth = 16;
+    private const int IconWidth = 18;
+
     public MainForm(string? openPath)
     {
         Text = "RefractorForge Archive";
-        Width = 1280;
-        Height = 820;
+        Width = 1180;
+        Height = 800;
         StartPosition = FormStartPosition.CenterScreen;
         AllowDrop = true;
         DragEnter += (_, e) => e.Effect = e.Data?.GetDataPresent(DataFormats.FileDrop) == true
@@ -59,11 +65,16 @@ public sealed class MainForm : Form
             OpenArchive(openPath);
     }
 
-    // ── UI construction ──────────────────────────────────────────────────────
+    // ── UI ───────────────────────────────────────────────────────────────────
+
+    private ToolStripMenuItem _miSave = null!, _miSaveAs = null!, _miClose = null!;
+    private ToolStripMenuItem _miReplace = null!, _miAdd = null!, _miDelete = null!, _miRevert = null!;
+    private ToolStripMenuItem _miExtractSel = null!, _miExtractAll = null!, _miValidate = null!;
 
     private void BuildUi()
     {
         var menu = new MenuStrip();
+
         var file = new ToolStripMenuItem("&File");
         file.DropDownItems.Add(new ToolStripMenuItem("&Open archive...", null, (_, _) => PickAndOpen())
             { ShortcutKeys = Keys.Control | Keys.O });
@@ -71,12 +82,10 @@ public sealed class MainForm : Form
         file.DropDownItems.Add(new ToolStripSeparator());
         _miSave = new ToolStripMenuItem("&Save", null, (_, _) => Save(null)) { ShortcutKeys = Keys.Control | Keys.S };
         _miSaveAs = new ToolStripMenuItem("Save &as...", null, (_, _) => SaveAs());
-        file.DropDownItems.Add(_miSave);
-        file.DropDownItems.Add(_miSaveAs);
-        file.DropDownItems.Add(new ToolStripSeparator());
         _miClose = new ToolStripMenuItem("&Close archive", null, (_, _) => CloseArchive());
-        file.DropDownItems.Add(_miClose);
-        file.DropDownItems.Add(new ToolStripMenuItem("E&xit", null, (_, _) => Close()));
+        file.DropDownItems.AddRange(new ToolStripItem[]
+            { _miSave, _miSaveAs, new ToolStripSeparator(), _miClose,
+              new ToolStripMenuItem("E&xit", null, (_, _) => Close()) });
 
         var edit = new ToolStripMenuItem("&Edit");
         _miReplace = new ToolStripMenuItem("&Replace selected file...", null, (_, _) => ReplaceSelected());
@@ -86,58 +95,70 @@ public sealed class MainForm : Form
         _miRevert = new ToolStripMenuItem("Re&vert selected", null, (_, _) => RevertSelected());
         edit.DropDownItems.AddRange(new ToolStripItem[] { _miReplace, _miAdd, _miDelete, _miRevert });
 
+        var view = new ToolStripMenuItem("&View");
+        view.DropDownItems.Add(new ToolStripMenuItem("&Expand all", null, (_, _) =>
+            { _tree.ExpandAll(_model.Items); Refill(); }) { ShortcutKeys = Keys.Control | Keys.E });
+        view.DropDownItems.Add(new ToolStripMenuItem("&Collapse all", null, (_, _) =>
+            { _tree.CollapseAll(); Refill(); }) { ShortcutKeys = Keys.Control | Keys.W });
+
         var tools = new ToolStripMenuItem("&Tools");
         _miExtractSel = new ToolStripMenuItem("&Extract selected...", null, (_, _) => Extract(false));
         _miExtractAll = new ToolStripMenuItem("Extract &all...", null, (_, _) => Extract(true));
         _miValidate = new ToolStripMenuItem("&Validate archive", null, (_, _) => ValidateArchive());
-        tools.DropDownItems.AddRange(new ToolStripItem[] { _miExtractSel, _miExtractAll, new ToolStripSeparator(), _miValidate });
+        tools.DropDownItems.AddRange(new ToolStripItem[]
+            { _miExtractSel, _miExtractAll, new ToolStripSeparator(), _miValidate });
 
         var help = new ToolStripMenuItem("&Help");
         help.DropDownItems.Add(new ToolStripMenuItem("&About", null, (_, _) => ShowAbout()));
 
-        menu.Items.AddRange(new ToolStripItem[] { file, edit, tools, help });
+        menu.Items.AddRange(new ToolStripItem[] { file, edit, view, tools, help });
 
-        var bar = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden };
-        bar.Items.Add(new ToolStripLabel("Search:"));
-        _search.Width = 260;
-        _search.TextChanged += (_, _) => ApplyFilter();
-        bar.Items.Add(_search);
-        bar.Items.Add(new ToolStripButton("Clear", null, (_, _) => _search.Text = string.Empty));
-
-        // Left: folder tree. Right: file list over preview.
-        var outer = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 320, Orientation = Orientation.Vertical };
-        var inner = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
-
-        _tree.Dock = DockStyle.Fill;
-        _tree.HideSelection = false;
-        _tree.AfterSelect += (_, e) =>
-        {
-            _folder = (string)(e.Node?.Tag ?? string.Empty);
-            _showAllFiles = false;
-            ApplyFilter();
-        };
-
+        // The list, with BGA's own columns and widths.
         _list.Dock = DockStyle.Fill;
         _list.View = View.Details;
         _list.FullRowSelect = true;
         _list.MultiSelect = true;
         _list.HideSelection = false;
-        _list.VirtualMode = true;                       // tens of thousands of entries per archive
+        _list.VirtualMode = true;
+        _list.OwnerDraw = true;
+        _list.BorderStyle = BorderStyle.None;
+        _list.HeaderStyle = ColumnHeaderStyle.Nonclickable;
         _list.RetrieveVirtualItem += OnRetrieveVirtualItem;
+        _list.DrawColumnHeader += (_, e) => e.DrawDefault = true;
+        _list.DrawItem += (_, e) => e.DrawDefault = false;       // painted per sub-item instead
+        _list.DrawSubItem += OnDrawSubItem;
         _list.SelectedIndexChanged += (_, _) => OnSelectionChanged();
-        _list.Columns.Add("Name", 340);
-        _list.Columns.Add("Size", 100, HorizontalAlignment.Right);
-        _list.Columns.Add("Packed", 100, HorizontalAlignment.Right);
-        _list.Columns.Add("Ratio", 70, HorizontalAlignment.Right);
-        _list.Columns.Add("Status", 90);
-        _list.Columns.Add("Path", 420);
+        _list.MouseDown += OnListMouseDown;
+        _list.MouseDoubleClick += OnListDoubleClick;
+        _list.KeyDown += OnListKeyDown;
+        _list.Columns.Add("Filename", 350);
+        _list.Columns.Add("Size", 90, HorizontalAlignment.Right);
+        _list.Columns.Add("Compressed", 90, HorizontalAlignment.Right);
+        _list.Columns.Add("Ratio", 73, HorizontalAlignment.Right);
+        _list.Columns.Add("Offset", 110, HorizontalAlignment.Right);
+        _list.Columns.Add("Status", 80);
+
+        // Search along the BOTTOM of the list, where BGA keeps it.
+        var searchBar = new Panel { Dock = DockStyle.Bottom, Height = 28, Padding = new Padding(4, 3, 4, 3) };
+        var searchLabel = new Label
+            { Text = "Search:", Dock = DockStyle.Left, Width = 52, TextAlign = ContentAlignment.MiddleLeft };
+        _search.Dock = DockStyle.Fill;
+        _search.TextChanged += (_, _) => Refill();
+        var searchClear = new Button { Text = "Clear", Dock = DockStyle.Right, Width = 60 };
+        searchClear.Click += (_, _) => _search.Text = string.Empty;
+        searchBar.Controls.Add(_search);
+        searchBar.Controls.Add(searchLabel);
+        searchBar.Controls.Add(searchClear);
+
+        var listPanel = new Panel { Dock = DockStyle.Fill };
+        listPanel.Controls.Add(_list);
+        listPanel.Controls.Add(searchBar);
 
         BuildPreviewHost();
 
-        inner.Panel1.Controls.Add(_list);
-        inner.Panel2.Controls.Add(_previewHost);
-        outer.Panel1.Controls.Add(_tree);
-        outer.Panel2.Controls.Add(inner);
+        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
+        split.Panel1.Controls.Add(listPanel);
+        split.Panel2.Controls.Add(_previewHost);
 
         var strip = new StatusStrip();
         _status.Spring = true;
@@ -145,15 +166,12 @@ public sealed class MainForm : Form
         strip.Items.Add(_status);
         strip.Items.Add(_statusRight);
 
-        Controls.Add(outer);
-        Controls.Add(bar);
+        Controls.Add(split);
         Controls.Add(menu);
         Controls.Add(strip);
         MainMenuStrip = menu;
-
-        // Docking order: last added sits outermost, so add the fill control first.
-        outer.BringToFront();
-        inner.SplitterDistance = 330;
+        split.BringToFront();
+        Shown += (_, _) => split.SplitterDistance = (int)(split.Height * 0.55);
     }
 
     private void BuildPreviewHost()
@@ -168,14 +186,16 @@ public sealed class MainForm : Form
         _previewCaption.Padding = new Padding(6, 0, 0, 0);
 
         _picture.Dock = DockStyle.Fill;
-        _picture.SizeMode = PictureBoxSizeMode.Zoom;    // fit without distorting; textures are often non-square
+        _picture.SizeMode = PictureBoxSizeMode.Zoom;
         _picture.BackColor = Color.FromArgb(48, 48, 48);
         _picture.Visible = false;
-        _picture.MouseDown += (_, e) => { if (Preview.KindOf(_current?.Name ?? "") == PreviewKind.Mesh) { _meshDragging = true; _meshLast = e.Location; } };
+        _picture.MouseDown += (_, e) =>
+        {
+            if (Preview.KindOf(_current?.Name ?? "") == PreviewKind.Mesh) { _meshDragging = true; _meshLast = e.Location; }
+        };
         _picture.MouseUp += (_, _) => _meshDragging = false;
         _picture.MouseMove += OnMeshDrag;
         _picture.MouseWheel += OnMeshWheel;
-        // A PictureBox only receives the wheel once it has focus.
         _picture.MouseEnter += (_, _) => { if (_picture.Visible) _picture.Focus(); };
 
         _text.Dock = DockStyle.Fill;
@@ -202,9 +222,211 @@ public sealed class MainForm : Form
         _previewHost.Controls.Add(_previewCaption);
     }
 
-    private ToolStripMenuItem _miSave = null!, _miSaveAs = null!, _miClose = null!;
-    private ToolStripMenuItem _miReplace = null!, _miAdd = null!, _miDelete = null!, _miRevert = null!;
-    private ToolStripMenuItem _miExtractSel = null!, _miExtractAll = null!, _miValidate = null!;
+    // ── Drawing the tree into the list ───────────────────────────────────────
+
+    private void OnRetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
+    {
+        // Owner-draw paints the text, but the control still needs an item per row for selection and hit
+        // testing, and one sub-item per column so DrawSubItem is raised for each.
+        var lvi = new ListViewItem(string.Empty);
+        for (int i = 1; i < _list.Columns.Count; i++) lvi.SubItems.Add(string.Empty);
+        e.Item = lvi;
+    }
+
+    private TreeModel.Row? RowAt(int index) =>
+        index >= 0 && index < _tree.Rows.Count ? _tree.Rows[index] : null;
+
+    private void OnDrawSubItem(object? sender, DrawListViewSubItemEventArgs e)
+    {
+        var row = RowAt(e.ItemIndex);
+        if (row is null) return;
+
+        bool selected = e.Item?.Selected == true;
+        bool focused = _list.Focused;
+        var backColor = selected
+            ? (focused ? SystemColors.Highlight : SystemColors.ControlLight)
+            : _list.BackColor;
+        using (var bg = new SolidBrush(backColor)) e.Graphics.FillRectangle(bg, e.Bounds);
+
+        Color fore = selected && focused ? SystemColors.HighlightText : _list.ForeColor;
+        if (!selected)
+        {
+            // Pending edits are the one thing worth colouring: green for content that will be written,
+            // grey for a folder's aggregate row so real files read as the foreground.
+            if (row.Item?.State is ArchiveModel.EntryState.Added or ArchiveModel.EntryState.Replaced)
+                fore = Color.FromArgb(0, 110, 0);
+            else if (row.IsFolder)
+                fore = Color.FromArgb(70, 70, 70);
+        }
+
+        using var fmt = new StringFormat
+        {
+            LineAlignment = StringAlignment.Center,
+            Trimming = StringTrimming.EllipsisCharacter,
+            FormatFlags = StringFormatFlags.NoWrap,
+        };
+        using var brush = new SolidBrush(fore);
+
+        if (e.ColumnIndex == 0)
+        {
+            int x = e.Bounds.Left + 2 + row.Depth * IndentPerLevel;
+
+            if (row.IsFolder)
+                DrawGlyph(e.Graphics, new Rectangle(x, e.Bounds.Top, GlyphWidth, e.Bounds.Height),
+                    _tree.IsExpanded(row.Path));
+            x += GlyphWidth;
+
+            int iconIdx = row.IsFolder
+                ? (_tree.IsExpanded(row.Path) ? ShellIcons.FolderOpen : ShellIcons.FolderClosed)
+                : _icons.ForFile(row.Display);
+            if (iconIdx >= 0 && iconIdx < _icons.Images.Images.Count)
+                _icons.Images.Draw(e.Graphics, x, e.Bounds.Top + (e.Bounds.Height - 16) / 2, iconIdx);
+            x += IconWidth;
+
+            fmt.Alignment = StringAlignment.Near;
+            var textRect = new Rectangle(x, e.Bounds.Top, Math.Max(e.Bounds.Right - x - 2, 4), e.Bounds.Height);
+            e.Graphics.DrawString(row.Display, _list.Font, brush, textRect, fmt);
+            return;
+        }
+
+        string text = ColumnText(row, e.ColumnIndex);
+        if (text.Length == 0) return;
+
+        fmt.Alignment = _list.Columns[e.ColumnIndex].TextAlign == HorizontalAlignment.Right
+            ? StringAlignment.Far : StringAlignment.Near;
+        var r = new Rectangle(e.Bounds.Left + 3, e.Bounds.Top, Math.Max(e.Bounds.Width - 6, 4), e.Bounds.Height);
+        e.Graphics.DrawString(text, _list.Font, brush, r, fmt);
+    }
+
+    private string ColumnText(TreeModel.Row row, int col)
+    {
+        if (row.IsFolder)
+        {
+            // A folder reports what it contains, so a collapsed branch still tells you something.
+            return col switch
+            {
+                1 => row.TotalSize.ToString("N0"),
+                2 => row.TotalPacked.ToString("N0"),
+                3 => row.TotalSize > 0 ? $"{100.0 * row.TotalPacked / row.TotalSize:0}%" : "",
+                5 => $"{row.FileCount:N0} file(s)",
+                _ => "",
+            };
+        }
+
+        var it = row.Item!;
+        return col switch
+        {
+            1 => it.UncompressedSize.ToString("N0"),
+            2 => it.BlockSize.ToString("N0"),
+            3 => it.UncompressedSize > 0 ? $"{100.0 * it.BlockSize / it.UncompressedSize:0}%" : "",
+            4 => it.State == ArchiveModel.EntryState.Added ? "" : "0x" + it.Offset.ToString("X8"),
+            5 => it.State switch
+            {
+                ArchiveModel.EntryState.Added => "added",
+                ArchiveModel.EntryState.Replaced => "replaced",
+                _ => it.IsCompressed ? "packed" : "stored",
+            },
+            _ => "",
+        };
+    }
+
+    /// <summary>The expander. Uses the themed triangle so it matches Explorer, falling back to a drawn +/-
+    /// box on a machine with visual styles turned off.</summary>
+    private static void DrawGlyph(Graphics g, Rectangle bounds, bool expanded)
+    {
+        var box = new Rectangle(bounds.Left + 2, bounds.Top + (bounds.Height - 10) / 2, 10, 10);
+        try
+        {
+            var element = expanded
+                ? System.Windows.Forms.VisualStyles.VisualStyleElement.TreeView.Glyph.Opened
+                : System.Windows.Forms.VisualStyles.VisualStyleElement.TreeView.Glyph.Closed;
+            if (System.Windows.Forms.VisualStyles.VisualStyleRenderer.IsElementDefined(element))
+            {
+                new System.Windows.Forms.VisualStyles.VisualStyleRenderer(element).DrawBackground(g, box);
+                return;
+            }
+        }
+        catch { /* fall through to the drawn box */ }
+
+        using var pen = new Pen(Color.Gray);
+        g.DrawRectangle(pen, box);
+        g.DrawLine(pen, box.Left + 2, box.Top + box.Height / 2, box.Right - 2, box.Top + box.Height / 2);
+        if (!expanded)
+            g.DrawLine(pen, box.Left + box.Width / 2, box.Top + 2, box.Left + box.Width / 2, box.Bottom - 2);
+    }
+
+    /// <summary>Was the click on a folder's expander rather than on the row itself?</summary>
+    private static bool HitGlyph(TreeModel.Row row, int x)
+    {
+        if (!row.IsFolder) return false;
+        int left = 2 + row.Depth * IndentPerLevel;
+        return x >= left && x < left + GlyphWidth;
+    }
+
+    private void OnListMouseDown(object? sender, MouseEventArgs e)
+    {
+        var hit = _list.HitTest(e.Location);
+        var row = RowAt(hit.Item?.Index ?? -1);
+        if (row is null) return;
+        if (e.Button == MouseButtons.Left && HitGlyph(row, e.X))
+        {
+            _tree.Toggle(row.Path);
+            Refill(keepSelectionPath: row.Path);
+        }
+    }
+
+    private void OnListDoubleClick(object? sender, MouseEventArgs e)
+    {
+        var hit = _list.HitTest(e.Location);
+        var row = RowAt(hit.Item?.Index ?? -1);
+        if (row is { IsFolder: true })
+        {
+            _tree.Toggle(row.Path);
+            Refill(keepSelectionPath: row.Path);
+        }
+    }
+
+    /// <summary>Left and right collapse and expand, as in any tree.</summary>
+    private void OnListKeyDown(object? sender, KeyEventArgs e)
+    {
+        var row = SelectedRows().FirstOrDefault();
+        if (row is null || !row.IsFolder) return;
+        if (e.KeyCode == Keys.Left && _tree.IsExpanded(row.Path))
+        { _tree.SetExpanded(row.Path, false); Refill(keepSelectionPath: row.Path); e.Handled = true; }
+        else if (e.KeyCode == Keys.Right && !_tree.IsExpanded(row.Path))
+        { _tree.SetExpanded(row.Path, true); Refill(keepSelectionPath: row.Path); e.Handled = true; }
+    }
+
+    private IEnumerable<TreeModel.Row> SelectedRows()
+    {
+        foreach (int i in _list.SelectedIndices)
+            if (RowAt(i) is { } r) yield return r;
+    }
+
+    private IEnumerable<ArchiveModel.Item> Selected() =>
+        SelectedRows().Where(r => r.Item is not null).Select(r => r.Item!);
+
+    /// <summary>Rebuild the flattened rows and hand the new count to the virtual list.</summary>
+    private void Refill(string? keepSelectionPath = null)
+    {
+        _tree.Build(_model.Items, _search.Text.Trim());
+        _list.VirtualListSize = _tree.Rows.Count;
+        _list.Invalidate();
+
+        if (keepSelectionPath is not null)
+        {
+            int idx = -1;
+            for (int i = 0; i < _tree.Rows.Count; i++)
+                if (_tree.Rows[i].Path == keepSelectionPath) { idx = i; break; }
+            if (idx >= 0)
+            {
+                _list.SelectedIndices.Clear();
+                _list.SelectedIndices.Add(idx);
+                _list.EnsureVisible(idx);
+            }
+        }
+        UpdateStatus();
+    }
 
     // ── Opening / closing ────────────────────────────────────────────────────
 
@@ -244,12 +466,10 @@ public sealed class MainForm : Form
         finally { Cursor = Cursors.Default; }
 
         Text = $"RefractorForge Archive - {Path.GetFileName(path)}";
-        BuildTree();
-        _folder = string.Empty;
-        _showAllFiles = true;         // start by showing everything, so an archive is never a blank window
-        ApplyFilter();
+        _search.Text = string.Empty;
+        _tree.ExpandTopLevel(_model.Items);        // show the shape, not a wall of rows
+        Refill();
         UpdateEnabled();
-        UpdateStatus();
     }
 
     private void CloseArchive()
@@ -257,145 +477,47 @@ public sealed class MainForm : Form
         if (!ConfirmDiscard()) return;
         _audio.Stop();
         _model.Close();
-        _tree.Nodes.Clear();
-        _visible = new List<ArchiveModel.Item>();
-        _list.VirtualListSize = 0;
+        _tree.CollapseAll();
+        Refill();
         ShowPreview(PreviewKind.None, null, null);
         Text = "RefractorForge Archive";
         UpdateEnabled();
-        UpdateStatus();
     }
 
     private bool ConfirmDiscard()
     {
         if (!_model.IsDirty) return true;
-        var r = MessageBox.Show(this,
-            "This archive has unsaved changes. Discard them?", "Unsaved changes",
-            MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
-        return r == DialogResult.Yes;
+        return MessageBox.Show(this, "This archive has unsaved changes. Discard them?", "Unsaved changes",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         if (!ConfirmDiscard()) e.Cancel = true;
-        else { _audio.Dispose(); _model.Dispose(); }
+        else { _audio.Dispose(); _model.Dispose(); _icons.Dispose(); }
         base.OnFormClosing(e);
     }
 
-    // ── Tree + list ──────────────────────────────────────────────────────────
-
-    private void BuildTree()
-    {
-        _tree.BeginUpdate();
-        _tree.Nodes.Clear();
-        var root = new TreeNode(Path.GetFileName(_model.Path ?? "archive")) { Tag = string.Empty };
-        var byPath = new Dictionary<string, TreeNode>(StringComparer.OrdinalIgnoreCase) { [string.Empty] = root };
-
-        foreach (var item in _model.Items)
-        {
-            string folder = item.Folder;
-            if (folder.Length == 0 || byPath.ContainsKey(folder)) continue;
-
-            // Create every missing ancestor on the way down.
-            var parts = folder.Split('/');
-            string acc = string.Empty;
-            var parent = root;
-            foreach (var part in parts)
-            {
-                acc = acc.Length == 0 ? part : acc + "/" + part;
-                if (!byPath.TryGetValue(acc, out var node))
-                {
-                    node = new TreeNode(part) { Tag = acc };
-                    parent.Nodes.Add(node);
-                    byPath[acc] = node;
-                }
-                parent = node;
-            }
-        }
-
-        _tree.Nodes.Add(root);
-        root.Expand();
-        _tree.EndUpdate();
-    }
-
-    private void ApplyFilter()
-    {
-        string q = _search.Text.Trim();
-        IEnumerable<ArchiveModel.Item> src = _model.Items.Where(i => i.State != ArchiveModel.EntryState.Deleted);
-
-        if (q.Length > 0)
-            src = src.Where(i => i.Name.Contains(q, StringComparison.OrdinalIgnoreCase));
-        else if (!_showAllFiles)
-            // Files directly in the selected folder. Subfolders have their own nodes.
-            src = src.Where(i => string.Equals(i.Folder, _folder, StringComparison.OrdinalIgnoreCase));
-
-        _visible = src.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase).ToList();
-        _list.VirtualListSize = _visible.Count;
-        _list.Invalidate();
-        UpdateStatus();
-    }
-
-    private void OnRetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
-    {
-        if (e.ItemIndex < 0 || e.ItemIndex >= _visible.Count)
-        {
-            e.Item = new ListViewItem(string.Empty);
-            return;
-        }
-        var it = _visible[e.ItemIndex];
-        string ratio = it.UncompressedSize > 0 && it.IsCompressed
-            ? $"{100.0 * it.BlockSize / it.UncompressedSize:0}%"
-            : "-";
-        string state = it.State switch
-        {
-            ArchiveModel.EntryState.Added => "added",
-            ArchiveModel.EntryState.Replaced => "replaced",
-            ArchiveModel.EntryState.Deleted => "deleted",
-            _ => it.IsCompressed ? "packed" : "stored",
-        };
-        var lvi = new ListViewItem(new[]
-        {
-            it.FileName,
-            it.UncompressedSize.ToString("N0"),
-            it.BlockSize.ToString("N0"),
-            ratio,
-            state,
-            it.Folder,
-        });
-        if (it.State is ArchiveModel.EntryState.Added or ArchiveModel.EntryState.Replaced)
-            lvi.ForeColor = Color.FromArgb(0, 110, 0);
-        e.Item = lvi;
-    }
-
-    private IEnumerable<ArchiveModel.Item> Selected()
-    {
-        foreach (int idx in _list.SelectedIndices)
-            if (idx >= 0 && idx < _visible.Count) yield return _visible[idx];
-    }
+    // ── Preview ──────────────────────────────────────────────────────────────
 
     private void OnSelectionChanged()
     {
-        var sel = Selected().FirstOrDefault();
         UpdateEnabled();
-        if (sel is null || _list.SelectedIndices.Count != 1) { ShowPreview(PreviewKind.None, null, null); return; }
-        ShowFor(sel);
+        var rows = SelectedRows().Take(2).ToList();
+        if (rows.Count != 1 || rows[0].Item is null) { ShowPreview(PreviewKind.None, null, null); return; }
+        ShowFor(rows[0].Item!);
     }
-
-    // ── Preview ──────────────────────────────────────────────────────────────
 
     private void ShowFor(ArchiveModel.Item item)
     {
         _audio.Stop();
         _audioPlay.Text = "Play";
         _current = item;
-        try
-        {
-            _currentBytes = _model.Read(item);
-        }
+        try { _currentBytes = _model.Read(item); }
         catch (Exception ex)
         {
             _currentBytes = null;
-            ShowPreview(PreviewKind.Text, $"{item.Name} - could not be read", $"{ex.Message}");
+            ShowPreview(PreviewKind.Text, $"{item.Name} - could not be read", ex.Message);
             return;
         }
 
@@ -405,7 +527,7 @@ public sealed class MainForm : Form
         switch (kind)
         {
             case PreviewKind.Mesh:
-                _meshYaw = 35f; _meshPitch = 20f; _meshZoom = 1f;   // every model opens from the same angle
+                _meshYaw = 35f; _meshPitch = 20f; _meshZoom = 1f;
                 RenderMeshPreview();
                 break;
 
@@ -414,16 +536,15 @@ public sealed class MainForm : Form
                 var raw = MeshPreview.RenderRaw(_currentBytes, item.Name, 1024, out var rinfo);
                 if (raw is null || rinfo is null)
                 {
-                    ShowPreview(PreviewKind.Text,
-                        caption + "   (not a square 8- or 16-bit map)", Preview.ToHexDump(_currentBytes));
+                    ShowPreview(PreviewKind.Text, caption + "   (not a square 8- or 16-bit map)",
+                        Preview.ToHexDump(_currentBytes));
                     return;
                 }
                 _picture.Image?.Dispose();
                 _picture.Image = raw;
                 ShowPreview(PreviewKind.Image,
                     $"{caption}   -   {rinfo.Side} x {rinfo.Side} " +
-                    $"{(rinfo.SixteenBit ? "16-bit heightmap" : "8-bit index map")}, range {rinfo.Min}-{rinfo.Max}",
-                    null);
+                    $"{(rinfo.SixteenBit ? "16-bit heightmap" : "8-bit index map")}, range {rinfo.Min}-{rinfo.Max}", null);
                 break;
             }
 
@@ -441,28 +562,29 @@ public sealed class MainForm : Form
                 ShowPreview(PreviewKind.Image, $"{caption}   -   {bmp.Width} x {bmp.Height}", null);
                 break;
             }
+
             case PreviewKind.Text:
                 ShowPreview(PreviewKind.Text, caption, Preview.ToText(_currentBytes));
                 break;
+
             case PreviewKind.Audio:
                 _audioInfo.Text = $"{item.FileName}  -  {_currentBytes.Length:N0} bytes";
                 ShowPreview(PreviewKind.Audio, caption, null);
                 break;
+
             default:
                 ShowPreview(PreviewKind.Text, caption, Preview.ToHexDump(_currentBytes));
                 break;
         }
     }
 
-    /// <summary>Re-draw the current .sm at the current orbit, sized to the preview pane.</summary>
     private void RenderMeshPreview()
     {
         if (_currentBytes is null || _current is null) return;
         int w = Math.Max(_previewHost.ClientSize.Width, 64);
         int h = Math.Max(_previewHost.ClientSize.Height - _previewCaption.Height, 64);
 
-        Bitmap? bmp;
-        MeshPreview.MeshInfo? mi;
+        Bitmap? bmp; MeshPreview.MeshInfo? mi;
         try { bmp = MeshPreview.RenderMesh(_currentBytes, w, h, _meshYaw, _meshPitch, _meshZoom, out mi); }
         catch { bmp = null; mi = null; }
 
@@ -501,28 +623,19 @@ public sealed class MainForm : Form
     {
         _previewCaption.Text = caption ?? string.Empty;
         bool onPicture = kind is PreviewKind.Image or PreviewKind.Mesh;
-        // A model is already drawn to fit the pane, so stretching it again would only soften it.
         _picture.SizeMode = kind == PreviewKind.Mesh ? PictureBoxSizeMode.CenterImage : PictureBoxSizeMode.Zoom;
         _picture.Visible = onPicture;
         _audioPanel.Visible = kind == PreviewKind.Audio;
         _text.Visible = kind == PreviewKind.Text;
         if (text is not null) _text.Text = text;
-        if (!onPicture && _picture.Image is not null)
-        {
-            _picture.Image.Dispose();
-            _picture.Image = null;
-        }
+        if (!onPicture && _picture.Image is not null) { _picture.Image.Dispose(); _picture.Image = null; }
     }
 
     private void ToggleAudio()
     {
         if (_audio.IsPlaying) { _audio.Stop(); _audioPlay.Text = "Play"; return; }
         if (_currentBytes is null) return;
-        try
-        {
-            _audio.Play(_currentBytes);
-            _audioPlay.Text = "Stop";
-        }
+        try { _audio.Play(_currentBytes); _audioPlay.Text = "Stop"; }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Could not play this sound.\r\n\r\n{ex.Message}", "Playback failed",
@@ -532,9 +645,32 @@ public sealed class MainForm : Form
 
     // ── Commands ─────────────────────────────────────────────────────────────
 
+    /// <summary>Selecting a folder means everything under it, which is what a tree implies.</summary>
+    private List<ArchiveModel.Item> SelectedItemsDeep()
+    {
+        var result = new List<ArchiveModel.Item>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in SelectedRows())
+        {
+            if (row.Item is not null)
+            {
+                if (seen.Add(row.Item.Name)) result.Add(row.Item);
+                continue;
+            }
+            string prefix = row.Path + "/";
+            foreach (var i in _model.Items)
+                if (i.State != ArchiveModel.EntryState.Deleted &&
+                    i.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && seen.Add(i.Name))
+                    result.Add(i);
+        }
+        return result;
+    }
+
     private void Extract(bool all)
     {
-        var items = (all ? _model.Items.Where(i => i.State != ArchiveModel.EntryState.Deleted) : Selected()).ToList();
+        var items = all
+            ? _model.Items.Where(i => i.State != ArchiveModel.EntryState.Deleted).ToList()
+            : SelectedItemsDeep();
         if (items.Count == 0) return;
 
         using var d = new FolderBrowserDialog { Description = "Extract to which folder?", UseDescriptionForTitle = true };
@@ -545,16 +681,15 @@ public sealed class MainForm : Form
         Cursor = Cursors.WaitCursor;
         try
         {
+            string rootFull = Path.GetFullPath(d.SelectedPath);
             foreach (var it in items)
             {
-                // Entry paths are archive-relative and always forward-slashed. Reject anything that would
-                // escape the chosen folder rather than trusting the archive's own strings.
-                string rel = it.Name.Replace('/', Path.DirectorySeparatorChar);
-                string dest = Path.GetFullPath(Path.Combine(d.SelectedPath, rel));
-                if (!dest.StartsWith(Path.GetFullPath(d.SelectedPath), StringComparison.OrdinalIgnoreCase))
+                // Entry paths come out of the archive, so treat them as untrusted: anything that would land
+                // outside the chosen folder is refused rather than written.
+                string dest = Path.GetFullPath(Path.Combine(rootFull, it.Name.Replace('/', Path.DirectorySeparatorChar)));
+                if (!dest.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
                 {
-                    failed++;
-                    errors.Add($"{it.Name}: path escapes the target folder");
+                    failed++; errors.Add($"{it.Name}: path escapes the target folder");
                     continue;
                 }
                 try
@@ -583,9 +718,8 @@ public sealed class MainForm : Form
         try
         {
             _model.Replace(it, File.ReadAllBytes(d.FileName));
-            ApplyFilter();
+            Refill(keepSelectionPath: it.Name);
             ShowFor(it);
-            UpdateStatus();
         }
         catch (Exception ex)
         {
@@ -599,8 +733,10 @@ public sealed class MainForm : Form
         using var d = new OpenFileDialog { Title = "Add files to the archive", Multiselect = true };
         if (d.ShowDialog(this) != DialogResult.OK) return;
 
-        // New entries land in the folder currently selected in the tree, which is what "add here" means.
-        string folder = _folder;
+        // New files land in the folder of whatever is selected, which is what "add here" means in a tree.
+        var sel = SelectedRows().FirstOrDefault();
+        string folder = sel is null ? string.Empty : (sel.IsFolder ? sel.Path : sel.Item!.Folder);
+
         foreach (var f in d.FileNames)
         {
             string name = folder.Length == 0 ? Path.GetFileName(f) : folder + "/" + Path.GetFileName(f);
@@ -610,40 +746,32 @@ public sealed class MainForm : Form
                 MessageBox.Show(this, $"{f}\r\n\r\n{ex.Message}", "Add failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
-        BuildTree();
-        ApplyFilter();
-        UpdateStatus();
+        if (folder.Length > 0) _tree.RevealPath(folder + "/x");
+        Refill();
     }
 
     private void DeleteSelected()
     {
-        var items = Selected().ToList();
+        var items = SelectedItemsDeep();
         if (items.Count == 0) return;
-        var r = MessageBox.Show(this,
-            $"Remove {items.Count:N0} file(s) from the archive?\r\n\r\nNothing is written until you save.",
-            "Delete", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (r != DialogResult.Yes) return;
+        if (MessageBox.Show(this,
+                $"Remove {items.Count:N0} file(s) from the archive?\r\n\r\nNothing is written until you save.",
+                "Delete", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         foreach (var it in items) _model.Delete(it);
-        ApplyFilter();
-        UpdateStatus();
+        Refill();
     }
 
     private void RevertSelected()
     {
-        foreach (var it in Selected().ToList()) _model.Revert(it);
-        ApplyFilter();
-        UpdateStatus();
+        foreach (var it in SelectedItemsDeep()) _model.Revert(it);
+        Refill();
     }
 
     private void Save(string? path)
     {
         if (!_model.IsOpen) return;
         path ??= _model.Path!;
-        try
-        {
-            Cursor = Cursors.WaitCursor;
-            _model.Save(path);
-        }
+        try { Cursor = Cursors.WaitCursor; _model.Save(path); }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"The archive was NOT changed.\r\n\r\n{ex.Message}", "Save failed",
@@ -652,13 +780,11 @@ public sealed class MainForm : Form
         }
         finally { Cursor = Cursors.Default; }
 
-        // Saving is the moment corruption would be introduced, so check the result immediately rather than
-        // letting the game be the one to find out.
+        // Saving is the moment corruption would be introduced, so check the result now rather than letting
+        // the game be the one to find out.
         string? problem = RefractorFlatArchive.Validate(path);
-        BuildTree();
-        ApplyFilter();
+        Refill();
         UpdateEnabled();
-        UpdateStatus();
 
         if (problem is not null)
             MessageBox.Show(this,
@@ -727,22 +853,15 @@ public sealed class MainForm : Form
     {
         if (_model.Path is null) return;
         if (_model.IsDirty &&
-            MessageBox.Show(this,
-                "This checks the archive ON DISK, so unsaved changes are not included. Continue?",
-                "Validate", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK)
-            return;
+            MessageBox.Show(this, "This checks the archive ON DISK, so unsaved changes are not included. Continue?",
+                "Validate", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
 
         string? problem;
-        try
-        {
-            Cursor = Cursors.WaitCursor;
-            problem = RefractorFlatArchive.Validate(_model.Path);
-        }
+        try { Cursor = Cursors.WaitCursor; problem = RefractorFlatArchive.Validate(_model.Path); }
         finally { Cursor = Cursors.Default; }
 
         if (problem is null)
-            MessageBox.Show(this,
-                $"{_model.Items.Count:N0} entries checked. Every block decoded cleanly.",
+            MessageBox.Show(this, $"{_model.Items.Count:N0} entries checked. Every block decoded cleanly.",
                 "Archive is sound", MessageBoxButtons.OK, MessageBoxIcon.Information);
         else
             MessageBox.Show(this, problem, "Archive has a problem", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -766,7 +885,7 @@ public sealed class MainForm : Form
         _miSave.Enabled = open && _model.IsDirty;
         _miSaveAs.Enabled = open;
         _miClose.Enabled = open;
-        _miReplace.Enabled = _list.SelectedIndices.Count == 1;
+        _miReplace.Enabled = Selected().Take(2).Count() == 1;
         _miAdd.Enabled = open;
         _miDelete.Enabled = sel;
         _miRevert.Enabled = sel;
@@ -781,12 +900,13 @@ public sealed class MainForm : Form
 
         var live = _model.Items.Where(i => i.State != ArchiveModel.EntryState.Deleted).ToList();
         long unc = live.Sum(i => (long)i.UncompressedSize);
+        long packed = live.Sum(i => (long)i.BlockSize);
         int changed = _model.Items.Count(i => i.State != ArchiveModel.EntryState.Unchanged);
 
         _status.Text =
-            $"{live.Count:N0} entries  |  {Human(unc)} uncompressed  |  " +
+            $"{live.Count:N0} files  |  {Human(unc)} -> {Human(packed)}  |  " +
             $"{(_model.IsV11Format ? "Refractor2 v1.1" : "v1.0")}, " +
-            $"{(_model.IsCompressed ? "compressed" : "uncompressed")}  |  showing {_visible.Count:N0}" +
+            $"{(_model.IsCompressed ? "compressed" : "uncompressed")}  |  {_tree.Rows.Count:N0} rows shown" +
             (changed > 0 ? $"  |  {changed:N0} unsaved change(s)" : string.Empty);
 
         UpdateEnabled();
