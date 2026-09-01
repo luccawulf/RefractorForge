@@ -35,6 +35,12 @@ public sealed class MainForm : Form
     private byte[]? _currentBytes;
     private ArchiveModel.Item? _current;
 
+    // Mesh orbit. Kept on the form rather than inside the renderer so the angle survives re-renders while the
+    // user drags, and reset per file so a new model always arrives framed the same way.
+    private float _meshYaw = 35f, _meshPitch = 20f, _meshZoom = 1f;
+    private bool _meshDragging;
+    private Point _meshLast;
+
     public MainForm(string? openPath)
     {
         Text = "RefractorForge Archive";
@@ -165,6 +171,12 @@ public sealed class MainForm : Form
         _picture.SizeMode = PictureBoxSizeMode.Zoom;    // fit without distorting; textures are often non-square
         _picture.BackColor = Color.FromArgb(48, 48, 48);
         _picture.Visible = false;
+        _picture.MouseDown += (_, e) => { if (Preview.KindOf(_current?.Name ?? "") == PreviewKind.Mesh) { _meshDragging = true; _meshLast = e.Location; } };
+        _picture.MouseUp += (_, _) => _meshDragging = false;
+        _picture.MouseMove += OnMeshDrag;
+        _picture.MouseWheel += OnMeshWheel;
+        // A PictureBox only receives the wheel once it has focus.
+        _picture.MouseEnter += (_, _) => { if (_picture.Visible) _picture.Focus(); };
 
         _text.Dock = DockStyle.Fill;
         _text.Multiline = true;
@@ -392,6 +404,29 @@ public sealed class MainForm : Form
 
         switch (kind)
         {
+            case PreviewKind.Mesh:
+                _meshYaw = 35f; _meshPitch = 20f; _meshZoom = 1f;   // every model opens from the same angle
+                RenderMeshPreview();
+                break;
+
+            case PreviewKind.Image when Path.GetExtension(item.Name).Equals(".raw", StringComparison.OrdinalIgnoreCase):
+            {
+                var raw = MeshPreview.RenderRaw(_currentBytes, item.Name, 1024, out var rinfo);
+                if (raw is null || rinfo is null)
+                {
+                    ShowPreview(PreviewKind.Text,
+                        caption + "   (not a square 8- or 16-bit map)", Preview.ToHexDump(_currentBytes));
+                    return;
+                }
+                _picture.Image?.Dispose();
+                _picture.Image = raw;
+                ShowPreview(PreviewKind.Image,
+                    $"{caption}   -   {rinfo.Side} x {rinfo.Side} " +
+                    $"{(rinfo.SixteenBit ? "16-bit heightmap" : "8-bit index map")}, range {rinfo.Min}-{rinfo.Max}",
+                    null);
+                break;
+            }
+
             case PreviewKind.Image:
             {
                 var bmp = Preview.ToBitmap(item.Name, _currentBytes);
@@ -419,14 +454,60 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>Re-draw the current .sm at the current orbit, sized to the preview pane.</summary>
+    private void RenderMeshPreview()
+    {
+        if (_currentBytes is null || _current is null) return;
+        int w = Math.Max(_previewHost.ClientSize.Width, 64);
+        int h = Math.Max(_previewHost.ClientSize.Height - _previewCaption.Height, 64);
+
+        Bitmap? bmp;
+        MeshPreview.MeshInfo? mi;
+        try { bmp = MeshPreview.RenderMesh(_currentBytes, w, h, _meshYaw, _meshPitch, _meshZoom, out mi); }
+        catch { bmp = null; mi = null; }
+
+        if (bmp is null)
+        {
+            ShowPreview(PreviewKind.Text, $"{_current.Name}   (not a readable StandardMesh)",
+                Preview.ToHexDump(_currentBytes));
+            return;
+        }
+
+        _picture.Image?.Dispose();
+        _picture.Image = bmp;
+        string info = mi is null ? string.Empty
+            : $"   -   LOD 0 of {mi.Lods}, {mi.Materials} material(s), {mi.Vertices:N0} verts, {mi.Triangles:N0} tris" +
+              $"   -   {mi.Size.X:0.#} x {mi.Size.Y:0.#} x {mi.Size.Z:0.#}   -   drag to orbit, wheel to zoom";
+        ShowPreview(PreviewKind.Mesh, $"{_current.Name}   -   {_current.UncompressedSize:N0} bytes{info}", null);
+    }
+
+    private void OnMeshDrag(object? sender, MouseEventArgs e)
+    {
+        if (!_meshDragging || _current is null) return;
+        _meshYaw -= (e.X - _meshLast.X) * 0.5f;
+        _meshPitch = Math.Clamp(_meshPitch + (e.Y - _meshLast.Y) * 0.5f, -85f, 85f);
+        _meshLast = e.Location;
+        RenderMeshPreview();
+    }
+
+    private void OnMeshWheel(object? sender, MouseEventArgs e)
+    {
+        if (_current is null || Preview.KindOf(_current.Name) != PreviewKind.Mesh) return;
+        _meshZoom = Math.Clamp(_meshZoom * (e.Delta > 0 ? 0.88f : 1.14f), 0.15f, 8f);
+        RenderMeshPreview();
+    }
+
     private void ShowPreview(PreviewKind kind, string? caption, string? text)
     {
         _previewCaption.Text = caption ?? string.Empty;
-        _picture.Visible = kind == PreviewKind.Image;
+        bool onPicture = kind is PreviewKind.Image or PreviewKind.Mesh;
+        // A model is already drawn to fit the pane, so stretching it again would only soften it.
+        _picture.SizeMode = kind == PreviewKind.Mesh ? PictureBoxSizeMode.CenterImage : PictureBoxSizeMode.Zoom;
+        _picture.Visible = onPicture;
         _audioPanel.Visible = kind == PreviewKind.Audio;
         _text.Visible = kind == PreviewKind.Text;
         if (text is not null) _text.Text = text;
-        if (kind != PreviewKind.Image && _picture.Image is not null)
+        if (!onPicture && _picture.Image is not null)
         {
             _picture.Image.Dispose();
             _picture.Image = null;

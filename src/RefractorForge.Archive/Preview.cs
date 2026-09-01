@@ -5,7 +5,7 @@ using RefractorForge.Render;
 namespace RefractorForge.Archive;
 
 /// <summary>What kind of preview an entry gets, decided by extension.</summary>
-public enum PreviewKind { None, Image, Text, Audio, Binary }
+public enum PreviewKind { None, Image, Text, Audio, Mesh, Binary }
 
 public static class Preview
 {
@@ -23,6 +23,9 @@ public static class Preview
     public static PreviewKind KindOf(string name)
     {
         string ext = Path.GetExtension(name);
+        // .sm is orbitable, so it gets its own kind. A .raw renders to a still image like any texture.
+        if (ext.Equals(".sm", StringComparison.OrdinalIgnoreCase)) return PreviewKind.Mesh;
+        if (ext.Equals(".raw", StringComparison.OrdinalIgnoreCase)) return PreviewKind.Image;
         if (ImageExt.Contains(ext)) return PreviewKind.Image;
         if (TextExt.Contains(ext)) return PreviewKind.Text;
         if (AudioExt.Contains(ext)) return PreviewKind.Audio;
