@@ -54,6 +54,10 @@ public static class Erosion
     private static void ThermalPass(float[] hgt, int w, int h, Params p)
     {
         var delta = new float[w * h];
+        // Scratch for the four neighbours, allocated once: stack space from a stackalloc is only returned when
+        // the method exits, so allocating per cell per pass would grow the stack without bound.
+        Span<float> d = stackalloc float[4];
+        Span<int> n = stackalloc int[4];
         for (int it = 0; it < p.Iterations; it++)
         {
             Array.Clear(delta);
@@ -64,8 +68,7 @@ public static class Erosion
                     float here = hgt[i];
                     // Material moves to whichever neighbours are far enough below, proportionally.
                     float total = 0f;
-                    Span<float> d = stackalloc float[4];
-                    Span<int> n = stackalloc int[4] { i - 1, i + 1, i - w, i + w };
+                    n[0] = i - 1; n[1] = i + 1; n[2] = i - w; n[3] = i + w;
                     for (int k = 0; k < 4; k++)
                     {
                         float diff = here - hgt[n[k]] - p.TalusMeters;
