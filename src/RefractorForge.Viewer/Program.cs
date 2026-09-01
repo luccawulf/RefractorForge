@@ -306,6 +306,12 @@ uniform vec3 uCloudColor;
 uniform vec2 uCloudScroll; // UV offset = time * Cloud.setSpeed
 uniform float uCloudScale; // ray->UV projection scale (from Cloud.setTexScale)
 uniform float uCloudOpacity;
+// Night dim. Applied after the sky is chosen so it catches the level's real cubemap as well as the procedural
+// fallback - a map that ships a bright daytime skybox must not keep a noon sky over a night scene. The tint is
+// blue because moonlight is, and the dim is heavy: at full night the sky is mostly the fog colour, which is
+// what the game shows anyway once night fog closes the view down to ~130 m.
+uniform float uNight;
+uniform vec3 uNightSky;
 void main(){
     vec3 d = normalize(vDir);
     float cr = cos(uRot), sr = sin(uRot);
@@ -325,6 +331,7 @@ void main(){
         sky += vec3(1.0, 0.86, 0.62) * pow(s, 8.0) * 0.45;                     // warm glow around the sun
         sky += vec3(1.0, 0.97, 0.88) * smoothstep(0.9992, 0.9997, s) * 2.0;    // sun disc
     }
+    if (uNight > 0.0) sky = mix(sky, uNightSky * (0.35 + 0.65 * max(d.y, 0.0)), clamp(uNight, 0.0, 1.0));
     // --- animated clouds: a scrolling layer projected onto the upper hemisphere (dome) ---
     if (uHasCloud == 1 && d.y > 0.015) {
         vec2 uv = (d.xz / d.y) * uCloudScale + uCloudScroll;
@@ -1099,10 +1106,10 @@ bool showSounds = true;                                      // sound emitters: 
 bool playSounds = false;                                     // play placed LOOPING sounds while the camera is inside their ring
 SoundPlayback? soundPlayback = null;                         // NAudio mixer for the placed-sound preview (lazy on first enable)
 List<string>? soundWavArchives = null;                       // cached .rfa(s) searched for a level's / mod's .wav (lazy)
-// Locked objects tint red. With everything locked on load that would paint the ENTIRE map red, which is noise
-// rather than information - so the tint is off by default and is there for when locking is used selectively.
-// The lock itself is always in force; this only controls whether it is shown.
-bool showLockedTint = false;
+// Locked objects tint red, always. Lock state changes what a click will do, so hiding it behind a toggle meant
+// the one thing that explains "why will this not move" was invisible by default. A level ships fully locked, so
+// a freshly opened map reads as red until you unlock what you are working on - that IS the state, shown plainly
+// rather than inferred from a failed drag.
 bool showCollision = false;                                  // .sm collision-mesh wireframe overlay (off by default)
 bool expCollision = false;                                   // .obj export: include an experimental (empty-BSP) collision section
 bool showFoliage = false;                                    // overgrowth-trees overlay: instance the .wst geometry on the map (a VIEW; never saved)
@@ -1359,6 +1366,7 @@ uint terrainTexId = 0;   // baked GPU terrain atlas (0 = none ÃƒÂ¢Ã¢â‚�
 
 uint objProg = 0;
 int uMvpO = -1, uModelO = -1, uColorO = -1, uLightO = -1, uUseTexO = -1, uAlphaTestO = -1, uAlphaEnableO = -1, uTintO = -1;
+int uNightS = -1, uNightSkyS = -1;   // sky night dim
 int uAmbLightT = -1, uDifLightT = -1, uAmbLightO = -1, uDifLightO = -1;   // level lighting -> terrain + object shaders
 GlObjects? glObjects = null;
 // Editable lighting (Init.con renderer.globalAmbientColor / ambientColor / diffuseColor / specularColor), seeded
@@ -2777,6 +2785,8 @@ void OnLoad()
     uSMhasTex = gl.GetUniformLocation(skyMeshProg, "uHasTex");
     uSMopaque = gl.GetUniformLocation(skyMeshProg, "uOpaque");
     uSMtint = gl.GetUniformLocation(skyMeshProg, "uTint");
+    uNightS = gl.GetUniformLocation(skyProg, "uNight");
+    uNightSkyS = gl.GetUniformLocation(skyProg, "uNightSky");
     cloudTex = BuildCloudTexture(256);
     LoadCloudsFromEnv();
     weatherProg = BuildProgram(WeatherVert, WeatherFrag);
@@ -5915,7 +5925,7 @@ void SetSelectionLocked(bool locked)
 // locked, so the common case costs nothing.
 IReadOnlySet<int>? LockedIndices()
 {
-    if (!showLockedTint || so is null || lockedObjectIds.Count == 0) return null;
+    if (so is null || lockedObjectIds.Count == 0) return null;
     lockedIdxScratch.Clear();
     for (int i = 0; i < so.Objects.Count; i++)
         if (lockedObjectIds.Contains(so.Objects[i].Id)) lockedIdxScratch.Add(i);
@@ -6196,6 +6206,8 @@ void OnRender(double dt)
         if (cloudsOn && cloudTex != 0)
         {
             gl.Uniform3(uCloudColorS, cloudColor.X, cloudColor.Y, cloudColor.Z);
+            if (uNightS >= 0) gl.Uniform1(uNightS, lightRig.NightAmount);
+            if (uNightSkyS >= 0) gl.Uniform3(uNightSkyS, lightRig.NightR, lightRig.NightG, lightRig.NightB);
             gl.Uniform2(uCloudScrollS, (float)(appClock * cloudSpeedX), (float)(appClock * cloudSpeedY));
             gl.Uniform1(uCloudScaleS, cloudScale);
             gl.Uniform1(uCloudOpacityS, cloudOpacity);
@@ -6352,7 +6364,7 @@ void OnRender(double dt)
                 int vIdx = gameplayEdit.VehicleSpawns.IndexOf(v);
                 if (!GpVisible(GpKind.Vehicle, vIdx)) continue;   // game-type filter
                 bool vSel = gpKind == GpKind.Vehicle && gpIndex == vIdx && vIdx >= 0;
-                bool vLocked = showLockedTint && vIdx >= 0 && IsGameplayLocked(GpKind.Vehicle, vIdx);
+                bool vLocked = vIdx >= 0 && IsGameplayLocked(GpKind.Vehicle, vIdx);
                 var vTint = vLocked ? (vSel ? new Vector3(2.1f, 0.72f, 0.62f) : new Vector3(1.6f, 0.42f, 0.38f))
                           : vSel ? new Vector3(1.5f, 1.4f, 0.4f) : Vector3.One;
                 glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
@@ -7840,8 +7852,6 @@ void LayersPanel()
     ImGui.Checkbox(Loc.TL("Texture transparency"), ref alphaTransparency);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
     if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
-    ImGui.Checkbox(Loc.TL("Tint locked objects red"), ref showLockedTint);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Everything a level ships is locked on load, so this is off by default - turn it on once you have unlocked what you are working on."));
     ImGui.Checkbox(string.Format(Loc.T("Vehicles ({0})"), gameplayEdit.VehicleSpawns.Count) + "###vehLayer", ref showVehicles);
     ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
     ImGui.Checkbox(string.Format(Loc.T("Spawn Points ({0})"), gameplayEdit.SoldierSpawns.Count) + "###spawnLayer", ref showSpawns);
@@ -10609,6 +10619,14 @@ void LightsPanel()
         fogEnabled = true;
         fogColor = new Vector3(0.09f, 0.10f, 0.11f);
         fogStart = 85f; fogEnd = 130f;
+
+        // Basrah Nights ships NO skybox of its own - neither its archive nor its patch contains sky textures or
+        // a SkyAndSun.con. At fogend 130 the sky is simply never seen: the fog colour IS the horizon. So the
+        // night "skybox" is the fog above, plus dimming whatever sky the level does have, and darkening the
+        // clouds so a bright daytime cloud layer does not hang over a night map.
+        cloudColor = new Vector3(0.13f, 0.15f, 0.20f);
+        cloudsDirty = true;
+        if (lightRig.NightAmount < 0.85f) lightRig.NightAmount = 0.85f;
         BroadcastLight();
         Toast(Loc.T("Night lighting applied - written to Init.con on save."));
     }
