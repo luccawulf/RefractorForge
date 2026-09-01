@@ -537,6 +537,9 @@ LightRig lightRig = new();
 Dictionary<uint, int[]> plLocs = new();
 int selLight = -1;              // index into lightRig.Lights, -1 = none
 bool showLightGizmos = true;
+bool lightDragging = false;     // dragging the selected light in the viewport
+float lightDragOffset = 0f;     // its height above the ground when the drag began, so a drag follows terrain
+bool lightDragVertical = false; // Shift-drag raises and lowers instead of moving across the ground
 string[] levelArchives = Array.Empty<string>();   // all level .rfa (base + patches); empty when the level is a FOLDER
 string[] meshArchives = Array.Empty<string>();     // standardMesh/objects .rfa + patches - no limit
 string[] texPicks = Array.Empty<string>();   // texture*.rfa the user picked (their folders are also scanned for siblings)
@@ -1802,6 +1805,27 @@ void OnLoad()
                 }
                 return;
             }
+            // Dragging a light. Across the ground it keeps the height it had, so a street lamp stays a street
+            // lamp as it moves over a slope; Shift-drag raises and lowers it instead.
+            if (lightDragging && selLight >= 0 && selLight < lightRig.Lights.Count
+                && mouse!.IsButtonPressed(MouseButton.Left))
+            {
+                var l = lightRig.Lights[selLight];
+                if (lightDragVertical)
+                {
+                    float perPixel = 0.15f;
+                    if (kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight))) perPixel *= 0.25f;
+                    l.Position = new Vec3(l.Position.X, l.Position.Y - (pos.Y - lastMouse.Y) * perPixel, l.Position.Z);
+                }
+                else if (terrainPick is not null)
+                {
+                    var dray = Picking.ScreenToRay(cam, pos.X, pos.Y, window.FramebufferSize.X, window.FramebufferSize.Y);
+                    if (terrainPick.Raycast(dray, out var dg))
+                        l.Position = new Vec3(dg.X, dg.Y + lightDragOffset, dg.Z);
+                }
+                return;
+            }
+
             // Dragging a vertex: vertical mouse travel is height. Screen-space rather than a ground raycast,
             // because the point being dragged moves out from under the cursor as it rises.
             if (vertDragging && stroke is not null && heightmap is not null && mouse!.IsButtonPressed(MouseButton.Left))
@@ -1919,6 +1943,7 @@ void OnLoad()
                 return;
             }
             // Finish a terrain stroke: coalesce into one edit and push it onto the shared undo stack.
+            lightDragging = false;
             if (stroke is not null)
             {
                 vertDragging = false;
@@ -2058,6 +2083,25 @@ void OnLoad()
                 return;
             }
             if (btn != MouseButton.Left) return;
+
+            // A placed light behaves like any other object you can grab: Select, Move and Nudge all pick it and
+            // start a drag. Tested before the object/terrain picks so a lamp standing in front of a building is
+            // still reachable.
+            if (toolNames[tool] is "Select" or "Move" or "Nudge")
+            {
+                int lHit = PickLight(new Vector2(lastMouse.X, lastMouse.Y));
+                if (lHit >= 0)
+                {
+                    selLight = lHit;
+                    var ll = lightRig.Lights[lHit];
+                    lightDragging = true;
+                    lightDragVertical = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
+                    lightDragOffset = ll.Position.Y - GroundUnder(ll.Position.X, ll.Position.Z);
+                    // Selecting a light clears the object selection, so the two never look simultaneously active.
+                    multi.Clear(); selected = -1; SyncTransformEdit();
+                    return;
+                }
+            }
 
             // Measure tool: each left-click drops a terrain point (Esc clears / exits).
             if (measureMode && terrainPick is not null && terrainPick.Raycast(ray, out var mpt))
@@ -10368,6 +10412,37 @@ void LevelTreePanel()
     ImGui.EndChild();
 }
 
+// Ground height under a world position, sampled the way the rest of the file does.
+float GroundUnder(float wx, float wz)
+{
+    if (heightmap is null) return 0f;
+    float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+    int gx = Math.Clamp((int)MathF.Round(wx / sp), 0, heightmap.Width - 1);
+    int gz = Math.Clamp((int)MathF.Round(wz / sp), 0, heightmap.Height - 1);
+    return cfg.HeightToMeters(heightmap[gx, gz]);
+}
+
+// Which light is under the cursor, by the same screen-space handle test the road points use. Lights are drawn
+// as markers rather than geometry, so hit-testing the marker is what matches what the eye is aiming at.
+int PickLight(Vector2 mouse)
+{
+    if (!showLightGizmos || lightRig.Lights.Count == 0) return -1;
+    var fb = window.FramebufferSize;
+    var vp = cam.ViewProjection;
+    int best = -1;
+    float bestD2 = 18f * 18f * uiScale * uiScale;      // generous: a lamp is a small target
+    for (int i = 0; i < lightRig.Lights.Count; i++)
+    {
+        var l = lightRig.Lights[i];
+        var sp = Gizmo.Project(new Vector3(l.Position.X, l.Position.Y, l.Position.Z), vp, fb.X, fb.Y);
+        if (float.IsNaN(sp.X)) continue;
+        float dx = sp.X - mouse.X, dy = sp.Y - mouse.Y;
+        float d2 = dx * dx + dy * dy;
+        if (d2 <= bestD2) { bestD2 = d2; best = i; }
+    }
+    return best;
+}
+
 // Burn the placed lights into the ground texture.
 //
 // This is the half of the bake that carries COLOUR. It works the way DC_Basrah_Nights does: the ground art
@@ -10428,27 +10503,66 @@ void LightGizmos()
         var col = new Vector4(l.ColorR, l.ColorG, l.ColorB, l.Enabled ? 1f : 0.35f);
         uint c = ImGui.GetColorU32(col);
         bool sel = i == selLight;
+
+        // A soft halo behind the bulb. Fixed screen size on purpose: the marker has to stay findable and
+        // clickable whatever the radius is, and a light whose reach is 2 m must not become an invisible speck.
+        float glow = (sel ? 15f : 11f) * uiScale;
+        for (int ring = 3; ring >= 1; ring--)
+            dl.AddCircleFilled(scr, glow * ring / 3f,
+                ImGui.GetColorU32(new Vector4(l.ColorR, l.ColorG, l.ColorB, (l.Enabled ? 0.16f : 0.06f))));
         dl.AddCircleFilled(scr, (sel ? 8f : 5f) * uiScale, c);
         dl.AddCircle(scr, (sel ? 11f : 7f) * uiScale,
             ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.85f)), 0, 2f);
 
-        // The reach, drawn as a horizontal ring at the light's height: the radius is where the light reaches
-        // zero, which is the number you are actually tuning.
-        if (sel || showLightGizmos)
+        // A stem down to the ground. Height is the thing that decides whether a light reaches anything at all,
+        // and it is invisible from a floating dot - a lamp 30 m up with a 25 m reach lights nothing, and looks
+        // identical to one sitting on the ground until you draw the drop.
+        float ground = GroundUnder(l.Position.X, l.Position.Z);
+        float above = wpos.Y - ground;
+        var footScr = Gizmo.Project(new Vector3(wpos.X, ground, wpos.Z), vp, fb.X, fb.Y);
+        bool reaches = l.Radius >= above;
+        if (!float.IsNaN(footScr.X))
         {
+            // Red when the reach cannot touch the ground: that is always a mistake worth seeing immediately.
+            uint stem = ImGui.GetColorU32(reaches
+                ? new Vector4(l.ColorR, l.ColorG, l.ColorB, sel ? 0.55f : 0.25f)
+                : new Vector4(1f, 0.35f, 0.30f, sel ? 0.9f : 0.5f));
+            dl.AddLine(scr, footScr, stem, sel ? 2f : 1f);
+            dl.AddCircle(footScr, 3f * uiScale, stem, 8, 1.5f);
+        }
+
+        // The reach: a ring at the light's height, plus the circle it actually casts on the ground. The second
+        // one is what you are really aiming, and for a light up a pole it is much smaller than the first.
+        void Ring(float cy, float rad, float alpha, float thick)
+        {
+            if (rad <= 0.01f) return;
             const int seg = 40;
             Vector2 prev = default;
             bool have = false;
             for (int k = 0; k <= seg; k++)
             {
                 float a = k / (float)seg * MathF.Tau;
-                var wp = wpos + new Vector3(MathF.Cos(a) * l.Radius, 0f, MathF.Sin(a) * l.Radius);
-                var sp = Gizmo.Project(wp, vp, fb.X, fb.Y);
-                if (have) dl.AddLine(prev, sp, ImGui.GetColorU32(new Vector4(l.ColorR, l.ColorG, l.ColorB, sel ? 0.75f : 0.28f)), sel ? 2f : 1f);
-                prev = sp; have = true;
+                var wp = new Vector3(wpos.X + MathF.Cos(a) * rad, cy, wpos.Z + MathF.Sin(a) * rad);
+                var sp2 = Gizmo.Project(wp, vp, fb.X, fb.Y);
+                if (float.IsNaN(sp2.X)) { have = false; continue; }
+                if (have) dl.AddLine(prev, sp2, ImGui.GetColorU32(new Vector4(l.ColorR, l.ColorG, l.ColorB, alpha)), thick);
+                prev = sp2; have = true;
             }
         }
-        if (sel) dl.AddText(scr + new Vector2(12f, -6f), ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)), l.Name);
+        Ring(wpos.Y, l.Radius, sel ? 0.7f : 0.25f, sel ? 2f : 1f);
+        if (reaches)
+        {
+            // Pythagoras: the sphere of radius R centred `above` metres up meets the ground in a circle.
+            float groundR = MathF.Sqrt(MathF.Max(l.Radius * l.Radius - above * above, 0f));
+            Ring(ground + 0.05f, groundR, sel ? 0.55f : 0.2f, sel ? 2f : 1f);
+        }
+
+        if (sel)
+        {
+            string tag = $"{l.Name}   {above:0.#} m up, reach {l.Radius:0} m";
+            if (!reaches) tag += "   - does not reach the ground";
+            dl.AddText(scr + new Vector2(13f, -7f), ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.95f)), tag);
+        }
     }
 }
 
@@ -10493,13 +10607,11 @@ void LightsPanel()
         var pos = cam.Position;
         if (heightmap is not null)
         {
-            // Drop it near the ground if the camera is high up or underground, so a new light lands somewhere
-            // it actually lights something instead of in the sky.
-            float sp2 = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
-            int gx = Math.Clamp((int)MathF.Round(pos.X / sp2), 0, heightmap.Width - 1);
-            int gz = Math.Clamp((int)MathF.Round(pos.Z / sp2), 0, heightmap.Height - 1);
-            float g = cfg.HeightToMeters(heightmap[gx, gz]);
-            if (pos.Y > g + 60f || pos.Y < g) pos.Y = g + 6f;
+            // ALWAYS put a new light at lamp height, never at the camera. Placing it where the camera happens to
+            // be floating is what made a new light appear to do nothing: fly at 30 m, add a light with a 25 m
+            // reach, and the ground is simply out of range. A lamp is a lamp - it belongs near the ground, and
+            // the height is easy to change afterwards.
+            pos.Y = GroundUnder(pos.X, pos.Z) + 3f;
         }
         lightRig.Lights.Add(new PointLight
         {
@@ -10559,11 +10671,31 @@ void LightsPanel()
         if (ImGui.DragFloat3(Loc.TL("Position"), ref pv, 0.25f))
             l.Position = new Vec3(pv.X, pv.Y, pv.Z);
 
+        float gnd = GroundUnder(l.Position.X, l.Position.Z);
+        float above = l.Position.Y - gnd;
+        ImGui.TextDisabled(string.Format(Loc.T("{0:0.#} m above the ground"), above));
+
+        // The failure that looks like a broken feature: a light further above the ground than its own reach
+        // lights nothing at all, and from a floating marker there is no way to tell. Say so, and offer the fix.
+        if (l.Radius < above)
+        {
+            ImGui.TextColored(new Vector4(1f, 0.45f, 0.4f, 1f), Loc.T("Reach does not touch the ground."));
+            if (ImGui.Button(Loc.TL("Drop to lamp height")))
+                l.Position = new Vec3(l.Position.X, gnd + 3f, l.Position.Z);
+            ImGui.SameLine();
+            if (ImGui.Button(Loc.TL("Grow reach to fit")))
+                l.Radius = MathF.Ceiling(above * 1.6f);
+        }
+
         if (ImGui.Button(Loc.TL("Move to camera")))
             l.Position = new Vec3(cam.Position.X, cam.Position.Y, cam.Position.Z);
         ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Drop to ground")))
+            l.Position = new Vec3(l.Position.X, GroundUnder(l.Position.X, l.Position.Z) + 3f, l.Position.Z);
+        ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Go to light")))
             cam.Position = new Vector3(l.Position.X, l.Position.Y + 8f, l.Position.Z + 14f);
+        ImGui.TextDisabled(Loc.T("Click a light in the viewport to select it; drag to move, Shift-drag for height."));
     }
 
     ImGui.TextDisabled($"{lightRig.Lights.Count} light(s)");
