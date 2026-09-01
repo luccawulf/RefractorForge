@@ -38,8 +38,35 @@ public sealed class TreeModel
     private Node _root = new() { Path = "", Name = "" };
     private readonly HashSet<string> _expanded = new(StringComparer.OrdinalIgnoreCase);
     private List<Row> _rows = new();
+    private int _sortColumn = -1;
+    private bool _sortDescending;
 
     public IReadOnlyList<Row> Rows => _rows;
+
+    /// <summary>
+    /// Which column orders siblings. The sort deliberately applies WITHIN each folder rather than across the
+    /// whole archive: flattening the tree to sort it would throw away the structure the list exists to show,
+    /// and "the biggest file in this folder" is the question people actually ask.
+    /// </summary>
+    public void SetSort(int column, bool descending)
+    {
+        _sortColumn = column;
+        _sortDescending = descending;
+    }
+
+    private IEnumerable<ArchiveModel.Item> SortFiles(IEnumerable<ArchiveModel.Item> files)
+    {
+        var ordered = _sortColumn switch
+        {
+            1 => files.OrderBy(f => f.UncompressedSize),
+            2 => files.OrderBy(f => f.BlockSize),
+            3 => files.OrderBy(f => f.UncompressedSize > 0 ? (double)f.BlockSize / f.UncompressedSize : 0.0),
+            4 => files.OrderBy(f => f.Offset),
+            5 => files.OrderBy(f => f.State.ToString(), StringComparer.OrdinalIgnoreCase),
+            _ => files.OrderBy(f => f.FileName, StringComparer.OrdinalIgnoreCase),
+        };
+        return _sortDescending ? ordered.Reverse() : ordered;
+    }
 
     /// <summary>Rebuild from the archive. <paramref name="filter"/> non-empty switches to a flat, filtered
     /// view: while searching, folders are noise — you want the matches.</summary>
@@ -50,9 +77,12 @@ public sealed class TreeModel
 
         if (filter.Length > 0)
         {
-            _rows = live
-                .Where(i => i.Name.Contains(filter, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
+            var matches = live.Where(i => i.Name.Contains(filter, StringComparison.OrdinalIgnoreCase));
+            _rows = (_sortColumn <= 0
+                    ? (_sortDescending
+                        ? matches.OrderByDescending(i => i.Name, StringComparer.OrdinalIgnoreCase)
+                        : matches.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase))
+                    : SortFiles(matches))
                 .Select(i => new Row
                 {
                     Path = i.Name, Display = i.Name, Depth = 0, IsFolder = false, Item = i,
@@ -118,7 +148,7 @@ public sealed class TreeModel
             Flatten(c, depth + 1);
 
         // Files after subfolders, which is the order every file manager uses.
-        foreach (var f in n.Files.OrderBy(f => f.FileName, StringComparer.OrdinalIgnoreCase))
+        foreach (var f in SortFiles(n.Files))
             _rows.Add(new Row
             {
                 Path = f.Name, Display = f.FileName, Depth = depth + 1, IsFolder = false, Item = f,

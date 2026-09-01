@@ -127,6 +127,43 @@ public class TreeModelTests
     }
 
     [Fact]
+    public void Sorting_orders_files_within_their_folder_and_leaves_the_hierarchy_alone()
+    {
+        // The whole point of the list is the structure, so a sort must not flatten it: files reorder inside
+        // their own folder, and the folders stay where they are.
+        var items = new List<ArchiveModel.Item>
+        {
+            F("a/small.con", 10, 5),
+            F("a/huge.con", 9000, 4000),
+            F("a/medium.con", 500, 250),
+            F("b/only.con", 77, 30),
+        };
+        var t = new TreeModel();
+        t.ExpandAll(items);
+
+        t.SetSort(1, descending: true);          // column 1 = Size
+        t.Build(items, "");
+
+        var rows = t.Rows.ToList();
+        int aAt = rows.FindIndex(r => r.Path == "a");
+        int bAt = rows.FindIndex(r => r.Path == "b");
+        Assert.True(aAt < bAt, "folder order is untouched by a file sort");
+
+        var inA = rows.Skip(aAt + 1).TakeWhile(r => !r.IsFolder).Select(r => r.Display).ToList();
+        Assert.Equal(new[] { "huge.con", "medium.con", "small.con" }, inA);
+
+        // b's single file must still sit under b, not get pulled in among a's.
+        Assert.Equal("only.con", rows[bAt + 1].Display);
+
+        t.SetSort(1, descending: false);
+        t.Build(items, "");
+        rows = t.Rows.ToList();
+        aAt = rows.FindIndex(r => r.Path == "a");
+        inA = rows.Skip(aAt + 1).TakeWhile(r => !r.IsFolder).Select(r => r.Display).ToList();
+        Assert.Equal(new[] { "small.con", "medium.con", "huge.con" }, inA);
+    }
+
+    [Fact]
     public void Subfolders_come_before_loose_files_at_the_same_level()
     {
         // The order every file manager uses; without it a folder can end up buried among its siblings' files.

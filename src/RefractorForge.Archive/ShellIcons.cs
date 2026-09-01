@@ -1,9 +1,10 @@
+using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace RefractorForge.Archive;
 
 /// <summary>
-/// 16x16 icons for the file list, taken from the Windows shell.
+/// Icons for the file list, taken from the Windows shell.
 ///
 /// Asking the shell means a .wav, a .txt or a .dds gets whatever icon the user's own machine shows for it in
 /// Explorer, so the list looks native and stays right when someone installs a different image editor. It also
@@ -16,6 +17,7 @@ namespace RefractorForge.Archive;
 public sealed class ShellIcons : IDisposable
 {
     private const uint SHGFI_ICON = 0x000000100;
+    private const uint SHGFI_LARGEICON = 0x000000000;
     private const uint SHGFI_SMALLICON = 0x000000001;
     private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
@@ -38,22 +40,25 @@ public sealed class ShellIcons : IDisposable
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(IntPtr hIcon);
 
-    /// <summary>The ImageList the ListView draws from. Index 0 is a closed folder, 1 an open one.</summary>
-    public ImageList Images { get; } = new()
-    {
-        ImageSize = new Size(16, 16),
-        ColorDepth = ColorDepth.Depth32Bit,
-    };
+    /// <summary>The ImageList the list draws from. Index 0 is a closed folder, 1 an open one.</summary>
+    public ImageList Images { get; }
+
+    /// <summary>Edge length of every icon, in pixels.</summary>
+    public int Size { get; }
 
     public const int FolderClosed = 0;
     public const int FolderOpen = 1;
 
     private readonly Dictionary<string, int> _byExt = new(StringComparer.OrdinalIgnoreCase);
 
-    public ShellIcons()
+    /// <param name="size">Icon edge in pixels. Above 16 the source is the shell's 32px icon scaled DOWN,
+    /// never the 16px one scaled up — enlarging a 16px icon is exactly what makes a file list look blurry.</param>
+    public ShellIcons(int size = 24)
     {
-        Images.Images.Add(Folder(open: false) ?? Blank());
-        Images.Images.Add(Folder(open: true) ?? Blank());
+        Size = Math.Clamp(size, 16, 48);
+        Images = new ImageList { ImageSize = new Size(Size, Size), ColorDepth = ColorDepth.Depth32Bit };
+        Images.Images.Add(Scale(Folder(open: false)));
+        Images.Images.Add(Scale(Folder(open: true)));
     }
 
     /// <summary>Icon index for a file name, added to the list on first sight of each extension.</summary>
@@ -70,7 +75,8 @@ public sealed class ShellIcons : IDisposable
             // "x" + ext is a path that need not exist: USEFILEATTRIBUTES makes the shell answer from the
             // extension alone rather than going to the filesystem.
             var h = SHGetFileInfo("x" + ext, FILE_ATTRIBUTE_NORMAL, ref info,
-                (uint)Marshal.SizeOf<SHFILEINFO>(), SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+                (uint)Marshal.SizeOf<SHFILEINFO>(),
+                SHGFI_ICON | SizeFlag | SHGFI_USEFILEATTRIBUTES);
             if (h != IntPtr.Zero && info.hIcon != IntPtr.Zero)
             {
                 ico = (Icon)Icon.FromHandle(info.hIcon).Clone();
@@ -80,20 +86,22 @@ public sealed class ShellIcons : IDisposable
         catch { ico = null; }
 
         idx = Images.Images.Count;
-        Images.Images.Add(ico ?? Blank());
-        ico?.Dispose();
+        Images.Images.Add(Scale(ico));
         _byExt[ext] = idx;
         return idx;
     }
 
-    private static Icon? Folder(bool open)
+    private uint SizeFlag => Size > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON;
+
+    private Icon? Folder(bool open)
     {
         try
         {
             var info = new SHFILEINFO();
             // A directory path that need not exist, for the same reason as above.
             var h = SHGetFileInfo(open ? Path.GetTempPath() : "x", FILE_ATTRIBUTE_DIRECTORY, ref info,
-                (uint)Marshal.SizeOf<SHFILEINFO>(), SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+                (uint)Marshal.SizeOf<SHFILEINFO>(),
+                SHGFI_ICON | SizeFlag | SHGFI_USEFILEATTRIBUTES);
             if (h == IntPtr.Zero || info.hIcon == IntPtr.Zero) return null;
             var ico = (Icon)Icon.FromHandle(info.hIcon).Clone();
             DestroyIcon(info.hIcon);
@@ -102,11 +110,22 @@ public sealed class ShellIcons : IDisposable
         catch { return null; }
     }
 
-    /// <summary>A transparent 16x16, so a missing icon still occupies its slot and every index stays aligned.</summary>
-    private static Icon Blank()
+    /// <summary>Rasterise at exactly the list's size with a high-quality filter. A null icon still produces a
+    /// transparent bitmap, so a missing one occupies its slot and every later index stays aligned.</summary>
+    private Bitmap Scale(Icon? ico)
     {
-        using var bmp = new Bitmap(16, 16);
-        return Icon.FromHandle(bmp.GetHicon());
+        var bmp = new Bitmap(Size, Size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        if (ico is null) return bmp;
+        using (ico)
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.CompositingQuality = CompositingQuality.HighQuality;
+            using var src = ico.ToBitmap();
+            g.DrawImage(src, new Rectangle(0, 0, Size, Size));
+        }
+        return bmp;
     }
 
     public void Dispose() => Images.Dispose();

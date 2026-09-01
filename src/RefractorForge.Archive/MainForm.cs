@@ -20,7 +20,9 @@ public sealed class MainForm : Form
     private readonly ArchiveModel _model = new();
     private readonly TreeModel _tree = new();
     private readonly AudioPreview _audio = new();
-    private readonly ShellIcons _icons = new();
+    private readonly AppSettings _settings = AppSettings.Load();
+    private readonly ShellIcons _icons;
+    private readonly ExternalEdit _edit;
 
     private readonly ListView _list = new();
     private readonly ToolStripStatusLabel _status = new();
@@ -42,13 +44,20 @@ public sealed class MainForm : Form
     private bool _meshDragging;
     private Point _meshLast;
 
-    // Column 0 geometry: indent per level, then the expander, then the icon, then the name.
-    private const int IndentPerLevel = 19;
+    // Column 0 geometry. The indent and the icon column scale with the icon size so the row still lines up
+    // when the icons get bigger.
     private const int GlyphWidth = 16;
-    private const int IconWidth = 18;
+    private int IconWidth => _icons.Size + 4;
+    private int IndentPerLevel => GlyphWidth + 3;
+
+    private ToolStripMenuItem _miRecent = null!, _miEditOs = null!, _miEditWith = null!;
 
     public MainForm(string? openPath)
     {
+        _icons = new ShellIcons(_settings.IconSize);
+        _edit = new ExternalEdit { Sync = this };
+        _edit.Changed += OnExternalEditChanged;
+
         Text = "RefractorForge Archive";
         Width = 1180;
         Height = 800;
@@ -83,9 +92,11 @@ public sealed class MainForm : Form
         _miSave = new ToolStripMenuItem("&Save", null, (_, _) => Save(null)) { ShortcutKeys = Keys.Control | Keys.S };
         _miSaveAs = new ToolStripMenuItem("Save &as...", null, (_, _) => SaveAs());
         _miClose = new ToolStripMenuItem("&Close archive", null, (_, _) => CloseArchive());
+        _miRecent = new ToolStripMenuItem("&Recent");
         file.DropDownItems.AddRange(new ToolStripItem[]
-            { _miSave, _miSaveAs, new ToolStripSeparator(), _miClose,
+            { _miSave, _miSaveAs, new ToolStripSeparator(), _miRecent, new ToolStripSeparator(), _miClose,
               new ToolStripMenuItem("E&xit", null, (_, _) => Close()) });
+        RebuildRecentMenu();
 
         var edit = new ToolStripMenuItem("&Edit");
         _miReplace = new ToolStripMenuItem("&Replace selected file...", null, (_, _) => ReplaceSelected());
@@ -93,7 +104,11 @@ public sealed class MainForm : Form
         _miDelete = new ToolStripMenuItem("&Delete selected", null, (_, _) => DeleteSelected())
             { ShortcutKeys = Keys.Delete };
         _miRevert = new ToolStripMenuItem("Re&vert selected", null, (_, _) => RevertSelected());
-        edit.DropDownItems.AddRange(new ToolStripItem[] { _miReplace, _miAdd, _miDelete, _miRevert });
+        _miEditOs = new ToolStripMenuItem("&Open in the associated program", null, (_, _) => EditExternally(null))
+            { ShortcutKeys = Keys.Control | Keys.Return };
+        _miEditWith = new ToolStripMenuItem("Open &with...", null, (_, _) => EditWithChosenProgram());
+        edit.DropDownItems.AddRange(new ToolStripItem[]
+            { _miEditOs, _miEditWith, new ToolStripSeparator(), _miReplace, _miAdd, _miDelete, _miRevert });
 
         var view = new ToolStripMenuItem("&View");
         view.DropDownItems.Add(new ToolStripMenuItem("&Expand all", null, (_, _) =>
@@ -122,7 +137,9 @@ public sealed class MainForm : Form
         _list.VirtualMode = true;
         _list.OwnerDraw = true;
         _list.BorderStyle = BorderStyle.None;
-        _list.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+        _list.HeaderStyle = ColumnHeaderStyle.Clickable;
+        _list.ColumnClick += OnColumnClick;
+        _list.ItemDrag += OnItemDrag;
         _list.RetrieveVirtualItem += OnRetrieveVirtualItem;
         _list.DrawColumnHeader += (_, e) => e.DrawDefault = true;
         _list.DrawItem += (_, e) => e.DrawDefault = false;       // painted per sub-item instead
@@ -131,6 +148,7 @@ public sealed class MainForm : Form
         _list.MouseDown += OnListMouseDown;
         _list.MouseDoubleClick += OnListDoubleClick;
         _list.KeyDown += OnListKeyDown;
+        _list.SmallImageList = _icons.Images;   // sets the row height; the drawing is still ours
         _list.Columns.Add("Filename", 350);
         _list.Columns.Add("Size", 90, HorizontalAlignment.Right);
         _list.Columns.Add("Compressed", 90, HorizontalAlignment.Right);
@@ -356,7 +374,7 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Was the click on a folder's expander rather than on the row itself?</summary>
-    private static bool HitGlyph(TreeModel.Row row, int x)
+    private bool HitGlyph(TreeModel.Row row, int x)
     {
         if (!row.IsFolder) return false;
         int left = 2 + row.Depth * IndentPerLevel;
@@ -466,6 +484,8 @@ public sealed class MainForm : Form
         finally { Cursor = Cursors.Default; }
 
         Text = $"RefractorForge Archive - {Path.GetFileName(path)}";
+        _settings.AddRecent(path);
+        RebuildRecentMenu();
         _search.Text = string.Empty;
         _tree.ExpandTopLevel(_model.Items);        // show the shape, not a wall of rows
         Refill();
@@ -494,7 +514,7 @@ public sealed class MainForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         if (!ConfirmDiscard()) e.Cancel = true;
-        else { _audio.Dispose(); _model.Dispose(); _icons.Dispose(); }
+        else { _audio.Dispose(); _edit.Dispose(); _model.Dispose(); _icons.Dispose(); }
         base.OnFormClosing(e);
     }
 
@@ -876,6 +896,118 @@ public sealed class MainForm : Form
             "verifies every block it writes with an independent, engine-validated LZO decoder.",
             "About", MessageBoxButtons.OK, MessageBoxIcon.Information);
 
+    // ── External editing, recent files, sorting, drag-out ────────────────────
+
+    /// <summary>Open the selected entry in a real editor and pick the change back up when it is saved.</summary>
+    private void EditExternally(string? program)
+    {
+        var it = Selected().FirstOrDefault();
+        if (it is null) return;
+        try
+        {
+            program ??= _settings.Editors.TryGetValue(Path.GetExtension(it.Name).ToLowerInvariant(), out var p) &&
+                        p.Length > 0 ? p : null;
+            _edit.Open(it, _model.Read(it), program);
+            _statusRight.Text = $"Editing {it.FileName} externally - save there and it comes straight back";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this,
+                "Could not open this file." + Environment.NewLine + Environment.NewLine +
+                ex.Message + Environment.NewLine + Environment.NewLine +
+                
+                "If nothing is associated with this type, use Open with... to pick a program.",
+                "Open failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void EditWithChosenProgram()
+    {
+        var it = Selected().FirstOrDefault();
+        if (it is null) return;
+        using var d = new OpenFileDialog
+        {
+            Title = $"Open {it.FileName} with which program?",
+            Filter = "Programs (*.exe)|*.exe|All files (*.*)|*.*",
+        };
+        if (d.ShowDialog(this) != DialogResult.OK) return;
+
+        // Remember the choice per extension, so the next .con opens in the same editor without asking.
+        _settings.Editors[Path.GetExtension(it.Name).ToLowerInvariant()] = d.FileName;
+        _settings.Save();
+        EditExternally(d.FileName);
+    }
+
+    /// <summary>An externally-edited file came back. Stage it like any other replacement - it still has to go
+    /// through Save, and still gets verified.</summary>
+    private void OnExternalEditChanged(ArchiveModel.Item item, byte[] data)
+    {
+        if (_model.Find(item.Name) is null) return;      // archive closed or the entry went away meanwhile
+        _model.Replace(item, data);
+        Refill(keepSelectionPath: item.Name);
+        if (_current == item) ShowFor(item);
+        _statusRight.Text = $"{item.FileName} updated from the editor  {DateTime.Now:HH:mm:ss}";
+    }
+
+    private void RebuildRecentMenu()
+    {
+        _miRecent.DropDownItems.Clear();
+        var gone = new List<string>();
+        foreach (var path in _settings.Recent)
+        {
+            if (!File.Exists(path)) { gone.Add(path); continue; }
+            string captured = path;
+            _miRecent.DropDownItems.Add(new ToolStripMenuItem(path, null, (_, _) => OpenArchive(captured)));
+        }
+        // Quietly drop entries that no longer exist rather than offering them again.
+        if (gone.Count > 0) { _settings.Recent.RemoveAll(gone.Contains); _settings.Save(); }
+        _miRecent.Enabled = _miRecent.DropDownItems.Count > 0;
+    }
+
+    private int _sortColumn = -1;
+    private bool _sortDescending;
+
+    /// <summary>
+    /// Sort by a column. Folders keep their place in the hierarchy and their contents sort within them - a
+    /// sort that flattened the tree would throw away the structure the list exists to show.
+    /// </summary>
+    private void OnColumnClick(object? sender, ColumnClickEventArgs e)
+    {
+        if (e.Column == _sortColumn) _sortDescending = !_sortDescending;
+        else { _sortColumn = e.Column; _sortDescending = e.Column != 0; }   // sizes read best largest-first
+        _tree.SetSort(_sortColumn, _sortDescending);
+        Refill();
+    }
+
+    /// <summary>Dragging rows out of the window hands Explorer real files, extracted to a temp folder.</summary>
+    private void OnItemDrag(object? sender, ItemDragEventArgs e)
+    {
+        var items = SelectedItemsDeep();
+        if (items.Count == 0) return;
+
+        string stage = Path.Combine(Path.GetTempPath(), "RefractorForgeArchive",
+            "drag-" + Guid.NewGuid().ToString("N")[..8]);
+        var paths = new List<string>();
+        try
+        {
+            foreach (var it in items)
+            {
+                string dest = Path.Combine(stage, it.Name.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                File.WriteAllBytes(dest, _model.Read(it));
+                paths.Add(dest);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Could not prepare the drag", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var data = new DataObject(DataFormats.FileDrop, paths.ToArray());
+        DoDragDrop(data, DragDropEffects.Copy);
+    }
+
     // ── Chrome ───────────────────────────────────────────────────────────────
 
     private void UpdateEnabled()
@@ -885,7 +1017,10 @@ public sealed class MainForm : Form
         _miSave.Enabled = open && _model.IsDirty;
         _miSaveAs.Enabled = open;
         _miClose.Enabled = open;
-        _miReplace.Enabled = Selected().Take(2).Count() == 1;
+        bool single = Selected().Take(2).Count() == 1;
+        _miReplace.Enabled = single;
+        _miEditOs.Enabled = single;
+        _miEditWith.Enabled = single;
         _miAdd.Enabled = open;
         _miDelete.Enabled = sel;
         _miRevert.Enabled = sel;
