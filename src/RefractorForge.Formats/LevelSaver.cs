@@ -348,7 +348,7 @@ public static class LevelSaver
     /// (standalone patch).</summary>
     /// <summary>The archive's level-folder entry prefix (e.g. "bfvietnam/levels/Foo/"), derived from where
     /// StaticObjects.con (or Init.con / Heightmap.raw) lives, so brand-new files can be added under the same path.</summary>
-    private static string ArchivePrefix(RefractorFlatArchive arch)
+    public static string ArchivePrefix(RefractorFlatArchive arch)
     {
         foreach (var anchor in new[] { "StaticObjects.con", "Init.con", "Heightmap.raw" })
         {
@@ -443,17 +443,31 @@ public static class LevelSaver
             foreach (var (name, bytes) in extraFiles)
                 Put(FindEntry(arch, name, false), bytes);
 
-        // New files — UPSERT: if an entry with the same leaf already exists (e.g. re-baked ObjectLightMaps/*.tga),
-        // override it in place (preserving the archive's exact path/case); otherwise add it verbatim under the level's
-        // archive prefix (e.g. a brand-new Effects/RF_Weather.con, or object lightmaps on a level that shipped none).
+        // New files — UPSERT, resolved by PATH first. An entry at exactly <prefix><rel> wins; otherwise a leaf
+        // match, but only when that leaf is UNIQUE in the archive (that fallback exists for re-baked
+        // ObjectLightMaps/*.tga and painted Pathfinding/*.raw, whose directory case can differ); otherwise the
+        // file is added verbatim under the level's prefix.
+        //
+        // Leaf-only matching used to be unconditional, which silently redirected a level-local object's
+        // Objects.con / Geometries.con onto whatever unrelated object happened to come first in the archive —
+        // destroying that object and leaving the new one with no files at all. Those leaves are the most common
+        // names in any level that already ships local objects.
         if (newEntries is not null)
         {
             string prefix = ArchivePrefix(arch);
             foreach (var (rel, bytes) in newEntries)
             {
                 var relNorm = rel.Replace('\\', '/').TrimStart('/');
-                var leaf = relNorm[(relNorm.LastIndexOf('/') + 1)..];
-                Put(FindEntry(arch, "/" + leaf, false) ?? (prefix + relNorm), bytes);
+                var full = prefix + relNorm;
+                string? target = arch.Entries.FirstOrDefault(e =>
+                    string.Equals(e.Name.Replace('\\', '/'), full, System.StringComparison.OrdinalIgnoreCase))?.Name;
+                if (target is null)
+                {
+                    var leaf = relNorm[(relNorm.LastIndexOf('/') + 1)..];
+                    var byLeaf = FindEntries(arch, "/" + leaf);
+                    if (byLeaf.Count == 1) target = byLeaf[0];
+                }
+                Put(target ?? full, bytes);
             }
         }
 

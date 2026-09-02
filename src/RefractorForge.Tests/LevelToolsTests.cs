@@ -6,6 +6,7 @@ using RefractorForge.Formats.Packaging;
 using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Terrain;
 using RefractorForge.Formats.Validation;
+using RefractorForge.Render;
 using Xunit;
 
 namespace RefractorForge.Tests;
@@ -383,6 +384,69 @@ public class LevelToolsTests
         Assert.Contains("textureManager.alternativePath bf1942/levels/Test_Level/Texture", p1);
         Assert.StartsWith("renderer.fogstart 100", p1);
         Assert.Equal(p1, DecalObject.PatchInitCon(p1, "Test_Level"));   // idempotent
+    }
+
+    // The engine's shader parser is strict: every statement inside a subshader block takes a value and ends in
+    // a semicolon, or it throws and the material never gets its texture. Verified against 6,229 shipped
+    // subshaders, in which bare `transparent` / `twosided` and folder-less texture names never occur.
+    [Fact]
+    public void Decal_shader_matches_the_grammar_the_engine_parses()
+    {
+        var built = DecalObject.Build("Test_Level", "poster", 2f, 3f, "pic", new byte[] { 1, 2, 3 });
+        var rs = System.Text.Encoding.Latin1.GetString(built.Files.First(f => f.RelPath.EndsWith(".rs")).Bytes);
+
+        var body = rs.Split('{')[1].Split('}')[0];
+        foreach (var line in body.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0))
+            Assert.EndsWith(";", line);
+
+        Assert.Contains("transparent false;", rs);      // booleans always carry a value
+        Assert.Contains("twosided true;", rs);
+        Assert.Contains("lighting true;", rs);
+        Assert.Contains("texture \"texture/pic\";", rs);   // folder-qualified, as all 4,406 shipped references are
+        Assert.DoesNotContain("\ttransparent\r", rs);
+        Assert.DoesNotContain("\ttwosided\r", rs);
+
+        // The subshader name is the binding key: it must equal the material name stored in the .sm.
+        Assert.Contains("subshader \"poster_Material0\"", rs);
+        Assert.True(StandardMesh.TryParse(built.Files.First(f => f.RelPath.EndsWith(".sm")).Bytes, out var sm));
+        Assert.Equal("poster_Material0", sm!.Lods[0][0].Name);
+    }
+
+    // BF1942 and Battlefield Vietnam share no archive namespace, so a path written for one resolves to nothing
+    // in the other and the object silently gets no mesh.
+    [Fact]
+    public void Decal_paths_follow_the_target_games_mount_root()
+    {
+        var bfv = DecalObject.Build("Ia_Drang", "poster", 1f, 1f, "pic", new byte[] { 1 }, baseSub: "BfVietnam");
+        var geom = System.Text.Encoding.Latin1.GetString(bfv.Files.First(f => f.RelPath.EndsWith("Geometries.con")).Bytes);
+        Assert.Contains("../BfVietnam/levels/Ia_Drang/StandardMesh/poster", geom);
+        Assert.DoesNotContain("bf1942", geom);
+        Assert.Contains("textureManager.alternativePath BfVietnam/levels/Ia_Drang/Texture",
+                        DecalObject.PatchInitCon("renderer.fogstart 100\r\n", "Ia_Drang", "BfVietnam"));
+
+        // The full 0..5 ramp every shipped Geometries.con writes; a truncated one culls the decal early.
+        for (int i = 0; i <= 5; i++) Assert.Contains($"setLodDistance {i} ", geom);
+    }
+
+    // The texture manager drops any texture that is not power-of-two on both axes, and an object texture without
+    // a mip chain aliases badly at distance.
+    [Fact]
+    public void Decal_texture_is_power_of_two_and_carries_a_mip_chain()
+    {
+        var odd = new Texture2D(300, 90, new byte[300 * 90 * 4]);
+        var snapped = DdsTexture.ToPowerOfTwo(odd, 4, 1024);
+        Assert.Equal(256, snapped.Width);
+        Assert.Equal(64, snapped.Height);      // 90 is nearer 64 than 128
+        Assert.Equal(512, DdsTexture.ToPowerOfTwo(new Texture2D(4000, 8, new byte[4000 * 8 * 4]), 4, 512).Width);
+
+        var dds = DdsTexture.EncodeUncompressedMipped(snapped);
+        Assert.Equal(9u, BitConverter.ToUInt32(dds, 28));                       // 256 -> 9 levels
+        Assert.Equal(32u, BitConverter.ToUInt32(dds, 88));                     // still plain 32-bit ARGB
+        Assert.Equal(0u, BitConverter.ToUInt32(dds, 84));                      // no FourCC: uncompressed
+        int expect = 128; for (int w = 256, h = 64; ; w = Math.Max(1, w / 2), h = Math.Max(1, h / 2))
+        { expect += w * h * 4; if (w == 1 && h == 1) break; }
+        Assert.Equal(expect, dds.Length);
+        Assert.True(DdsTexture.Decode(dds) is { Width: 256, Height: 64 });     // our own reader still round-trips it
     }
 
     // ---- annotations / groups / packaging ----

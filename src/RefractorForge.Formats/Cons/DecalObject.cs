@@ -27,7 +27,7 @@ public static class DecalObject
 {
     public sealed record Built(string Template, List<(string RelPath, byte[] Bytes)> Files, string RunLine, ObjMesh Mesh);
 
-    /// <param name="levelName">The level folder name, as it appears under bf1942/levels/.</param>
+    /// <param name="levelName">The level folder name, as it appears under &lt;baseSub&gt;/levels/.</param>
     /// <param name="name">Template name (letters, digits, underscore).</param>
     /// <param name="widthMeters">Quad width.</param>
     /// <param name="heightMeters">Quad height.</param>
@@ -35,29 +35,48 @@ public static class DecalObject
     /// <param name="ddsBytes">The texture, already encoded as DDS.</param>
     /// <param name="flat">Lay it flat on the ground (a scorch mark) instead of standing it up (a poster).</param>
     /// <param name="doubleSided">Emit a second, reversed quad so it is visible from behind.</param>
+    /// <param name="baseSub">The game's archive mount root: "bf1942" or "BfVietnam". The two games share no
+    /// namespace, so a BF1942 path resolves to nothing in Vietnam and the object silently gets no mesh.</param>
     public static Built Build(string levelName, string name, float widthMeters, float heightMeters,
-                              string textureName, byte[] ddsBytes, bool flat = false, bool doubleSided = true)
+                              string textureName, byte[] ddsBytes, bool flat = false, bool doubleSided = true,
+                              string baseSub = "bf1942")
     {
         name = Sanitize(name);
         textureName = Sanitize(textureName);
-        var mesh = Quad(widthMeters, heightMeters, textureName, flat, doubleSided);
+        // The engine binds a mesh section to a shader by the MATERIAL NAME stored in the .sm, looked up in one
+        // global registry — so follow DICE's <Mesh>_MaterialN convention rather than naming it after the user's
+        // picture, which could collide with a mod's material.
+        string material = name + "_Material0";
+        var mesh = Quad(widthMeters, heightMeters, material, flat, doubleSided);
 
         var files = new List<(string, byte[])>();
         var crlf = new UTF8Encoding(false);
 
         files.Add(($"StandardMesh/{name}.sm", StandardMeshWriter.Write(mesh)));
 
-        // The .rs binds the material to the texture; alpha is honoured so a poster can have cut-out edges.
-        string rs = $"subshader \"{textureName}\" \"StandardMesh/Default\"\r\n{{\r\n\ttexture \"{textureName}\"\r\n" +
-                    "\tmaterialDiffuse 1 1 1\r\n\ttransparent\r\n\talphaTestRef 0.5\r\n\ttwosided\r\n}\r\n";
+        // The .rs binds the material to the texture. The shader grammar is strict: every statement takes a value
+        // and ends in a semicolon, or the parser throws and the subshader is never registered. The texture value
+        // is folder-qualified — all 4,406 shipped references are, and a bare name resolves at the archive root
+        // instead of the level's Texture folder. `transparent false` + alphatestref is retail's cut-out recipe
+        // (blending would also need `depthWrite false`, and a photo is opaque anyway).
+        string rs = $"subshader \"{material}\" \"StandardMesh/Default\"\r\n{{\r\n" +
+                    "\tlighting true;\r\n\tlightingSpecular false;\r\n\tmaterialDiffuse 1 1 1;\r\n" +
+                    "\ttransparent false;\r\n\talphaTestRef 0.5;\r\n\ttwosided true;\r\n" +
+                    $"\ttexture \"texture/{textureName}\";\r\n}}\r\n";
         files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(rs)));
         files.Add(($"Texture/{textureName}.dds", ddsBytes));
 
+        // The full 0..5 LOD ramp every shipped Geometries.con writes; the last entry is the far distance, so a
+        // truncated ramp makes the decal stop drawing long before the level's view distance.
         string geom =
             $"GeometryTemplate.create StandardMesh {name}\r\n" +
-            $"GeometryTemplate.file ../bf1942/levels/{levelName}/StandardMesh/{name}\r\n" +
+            $"GeometryTemplate.file ../{baseSub}/levels/{levelName}/StandardMesh/{name}\r\n" +
             "GeometryTemplate.setLodDistance 0 0\r\n" +
-            "GeometryTemplate.setLodDistance 1 200\r\n\r\n";
+            "GeometryTemplate.setLodDistance 1 100\r\n" +
+            "GeometryTemplate.setLodDistance 2 200\r\n" +
+            "GeometryTemplate.setLodDistance 3 400\r\n" +
+            "GeometryTemplate.setLodDistance 4 600\r\n" +
+            "GeometryTemplate.setLodDistance 5 1000\r\n\r\n";
         files.Add(($"Objects/{name}/Geometries.con", crlf.GetBytes(geom)));
 
         string obj =
@@ -85,12 +104,12 @@ public static class DecalObject
     /// Make sure Init.con runs the level's Objects folder and looks in its Texture folder. Both lines are what
     /// retail levels with local objects carry; adding them when absent is what makes a decal appear at all.
     /// </summary>
-    public static string PatchInitCon(string existing, string levelName)
+    public static string PatchInitCon(string existing, string levelName, string baseSub = "bf1942")
     {
         var lines = existing.Replace("\r\n", "\n").Split('\n').ToList();
         bool hasRun = lines.Any(l => l.Trim().Equals("run Objects/Objects", StringComparison.OrdinalIgnoreCase)
                                   || l.Trim().Equals("run Objects/objects", StringComparison.OrdinalIgnoreCase));
-        string texLine = $"textureManager.alternativePath bf1942/levels/{levelName}/Texture";
+        string texLine = $"textureManager.alternativePath {baseSub}/levels/{levelName}/Texture";
         bool hasTex = lines.Any(l => l.Trim().Equals(texLine, StringComparison.OrdinalIgnoreCase));
         if (hasRun && hasTex) return existing;
 

@@ -4666,6 +4666,7 @@ void DoRepackBaseInPlace()
         if (wxInit is { } we) extras.Add(we);
         foreach (var (name, bytes) in DirtyNavFiles()) wxFiles.Add(($"Pathfinding/{name}", bytes));   // UPSERT, see DoSaveCore
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));
+        foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
         var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
         var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(levelDir);
         if (verr is not null) { Console.WriteLine($"REPACK VALIDATION FAILED: {verr}"); Toast(Loc.T("SAVE FAILED VALIDATION - do not use this file. See Log / Errors.")); showLog = true; return; }
@@ -10608,23 +10609,90 @@ int PickLight(Vector2 mouse)
 
 void WritePendingLevelFiles(string dir, List<string> written)
 {
-    foreach (var (rel, bytes) in pendingLevelFiles)
+    // Only drop what actually reached disk - a file that failed (locked, read-only game folder) stays queued so
+    // the next save retries it, instead of vanishing with the decal half-registered.
+    var done = new List<(string RelPath, byte[] Bytes)>();
+    foreach (var pf in pendingLevelFiles)
     {
         try
         {
-            var full = System.IO.Path.Combine(dir, rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+            var full = System.IO.Path.Combine(dir, pf.RelPath.Replace('/', System.IO.Path.DirectorySeparatorChar));
             System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full)!);
-            System.IO.File.WriteAllBytes(full, bytes);
+            System.IO.File.WriteAllBytes(full, pf.Bytes);
             written.Add(full);
+            done.Add(pf);
         }
-        catch (Exception ex) { Console.WriteLine($"level file {rel}: {ex.Message}"); }
+        catch (Exception ex) { Console.WriteLine($"level file {pf.RelPath}: {ex.Message}"); }
     }
-    pendingLevelFiles.Clear();
+    pendingLevelFiles.RemoveAll(done.Contains);
+    if (pendingLevelFiles.Count > 0)
+        Toast(string.Format(Loc.T("{0} level file(s) could not be written - still queued."), pendingLevelFiles.Count));
 }
 
 // ---- Decal objects ---------------------------------------------------------------------------------------------
 
-string LevelNameForCon() => System.IO.Path.GetFileNameWithoutExtension(levelDir ?? "level");
+// The level's identity as the ARCHIVE spells it, which is not the file name: a patch archive
+// "Hue_001.rfa" still holds "BfVietnam/levels/Hue/...". Paths written into .con files must use the archive's
+// name, or they point at a level directory that does not exist.
+(string Root, string Level) LevelIdentity()
+{
+    if (levelDir is not null && LevelArchive.IsRfa(levelDir))
+    {
+        try
+        {
+            var prefix = RefractorForge.Formats.LevelSaver.ArchivePrefix(new RefractorFlatArchive(levelDir))
+                            .Replace('\\', '/').Trim('/');
+            var seg = prefix.Split('/');
+            if (seg.Length >= 3) return (seg[0], seg[^1]);   // <root>/levels/<Level>
+        }
+        catch { }
+    }
+    string nm = System.IO.Path.GetFileNameWithoutExtension(levelDir ?? "level");
+    nm = System.Text.RegularExpressions.Regex.Replace(nm, @"_\d{3}$", "");   // strip a patch suffix
+    return (gameIsBf1942 ? "bf1942" : "BfVietnam", nm);
+}
+
+string LevelNameForCon() => LevelIdentity().Level;
+
+// Read one of the level's own text files, whether the level is a folder or a packed .rfa. For an archive the
+// mounted list is walked in order so a patch's copy wins, exactly as the game would see it.
+string? ReadLevelText(string relPath)
+{
+    try
+    {
+        if (levelDir is null) return null;
+        if (System.IO.Directory.Exists(levelDir))
+        {
+            var leaf = relPath[(relPath.LastIndexOf('/') + 1)..];
+            var hit = System.IO.Directory.EnumerateFiles(levelDir, leaf, System.IO.SearchOption.AllDirectories)
+                        .Where(f => f.Replace('\\', '/').EndsWith(relPath, StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(f => f.Count(c => c == System.IO.Path.DirectorySeparatorChar)).FirstOrDefault()
+                      ?? System.IO.Directory.EnumerateFiles(levelDir, leaf, System.IO.SearchOption.AllDirectories)
+                        .OrderBy(f => f.Count(c => c == System.IO.Path.DirectorySeparatorChar)).FirstOrDefault();
+            return hit is null ? null : System.IO.File.ReadAllText(hit);
+        }
+        string? text = null;
+        foreach (var rfa in rfaList.Where(LevelArchive.IsRfa))
+        {
+            try
+            {
+                var arch = new RefractorFlatArchive(rfa);
+                var want = (RefractorForge.Formats.LevelSaver.ArchivePrefix(arch) + relPath).Replace('\\', '/');
+                var e = arch.Entries.FirstOrDefault(x => string.Equals(x.Name.Replace('\\', '/'), want, StringComparison.OrdinalIgnoreCase));
+                if (e is not null) text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
+            }
+            catch { }
+        }
+        return text;
+    }
+    catch { return null; }
+}
+
+// The newest queued copy of a level file this session, so repeated edits accumulate instead of each one
+// starting again from the on-disk text.
+string? PendingText(string relPath)
+    => pendingLevelFiles.Where(f => f.RelPath.Equals(relPath, StringComparison.OrdinalIgnoreCase))
+                        .Select(f => System.Text.Encoding.Latin1.GetString(f.Bytes)).LastOrDefault();
 
 void DecalDialog()
 {
@@ -10667,37 +10735,39 @@ bool CreateDecalObject()
         var tex = LoadImageAsTexture(decalImagePath);
         if (tex is null) { Toast(Loc.T("Could not load that image.")); return false; }
 
+        // Nothing runs the decal's Objects folder unless Init.con says so, and most levels ship no such line -
+        // so if we cannot find an Init.con to patch, refuse rather than queue files that can never load.
+        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
+        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the decal in.")); return false; }
+
+        var (baseSub, levelName) = LevelIdentity();
         string name = RefractorForge.Formats.Con.DecalObject.Sanitize(decalName);
         string texName = RefractorForge.Formats.Con.DecalObject.Sanitize("decal_" + name);
-        // Uncompressed BGRA DDS: the same encoder the minimap ships through, which the engine is known to read.
-        var dds = DdsTexture.EncodeUncompressed(tex);
-        var built = RefractorForge.Formats.Con.DecalObject.Build(LevelNameForCon(), name, decalW, decalH, texName, dds, decalFlat, true);
 
-        // Queue every file for the save, then the two registration patches.
+        // The texture manager drops any texture that is not power-of-two on both axes, and an object texture
+        // wants a mip chain or it shimmers at distance. Uncompressed 32-bit is fine: the engine's own loader
+        // picks its format from the bit count alone.
+        var texPow2 = DdsTexture.ToPowerOfTwo(tex, 4, 1024);
+        var dds = DdsTexture.EncodeUncompressedMipped(texPow2);
+        var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub);
+
+        // Queue every file for the save, then the two registration patches. Both patches build on the newest
+        // queued copy when there is one, so a second decal adds to the first rather than replacing it.
         foreach (var f in built.Files) pendingLevelFiles.Add(f);
-        string ocPath = System.IO.Path.Combine(levelDir, "Objects", "objects.con");
-        string? ocExisting = System.IO.File.Exists(ocPath) ? System.IO.File.ReadAllText(ocPath) : null;
-        ocExisting ??= pendingLevelFiles.Where(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase))
-                                        .Select(f => System.Text.Encoding.Latin1.GetString(f.Bytes)).LastOrDefault();
+
+        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
         pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
         pendingLevelFiles.Add(("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
             RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine))));
 
-        var initPath = System.IO.Directory.Exists(levelDir)
-            ? System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
-                .OrderBy(f => f.Count(c => c == System.IO.Path.DirectorySeparatorChar)).FirstOrDefault()
-            : null;
-        if (initPath is not null)
-        {
-            string patched = RefractorForge.Formats.Con.DecalObject.PatchInitCon(System.IO.File.ReadAllText(initPath), LevelNameForCon());
-            pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
-            pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(patched)));
-        }
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
 
         // Show it now: register the render mesh under the template name, exactly as an imported .obj is.
-        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, tex)));
+        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, texPow2)));
         importedObjs[built.Template] = built.Mesh;
-        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (texName, texName, Vector3.One) };
+        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (name + "_Material0", texName, Vector3.One) };
         BroadcastObjMesh(built.Template);
         RebuildCatalog();
         browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
@@ -10912,7 +10982,7 @@ void PackageDialog()
 bool BuildPackage()
 {
     if (levelDir is null || heightmap is null) return false;
-    string levelName = LevelNameForCon();
+    var (pkgRoot, levelName) = LevelIdentity();
     var zipPath = Picker.Save("Write the package zip", "Zip archives|*.zip", levelName + ".zip", levelDir);
     if (zipPath is null) return false;
     try
@@ -10923,7 +10993,7 @@ bool BuildPackage()
         System.IO.Directory.CreateDirectory(tmpDir);
         string clientRfa = System.IO.Path.Combine(tmpDir, levelName + ".rfa");
         if (System.IO.Directory.Exists(levelDir))
-            RefractorForge.Formats.LevelSaver.PackFolder(levelDir, clientRfa, $"bf1942/levels/{levelName}");
+            RefractorForge.Formats.LevelSaver.PackFolder(levelDir, clientRfa, $"{pkgRoot}/levels/{levelName}");
         else if (System.IO.File.Exists(levelDir)) System.IO.File.Copy(levelDir, clientRfa, true);
         else { Toast(Loc.T("Save the level first.")); return false; }
 

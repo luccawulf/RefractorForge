@@ -363,6 +363,110 @@ public static class DdsTexture
     }
 
     public static void Save(Texture2D t, string path) => File.WriteAllBytes(path, EncodeUncompressed(t));
+
+    /// <summary>
+    /// The same uncompressed 32-bit surface, but with a full box-filtered mipmap chain and the header
+    /// bookkeeping shipped textures use. Object textures need this: a single-level texture on a quad seen at a
+    /// distance aliases hard, and 2,343 of 2,550 retail .dds carry a chain. The engine reads only the FourCC,
+    /// bit count and green mask to choose a format, so the surface stays plain ARGB8888 and the alpha survives
+    /// for alphaTestRef.
+    /// </summary>
+    public static byte[] EncodeUncompressedMipped(Texture2D t)
+    {
+        var levels = new List<Texture2D> { t };
+        while (levels[^1].Width > 1 || levels[^1].Height > 1) levels.Add(HalveBox(levels[^1]));
+
+        int total = 0;
+        foreach (var l in levels) total += l.Width * l.Height * 4;
+        var buf = new byte[128 + total];
+        buf[0] = (byte)'D'; buf[1] = (byte)'D'; buf[2] = (byte)'S'; buf[3] = (byte)' ';
+        void U32(int off, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off), v);
+        U32(4, 124);
+        U32(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000);   // CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT|LINEARSIZE
+        U32(12, (uint)t.Height);
+        U32(16, (uint)t.Width);
+        U32(20, (uint)(t.Width * t.Height * 4));                // dwPitchOrLinearSize = the surface, as shipped files write it
+        U32(28, (uint)levels.Count);                            // dwMipMapCount
+        U32(76, 32);
+        U32(80, 0x40 | 0x1);
+        U32(88, 32);
+        U32(92, 0x00FF0000);
+        U32(96, 0x0000FF00);
+        U32(100, 0x000000FF);
+        U32(104, 0xFF000000);
+        U32(108, 0x1000 | 0x8 | 0x400000);                      // TEXTURE|COMPLEX|MIPMAP
+        int o = 128;
+        foreach (var l in levels)
+        {
+            var px = l.Rgba;
+            for (int i = 0; i < l.Width * l.Height; i++)
+            {
+                buf[o++] = px[i * 4 + 2]; buf[o++] = px[i * 4 + 1];
+                buf[o++] = px[i * 4 + 0]; buf[o++] = px[i * 4 + 3];
+            }
+        }
+        return buf;
+    }
+
+    /// <summary>Half-size box filter, one mip level down (each axis floors at 1).</summary>
+    private static Texture2D HalveBox(Texture2D s)
+    {
+        int w = Math.Max(1, s.Width / 2), h = Math.Max(1, s.Height / 2);
+        var dst = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int x0 = Math.Min(x * 2, s.Width - 1), x1 = Math.Min(x * 2 + 1, s.Width - 1);
+                int y0 = Math.Min(y * 2, s.Height - 1), y1 = Math.Min(y * 2 + 1, s.Height - 1);
+                for (int c = 0; c < 4; c++)
+                    dst[(y * w + x) * 4 + c] = (byte)((
+                        s.Rgba[(y0 * s.Width + x0) * 4 + c] + s.Rgba[(y0 * s.Width + x1) * 4 + c] +
+                        s.Rgba[(y1 * s.Width + x0) * 4 + c] + s.Rgba[(y1 * s.Width + x1) * 4 + c] + 2) / 4);
+            }
+        return new Texture2D(w, h, dst);
+    }
+
+    /// <summary>
+    /// Resample to power-of-two dimensions, clamped to [min,max]. The engine's texture manager runs an
+    /// is-power-of-two test on both axes and, in its default mode, logs "Ignoring non-pow2 texture" and drops
+    /// the image — so a photo or screenshot handed straight through would leave the object untextured.
+    /// Stretches rather than pads, so the quad's UVs still cover the whole picture.
+    /// </summary>
+    public static Texture2D ToPowerOfTwo(Texture2D t, int min = 4, int max = 1024)
+    {
+        static int Snap(int v, int min, int max)
+        {
+            int p = 1;
+            while (p * 2 <= v && p < 1 << 20) p *= 2;
+            if (v > p && p * 2 - v < v - p) p *= 2;      // nearest, not always down
+            return Math.Clamp(p, min, max);
+        }
+        int w = Snap(t.Width, min, max), h = Snap(t.Height, min, max);
+        if (w == t.Width && h == t.Height) return t;
+
+        var dst = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+        {
+            float sy = (y + 0.5f) * t.Height / h - 0.5f;
+            int y0 = Math.Clamp((int)MathF.Floor(sy), 0, t.Height - 1);
+            int y1 = Math.Min(y0 + 1, t.Height - 1);
+            float fy = Math.Clamp(sy - y0, 0f, 1f);
+            for (int x = 0; x < w; x++)
+            {
+                float sx = (x + 0.5f) * t.Width / w - 0.5f;
+                int x0 = Math.Clamp((int)MathF.Floor(sx), 0, t.Width - 1);
+                int x1 = Math.Min(x0 + 1, t.Width - 1);
+                float fx = Math.Clamp(sx - x0, 0f, 1f);
+                for (int c = 0; c < 4; c++)
+                {
+                    float a = t.Rgba[(y0 * t.Width + x0) * 4 + c] * (1 - fx) + t.Rgba[(y0 * t.Width + x1) * 4 + c] * fx;
+                    float b = t.Rgba[(y1 * t.Width + x0) * 4 + c] * (1 - fx) + t.Rgba[(y1 * t.Width + x1) * 4 + c] * fx;
+                    dst[(y * w + x) * 4 + c] = (byte)MathF.Round(a * (1 - fy) + b * fy);
+                }
+            }
+        }
+        return new Texture2D(w, h, dst);
+    }
 }
 
 /// <summary>
