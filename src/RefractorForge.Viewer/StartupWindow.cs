@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
+using RefractorForge.Formats;
 
 namespace RefractorForge.Viewer;
 
@@ -184,17 +185,21 @@ internal static class StartupWindow
                     MessageBox.Show(Loc.T("The project folder is already gone; removing it from the list."),
                                     "RefractorForge", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
+                else if (PathSafety.ProtectedReason(dir) is { } why)
+                {
+                    // A project folder is whatever the user once pointed at, and nothing stopped that from being the
+                    // folder RefractorForge runs from, a game install, or a whole user profile. Deleting one of those
+                    // took the application with it, so the delete is refused outright rather than confirmed.
+                    MessageBox.Show(string.Format(
+                            Loc.T("Refusing to delete this folder: {1}.{0}{0}{2}{0}{0}Only the entry is removed from the list. If you really want this folder gone, delete it yourself in Explorer."),
+                            Environment.NewLine, why, dir),
+                        Loc.T("Delete project"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
                 else
                 {
                     // Spell out exactly what is about to be destroyed, and how much of it. A project folder holds the
                     // EXTRACTED level - heightmap, objects, textures - not just the .rfproj.
-                    long bytes = 0; int files = 0;
-                    try
-                    {
-                        foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
-                        { files++; try { bytes += new FileInfo(f).Length; } catch { } }
-                    }
-                    catch { }
+                    var (files, bytes) = PathSafety.Measure(dir);
                     var msg = string.Format(
                         Loc.T("Permanently delete the project folder and everything in it?{0}{0}{1}{0}{2} file(s), {3:N0} MB{0}{0}This deletes the extracted level itself, not just the project file. It cannot be undone. The original .rfa in your game folder is not touched."),
                         Environment.NewLine, dir, files, bytes / 1048576.0);

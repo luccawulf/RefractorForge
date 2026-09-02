@@ -85,6 +85,18 @@ public static class Picker
         t.Join();
     }
 
+    /// <summary>Modal yes/no on its own STA thread, defaulting to NO. For the choices that can lose files.</summary>
+    public static bool Confirm(string message, string title = "RefractorForge")
+    {
+        bool yes = false;
+        var t = new Thread(() => yes = MessageBox.Show(message, title, MessageBoxButtons.YesNo,
+                                                      MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        return yes;
+    }
+
     private static string? RunSta(Func<string?> show)
     {
         string? result = null;

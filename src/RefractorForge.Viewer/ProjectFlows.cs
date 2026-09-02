@@ -64,6 +64,7 @@ internal static class ProjectFlows
         var (game, mod, gameRoot, mapName) = InferFromPath(rfas[0]);
         var dest = Picker.Folder($"Choose an EMPTY folder to extract '{mapName}' into (this becomes the project folder)", null);
         if (dest is null) return null;
+        if (!AcceptProjectFolder(dest, extracting: true)) return null;
         // Pull in the level's patch archives even when the user picked only the base. The engine mounts
         // <Map>_NNN.rfa over <Map>.rfa automatically and a level's terrain textures often live in one, so
         // extracting the base alone produced a project folder whose ground rendered from incomplete tiles.
@@ -83,6 +84,7 @@ internal static class ProjectFlows
     {
         var dir = Picker.Folder("Select the extracted level folder (the project folder)", null);
         if (dir is null) return null;
+        if (!AcceptProjectFolder(dir, extracting: false)) return null;
         var existing = Directory.EnumerateFiles(dir, "*.rfproj").FirstOrDefault();
         if (existing is not null) { try { return RfProject.Load(existing); } catch { } }
 
@@ -121,6 +123,31 @@ internal static class ProjectFlows
         // and the mapper can place that mod's objects. Skipping falls back to the last-used archives.
         if (!AskModTarget(p)) FallbackCustom(p, Array.Empty<string>());
         return p;
+    }
+
+    /// <summary>
+    /// Vet a folder before it becomes a project folder. A project folder is later offered for deletion, so one that
+    /// is really the RefractorForge install, a game install or a user profile is refused here rather than accepted
+    /// and destroyed later. Extracting into a folder that already holds files is allowed but confirmed, since that
+    /// is how somebody ends up with a "project" that is actually their application or game directory.
+    /// </summary>
+    private static bool AcceptProjectFolder(string dir, bool extracting)
+    {
+        if (PathSafety.ProtectedReason(dir) is { } why)
+        {
+            Picker.Error($"That folder cannot be used as a project folder: {why}.\n\n{dir}\n\n" +
+                         "A project folder holds the extracted level and can be deleted from the startup screen, " +
+                         "so it has to be a folder of its own. Make a new, empty folder instead.");
+            return false;
+        }
+        if (extracting && !PathSafety.IsEmpty(dir))
+        {
+            var (files, bytes) = PathSafety.Measure(dir);
+            return Picker.Confirm($"That folder is not empty - it already holds {files} file(s), {bytes / 1048576.0:N0} MB.\n\n{dir}\n\n" +
+                                  "Extracting here mixes the level in with whatever is already there, and this folder then " +
+                                  "counts as the project folder. Continue anyway?");
+        }
+        return true;
     }
 
     /// <summary>Ask which mod a project targets and record it (Default mode resolves that mod's full mount chain).

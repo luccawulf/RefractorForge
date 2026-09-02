@@ -627,6 +627,7 @@
  "Refractor has no decal primitive: posters, signs and scorch marks in retail maps are ordinary objects with a flat mesh. This makes one from your image and registers it as a level-local object, so it ships inside the map and needs nothing from the mod.": "Refractor にはデカール専用の仕組みがありません。製品版マップのポスター・看板・焦げ跡は平面メッシュの通常オブジェクトです。ここでは画像からそれを作り、レベル固有オブジェクトとして登録するので、マップに同梱され MOD 側には何も必要ありません。",
  "Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads.": "Refractor は動的ポイントライトを描画しません - 夜マップの灼はベイクされています。\nこれらはエディタを照らして位置を決めるためのもので、\nベイクするとゲームが読むライトマップに書き込まれます。",
  "Refresh": "更新",
+ "Refusing to delete this folder: {1}.{0}{0}{2}{0}{0}Only the entry is removed from the list. If you really want this folder gone, delete it yourself in Explorer.": "このフォルダーの削除を拒否しました: {1}。{0}{0}{2}{0}{0}一覧から項目を削除しただけです。本当にこのフォルダーを消したい場合は、エクスプローラーで手動で削除してください。",
  "Reload Level Lightmap (display)": "レベルのライトマップを再読み込み（表示用）",
  "Reload level navmap": "レベルのナビマップを再読込",
  "Remove from list": "リストから削除",
