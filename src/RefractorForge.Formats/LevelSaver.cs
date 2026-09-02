@@ -105,6 +105,17 @@ public static class LevelSaver
             string cdir = Directory.Exists(Path.Combine(levelDir, "Conquest"))
                 ? Path.Combine(levelDir, "Conquest") : levelDir;
             var immo = gameplay.ToImmutable();
+            // Read the loaded mode as it still is on disk, BEFORE it is overwritten below. Without this "before"
+            // the other modes cannot be told which instances actually moved, and guessing corrupts them.
+            GameplayObjects originalFolderGp;
+            try
+            {
+                string[] LF(string f) { var p = Path.Combine(cdir, f); return File.Exists(p) ? File.ReadAllLines(p) : System.Array.Empty<string>(); }
+                originalFolderGp = GameplayObjects.Parse(LF("ControlPoints.con"), LF("ControlPointTemplates.con"),
+                                                         LF("ObjectSpawns.con"), LF("ObjectSpawnTemplates.con"),
+                                                         LF("SoldierSpawns.con"), LF("SoldierSpawnTemplates.con"));
+            }
+            catch { originalFolderGp = immo; }   // unreadable -> treat as "nothing moved" and leave other modes alone
             GameplayWriter.WriteInstanceFiles(cdir, immo);
             written.Add(Path.Combine(cdir, "ControlPoints.con"));
             written.Add(Path.Combine(cdir, "ObjectSpawns.con"));
@@ -120,7 +131,7 @@ public static class LevelSaver
             foreach (var other in GameModeDirs(levelDir))
             {
                 if (string.Equals(other, cdir, System.StringComparison.OrdinalIgnoreCase)) continue;
-                written.AddRange(GameplayWriter.PatchInstanceFiles(other, immo));
+                written.AddRange(GameplayWriter.PatchInstanceFiles(other, originalFolderGp, immo));
                 PatchGameplayTemplates(levelDir, other, immo, written);
             }
         }
@@ -405,6 +416,18 @@ public static class LevelSaver
 
             // The mode the editor loaded from is written in full; every OTHER mode's copy is PATCHED in place, so
             // an edit reaches the whole map without adding a Conquest-only object to CTF or dropping a CTF-only one.
+            // The mode the editor loaded, exactly as the archive still holds it. Without this "before" a patcher
+            // cannot tell which instances the user moved, and every attempt to guess (by template name, by
+            // ordinal) corrupted the other modes on saves that changed nothing at all.
+            string[] OL(string suffix)
+            {
+                var n = FindEntry(arch, suffix, true);
+                return n is null ? System.Array.Empty<string>() : EntryLines(arch, n);
+            }
+            var originalGp = GameplayObjects.Parse(OL("ControlPoints.con"), OL("ControlPointTemplates.con"),
+                                                   OL("ObjectSpawns.con"), OL("ObjectSpawnTemplates.con"),
+                                                   OL("SoldierSpawns.con"), OL("SoldierSpawnTemplates.con"));
+
             void WriteInstances(string suffix, string full)
             {
                 var primary = FindEntry(arch, suffix, true);
@@ -412,7 +435,7 @@ public static class LevelSaver
                 foreach (var name in FindEntries(arch, suffix))
                 {
                     if (string.Equals(name, primary, System.StringComparison.OrdinalIgnoreCase)) continue;
-                    Put(name, Latin1(GameplayWriter.PatchInstanceTransforms(EntryLines(arch, name), immo)));
+                    Put(name, Latin1(GameplayWriter.PatchInstanceTransforms(EntryLines(arch, name), originalGp, immo)));
                 }
             }
 

@@ -17,7 +17,10 @@ public readonly record struct ControlPointDef(string Name, Vec3 Position, float 
     // BFV single conversion time; BF1942 uses the separate get/lose pair below.
     int TimeToGetControl = 40, int TimeToLoseControl = 40, int DisableIfEnemyInside = 0, int DisableWhenLosing = 0,
     int LoseControlWhenEnemyClose = 1, int LoseControlWhenNotClose = 0, int UnableToChangeTeam = 0, int OnlyTakableByTeam = 0,
-    int HasCollisionPhysics = 1);
+    int HasCollisionPhysics = 1,
+    // Flags carry a rotation like any other placed object (it aims the pole). It was parsed and then thrown away,
+    // so every control point lost its facing the first time a level was saved.
+    Vec3 Rotation = default);
 
 /// <summary>A vehicle spawner: where it sits, which vehicle template it spawns, its OS id (<c>setOSId</c>) and the
 /// <c>setTeam</c> the spawner belongs to — all preserved for round-tripping. <see cref="Vehicle"/> is the display
@@ -307,14 +310,15 @@ public sealed record GameplayObjects(
         foreach (var b in ParseObjectBlocks(pointLines))
         {
             if (!tmpl.TryGetValue(b.Name, out var t) || t is null)
-            { list.Add(new ControlPointDef(b.Name, b.Position, 20f, 0, ControlPointName: b.Name)); continue; }
+            { list.Add(new ControlPointDef(b.Name, b.Position, 20f, 0, ControlPointName: b.Name, Rotation: b.Rotation)); continue; }
             list.Add(new ControlPointDef(b.Name, b.Position, t.Radius > 0 ? t.Radius : 20f, t.Sg,
                                          t.Team, t.Area, t.Conv, string.IsNullOrEmpty(t.CpName) ? b.Name : t.CpName, t.Osid,
                                          string.IsNullOrEmpty(t.Pole) ? "flagbase_m1" : t.Pole,
                                          string.IsNullOrEmpty(t.Flag1) ? "flagge_m1" : t.Flag1,
                                          string.IsNullOrEmpty(t.Flag2) ? "flaguk_m1" : t.Flag2,
                                          t.FlagY > 0 ? t.FlagY : 8.2f,
-                                         t.TimeGet, t.TimeLose, t.DisEnemy, t.DisLosing, t.LoseEnemyClose, t.LoseNotClose, t.UnableChange, t.OnlyTakable, t.HasCollision));
+                                         t.TimeGet, t.TimeLose, t.DisEnemy, t.DisLosing, t.LoseEnemyClose, t.LoseNotClose, t.UnableChange, t.OnlyTakable, t.HasCollision,
+                                         b.Rotation));
         }
         return list;
     }

@@ -368,12 +368,18 @@ public class LevelToolsTests
             "Object.setTeam 1",
         };
 
+        // Where the three AA guns were in the mode the editor loaded...
+        var before = new EditableGameplay(GameplayObjects.Empty);
+        before.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(100, 10, 100), Vec3.Zero, "aa", 1, Team: 1));
+        before.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(200, 10, 200), Vec3.Zero, "aa", 1, Team: 2));
+        before.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(300, 10, 300), Vec3.Zero, "aa", 1, Team: 1));
+        // ...and where the user dragged each of them. Each must follow its OWN gun, not all take the last one's spot.
         var gp = new EditableGameplay(GameplayObjects.Empty);
         gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(111, 10, 111), Vec3.Zero, "aa", 1, Team: 1));
         gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(222, 10, 222), Vec3.Zero, "aa", 1, Team: 2));
         gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(333, 10, 333), Vec3.Zero, "aa", 1, Team: 1));
 
-        var outp = GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable());
+        var outp = GameplayWriter.PatchInstanceTransforms(file, before.ToImmutable(), gp.ToImmutable());
         var positions = outp.Split('\n')
                             .Where(l => l.TrimStart().StartsWith("Object.absolutePosition", StringComparison.OrdinalIgnoreCase))
                             .Select(l => l.Trim()).ToList();
@@ -396,10 +402,12 @@ public class LevelToolsTests
             "Object.create AAGunSpawner", "Object.absolutePosition 100/10/100",
             "Object.create AAGunSpawner", "Object.absolutePosition 200/10/200",
         };
+        var before = new EditableGameplay(GameplayObjects.Empty);
+        before.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(500, 10, 500), Vec3.Zero, "aa", 1, Team: 1));
         var gp = new EditableGameplay(GameplayObjects.Empty);
         gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(999, 10, 999), Vec3.Zero, "aa", 1, Team: 1));
 
-        var outp = GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable());
+        var outp = GameplayWriter.PatchInstanceTransforms(file, before.ToImmutable(), gp.ToImmutable());
         Assert.Contains("100/10/100", outp);
         Assert.Contains("200/10/200", outp);
         Assert.DoesNotContain("999", outp);
@@ -410,9 +418,11 @@ public class LevelToolsTests
     public void Unknown_templates_pass_through_unchanged()
     {
         var file = new[] { "Object.create SomethingElse", "Object.absolutePosition 7/7/7" };
+        var before = new EditableGameplay(GameplayObjects.Empty);
+        before.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(9, 9, 9), Vec3.Zero, "aa", 1, Team: 1));
         var gp = new EditableGameplay(GameplayObjects.Empty);
         gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(1, 2, 3), Vec3.Zero, "aa", 1, Team: 1));
-        Assert.Contains("7/7/7", GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable()));
+        Assert.Contains("7/7/7", GameplayWriter.PatchInstanceTransforms(file, before.ToImmutable(), gp.ToImmutable()));
     }
 
 

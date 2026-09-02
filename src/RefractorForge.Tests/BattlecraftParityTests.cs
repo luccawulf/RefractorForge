@@ -32,14 +32,17 @@ public class BattlecraftParityTests
         var src = string.Join(NL,
             "rem *** CTF flags ***",
             "Object.create AXIS_CONTROLPOINT_CITY",
-            "Object.absolutePosition 662.291/102.996/502.494",
+            "Object.absolutePosition 662.291/10/20",
             "rem",
             "Object.create CTF_ONLY_FLAG",
             "Object.absolutePosition 1/2/3",
             "");
 
+        // The flag as it WAS in the mode the editor loaded, then where the user dragged it to. Propagation is
+        // driven by that before/after pair - an instance elsewhere is moved only if it sits where this one was.
+        var before = Gp(("AXIS_CONTROLPOINT_CITY", 662.291f));
         var gp = Gp(("AXIS_CONTROLPOINT_CITY", 700f));
-        var outText = GameplayWriter.PatchInstanceTransforms(src.Split(NL), gp);
+        var outText = GameplayWriter.PatchInstanceTransforms(src.Split(NL), before, gp);
 
         Assert.Contains("Object.absolutePosition 700/10/20", outText);        // the edited flag moved
         Assert.Contains("Object.create CTF_ONLY_FLAG", outText);              // the mode-only flag survives
