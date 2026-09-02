@@ -707,6 +707,10 @@ Dictionary<string, byte[]> bakedObjectLightmaps = new(StringComparer.OrdinalIgno
 // The level is .rfa-based if we have explicit level archives, or levelDir itself is a .rfa file.
 string[] rfaList = levelArchives.Length > 0 ? levelArchives
                  : (levelDir is not null && LevelArchive.IsRfa(levelDir) ? new[] { levelDir } : Array.Empty<string>());
+// A base-game archive borrowed purely to supply terrain for an add-on map (see the layering block below). It is
+// prepended to rfaList so the mod's own files still win, which makes it rfaList[0] - but it is NOT the level the
+// user opened, and a save must never be aimed at it.
+string? layeredTerrainRfa = null;
 // AUTO-MOUNT PATCH ARCHIVES: the engine layers <Level>_NNN.rfa over the base (Dystopia_City_001.rfa overrides
 // 3 StaticObjects.con + 1400 entries). Users usually pick just the base, so add numeric-suffix siblings of every
 // picked archive automatically - appended AFTER their base (LevelArchive is last-wins) and numerically ordered.
@@ -776,6 +780,7 @@ if (rfaList.Length > 0)
                 if (hit is not null)
                 {
                     rfaList = new[] { hit }.Concat(rfaList).ToArray();   // base terrain UNDER the mod's overrides
+                    layeredTerrainRfa = hit;                            // borrowed, not the user's level - never a save target
                     Console.WriteLine($"Layered base terrain for '{name}' from {Path.GetFileName(mp)} ({hit}).");
                     break;
                 }
@@ -4538,7 +4543,7 @@ void DoSaveCore()
     // The engine and the editor's auto-mount both layer it on top, so the saved state is exactly what loads.
     if (levelDir is not null && LevelArchive.IsRfa(levelDir))
     {
-        string baseRfa = rfaList.Length > 0 ? rfaList[0] : levelDir;
+        string baseRfa = SaveBaseRfa() ?? levelDir;
         var sndScripts = sounds.DirtyScripts();
         var extras = new List<(string Name, byte[] Bytes)>(sndScripts);
         var tiles = PaintedTileBytes();                 // painted surface tiles -> into the patch
@@ -4602,8 +4607,8 @@ void DoSaveCore()
 void DoSavePatch(bool serverSideOnly = false)
 {
     if (so is null) return;
-    string? baseRfa = rfaList.Length > 0 ? rfaList[0]
-                    : (levelDir is not null && LevelArchive.IsRfa(levelDir) ? levelDir : null);
+    string? baseRfa = SaveBaseRfa()
+                    ?? (levelDir is not null && LevelArchive.IsRfa(levelDir) ? levelDir : null);
     if (baseRfa is null) { Toast(Loc.T("Save as Patch needs an .rfa-loaded level (folder levels save in place with Ctrl+S).")); return; }
     var dir = Path.GetDirectoryName(Path.GetFullPath(baseRfa)) ?? ".";
     var defName = Path.GetFileName(RefractorForge.Formats.LevelSaver.NextPatchPath(baseRfa));
@@ -4640,8 +4645,13 @@ void DoSavePatch(bool serverSideOnly = false)
         // Clear dirty only for assets that actually matched a base entry (see DoSave); unmatched stay dirty.
         if (tiles.Count > 0 && tiles.Any(t => names.Any(n => n.EndsWith(t.Name, StringComparison.OrdinalIgnoreCase)))) atlasPainted = false;
         if (navFiles.Count > 0 && navFiles.Any(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase)))) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; }
-        Toast(string.Format(Loc.T("{0} patch: {1} file(s) -> {2} (verified OK)"), serverSideOnly ? "SSM" : "Map", names.Count, Path.GetFileName(outPath)));
+        Toast(string.Format(Loc.T("{0} patch: {1} file(s) -> {2}. In game, play '{3}' - a patch is not a separate map."),
+                            serverSideOnly ? "SSM" : "Map", names.Count, Path.GetFileName(outPath), LevelNameForCon()));
         Console.WriteLine($"Patch {outPath} ({(serverSideOnly ? "server-side only" : "full")}, verified OK):");
+        Console.WriteLine($"   Layered over: {baseRfa}");
+        Console.WriteLine($"   In game this does NOT appear as its own map - launch '{LevelNameForCon()}' and the patch");
+        Console.WriteLine($"   overrides it. Keep the <Level>_NNN.rfa name: renaming it makes the game read it as a");
+        Console.WriteLine($"   standalone level, which it is not (it holds only the edited files), and that crashes.");
         foreach (var nm in names) Console.WriteLine("   " + nm);
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
     }
@@ -10631,6 +10641,20 @@ void WritePendingLevelFiles(string dir, List<string> written)
 
 // ---- Decal objects ---------------------------------------------------------------------------------------------
 
+// The archive a save must be aimed at: the level the USER opened, never a base-game archive that was layered
+// underneath only to lend an add-on map its terrain. Getting this wrong writes the patch into the retail game's
+// level folder, where the mod's own copy of the map then overrides it in game - the edit appears to vanish.
+string? SaveBaseRfa()
+{
+    foreach (var r in rfaList)
+    {
+        if (layeredTerrainRfa is not null &&
+            Path.GetFullPath(r).Equals(Path.GetFullPath(layeredTerrainRfa), StringComparison.OrdinalIgnoreCase)) continue;
+        return r;
+    }
+    return null;
+}
+
 // The level's identity as the ARCHIVE spells it, which is not the file name: a patch archive
 // "Hue_001.rfa" still holds "BfVietnam/levels/Hue/...". Paths written into .con files must use the archive's
 // name, or they point at a level directory that does not exist.
@@ -12331,7 +12355,7 @@ string CopyBikToMovies(string bikPath)
     {
         var anchor = levelDir is not null && LevelArchive.IsRfa(levelDir) ? Path.GetDirectoryName(Path.GetFullPath(levelDir))
                    : levelDir is not null ? Path.GetFullPath(levelDir)
-                   : rfaList.Length > 0 ? Path.GetDirectoryName(Path.GetFullPath(rfaList[0])) : null;
+                   : SaveBaseRfa() is { } sb ? Path.GetDirectoryName(Path.GetFullPath(sb)) : null;
         for (var d = anchor is null ? null : new DirectoryInfo(anchor); d?.Parent is not null; d = d.Parent)
             if (d.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase))
             {

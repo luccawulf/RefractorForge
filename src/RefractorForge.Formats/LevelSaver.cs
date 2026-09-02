@@ -373,6 +373,16 @@ public static class LevelSaver
         var names = new List<string>();
         void Put(string? name, byte[]? data) { if (name is not null && data is not null) { repl[name] = data; names.Add(name); } }
 
+        // Same, but for a core level file the archive may not ship at all. Add-on maps that borrow their base
+        // map's terrain often carry no MaterialMap.raw or growth maps of their own, and matching-only meant an
+        // edit to one was silently dropped: the save reported success and the change was simply gone. Writing it
+        // under the level's own prefix is what the engine reads, exactly as a level that shipped the file.
+        void PutOrAdd(string leaf, byte[]? data, string? addAt = null)
+        {
+            if (data is null) return;
+            Put(FindEntry(arch, leaf, false) ?? (ArchivePrefix(arch) + (addAt ?? leaf)), data);
+        }
+
         if (terrainConfig is not null)
         {
             var tcName = FindEntry(arch, "Terrain.con", false);
@@ -382,12 +392,12 @@ public static class LevelSaver
                 Put(tcName, Latin1(string.Join("\n", terrainConfig.PatchConLines(lines))));
             }
         }
-        if (so is not null) Put(FindEntry(arch, "StaticObjects.con", false), SerializeStaticObjects(so));
-        if (heightmap is not null) Put(FindEntry(arch, "Heightmap.raw", false), heightmap.ToBytes());
-        if (material is not null) Put(FindEntry(arch, "MaterialMap.raw", false), material.Samples);
-        if (growth?.Under is not null) Put(FindEntry(arch, "UnderGrowthMap.raw", false), growth.Under.Samples);
-        if (growth?.Over is not null) Put(FindEntry(arch, "OverGrowthMap.raw", false), growth.Over.Samples);
-        if (shadow is not null) Put(FindEntry(arch, "LightmapShadowBits.lsb", false), shadow.Encode());
+        if (so is not null) PutOrAdd("StaticObjects.con", SerializeStaticObjects(so));
+        if (heightmap is not null) PutOrAdd("Heightmap.raw", heightmap.ToBytes());
+        if (material is not null) PutOrAdd("MaterialMap.raw", material.Samples);
+        if (growth?.Under is not null) PutOrAdd("UnderGrowthMap.raw", growth.Under.Samples);
+        if (growth?.Over is not null) PutOrAdd("OverGrowthMap.raw", growth.Over.Samples);
+        if (shadow is not null) PutOrAdd("LightmapShadowBits.lsb", shadow.Encode(), "Textures/LightmapShadowBits.lsb");
 
         if (gameplay is not null)
         {

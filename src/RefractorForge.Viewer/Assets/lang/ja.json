@@ -957,6 +957,7 @@
  "{0} objects": "オブジェクト {0} 個",
  "{0} open, {1} resolved": "未解決 {0}、解決済み {1}",
  "{0} patch: {1} file(s) -> {2} (verified OK)": "{0} パッチ：{1} ファイル → {2}（検証 OK）",
+ "{0} patch: {1} file(s) -> {2}. In game, play '{3}' - a patch is not a separate map.": "{0} パッチ: {1} ファイル -> {2}。ゲームでは '{3}' をプレイしてください。パッチは独立したマップではありません。",
  "{0} peer(s) connected": "{0} 人が接続中",
  "{0} selected": "{0} 個選択中",
  "{0} selected - editing primary (gizmo moves all)": "{0} 個選択中 - プライマリを編集（ギズモで全て移動）",

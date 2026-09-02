@@ -346,6 +346,68 @@ public class LevelToolsTests
         Assert.Equal(130f, TimeOfDayPreset.Night.FogEnd);
     }
 
+    // ---- patch saving ----
+
+    // Retail ships level patches with GAPS - vanilla Bocage has _000, _003 and _006 and no others - so the next
+    // patch must be one past the HIGHEST, not one past the count, and must never reuse a retail number.
+    [Fact]
+    public void Next_patch_number_follows_the_highest_existing_patch_even_with_gaps()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "rfpatch_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var basePath = Path.Combine(dir, "Bocage.rfa");
+            File.WriteAllBytes(basePath, new byte[] { 1 });
+            foreach (var n in new[] { "000", "003", "006" })
+                File.WriteAllBytes(Path.Combine(dir, $"Bocage_{n}.rfa"), new byte[] { 1 });
+
+            Assert.Equal("Bocage_007.rfa", Path.GetFileName(LevelSaver.NextPatchPath(basePath)));
+
+            // Asking from a patch resolves against the same base stem, not "Bocage_006_007".
+            Assert.Equal("Bocage_007.rfa", Path.GetFileName(LevelSaver.NextPatchPath(Path.Combine(dir, "Bocage_006.rfa"))));
+
+            // A level with no patches yet starts at _001, leaving _000 alone.
+            var solo = Path.Combine(dir, "Wake.rfa");
+            File.WriteAllBytes(solo, new byte[] { 1 });
+            Assert.Equal("Wake_001.rfa", Path.GetFileName(LevelSaver.NextPatchPath(solo)));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    // A level edit whose file the base archive does not ship must still be written. Add-on maps that borrow a base
+    // map's terrain often carry no MaterialMap.raw of their own; matching-only silently dropped the edit and still
+    // reported the save as successful.
+    [Fact]
+    public void Editing_a_file_the_archive_does_not_ship_adds_it_instead_of_dropping_it()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "rfadd_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        try
+        {
+            // A minimal add-on level: StaticObjects + Heightmap, but NO MaterialMap.raw.
+            var basePath = Path.Combine(dir, "AddOn.rfa");
+            RefractorFlatArchive.WriteFile(basePath, new (string, byte[])[]
+            {
+                ("bf1942/levels/AddOn/StaticObjects.con", System.Text.Encoding.Latin1.GetBytes("rem\r\n")),
+                ("bf1942/levels/AddOn/Heightmap.raw", new byte[8 * 8 * 2]),
+            }, compress: false, XPackId.Default);
+
+            var material = new MaterialMap(8, 8);
+            material.Samples[5] = 3;
+            var outPath = Path.Combine(dir, "AddOn_001.rfa");
+            var names = LevelSaver.WritePatchRfa(basePath, outPath, null, null, material, null);
+
+            Assert.Contains(names, n => n.Replace('\\', '/').Equals("bf1942/levels/AddOn/MaterialMap.raw", StringComparison.OrdinalIgnoreCase));
+            Assert.Null(RefractorFlatArchive.Validate(outPath));
+
+            var written = new RefractorFlatArchive(outPath);
+            var e = written.Entries.Single(x => x.Name.EndsWith("MaterialMap.raw", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(3, written.Read(e)[5]);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     // ---- decal object ----
 
     [Fact]
