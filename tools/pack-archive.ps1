@@ -33,7 +33,7 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage -Force
 Copy-Item (Join-Path $repo "docs\ARCHIVE_TOOL.md") (Join-Path $stage "README.md") -Force
-if (Test-Path (Join-Path $repo "LICENSE")) { Copy-Item (Join-Path $repo "LICENSE") $stage -Force }
+if (Test-Path (Join-Path $repo "LICENSE.txt")) { Copy-Item (Join-Path $repo "LICENSE.txt") $stage -Force }
 
 # Verify: the exe must start and exit cleanly when asked for nothing (a broken single-file publish dies here).
 $size = (Get-Item (Join-Path $stage "RefractorForgeArchive.exe")).Length

@@ -10,6 +10,8 @@
     <Nullable>enable</Nullable>
     <!-- A texture.rfa is ~2 GiB and single entries run to tens of MB, so never the 2 GB-capped 32-bit host. -->
     <PlatformTarget>x64</PlatformTarget>
+    <!-- The mark: three stacked archive layers, top one winning - what the program shows that nothing else does. -->
+    <ApplicationIcon>archive.ico</ApplicationIcon>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>

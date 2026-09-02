@@ -1,3 +1,5 @@
+![RefractorForge Archive](archive-banner.png)
+
 # RefractorForge Archive
 
 A browser, editor and toolbox for Refractor Flat Archives (`.rfa`) — Battlefield 1942 and Battlefield Vietnam — and for whole mods. One self-contained program; nothing to install.
