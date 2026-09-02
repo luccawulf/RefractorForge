@@ -18,6 +18,5 @@
     <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
     <ProjectReference Include="..\RefractorForge.Collab\RefractorForge.Collab.csproj" />
     <ProjectReference Include="..\RefractorForge.Mcp\RefractorForge.Mcp.csproj" />
-    <ProjectReference Include="..\RefractorForge.Archive\RefractorForge.Archive.csproj" />
   </ItemGroup>
 </Project>

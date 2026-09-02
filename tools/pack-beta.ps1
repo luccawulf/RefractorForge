@@ -66,7 +66,8 @@ $mcpExe = Join-Path $mcpPub "RefractorForge.Mcp.exe"
 if (-not (Test-Path $mcpExe)) { throw "the MCP server did not publish" }
 Copy-Item $mcpExe $stage -Force
 Copy-Item (Join-Path $repo "docs\MCP_SERVER.md") $stage -Force
-# The archive tool is its own product with its own releases: see tools\pack-archive.ps1.
+# The archive tool is its own product in its own repository: https://github.com/luccawulf/RefractorForgeArchive
+# (it carries Formats and Render as git subtrees of this one; see its tools\sync-libs.ps1).
 
 if ($IncludeFfmpeg) {
     if (-not (Test-Path (Join-Path $FfmpegFrom "ffmpeg.exe"))) { throw "no ffmpeg.exe under $FfmpegFrom" }
