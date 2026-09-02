@@ -63,6 +63,7 @@ public sealed class TreeModel
             3 => files.OrderBy(f => f.UncompressedSize > 0 ? (double)f.BlockSize / f.UncompressedSize : 0.0),
             4 => files.OrderBy(f => f.Offset),
             5 => files.OrderBy(f => f.State.ToString(), StringComparer.OrdinalIgnoreCase),
+            6 => files.OrderBy(f => f.Source ?? "", StringComparer.OrdinalIgnoreCase),
             _ => files.OrderBy(f => f.FileName, StringComparer.OrdinalIgnoreCase),
         };
         return _sortDescending ? ordered.Reverse() : ordered;

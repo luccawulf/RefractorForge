@@ -67,6 +67,17 @@ if (-not (Test-Path $mcpExe)) { throw "the MCP server did not publish" }
 Copy-Item $mcpExe $stage -Force
 Copy-Item (Join-Path $repo "docs\MCP_SERVER.md") $stage -Force
 
+# The archive tool: a separate window for browsing, editing and diffing .rfa archives and whole mods, published
+# the same way so it runs from the download with nothing installed.
+Write-Host "== publishing the archive tool =="
+$arcPub = Join-Path $repo "src\RefractorForge.Archive\bin\Publish\Beta"
+if (Test-Path $arcPub) { Remove-Item $arcPub -Recurse -Force }
+dotnet publish "src\RefractorForge.Archive" -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $arcPub --nologo | Out-Null
+$arcExe = Join-Path $arcPub "RefractorForgeArchive.exe"
+if (-not (Test-Path $arcExe)) { throw "the archive tool did not publish" }
+Copy-Item $arcExe $stage -Force
+
 if ($IncludeFfmpeg) {
     if (-not (Test-Path (Join-Path $FfmpegFrom "ffmpeg.exe"))) { throw "no ffmpeg.exe under $FfmpegFrom" }
     # Copy the CONTENTS, not the folder: publish already created ffmpeg\ (for the notice), and Copy-Item -Recurse
@@ -87,7 +98,7 @@ $expect = Get-ChildItem $devDir -Recurse -File | Where-Object {
 
 $missing = @()
 foreach ($rel in $expect) { if (-not (Test-Path (Join-Path $stage $rel))) { $missing += $rel } }
-foreach ($must in @("RefractorForge.Mcp.exe", "MCP_SERVER.md")) {
+foreach ($must in @("RefractorForge.Mcp.exe", "MCP_SERVER.md", "RefractorForgeArchive.exe")) {
     if (-not (Test-Path (Join-Path $stage $must))) { $missing += $must }
 }
 if ($missing.Count -gt 0) {

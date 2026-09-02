@@ -11,6 +11,10 @@ namespace RefractorForge.Archive;
 /// touches the archive on disk until Save, and Save streams a fresh copy through
 /// <see cref="RefractorFlatArchive.RepackToFile"/>, which writes a sibling temp file and only then replaces the
 /// original — so a crash mid-save costs you the save, not the archive.
+///
+/// The same model also fronts a whole-mod <see cref="ModWorkspace"/>: every archive the mod mounts, merged the
+/// way the game merges them, read-only. Each item then knows which archive it came from and how many lower
+/// layers it shadows.
 /// </summary>
 public sealed class ArchiveModel : IDisposable
 {
@@ -26,6 +30,13 @@ public sealed class ArchiveModel : IDisposable
         public EntryState State { get; set; } = EntryState.Unchanged;
         public byte[]? Pending { get; set; }                    // replacement/new bytes, held until Save
 
+        // Workspace view only: where this winning copy lives and what it overrides.
+        public string? Source { get; init; }                    // archive file name
+        public string? SourceMod { get; init; }
+        public int LayerIndex { get; init; } = -1;
+        public int Overrides { get; init; }                     // lower layers that also ship this file
+        public Func<byte[]>? Reader { get; init; }
+
         public bool IsCompressed => BlockSize != UncompressedSize;
         public string Folder
         {
@@ -38,15 +49,24 @@ public sealed class ArchiveModel : IDisposable
     }
 
     private RefractorFlatArchive? _archive;
+    private ModWorkspace? _workspace;
     private readonly List<Item> _items = new();
 
     public string? Path { get; private set; }
-    public bool IsOpen => _archive is not null;
+    /// <summary>For a workspace: the mod folder it was built from.</summary>
+    public string? WorkspaceLabel { get; private set; }
+    public bool IsOpen => _archive is not null || _workspace is not null;
+    public bool IsWorkspace => _workspace is not null;
+    public ModWorkspace? Workspace => _workspace;
     public bool IsV11Format => _archive?.IsV11Format ?? false;
     public bool IsCompressed => _archive?.IsCompressed ?? true;
     public XPackId XPackId => _archive?.XPackId ?? XPackId.Default;
+    public RefractorFlatArchive? Archive => _archive;
 
     public IReadOnlyList<Item> Items => _items;
+
+    /// <summary>Workspace layers the user has switched off; their files are hidden from the list.</summary>
+    public HashSet<int> HiddenLayers { get; } = new();
 
     /// <summary>True when there is something worth saving.</summary>
     public bool IsDirty => _items.Any(i => i.State != EntryState.Unchanged);
@@ -67,10 +87,39 @@ public sealed class ArchiveModel : IDisposable
             });
     }
 
+    /// <summary>Show a whole mod as the one file system the game sees. Read-only.</summary>
+    public void OpenWorkspace(ModWorkspace ws, string label)
+    {
+        Close();
+        _workspace = ws;
+        WorkspaceLabel = label;
+        foreach (var f in ws.Files)
+        {
+            var layer = ws.Layers[f.LayerIndex];
+            var file = f;
+            _items.Add(new Item
+            {
+                Name = f.Name,
+                UncompressedSize = f.Entry.UncompressedSize,
+                BlockSize = f.Entry.BlockSize,
+                Offset = f.Entry.Offset,
+                Source = layer.Label,
+                SourceMod = layer.Mod,
+                LayerIndex = f.LayerIndex,
+                Overrides = f.Overridden.Count,
+                Reader = () => ws.Read(file),
+            });
+        }
+    }
+
     public void Close()
     {
         _archive = null;
+        _workspace?.Dispose();
+        _workspace = null;
         Path = null;
+        WorkspaceLabel = null;
+        HiddenLayers.Clear();
         _items.Clear();
     }
 
@@ -78,6 +127,7 @@ public sealed class ArchiveModel : IDisposable
     public byte[] Read(Item item)
     {
         if (item.Pending is not null) return item.Pending;
+        if (item.Reader is not null) return item.Reader();
         if (_archive is null) throw new InvalidOperationException("No archive is open.");
         var entry = _archive.Entries.FirstOrDefault(e => e.Name.Replace('\\', '/') == item.Name)
                     ?? throw new InvalidOperationException($"'{item.Name}' is not in the archive.");
@@ -89,6 +139,7 @@ public sealed class ArchiveModel : IDisposable
 
     public void Replace(Item item, byte[] data)
     {
+        RequireEditable();
         item.Pending = data;
         item.UncompressedSize = data.Length;
         if (item.State != EntryState.Added) item.State = EntryState.Replaced;
@@ -99,6 +150,7 @@ public sealed class ArchiveModel : IDisposable
     /// shipping into a map.</summary>
     public Item Add(string name, byte[] data)
     {
+        RequireEditable();
         name = name.Replace('\\', '/').TrimStart('/');
         if (Find(name) is { } existing)
         {
@@ -120,6 +172,7 @@ public sealed class ArchiveModel : IDisposable
 
     public void Delete(Item item)
     {
+        RequireEditable();
         if (item.State == EntryState.Added) _items.Remove(item);   // never existed on disk; just forget it
         else item.State = EntryState.Deleted;
     }
@@ -134,6 +187,12 @@ public sealed class ArchiveModel : IDisposable
             var e = _archive.Entries.FirstOrDefault(x => x.Name.Replace('\\', '/') == item.Name);
             if (e is not null) { item.UncompressedSize = e.UncompressedSize; item.BlockSize = e.BlockSize; }
         }
+    }
+
+    private void RequireEditable()
+    {
+        if (_workspace is not null)
+            throw new InvalidOperationException("A mod view is read-only. Open the file's own archive to edit it.");
     }
 
     /// <summary>
