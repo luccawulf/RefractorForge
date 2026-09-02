@@ -348,6 +348,74 @@ public class LevelToolsTests
 
     // ---- patch saving ----
 
+    // "Object.create <name>" names a TEMPLATE, not one placed thing - Bocage declares eight AAGunSpawner
+    // instances in one file. Keying the rewrite by name kept only the last and stamped its position onto all of
+    // them, so every repeated vehicle collapsed into a single stack and the map spawned duplicates on top of each
+    // other, from nothing but pressing save. Instances are matched by ordinal now.
+    [Fact]
+    public void Repeated_spawner_templates_keep_their_own_positions()
+    {
+        var file = new[]
+        {
+            "Object.create AAGunSpawner",
+            "Object.absolutePosition 100/10/100",
+            "Object.setTeam 1",
+            "Object.create AAGunSpawner",
+            "Object.absolutePosition 200/10/200",
+            "Object.setTeam 2",
+            "Object.create AAGunSpawner",
+            "Object.absolutePosition 300/10/300",
+            "Object.setTeam 1",
+        };
+
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(111, 10, 111), Vec3.Zero, "aa", 1, Team: 1));
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(222, 10, 222), Vec3.Zero, "aa", 1, Team: 2));
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(333, 10, 333), Vec3.Zero, "aa", 1, Team: 1));
+
+        var outp = GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable());
+        var positions = outp.Split('\n')
+                            .Where(l => l.TrimStart().StartsWith("Object.absolutePosition", StringComparison.OrdinalIgnoreCase))
+                            .Select(l => l.Trim()).ToList();
+
+        Assert.Equal(3, positions.Count);
+        Assert.Equal(3, positions.Distinct().Count());            // the whole bug: they must not collapse
+        Assert.Contains(positions, l => l.Contains("111"));
+        Assert.Contains(positions, l => l.Contains("222"));
+        Assert.Contains(positions, l => l.Contains("333"));
+        Assert.Equal(3, outp.Split('\n').Count(l => l.TrimStart().StartsWith("Object.create", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    // A game mode with a genuinely different layout must be left exactly as shipped rather than guessed at -
+    // stamping one mode's coordinates onto another's is how the stacking happened in the first place.
+    [Fact]
+    public void A_mode_with_a_different_instance_count_is_left_untouched()
+    {
+        var file = new[]
+        {
+            "Object.create AAGunSpawner", "Object.absolutePosition 100/10/100",
+            "Object.create AAGunSpawner", "Object.absolutePosition 200/10/200",
+        };
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(999, 10, 999), Vec3.Zero, "aa", 1, Team: 1));
+
+        var outp = GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable());
+        Assert.Contains("100/10/100", outp);
+        Assert.Contains("200/10/200", outp);
+        Assert.DoesNotContain("999", outp);
+    }
+
+    // A template the edit knows nothing about is never rewritten.
+    [Fact]
+    public void Unknown_templates_pass_through_unchanged()
+    {
+        var file = new[] { "Object.create SomethingElse", "Object.absolutePosition 7/7/7" };
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.Vehicle, new VehicleSpawnDef("AAGunSpawner", new Vec3(1, 2, 3), Vec3.Zero, "aa", 1, Team: 1));
+        Assert.Contains("7/7/7", GameplayWriter.PatchInstanceTransforms(file, gp.ToImmutable()));
+    }
+
+
     // Retail ships level patches with GAPS - vanilla Bocage has _000, _003 and _006 and no others - so the next
     // patch must be one past the HIGHEST, not one past the count, and must never reuse a retail number.
     [Fact]

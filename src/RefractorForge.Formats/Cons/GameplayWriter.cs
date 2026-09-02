@@ -141,24 +141,42 @@ public static class GameplayWriter
     /// </summary>
     public static string PatchInstanceTransforms(IEnumerable<string> lines, GameplayObjects gp)
     {
-        // name -> (position, rotation?, team?, osId?). Later definitions win, matching the writers above.
-        var pos = new Dictionary<string, Vec3>(System.StringComparer.OrdinalIgnoreCase);
-        var rot = new Dictionary<string, Vec3>(System.StringComparer.OrdinalIgnoreCase);
-        var team = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
-        var osId = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
-
-        foreach (var c in gp.ControlPoints) pos[c.Name] = c.Position;
-        foreach (var s in gp.SoldierSpawns) { pos[s.Name] = s.Position; rot[s.Name] = s.Rotation; }
-        foreach (var v in gp.VehicleSpawns)
+        // `Object.create <name>` names a TEMPLATE, not one placed thing: Bocage declares eight AAGunSpawner
+        // instances in a single file. Keying the new transforms by name therefore kept only the LAST instance of
+        // each template and stamped its position onto every other one, collapsing all eight AA guns (and every
+        // repeated tank, plane and machine gun) into a single stack - visible in game as every vehicle spawning
+        // with duplicates on top of it, from nothing more than pressing save.
+        //
+        // Instances are matched by ORDINAL within their template instead, and only when this file declares
+        // exactly as many of that template as the edit holds. Equal counts mean the two files describe the same
+        // layout, so the k-th is the k-th; unequal counts mean a genuinely different per-mode layout, and those
+        // are left exactly as shipped rather than guessed at. Each edited instance is therefore used at most
+        // once, so this can never stack two things on one spot again.
+        var byName = new Dictionary<string, List<(Vec3 Pos, Vec3? Rot, int? Team, int? OsId)>>(System.StringComparer.OrdinalIgnoreCase);
+        void Add(string name, Vec3 p, Vec3? r, int? t, int? o)
         {
-            pos[v.Name] = v.Position; rot[v.Name] = v.Rotation;
-            team[v.Name] = v.Team;
-            if (v.OsId != 0) osId[v.Name] = v.OsId;
+            if (!byName.TryGetValue(name, out var l)) byName[name] = l = new();
+            l.Add((p, r, t, o));
+        }
+        foreach (var c in gp.ControlPoints) Add(c.Name, c.Position, null, null, null);
+        foreach (var s in gp.SoldierSpawns) Add(s.Name, s.Position, s.Rotation, null, null);
+        foreach (var v in gp.VehicleSpawns) Add(v.Name, v.Position, v.Rotation, v.Team, v.OsId != 0 ? v.OsId : null);
+
+        var all = lines.ToList();
+
+        // How many instances of each template this particular file declares.
+        var fileCount = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in all)
+        {
+            var sp0 = raw.TrimStart().Split(new[] { ' ', '\t', '\r', '\n' }, System.StringSplitOptions.RemoveEmptyEntries);
+            if (sp0.Length >= 2 && sp0[0].Equals("Object.create", System.StringComparison.OrdinalIgnoreCase))
+                fileCount[sp0[1]] = fileCount.TryGetValue(sp0[1], out var c) ? c + 1 : 1;
         }
 
+        var seen = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
         var sb = new StringBuilder();
-        string? cur = null;
-        foreach (var raw in lines)
+        (Vec3 Pos, Vec3? Rot, int? Team, int? OsId)? cur = null;
+        foreach (var raw in all)
         {
             var line = raw.Replace("\r", "").Replace("\n", "");
             var trimmed = line.TrimStart();
@@ -167,18 +185,25 @@ public static class GameplayWriter
 
             if (key == "object.create")
             {
-                // only track names this edit actually knows; anything else stays untouched
+                cur = null;
                 var name = sp.Length >= 2 ? sp[1] : null;
-                cur = name is not null && pos.ContainsKey(name) ? name : null;
+                if (name is not null && byName.TryGetValue(name, out var list))
+                {
+                    int k = seen.TryGetValue(name, out var c) ? c : 0;
+                    seen[name] = k + 1;
+                    // Only when the layouts line up, and only within range.
+                    if (fileCount.TryGetValue(name, out var fc) && fc == list.Count && k < list.Count) cur = list[k];
+                }
             }
             else if (cur is not null)
             {
+                var v = cur.Value;
                 string? repl = key switch
                 {
-                    "object.absoluteposition" => "Object.absolutePosition " + Pos(pos[cur]),
-                    "object.rotation" when rot.ContainsKey(cur) => "Object.rotation " + Pos(rot[cur]),
-                    "object.setteam" when team.ContainsKey(cur) => "Object.setTeam " + team[cur].ToString(CultureInfo.InvariantCulture),
-                    "object.setosid" when osId.ContainsKey(cur) => "Object.setOSId " + osId[cur].ToString(CultureInfo.InvariantCulture),
+                    "object.absoluteposition" => "Object.absolutePosition " + Pos(v.Pos),
+                    "object.rotation" when v.Rot is not null => "Object.rotation " + Pos(v.Rot.Value),
+                    "object.setteam" when v.Team is not null => "Object.setTeam " + v.Team.Value.ToString(CultureInfo.InvariantCulture),
+                    "object.setosid" when v.OsId is not null => "Object.setOSId " + v.OsId.Value.ToString(CultureInfo.InvariantCulture),
                     _ => null,
                 };
                 if (repl is not null)
