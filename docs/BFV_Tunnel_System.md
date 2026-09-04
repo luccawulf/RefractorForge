@@ -151,7 +151,41 @@ waterBelowTerrain.color .15/.15/.1
 ```
 
 `waterBelowTerrain` is a console object registered beside `water` on the PatchTerrain template; it takes the
-same properties as `water` and nothing else. Two things that crash or misbehave:
+same properties as `water` and nothing else.
+
+### The shader the second body needs — miss it and the level crashes on load
+
+**`drawWaterBelowTerrain 1` also requires a `WaterSettingBelowTerrain` subshader.** Each water body takes its
+material from a subshader of `standardMesh/levelWater.rs`: the surface from `WaterSetting`, the second body from
+`WaterSettingBelowTerrain`. **The base archive's file has only `WaterSetting`** (296 bytes, one block), so a level
+that turns the flag on without shipping its own copy dies as the terrain object is created:
+
+```
+RendShader: Couldn't load shader "StandardMesh/levelWater/WaterSettingBelowTerrain", loading default shader instead
+GeomPatchTerrain: Assert: (sms) Can't load or use: StandardMesh/levelWater/WaterSettingBelowTerrain.rs
+Current con-file: BfVietnam/levels/<map>/Init/Terrain.con(25)  Object.create terrainObject
+```
+
+Saigon68 ships `StandardMesh/levelWater.rs` (589 bytes) with both blocks — its second body is still, barely
+reflective and nearly opaque, which is what a flooded sewer wants:
+
+```
+subshader "WaterSettingBelowTerrain" "StandardMesh/Default"
+{
+	sequence "texture/Waterseq/test";
+	cubemap "texture/env_default.rcm";
+	sequenceCycleTime 2;
+	sequenceFrameCnt 30;
+	opacity 0.85;
+	materialDiffuse 1 1 1;
+	reflectivity 0.1;
+	uvSpeed 0 0 .05;
+	waterScale 30;
+	waterFade 0;
+}
+```
+
+Two smaller traps:
 
 - `waterBelowTerrain.*` lines are only meaningful once `GeometryTemplate.drawWaterBelowTerrain 1` exists on the
   terrain template, and Init.con runs `run Init/Terrain` *before* the water blocks — keep that order.
@@ -161,8 +195,9 @@ Cedar Falls, which does not set any of this, simply keeps its entire tunnel abov
 3.7 m, water 4.0 m). Saigon68 uses it to flood the sewers 1.8 m deep (floor −11.7, water −7.1). For a dry
 tunnel under a high river, set `waterBelowLevel` below the tunnel floor.
 
-RefractorForge writes the whole set from Window ▸ Tunnels ▸ *Tunnel water*: the two Terrain.con lines and a
-`waterBelowTerrain.*` block mirroring the level's own `water.*` colours.
+RefractorForge writes the whole set from Tools ▸ Tunnels ▸ *Tunnel water*: the two Terrain.con lines, a
+`waterBelowTerrain.*` block mirroring the level's own `water.*` colours, and the `levelWater.rs` override with both
+subshaders — every save re-checks that the shader is there whenever the flag is on.
 
 ## 4. Checklist for a custom map
 
@@ -172,7 +207,9 @@ RefractorForge writes the whole set from Window ▸ Tunnels ▸ *Tunnel water*: 
    children sit inside the tunnel's shafts.
 3. A 0-height vertex under each entrance point (Tunnels ▸ *Punch holes under entrances*, or the Hole brush).
 4. Water: either the whole tunnel above the river (Cedar Falls), or `drawWaterBelowTerrain 1` +
-   `waterBelowLevel` below the floor + the `waterBelowTerrain.*` block (Saigon68).
+   `waterBelowLevel` below the floor + the `waterBelowTerrain.*` colour block + **`StandardMesh/levelWater.rs`
+   carrying a `WaterSettingBelowTerrain` subshader** (Saigon68). The shader is not optional: without it the level
+   crashes on load.
 5. `mapManager.addObjectMap <tunnel template> <MapName> x/z/w/h` + `Textures/<MapName>.dds`.
 6. `allowSpawningBelowGround 1` on every spawn point inside.
 

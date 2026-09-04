@@ -37,6 +37,7 @@ internal static class NewMapDialog
                 result = new NewMapSpec(name.Text.Trim(), (string)game.SelectedItem!, ms, ws);
             }
         }) { Name = "newmap" };
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

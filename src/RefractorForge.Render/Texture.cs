@@ -191,6 +191,22 @@ public static class TgaTexture
     /// <summary>Encode an intensity texture (uses the .r channel) as the 8-bit colour-mapped TGA the engine reads for
     /// object lightmaps — exactly the format the originals use: 18-byte header, a 256-entry 24-bit BGR grayscale ramp
     /// colour map, then one index per pixel (= the gray value), bottom-left origin (rows written bottom-up).</summary>
+    /// <summary>The RIFF PAL every lightmapped retail level ships beside its maps (<c>Objectlightmaps/Palette.pal</c>,
+    /// 1,048 bytes, a grey ramp): the engine loads it before the maps (exe: <c>loadLightmapPalette</c>), so a level
+    /// that never had lightmaps gets one written with its first bake.</summary>
+    public static byte[] GreyPalettePal()
+    {
+        var b = new byte[1048];
+        void U32(int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(o), v);
+        b[0] = (byte)'R'; b[1] = (byte)'I'; b[2] = (byte)'F'; b[3] = (byte)'F'; U32(4, 1040);
+        b[8] = (byte)'P'; b[9] = (byte)'A'; b[10] = (byte)'L'; b[11] = (byte)' ';
+        b[12] = (byte)'d'; b[13] = (byte)'a'; b[14] = (byte)'t'; b[15] = (byte)'a'; U32(16, 1028);
+        b[20] = 0; b[21] = 3;                         // palVersion 0x0300
+        b[22] = 0; b[23] = 1;                         // 256 entries
+        for (int i = 0; i < 256; i++) { b[24 + i * 4] = (byte)i; b[25 + i * 4] = (byte)i; b[26 + i * 4] = (byte)i; b[27 + i * 4] = 0; }
+        return b;
+    }
+
     public static byte[] EncodeGrayColormapped(Texture2D t)
     {
         int w = t.Width, h = t.Height;
@@ -223,6 +239,17 @@ public static class TgaTexture
 public static class DdsTexture
 {
     public static Texture2D Load(string path) => Decode(File.ReadAllBytes(path));
+
+    /// <summary>What a DDS file is, without decoding it: its width and whether it is block-compressed (DXT/BC).
+    /// (0, false) for anything that is not a DDS.</summary>
+    public static (int Width, bool Dxt) HeaderInfo(byte[] d)
+    {
+        if (d.Length < 128 || d[0] != (byte)'D' || d[1] != (byte)'D' || d[2] != (byte)'S' || d[3] != (byte)' ') return (0, false);
+        int width = BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(16));
+        uint pfFlags = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(80));
+        bool dxt = (pfFlags & 0x4) != 0 && d[84] == (byte)'D' && d[85] == (byte)'X' && d[86] == (byte)'T';
+        return (width, dxt);
+    }
 
     public static Texture2D Decode(byte[] d)
     {
@@ -432,6 +459,31 @@ public static class DdsTexture
     /// the image — so a photo or screenshot handed straight through would leave the object untextured.
     /// Stretches rather than pads, so the quad's UVs still cover the whole picture.
     /// </summary>
+    /// <summary>
+    /// Put a picture in the top-left of a power-of-two canvas and leave the rest black, reporting how much of the
+    /// canvas it fills. This is what the engine does with a Bink frame - a 1920x800 movie is decoded into a 2048x1024
+    /// texture - so a quad that maps 0..1 over the result shows the padding as black bands. Feed the fractions back
+    /// into the mesh's UVs and the picture fills the quad exactly.
+    /// </summary>
+    public static Texture2D PadToPowerOfTwo(Texture2D t, out float uMax, out float vMax)
+    {
+        static int Up(int v) { int p = 1; while (p < v && p < 1 << 20) p *= 2; return Math.Max(p, 1); }
+        int w = Up(t.Width), h = Up(t.Height);
+        uMax = t.Width / (float)w;
+        vMax = t.Height / (float)h;
+        if (w == t.Width && h == t.Height) return t;
+
+        var dst = new byte[w * h * 4];
+        for (int y = 0; y < t.Height; y++)
+        {
+            Buffer.BlockCopy(t.Rgba, y * t.Width * 4, dst, y * w * 4, t.Width * 4);
+            for (int x = t.Width; x < w; x++) dst[(y * w + x) * 4 + 3] = 255;   // opaque black in the padding
+        }
+        for (int y = t.Height; y < h; y++)
+            for (int x = 0; x < w; x++) dst[(y * w + x) * 4 + 3] = 255;
+        return new Texture2D(w, h, dst);
+    }
+
     public static Texture2D ToPowerOfTwo(Texture2D t, int min = 4, int max = 1024)
     {
         static int Snap(int v, int min, int max)
@@ -479,6 +531,7 @@ public sealed class TerrainTexture
 {
     private readonly Texture2D?[,] _tiles;
     private readonly string?[,]? _tileNames;   // original on-disk leaf name per tile (e.g. "tx00x00.dds"), for byte-exact save-back
+    private readonly (int W, bool Dxt)[,]? _tileNative;   // the shipped file's size and whether it was DXT, so save-back matches it
     private readonly int _gridW, _gridH;
     private readonly float _worldSize;
     private int _maxTile;
@@ -502,6 +555,25 @@ public sealed class TerrainTexture
     /// <summary>Representative tile resolution (largest tile width) — for reporting.</summary>
     public int AtlasSize => _maxTile;
 
+    /// <summary>True when this level's terrain tiles are in a form the game cannot draw: not block-compressed, or
+    /// larger than the 512 px retail tiles ever go. Only one thing ever wrote those - an older RefractorForge, which
+    /// saved 1024x1024 uncompressed mip-less tiles and left the ground BLACK in game. The editor re-encodes them on
+    /// the next save.</summary>
+    public bool HasLegacyTiles
+    {
+        get
+        {
+            if (_tileNative is null) return false;
+            for (int r = 0; r < _gridH; r++)
+                for (int c = 0; c < _gridW; c++)
+                {
+                    var n = _tileNative[c, r];
+                    if (n.W > 0 && (!n.Dxt || n.W > 512)) return true;
+                }
+            return false;
+        }
+    }
+
     /// <summary>The atlas resolution that preserves the source tiles' full detail: the largest tile size times
     /// the grid side. A high-res terrain texture (e.g. 2048px tiles in a 2×2 grid) wants a 4096 atlas, not 2048.</summary>
     public int NativeSize => _maxTile * Math.Max(_gridW, _gridH);
@@ -515,9 +587,9 @@ public sealed class TerrainTexture
     private float _tileOriginX, _tileOriginY;      // cleared by ValidateCentringAgainst if the map disagrees
     private int _gridFullW, _gridFullH;
 
-    private TerrainTexture(Texture2D?[,] tiles, int gw, int gh, float worldSize, int maxTile, string?[,]? tileNames = null)
+    private TerrainTexture(Texture2D?[,] tiles, int gw, int gh, float worldSize, int maxTile, string?[,]? tileNames = null, (int W, bool Dxt)[,]? native = null)
     {
-        _tiles = tiles; _gridW = gw; _gridH = gh; _worldSize = worldSize; _maxTile = maxTile; _tileNames = tileNames;
+        _tiles = tiles; _gridW = gw; _gridH = gh; _worldSize = worldSize; _maxTile = maxTile; _tileNames = tileNames; _tileNative = native;
         // A tile is always 256 m, so a map's FULL grid follows from its world size. Naval maps texture only the
         // middle of the world and ship fewer tiles than that (Wake: 4x4 for a map that spans 8x8), leaving open
         // ocean around the edge. Anchoring those tiles at the origin corner - which is what indexing them directly
@@ -603,15 +675,22 @@ public sealed class TerrainTexture
         int gw = maxCol + 1, gh = maxRow + 1;
         var tiles = new Texture2D?[gw, gh];
         var names = new string?[gw, gh];
+        var native = new (int W, bool Dxt)[gw, gh];
         foreach (var kv in paths) names[kv.Key.col, kv.Key.row] = Path.GetFileName(kv.Value);   // preserve the on-disk name
         // Decode tiles in parallel (each writes its own cell; a high-res terrain texture has many large tiles).
         System.Threading.Tasks.Parallel.ForEach(paths, kv =>
         {
-            try { tiles[kv.Key.col, kv.Key.row] = DdsTexture.Load(kv.Value); } catch { }
+            try
+            {
+                var bytes = File.ReadAllBytes(kv.Value);
+                native[kv.Key.col, kv.Key.row] = DdsTexture.HeaderInfo(bytes);
+                tiles[kv.Key.col, kv.Key.row] = DdsTexture.Decode(bytes);
+            }
+            catch { }
         });
         int maxTile = 0;
         foreach (var t in tiles) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
-        var tt = new TerrainTexture(tiles, gw, gh, worldSize, maxTile, names);
+        var tt = new TerrainTexture(tiles, gw, gh, worldSize, maxTile, names, native);
         var detailPath = Path.Combine(texturesDir, "detail.dds");
         if (File.Exists(detailPath)) { try { tt.Detail = DdsTexture.Load(detailPath); } catch { } }
         return tt;
@@ -684,14 +763,20 @@ public sealed class TerrainTexture
         int gw = maxCol + 1, gh = maxRow + 1;
         var grid = new Texture2D?[gw, gh];
         var names = new string?[gw, gh];
+        var native = new (int W, bool Dxt)[gw, gh];
         foreach (var kv in pnames) names[kv.Key.col, kv.Key.row] = kv.Value;   // preserve the in-archive name (e.g. tx00x00.dds)
         System.Threading.Tasks.Parallel.ForEach(parsed, kv =>
         {
-            try { grid[kv.Key.col, kv.Key.row] = DdsTexture.Decode(kv.Value); } catch { }
+            try
+            {
+                native[kv.Key.col, kv.Key.row] = DdsTexture.HeaderInfo(kv.Value);
+                grid[kv.Key.col, kv.Key.row] = DdsTexture.Decode(kv.Value);
+            }
+            catch { }
         });
         int maxTile = 0;
         foreach (var t in grid) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
-        var tt = new TerrainTexture(grid, gw, gh, worldSize, maxTile, names);
+        var tt = new TerrainTexture(grid, gw, gh, worldSize, maxTile, names, native);
         if (detailDds is not null) { try { tt.Detail = DdsTexture.Decode(detailDds); } catch { } }
         return tt;
     }
@@ -765,7 +850,15 @@ public sealed class TerrainTexture
             {
                 var orig = _tiles[col, row];
                 if (orig is null) continue;                       // only re-emit tiles that existed
+                // At the SHIPPED size, not the loaded one. A DXT tile goes back at its own size (256 in every retail
+                // level, 512 in some mods). An uncompressed tile - only this editor ever wrote those: 1024, no mips,
+                // which the game drew as black ground - goes back to the retail 256.
                 int tw = orig.Width, th = orig.Height;
+                if (_tileNative is not null && _tileNative[col, row].W > 0)
+                {
+                    var nt = _tileNative[col, row];
+                    tw = th = nt.Dxt ? nt.W : Math.Min(nt.W, 256);
+                }
                 var rgba = new byte[tw * th * 4];
                 for (int ty = 0; ty < th; ty++)
                 {

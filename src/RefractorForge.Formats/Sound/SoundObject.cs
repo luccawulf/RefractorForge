@@ -1,0 +1,121 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+
+namespace RefractorForge.Formats.Sound;
+
+/// <summary>
+/// Builds a level-local ambient sound: the wav, the <c>.ssc</c> script that plays it and the <c>.con</c> that makes
+/// it a placeable object. Modelled line for line on a working retail point sound - al_vietnas's <c>rivermid</c>:
+///
+/// <code>
+/// Sounds/rivermid.con   ObjectTemplate.create SimpleObject rivermid
+///                       ObjectTemplate.loadSoundScript rivermid.ssc
+///                       (its ObjectTemplate.triggerRadius line the engine rejects - see below)
+/// Sounds/rivermid.ssc   load @ROOT/Sound/@RTD/alnas_river.wav ; loop ; minDistance 50 ; volume .4
+///                       + a Distance->Volume Ramp effect (param 70 / 150 / 1 / -1)
+/// Sound/22khz/*.wav     the audio itself
+/// </code>
+///
+/// <c>@RTD</c> is the sample-rate folder the engine picks from the player's sound-quality setting, so the wav is
+/// written under both <c>22khz</c> and <c>44kHz</c>; <c>minDistance</c> is the radius that stays at full volume and
+/// the Ramp carries it down to silence at <c>maxDistance</c> - the "loud up close, quiet far away" pair.
+/// The placed instance is an ordinary <c>Object.create &lt;name&gt;</c> line in StaticObjects.con.
+///
+/// WHERE THE SCRIPT GOES MATTERS: the engine resolves <c>loadSoundScript</c> relative to the folder of the .con that
+/// declared the template, not from some sound path. A template declared in <c>Sounds/&lt;n&gt;.con</c> finds
+/// <c>Sounds/&lt;n&gt;.ssc</c> (what <see cref="Build"/> writes); a sound put on an object declared in
+/// <c>Objects/&lt;n&gt;/Objects.con</c> needs the script at <c>Objects/&lt;n&gt;/&lt;n&gt;.ssc</c> - see
+/// <see cref="ScriptPathFor"/>.
+/// </summary>
+public static class SoundObject
+{
+    /// <param name="Template">The object name to place (also the .con/.ssc stem).</param>
+    /// <param name="Files">Level-relative paths and bytes, ready for the level folder or the .rfa.</param>
+    /// <param name="RunLine">The line that must appear in <c>Sounds/Environment.con</c> for the engine to read it.</param>
+    public sealed record Built(string Template, IReadOnlyList<(string RelPath, byte[] Bytes)> Files, string RunLine);
+
+    /// <summary>Everything a placed ambient sound needs. <paramref name="minDistance"/> is the full-volume radius,
+    /// <paramref name="maxDistance"/> where it fades to nothing.</summary>
+    /// <param name="stereo">Declare the sample as stereo. The format supports it and 276 of the game's own scripts
+    /// use it alongside distance settings, but a stereo sample is the wrong choice for something you should be able to
+    /// walk around - mono is what places a sound in the world.</param>
+    public static Built Build(string name, byte[] wavBytes, float volume = 0.6f, float minDistance = 20f,
+                              float maxDistance = 120f, bool loop = true, float? triggerRadius = null,
+                              bool stereo = false)
+    {
+        if (wavBytes is null || wavBytes.Length == 0) throw new ArgumentException("no wav data", nameof(wavBytes));
+        string tpl = Sanitize(name);
+        float minD = MathF.Max(1f, minDistance);
+        float maxD = MathF.Max(minD + 1f, maxDistance);
+        float trig = triggerRadius is { } tr && tr > 0f ? tr : maxD;
+
+        var ssc = new StringBuilder();
+        ssc.Append("#templateLevel HIGH\r\n\r\nnewPatch\r\n\r\n");
+        ssc.Append($"rem *** {tpl} (RefractorForge) ***\r\n");
+        ssc.Append($"load @ROOT/Sound/@RTD/{tpl}.wav\r\n");
+        if (loop) ssc.Append("loop\r\n");
+        if (stereo) ssc.Append("stereo\r\n");
+        ssc.Append($"minDistance {F(minD)}\r\n");
+        ssc.Append($"volume {F(volume)}\r\n");
+        ssc.Append("priority -10\r\n");
+        // The distance falloff, exactly the shape the retail scripts use: full at minDistance, gone at maxDistance.
+        ssc.Append("*** Distance Volume ***\r\nbeginEffect\r\n\tcontrolDestination Volume\r\n\tcontrolSource Distance\r\n");
+        ssc.Append($"\tenvelope Ramp\r\n\tparam {F(minD)}\r\n\tparam {F(maxD)}\r\n\tparam 1\r\n\tparam -1\r\nendEffect\r\n");
+
+        var con = new StringBuilder();
+        con.Append($"rem *** {tpl} ***\r\n");
+        con.Append($"ObjectTemplate.create SimpleObject {tpl}\r\n");
+        con.Append("ObjectTemplate.saveInSeparateFile 1\r\n");
+        con.Append($"ObjectTemplate.loadSoundScript {tpl}.ssc\r\n");
+        // No triggerRadius: it is an AreaObject property, and on a SimpleObject the engine rejects it as an unknown
+        // function (retail maps that carry the line get the same warning). The audible range is the script's
+        // minDistance plus its Distance->Volume ramp.
+
+        var files = new List<(string, byte[])>
+        {
+            // Both quality folders: the engine substitutes @RTD from the player's sound setting, and a level that
+            // ships only one is silent for everyone on the other.
+            ($"Sound/22khz/{tpl}.wav", wavBytes),
+            ($"Sound/44kHz/{tpl}.wav", wavBytes),
+            ($"Sounds/{tpl}.ssc", Encoding.Latin1.GetBytes(ssc.ToString())),
+            ($"Sounds/{tpl}.con", Encoding.Latin1.GetBytes(con.ToString())),
+        };
+        return new Built(tpl, files, $"run {tpl}.con");
+    }
+
+    /// <summary>Add the emitter's <c>run</c> line to the level's <c>Sounds/Environment.con</c> (creating the file's
+    /// content when the level has none). Idempotent - a level re-saved twice keeps one line.</summary>
+    public static string PatchEnvironmentCon(string? existing, string runLine)
+    {
+        string text = existing ?? DefaultEnvironmentCon;
+        foreach (var ln in text.Split('\n'))
+            if (ln.Trim().Equals(runLine, StringComparison.OrdinalIgnoreCase)) return text;
+        string nl = text.Contains("\r\n") ? "\r\n" : "\n";
+        return text.TrimEnd('\r', '\n') + nl + runLine + nl;
+    }
+
+    /// <summary>What a level with no sound layer at all needs before its first emitter (the retail preamble).</summary>
+    public const string DefaultEnvironmentCon =
+        "Sound.3d.occludeByDistanceFactor 0.9\r\nSound.3d.occludeByDistanceMax 1000\r\nSound.3d.occludeByDistanceMin 80\r\n" +
+        "Sound.3d.occludeByObjectDistance 30\r\nSound.3d.occludeByObjectFactor 0.8\r\nsound.distanceDelay.enableAsDefault 1\r\n\r\n";
+
+    /// <summary>Where a sound script has to sit for an object whose template is declared in its own
+    /// <c>Objects/&lt;folder&gt;/</c> - beside that .con, because that is where the engine looks.</summary>
+    public static string ScriptPathFor(string objectFolder, string template) => $"Objects/{objectFolder}/{template}.ssc";
+
+    /// <summary>A template name the engine (and a .con parser) can take: letters, digits and underscore.</summary>
+    public static string Sanitize(string name)
+    {
+        var sb = new StringBuilder();
+        foreach (char c in (name ?? "").Trim())
+            sb.Append(char.IsLetterOrDigit(c) ? c : '_');
+        var s = sb.ToString().Trim('_');
+        if (s.Length == 0) s = "sound";
+        if (char.IsDigit(s[0])) s = "s" + s;                 // a template may not start with a digit
+        return s.Length > 40 ? s[..40] : s;
+    }
+
+    private static string F(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
+}

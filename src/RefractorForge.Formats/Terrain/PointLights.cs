@@ -106,6 +106,16 @@ public sealed class LightRig
         return new LightRig();
     }
 
+    /// <summary>The rig as JSON text - what <see cref="Save"/> writes, and what a collaborator receives. Full-state,
+    /// like the gameplay layer: two peers can never hold two different lists.</summary>
+    public string ToJson() => JsonSerializer.Serialize(this);
+
+    public static LightRig FromJson(string json)
+    {
+        try { return JsonSerializer.Deserialize<LightRig>(json) ?? new LightRig(); }
+        catch { return new LightRig(); }
+    }
+
     public void Save(string levelDir)
     {
         var p = PathFor(levelDir);

@@ -68,6 +68,38 @@ public sealed class SoundScript
 
     public float Volume => FirstScalar("volume", 1f);
     public float MinDistance => FirstScalar("mindistance", 0f);
+
+    /// <summary>Where the sound reaches silence: the second distance of the <c>Distance</c> -&gt; <c>Volume</c>
+    /// <c>Ramp</c> effect (<c>param &lt;near&gt; / param &lt;far&gt; / param 1 / param -1</c>), which is how every
+    /// retail ambient shapes its falloff. Null when the script has no such effect, and the engine's own rolloff from
+    /// <see cref="MinDistance"/> is all there is.</summary>
+    public float? MaxDistance
+    {
+        get
+        {
+            bool inEffect = false, toVolume = false, fromDistance = false;
+            var ps = new List<float>();
+            foreach (var ln in _lines)
+            {
+                var k = KeyOf(ln);
+                if (k == "begineffect") { inEffect = true; toVolume = fromDistance = false; ps.Clear(); continue; }
+                if (!inEffect) continue;
+                if (k == "endeffect")
+                {
+                    if (toVolume && fromDistance && ps.Count >= 2) return ps[1];
+                    inEffect = false; continue;
+                }
+                var t = Tokens(ln);
+                if (t.Length >= 2)
+                {
+                    if (k == "controldestination") toVolume = t[1].Equals("Volume", System.StringComparison.OrdinalIgnoreCase);
+                    else if (k == "controlsource") fromDistance = t[1].Equals("Distance", System.StringComparison.OrdinalIgnoreCase);
+                    else if (k == "param" && float.TryParse(t[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var pv)) ps.Add(pv);
+                }
+            }
+            return null;
+        }
+    }
     public bool Loop => HasFlag("loop");
     public bool Stereo => HasFlag("stereo");
 

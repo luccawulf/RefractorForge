@@ -66,6 +66,22 @@ $mcpExe = Join-Path $mcpPub "RefractorForge.Mcp.exe"
 if (-not (Test-Path $mcpExe)) { throw "the MCP server did not publish" }
 Copy-Item $mcpExe $stage -Force
 Copy-Item (Join-Path $repo "docs\MCP_SERVER.md") $stage -Force
+# The central collaboration relay as its own program (docs\RelayServer.md). Whoever hosts a session runs it, so it
+# ships in the same download. Self-contained single-file for the same reason as the editor and the MCP server. It
+# lives in its own Server\ folder on purpose: the editor package carries no shared runtime, and a framework-
+# dependent build dropped beside the editor does not start ("No frameworks were found").
+Write-Host "== publishing the relay server =="
+$srvPub = Join-Path $repo "src\RefractorForge.Server\bin\Publish\Beta"
+if (Test-Path $srvPub) { Remove-Item $srvPub -Recurse -Force }
+dotnet publish "src\RefractorForge.Server" -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o $srvPub --nologo | Out-Null
+$srvExe = Join-Path $srvPub "RefractorForge.Server.exe"
+if (-not (Test-Path $srvExe)) { throw "the relay server did not publish" }
+$srvDir = Join-Path $stage "Server"
+New-Item -ItemType Directory -Force -Path $srvDir | Out-Null
+Copy-Item $srvExe $srvDir -Force
+Copy-Item (Join-Path $repo "docs\RelayServer.md") $srvDir -Force
+Copy-Item (Join-Path $repo "tools\refractorforge-relay.service") $srvDir -Force
 # The archive tool is its own product in its own repository: https://github.com/luccawulf/RefractorForgeArchive
 # (it carries Formats and Render as git subtrees of this one; see its tools\sync-libs.ps1).
 
@@ -89,7 +105,7 @@ $expect = Get-ChildItem $devDir -Recurse -File | Where-Object {
 
 $missing = @()
 foreach ($rel in $expect) { if (-not (Test-Path (Join-Path $stage $rel))) { $missing += $rel } }
-foreach ($must in @("RefractorForge.Mcp.exe", "MCP_SERVER.md")) {
+foreach ($must in @("RefractorForge.Mcp.exe", "MCP_SERVER.md", "Server\RefractorForge.Server.exe", "Server\RelayServer.md", "Server\refractorforge-relay.service")) {
     if (-not (Test-Path (Join-Path $stage $must))) { $missing += $must }
 }
 if ($missing.Count -gt 0) {

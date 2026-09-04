@@ -40,6 +40,7 @@ internal static class StartupWindow
             }
             catch { }
         }) { Name = "startup" };
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

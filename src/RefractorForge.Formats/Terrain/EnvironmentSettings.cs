@@ -132,10 +132,46 @@ public sealed class EnvironmentSettings
     // Water surface look (from Init.con: water.color / water.waterShallowAlpha).
     /// <summary>Water surface colour, RGB 0..1 (water.color).</summary>
     public Vec3 WaterColor { get; set; } = new(0.10f, 0.22f, 0.30f);
+    /// <summary>water.shallowColor - what the water looks like where it is SHALLOW, which on a river or a flooded
+    /// tunnel is most of what you see. It is a separate setting from the colour, and the editor used not to show it
+    /// at all: a level whose shallowColor disagreed with its colour rendered nothing like the viewport, which is how
+    /// a brown tunnel came out orange in game. Seeded from the body's colour when the level does not set it.</summary>
+    public Vec3 ShallowColor { get; set; } = new(0.10f, 0.22f, 0.30f);
+    public bool HasShallowColor { get; set; }
     /// <summary>Deep-water colour, RGB 0..1 (water.deepcolor); the submerged-terrain tint. Defaults to a blue.</summary>
     public Vec3 DeepColor { get; set; } = new(0.16f, 0.35f, 0.55f);
     /// <summary>Water surface transparency 0..1 (water.waterShallowAlpha); lower = more see-through.</summary>
     public float WaterAlpha { get; set; } = 0.6f;
+
+    // The SECOND water body of a tunnel map (waterBelowTerrain.*) has the same properties as the surface and is
+    // edited separately: a flooded sewer is not the same colour as the river above it. Saigon68 is the only retail
+    // level that ships the block. When a level turns tunnel water on for the first time these are seeded from the
+    // surface (what Saigon68 effectively did), then diverge as the author edits them.
+    /// <summary>waterBelowTerrain.color.</summary>
+    public Vec3 BelowColor { get; set; } = new(0.10f, 0.22f, 0.30f);
+    /// <summary>waterBelowTerrain.shallowColor - the same thing for the second body. Saigon68 sets it to its own
+    /// value rather than following its colour, so this is a real setting, not a derived one.</summary>
+    public Vec3 BelowShallowColor { get; set; } = new(0.10f, 0.22f, 0.30f);
+    public bool HasBelowShallowColor { get; set; }
+    /// <summary>waterBelowTerrain.deepColor.</summary>
+    public Vec3 BelowDeepColor { get; set; } = new(0.16f, 0.35f, 0.55f);
+    /// <summary>waterBelowTerrain.waterShallowAlpha.</summary>
+    public float BelowAlpha { get; set; } = 0.6f;
+    /// <summary>The level's file already declared waterBelowTerrain colours (so they are the author's, not seeds).</summary>
+    public bool HasBelowColors { get; set; }
+    /// <summary>waterBelowTerrain.waterAlphaDepth / waterColorDepth - how quickly the second body reaches full
+    /// opacity and full colour with depth. Saigon68's values, which is the only shipped example.</summary>
+    public const float DefaultBelowAlphaDepth = 0.4f;
+    public const float DefaultBelowColorDepth = 7.5f;
+    public float BelowAlphaDepth { get; set; } = DefaultBelowAlphaDepth;
+    public float BelowColorDepth { get; set; } = DefaultBelowColorDepth;
+
+    /// <summary>Start the second body from the surface's look - used the first time tunnel water is switched on.</summary>
+    public void SeedBelowWaterFromSurface()
+    {
+        if (HasBelowColors) return;
+        BelowColor = WaterColor; BelowDeepColor = DeepColor; BelowAlpha = WaterAlpha; BelowShallowColor = ShallowColor;
+    }
 
     // BF1942 TEXTURED water: two scrolling diffuse layers + a scrolling normal map, tiled + tinted by water.color
     // (Init.con water.texLayer1/2, water.normalMap, water.scroll*/tile*; Terrain.con Water.baseTex). When these resolve
@@ -239,6 +275,7 @@ public sealed class EnvironmentSettings
                 else if (tk == "water.basetex") e.WaterBaseTex = tv;   // Terrain.con: base water texture
             }
 
+        float? surfAlphaDepth = null, surfColorDepth = null;
         if (initLines is not null)
             foreach (var raw in initLines)
             {
@@ -255,9 +292,20 @@ public sealed class EnvironmentSettings
                         if (TryVec(val, out var lma)) { e.LMAmbientColor = lma; e.HasLMAmbient = true; }
                         else if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var lm1)) { e.LMAmbientColor = new Vec3(lm1, lm1, lm1); e.HasLMAmbient = true; }
                         break;
+                    // The second water body. Any of its keys means the level HAS one; the three the editor edits
+                    // are also read, so an author's colours come back instead of being re-seeded from the surface.
                     case "waterbelowterrain.color": case "waterbelowterrain.shallowcolor": case "waterbelowterrain.deepcolor":
                     case "waterbelowterrain.wateralphadepth": case "waterbelowterrain.watershallowalpha": case "waterbelowterrain.watercolordepth":
-                        e.WaterBelowEnabled = true; break;
+                        e.WaterBelowEnabled = true;
+                        if (key == "waterbelowterrain.color" && TryVec(val, out var bcl)) { e.BelowColor = bcl; e.HasBelowColors = true; }
+                        else if (key == "waterbelowterrain.shallowcolor" && TryVec(val, out var bsc)) { e.BelowShallowColor = bsc; e.HasBelowShallowColor = true; }
+                        else if (key == "waterbelowterrain.deepcolor" && TryVec(val, out var bdc)) { e.BelowDeepColor = bdc; e.HasBelowColors = true; }
+                        else if (key == "waterbelowterrain.watershallowalpha" && float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var bal)) { e.BelowAlpha = Math.Clamp(bal, 0.08f, 1f); e.HasBelowColors = true; }
+                        else if (key == "waterbelowterrain.wateralphadepth" && float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var bad)) e.BelowAlphaDepth = bad;
+                        else if (key == "waterbelowterrain.watercolordepth" && float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var bcd)) e.BelowColorDepth = bcd;
+                        break;
+                    case "water.wateralphadepth": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var sad)) surfAlphaDepth = sad; break;
+                    case "water.watercolordepth": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var scd)) surfColorDepth = scd; break;
                     case "renderer.diffusecolor": if (TryVec(val, out var dfc)) { e.DiffuseColor = dfc; e.HasDiffuse = true; } break;
                     case "renderer.specularcolor": if (TryVec(val, out var spc)) { e.SpecularColor = spc; e.HasSpecular = true; } break;
                     case "renderer.vertexfogenable": e.FogEnabled = val.StartsWith("1"); break;
@@ -273,6 +321,7 @@ public sealed class EnvironmentSettings
                     case "mapmanager.addobjectmap": if (ObjectMap.Parse(val) is { } om) e.ObjectMaps.Add(om); break;
                     case "water.color": if (TryVec(val, out var wcl)) e.WaterColor = wcl; break;
                     case "water.deepcolor": if (TryVec(val, out var wdc)) e.DeepColor = wdc; break;
+                    case "water.shallowcolor": if (TryVec(val, out var wsh)) { e.ShallowColor = wsh; e.HasShallowColor = true; } break;
                     case "water.watershallowalpha": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var wal)) e.WaterAlpha = Math.Clamp(wal, 0.08f, 1f); break;
                     // BF1942 textured-water layers + scroll/tile/specular.
                     case "water.texlayer1": e.WaterTexLayer1 = val; break;
@@ -291,6 +340,14 @@ public sealed class EnvironmentSettings
                     case "water.specularenable": e.WaterSpecularEnable = val.StartsWith("1"); break;
                 }
             }
+
+        // Saigon68 mirrors its surface's shallowColor and depth scales onto its tunnel water exactly, and sets a
+        // below colour that differs from its own shallowColor - so neither "identical to the surface" nor "different
+        // from its colour" says anything about whether a level meant it. Nothing is inferred here; the editor shows
+        // these values instead of guessing at them. A body that names no shallowColor simply takes its own colour.
+        if (!e.HasShallowColor) e.ShallowColor = e.WaterColor;
+        if (!e.HasBelowShallowColor) e.BelowShallowColor = e.BelowColor;
+        _ = surfAlphaDepth; _ = surfColorDepth;
 
         return e;
     }
@@ -369,13 +426,25 @@ public sealed class EnvironmentSettings
     {
         var outLines = new List<string>();
         bool dropGeoFile = false;
+        bool wroteSun = false;
         foreach (var raw in existing)
         {
             var t = raw.Trim();
             if (IsCloudLine(t, ref dropGeoFile)) continue;
+            // The sun's direction is rewritten in place, keeping the file's own indentation and everything else in it
+            // (skybox mesh, rotation, fog...) exactly where the author left it.
+            if (WriteSun && t.StartsWith("sky.sunLightDirectionVec", StringComparison.OrdinalIgnoreCase))
+            {
+                if (wroteSun) continue;                      // a duplicate line would fight the first
+                wroteSun = true;
+                outLines.Add(raw[..(raw.Length - raw.TrimStart().Length)] + $"sky.sunLightDirectionVec {V(SunDirection)}");
+                continue;
+            }
             outLines.Add(raw);
         }
         while (outLines.Count > 0 && outLines[^1].Trim().Length == 0) outLines.RemoveAt(outLines.Count - 1);   // trim trailing blanks
+        // A level that never declared one still needs the line once the editor has aimed the sun.
+        if (WriteSun && !wroteSun) outLines.Add($"sky.sunLightDirectionVec {V(SunDirection)}");
         outLines.AddRange(CloudConLines());
         return outLines;
     }
@@ -424,6 +493,14 @@ public sealed class EnvironmentSettings
     /// does not start rewriting fog it never touched.</summary>
     public bool WriteFog { get; set; }
     public bool WriteViewDistance { get; set; }
+    /// <summary>The surface water's colours were edited, so <c>water.color</c> / <c>deepColor</c> /
+    /// <c>waterShallowAlpha</c> go into Init.con. Without this the editor's water colour was a viewport-only
+    /// setting that never reached the game.</summary>
+    public bool WriteWater { get; set; }
+    /// <summary>The sun was aimed in the editor, so <c>sky.sunLightDirectionVec</c> goes into SkyAndSun.con. Without
+    /// this the manual sun was a viewport-only setting: the bakes used it, the game did not, and baked shadows then
+    /// disagreed with the game's own lighting.</summary>
+    public bool WriteSun { get; set; }
 
     public List<string> PatchInitConLines(IEnumerable<string> existing)
     {
@@ -438,6 +515,10 @@ public sealed class EnvironmentSettings
             ("renderer.fogstart",           $"renderer.fogstart {F(FogStart)}",                     WriteFog),
             ("renderer.fogend",             $"renderer.fogend {F(FogEnd)}",                         WriteFog),
             ("game.setviewdistance",        $"Game.setViewDistance {F(ViewDistance)}",              WriteViewDistance),
+            ("water.color",                 $"water.color {V(WaterColor)}",                         WriteWater),
+            ("water.shallowcolor",          $"water.shallowColor {V(ShallowColor)}",                WriteWater),
+            ("water.deepcolor",             $"water.deepColor {V(DeepColor)}",                      WriteWater),
+            ("water.watershallowalpha",     $"water.waterShallowAlpha {F(WaterAlpha)}",             WriteWater),
             ("game.setactivecombatarea",    CombatArea?.ToConLine() ?? "",                          HasCombatArea),
             ("game.istunnelmap",            $"Game.isTunnelMap {(IsTunnelMap ? 1 : 0)}",             WriteTunnel),
             ("game.usebelowgroundculling",  $"Game.useBelowGroundCulling {(UseBelowGroundCulling ? 1 : 0)}", WriteTunnel),
@@ -474,22 +555,24 @@ public sealed class EnvironmentSettings
             outLines.RemoveAll(l => l.TrimStart().StartsWith("waterBelowTerrain.", StringComparison.OrdinalIgnoreCase));
             if (WaterBelowEnabled)
             {
-                // Mirror the surface water's colour lines, the way Saigon68 is written. Only the colour keys: a
-                // BF1942 level's texLayer / scroll lines have no meaning on the second body.
-                string[] keys = { "color", "shallowcolor", "deepcolor", "wateralphadepth", "watershallowalpha", "watercolordepth" };
-                var mirror = new List<string>(); int lastWater = -1;
-                for (int i = 0; i < outLines.Count; i++)
+                // The second body's OWN complete block. It must not inherit anything from the surface: mirroring the
+                // surface's shallowColor and depth scales let a bright surface colour override the tunnel water
+                // entirely - a brown, half-transparent sewer came out opaque orange - which is the opposite of the
+                // two bodies being edited apart. Only colour keys belong here; a BF1942 level's texLayer / scroll
+                // lines have no meaning on the second body.
+                var block = new List<string>
                 {
-                    var t = outLines[i].TrimStart();
-                    if (!t.StartsWith("water.", StringComparison.OrdinalIgnoreCase)) continue;
-                    int sp = t.IndexOf(' ');
-                    var prop = (sp < 0 ? t[6..] : t[6..sp]).ToLowerInvariant();
-                    if (!keys.Contains(prop)) continue;
-                    lastWater = i;
-                    mirror.Add("waterBelowTerrain." + t[6..]);
-                }
-                if (mirror.Count == 0) mirror.Add($"waterBelowTerrain.color {V(WaterColor)}");
-                outLines.InsertRange(lastWater >= 0 ? lastWater + 1 : outLines.Count, mirror);
+                    $"waterBelowTerrain.color {V(BelowColor)}",
+                    $"waterBelowTerrain.shallowColor {V(BelowShallowColor)}",
+                    $"waterBelowTerrain.deepColor {V(BelowDeepColor)}",
+                    $"waterBelowTerrain.waterShallowAlpha {F(BelowAlpha)}",
+                    $"waterBelowTerrain.waterAlphaDepth {F(BelowAlphaDepth)}",
+                    $"waterBelowTerrain.waterColorDepth {F(BelowColorDepth)}",
+                };
+                int lastWater = -1;
+                for (int i = 0; i < outLines.Count; i++)
+                    if (outLines[i].TrimStart().StartsWith("water.", StringComparison.OrdinalIgnoreCase)) lastWater = i;
+                outLines.InsertRange(lastWater >= 0 ? lastWater + 1 : outLines.Count, block);
             }
         }
         return outLines;

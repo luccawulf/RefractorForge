@@ -33,7 +33,7 @@ public class LiveBridgeTests : IDisposable
         {
             Height = new Heightmap(4, 4),
             Material = new MaterialMap(4, 4),
-            Water = 30f,
+            Water = "WATER 30",
             Overgrowth = "OVERGROWTH 1 4 0.5",
         };
         _relay = new RelayServer(_doc, _world);

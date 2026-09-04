@@ -60,7 +60,7 @@ public class WaterAndLightingTests
     }
 
     [Fact]
-    public void The_below_terrain_water_colours_mirror_the_surface_water_the_way_Saigon68_ships_them()
+    public void The_below_terrain_block_carries_its_own_colours_and_mirrors_the_rest()
     {
         string[] init =
         {
@@ -73,20 +73,23 @@ public class WaterAndLightingTests
         };
         var e = EnvironmentSettings.Parse(null, null, init);
         Assert.False(e.WaterBelowEnabled);
+        e.SeedBelowWaterFromSurface();                  // switching it on starts the second body from the surface
         e.WriteWaterBelow = true; e.WaterBelowEnabled = true;
         var outLines = e.PatchInitConLines(init);
-        Assert.Equal(new[]
-        {
-            "run Init/Terrain",
-            "water.shallowColor 0.2/.1/.01",
-            "water.deepColor 0.5/.3/.01",
-            "water.waterAlphaDepth 0.400000",
-            "waterBelowTerrain.shallowColor 0.2/.1/.01",
-            "waterBelowTerrain.deepColor 0.5/.3/.01",
-            "waterBelowTerrain.waterAlphaDepth 0.400000",
-            "water.texLayer1 texture/water01",
-            "run Sounds/Environment",
-        }, outLines);
+
+        // Its own three, written from the below-water properties...
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.color "));
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.deepColor "));
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.waterShallowAlpha "));
+        // ...its shallowColor following ITS OWN colour and not the surface's, because inheriting the surface's let a
+        // bright river override a dark sewer entirely, and its own depth scales for the same reason...
+        Assert.DoesNotContain("waterBelowTerrain.shallowColor 0.2/.1/.01", outLines);
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.shallowColor "));
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.waterAlphaDepth "));
+        Assert.Contains(outLines, l => l.StartsWith("waterBelowTerrain.waterColorDepth "));
+        // ...and nothing that is not a colour.
+        Assert.DoesNotContain(outLines, l => l.StartsWith("waterBelowTerrain.texLayer"));
+        Assert.Contains("water.texLayer1 texture/water01", outLines);
         Assert.True(EnvironmentSettings.Parse(null, null, outLines).WaterBelowEnabled);
 
         e.WaterBelowEnabled = false;

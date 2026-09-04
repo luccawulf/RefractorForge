@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
+    <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
   </ItemGroup>
 
 </Project>

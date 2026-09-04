@@ -72,14 +72,12 @@ public class CollabNetTests
 
         var worldW = new CollabWorldState();
         Assert.True(worldW.ApplyOp("WATER 22.5"), "WATER op recognised");
-        Assert.True(worldW.Water.HasValue && MathF.Abs(worldW.Water!.Value - 22.5f) < 0.01f,
-            $"water level set from op ({worldW.Water:0.00})");
+        Assert.True(worldW.Water == "WATER 22.5", $"water op set from op ({worldW.Water})");
         var wops = worldW.SnapshotOps().ToList();
         Assert.True(wops.Count == 1 && wops[0].StartsWith("WATER"), "water snapshots as WATER op");
 
         world.ApplyOp("WATER 33.0");
-        Assert.True(world.Water.HasValue && MathF.Abs(world.Water!.Value - 33.0f) < 0.01f,
-            $"WATER ApplyOp updates world ({world.Water:0.00})");
+        Assert.True(world.Water == "WATER 33.0", $"WATER ApplyOp updates world ({world.Water})");
 
         string tmpDir = Path.Combine(Path.GetTempPath(), "rf_cns_" + Guid.NewGuid().ToString("N")[..8]);
         var server = new RelayServer(world: world);
@@ -93,8 +91,7 @@ public class CollabNetTests
             Assert.True(loaded is not null, "CollabWorldState.Load returns non-null");
             Assert.True(loaded!.Height is not null && loaded.Height[4, 4] == 30000, "height persists");
             Assert.True(loaded.Material is not null && loaded.Material[4, 4] == 7, "material persists");
-            Assert.True(loaded.Water.HasValue && MathF.Abs(loaded.Water!.Value - 33.0f) < 0.01f,
-                $"water persists ({loaded.Water:0.00})");
+            Assert.True(loaded.Water == "WATER 33.0", $"water persists ({loaded.Water})");
         }
         finally { try { Directory.Delete(tmpDir, true); } catch { } }
     }

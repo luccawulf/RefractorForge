@@ -92,6 +92,7 @@ internal static class ModPickerDialog
             if (f.ShowDialog() == DialogResult.OK && mods.SelectedItem is string chosen && Directory.Exists(root.Text.Trim()))
                 result = new ModTarget(root.Text.Trim(), chosen, inherit.Checked);
         }) { Name = "modpicker" };
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

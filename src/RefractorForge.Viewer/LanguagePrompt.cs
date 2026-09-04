@@ -25,7 +25,7 @@ internal static class LanguagePrompt
     public static string Ask()
     {
         string chosen = "en";
-        var t = new Thread(() => { try { chosen = ShowDialogSta(); } catch { } }) { Name = "langprompt" };
+        var t = new Thread(() => { try { chosen = ShowDialogSta(); } catch { } }) { IsBackground = true, Name = "langprompt" };
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

@@ -1,0 +1,37 @@
+# RefractorForge central collaboration relay - systemd unit.
+#
+#   sudo cp refractorforge-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now refractorforge-relay
+#   journalctl -u refractorforge-relay -f
+#
+# Every editor connects OUT to this machine (Collab > Join <ip>:7777), so nobody forwards a port at home;
+# only this machine's firewall needs 7777/tcp open. The session is persisted under /var/lib/refractorforge
+# and resumed on restart. Set the password in the Environment line (or drop --pass for an open relay).
+
+[Unit]
+Description=RefractorForge collaboration relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=refractorforge
+Group=refractorforge
+WorkingDirectory=/opt/refractorforge-relay
+Environment=RF_PORT=7777
+Environment=RF_PASS=change-me
+ExecStart=/opt/refractorforge-relay/RefractorForge.Server ${RF_PORT} --save /var/lib/refractorforge/session --pass ${RF_PASS}
+# SIGTERM is what "systemctl stop" sends; the relay flushes its state on it before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=5
+StateDirectory=refractorforge
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/refractorforge
+
+[Install]
+WantedBy=multi-user.target

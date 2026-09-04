@@ -839,6 +839,38 @@ public sealed class MeshLibrary
         return template;
     }
 
+    /// <summary>Every LOD mesh a placed template is drawn with, by MESH NAME, highest detail first - the names the
+    /// game gives that object's lightmaps. Retail Hue lights <c>O_HueHouse_B</c> (a Bundle whose LodObject holds
+    /// <c>O_HueHouse_B_M1</c> and <c>_M2</c>) through <c>O_HueHouse_B_M1_&lt;pos&gt;.tga</c> AND
+    /// <c>O_HueHouse_B_M2_&lt;pos&gt;.tga</c>, one per LOD, each on that LOD mesh's own unwrap; a file named after the
+    /// placed template is never read. A plain single-geometry template yields its one mesh. Children placed at an
+    /// offset inside a Bundle are left out (the engine would name those by their own position).</summary>
+    public IReadOnlyList<string> LodGeometryNames(string template)
+    {
+        var res = new List<string>();
+        if (string.IsNullOrWhiteSpace(template)) return res;
+        EnsureObjectGeometry();
+        EnsureAllTemplates();
+        string GeomFile(string g) => _geomFile!.TryGetValue(g, out var f) && f.Length > 0 ? f : g;
+        void Add(string g) { var n = GeomFile(g); if (!res.Contains(n, StringComparer.OrdinalIgnoreCase)) res.Add(n); }
+        if (_objGeom!.TryGetValue(template, out var direct) && direct.Length > 0) Add(direct);
+        if (_allTemplates!.TryGetValue(template, out var root)) CollectLodGeometries(root, Add, new HashSet<string>(StringComparer.OrdinalIgnoreCase), 0);
+        if (res.Count == 0) res.Add(template);
+        return res;
+    }
+
+    private void CollectLodGeometries(ConTemplate tpl, Action<string> add, HashSet<string> visiting, int depth)
+    {
+        if (depth > 24) return;
+        if (tpl.Geometry is { Length: > 0 } g) add(g);
+        foreach (var (child, pos, rot) in tpl.Children)
+        {
+            if (!tpl.IsLod && (pos != Vector3.Zero || rot != Vector3.Zero)) continue;   // an offset part, not an alternative
+            if (!visiting.Add(child)) continue;
+            if (_allTemplates!.TryGetValue(child, out var ct)) CollectLodGeometries(ct, add, visiting, depth + 1);
+        }
+    }
+
     // Depth-first walk for the first ObjectTemplate.geometry in a Bundle/LodObject hierarchy (LodObject -> first child).
     private string? FirstGeometry(ConTemplate tpl, HashSet<string> visiting, int depth)
     {
@@ -872,6 +904,8 @@ public sealed class MeshLibrary
         public bool IsBelowGround;                             // isBelowGround 1: lives under the terrain, culled with it
         public bool IsEntryPoint;                              // isEntryPoint 1: soldiers may pass the terrain near it
         public bool HasMap;                                    // hasMap 1: an underground minimap is bound to it
+        public string? SoundScript;                            // loadSoundScript <file>.ssc
+        public bool AutoPlaySound;                             // autoPlaySound 1: an ambient, heard by distance
     }
 
     /// <summary>What a placed object means to the tunnel system, resolved through the whole template registry:
@@ -889,6 +923,26 @@ public sealed class MeshLibrary
             if (_allTemplates.TryGetValue(child, out var ct) && ct.IsEntryPoint) { entry = true; offs.Add(pos); }
         if (!t.IsBelowGround && !entry && !t.HasMap) return null;
         return new TunnelInfo(t.IsBelowGround, entry, t.HasMap, offs);
+    }
+
+    /// <summary>What sound a placed template carries, if any: the <c>.ssc</c> it loads and whether it is an AMBIENT
+    /// (<c>autoPlaySound</c> - started with the level and heard by distance, like the game's generators and speakers)
+    /// or tied to the object being DRAWN, which is what an object with a sound script but no autoPlaySound does.
+    /// Looks through a Bundle/LodObject's children too, since that is where retail keeps the sounding part.</summary>
+    public (string Script, bool AutoPlay)? SoundOf(string template)
+    {
+        EnsureAllTemplates();
+        if (_allTemplates is null) return null;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        (string, bool)? Walk(string name, int depth)
+        {
+            if (depth > 8 || !seen.Add(name) || !_allTemplates!.TryGetValue(name, out var t)) return null;
+            if (t.SoundScript is { Length: > 0 } s) return (s, t.AutoPlaySound);
+            foreach (var (child, _, _) in t.Children)
+                if (Walk(child, depth + 1) is { } hit) return hit;
+            return null;
+        }
+        return Walk(template, 0);
     }
 
     /// <summary>The first ObjectTemplate.create name in a single .con entry (the main Objects.con's root), or null.</summary>
@@ -953,6 +1007,8 @@ public sealed class MeshLibrary
             else if (cmd.Equals("isBelowGround", StringComparison.OrdinalIgnoreCase)) cur.IsBelowGround = arg.StartsWith("1");
             else if (cmd.Equals("isEntryPoint", StringComparison.OrdinalIgnoreCase)) cur.IsEntryPoint = arg.StartsWith("1");
             else if (cmd.Equals("hasMap", StringComparison.OrdinalIgnoreCase)) cur.HasMap = arg.StartsWith("1");
+            else if (cmd.Equals("loadSoundScript", StringComparison.OrdinalIgnoreCase)) cur.SoundScript = arg.Trim();
+            else if (cmd.Equals("autoPlaySound", StringComparison.OrdinalIgnoreCase)) cur.AutoPlaySound = arg.StartsWith("1");
             else if (cmd.Equals("setPivotPosition", StringComparison.OrdinalIgnoreCase)) cur.Pivot = ParseVec(arg);
             else if (cmd.Equals("setObjectTemplate", StringComparison.OrdinalIgnoreCase))
             {

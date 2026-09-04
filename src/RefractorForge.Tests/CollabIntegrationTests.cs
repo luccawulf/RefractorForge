@@ -192,7 +192,7 @@ public class CollabIntegrationTests : IDisposable
         using var b = Bridge();
 
         b.SendWorldOp("WATER 42.5");
-        Assert.True(Wait(() => _world.Water is { } w && MathF.Abs(w - 42.5f) < 0.01f), "water level did not stick");
+        Assert.True(Wait(() => _world.Water == "WATER 42.5"), "water op did not stick");
 
         b.SendWorldOp($"MATERIAL 0 2 3 1 1 {Convert.ToBase64String(new byte[] { 7 })}");
         Assert.True(Wait(() => _world.Material![2, 3] == 7), "material paint did not stick");

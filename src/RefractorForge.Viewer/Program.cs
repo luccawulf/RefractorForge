@@ -76,16 +76,10 @@ ConsoleLog.Install();   // tee console output into an in-app Log/Errors box (sho
 
 if (args.Length >= 1 && args[0] == "--relay")
 {
-    var relayArgs = args.Skip(1).ToList();
-    int saveIdx = relayArgs.IndexOf("--save");
-    string? savePath = null;
-    if (saveIdx >= 0) { savePath = saveIdx + 1 < relayArgs.Count ? relayArgs[saveIdx + 1] : null; relayArgs.RemoveRange(saveIdx, savePath is null ? 1 : 2); }
-    int passIdx = relayArgs.IndexOf("--pass");
-    string? relayPass = null;
-    if (passIdx >= 0) { relayPass = passIdx + 1 < relayArgs.Count ? relayArgs[passIdx + 1] : null; relayArgs.RemoveRange(passIdx, relayPass is null ? 1 : 2); }
-    int relayPort = relayArgs.Count >= 1 && int.TryParse(relayArgs[0], out var rp) ? rp : 7777;
-    string? seedPath = relayArgs.Count >= 2 ? relayArgs[1] : null;
-    CollabSession.RunRelay(relayPort, seedPath, savePath, relayPass);
+    var relayOpts = RefractorForge.Collab.RelayOptions.Parse(args.Skip(1).ToList(), out var relayErr);
+    if (relayErr is not null) Console.WriteLine("error: " + relayErr + "\n");
+    if (relayErr is not null || relayOpts.Help) { Console.WriteLine(RefractorForge.Collab.RelayOptions.Usage); return; }
+    CollabSession.RunRelay(relayOpts);
     return;
 }
 
@@ -253,10 +247,27 @@ uniform vec2 uScroll1; uniform vec2 uScroll2; uniform vec2 uScrollN;   // direct
 uniform float uTile1; uniform float uTile2; uniform float uTileN;     // water.tileLayer*
 uniform vec3 uSpecColor;
 uniform float uReflect; uniform int uHasSkyCube; uniform samplerCube uSkyCube;   // levelWater.rs 'reflectivity', mirrored off the level's own sky
+// BfVietnam: the levelWater.rs `sequence` - 32 animated NORMAL maps, cross-faded, tiled every waterScale metres.
+uniform int uWaterSeq; uniform sampler2D uSeqA; uniform sampler2D uSeqB; uniform float uSeqMix;
+uniform float uWaterScaleM; uniform vec3 uMatDiffuse;
 void main(){
     vec3 viewDir = normalize(uCamPos - vWorld);
     vec3 n; vec3 col; float alpha;
-    if (uHasWaterTex == 1) {
+    if (uWaterSeq == 1) {
+        // The game's own water: ripple normals from the animated sequence (tangent space, z up -> world Y),
+        // the level's water.color tinted by the shader's materialDiffuse, and the sky reflection below does the
+        // rest. This is why in-game water never looked like the editor's flat plane.
+        vec2 w = vWorld.xz / max(uWaterScaleM, 1.0);
+        vec3 na = texture(uSeqA, w).rgb * 2.0 - 1.0;
+        vec3 nb = texture(uSeqB, w).rgb * 2.0 - 1.0;
+        vec3 nm = normalize(mix(na, nb, uSeqMix));
+        n = normalize(vec3(nm.x, 4.0, nm.y));
+        col = uWaterColor * uMatDiffuse * 2.2;
+        float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0);
+        vec3 h = normalize(normalize(uLightDir) + viewDir);
+        col += uSpecColor * pow(max(dot(n, h), 0.0), 90.0) * 0.85;      // sun glint off the ripples
+        alpha = mix(uWaterAlpha, 1.0, fres * 0.4);
+    } else if (uHasWaterTex == 1) {
         vec2 w = vWorld.xz;
         vec3 nm = texture(uNormal, w * (uTileN*0.04) + uScrollN*uTime).rgb * 2.0 - 1.0;   // tangent-space ripple normal
         n = normalize(vec3(nm.x, 6.0, nm.y));                                             // bias strongly toward up (flat water)
@@ -608,9 +619,32 @@ bool showTunnels = false;         // the Tunnels (BFV 1.2) window
 bool showTunnelEntries = true;    // draw the entry-point spheres: where a soldier passes through the terrain
 // The BFV water shader (standardMesh/levelWater.rs): reflectivity + opacity, shipped as a level-side override.
 float waterReflect = 0.20f, waterOpacity = 0.35f; bool waterShaderLoaded = false; string? waterRsText = null;
+// The tunnel map's second water body has its own subshader in the same file. Saigon68's values are the defaults.
+float waterBelowReflect = 0.10f, waterBelowOpacity = 0.85f;
 RefractorForge.Formats.Terrain.WaterShaderSettings waterShaderBase = RefractorForge.Formats.Terrain.WaterShaderSettings.RetailDefault;
 // Decal dialog: the picture's own size, aspect lock, and the video path.
 bool decalKeepAspect = true; int decalImgW = 0, decalImgH = 0; string decalInfoPath = ""; bool decalVideo = false;
+// A video decal gets a voice: the movie's own audio track, written as a level sound script on the decal object, so
+// it plays from the middle of the screen and fades with distance like any other ambient sound.
+bool decalSound = true; float decalSoundVol = 0.8f, decalSoundNear = 8f, decalSoundFar = 60f;
+// How the screen's sound behaves. "Ambient" is autoPlaySound 1 - started with the level, heard by distance, the way
+// every retail speaker and generator works. Without that line the engine ties the sound to the object being DRAWN, so
+// it snaps on at full volume when you look at the screen and stops when you look away; a real effect, and some maps
+// want exactly that, so it is offered rather than fixed.
+int decalSoundMode = 0;                     // 0 = ambient (by distance), 1 = only while looked at
+bool decalLimitDraw = false;                // stop drawing the screen past a distance...
+float decalLookRange = 120f;                // ...this one. In look-at mode it is also how far the sound carries.
+bool decalSoundStereo = false;              // mono places the sound at the screen; stereo is fuller but not positional
+// Bink conversion runs on a worker: a real video takes minutes, and doing it on the UI thread froze the editor.
+System.Threading.Tasks.Task<(string? Path, string Error)>? bikTask = null;
+int bikWidthIdx = 1;                                   // how big the converted video should be
+int[] bikWidths = { 256, 512, 1024, 0 };               // 0 = leave the source alone
+string[] bikWidthNames = { "256 px", "512 px", "1024 px", "Original" };
+System.Diagnostics.Stopwatch bikTaskClock = new();
+long bikProgressBytes = 0;
+// Importing an ordinary sound (mp3/wav) as a placeable ambient emitter.
+string sndImportPath = "", sndImportName = "";
+float sndVol = 0.7f, sndNear = 20f, sndFar = 120f; bool sndLoop = true; bool showSoundImport = false;
 bool lightDragging = false;     // dragging the selected light in the viewport
 float lightDragOffset = 0f;     // its height above the ground when the drag began, so a drag follows terrain
 bool lightDragVertical = false; // Shift-drag raises and lowers instead of moving across the ground
@@ -926,6 +960,9 @@ CollabSession? collab = null;   // the collaboration session (set via the Collab
 // Set while an inbound edit is being pushed onto the undo stack. The push fires hist.OnDo, which is what normally
 // broadcasts an edit - and broadcasting an edit we just received would echo it straight back to the sender.
 bool applyingRemote = false;
+string? lastRigWire = null;             // the placed lights as last sent or received, so an edit goes out once
+(bool Lsb, bool Objects, bool Ground)? pendingRemoteBake = null;   // a peer baked: re-run the same bakes next update
+bool bakedLsb = false, bakedObjects = false, bakedGround = false;  // which bakes have run this session (what a joiner re-runs)
 var hist = so is not null ? new EditHistory(so) : null;
 // (the hist.OnDo collaboration hook is wired in OnLoad, where all the captured editor state is assigned)
 
@@ -1181,6 +1218,10 @@ HashSet<string> lockedGameplayKeys = new(StringComparer.OrdinalIgnoreCase);
 int terrainView = 0;
 bool showSpawnLinks = true;                                   // lines from each vehicle/soldier spawn to its owning control point
 bool showSounds = true;                                      // sound emitters: marker + audible-radius (minDistance) ring
+// What a placed object's sound looks like on the map: the full-volume radius, the distance it fades to nothing, and
+// whether it is an ambient or one of the look-at kind. Resolved once per template (the .ssc has to be read out of the
+// level) and cached; covers both the level's Sounds/*.con emitters and sounds carried by an object template.
+Dictionary<string, (float Near, float Far, bool AutoPlay, float Volume)?> soundInfoCache = new(StringComparer.OrdinalIgnoreCase);
 bool playSounds = false;                                     // play placed LOOPING sounds while the camera is inside their ring
 SoundPlayback? soundPlayback = null;                         // NAudio mixer for the placed-sound preview (lazy on first enable)
 List<string>? soundWavArchives = null;                       // cached .rfa(s) searched for a level's / mod's .wav (lazy)
@@ -1437,6 +1478,7 @@ int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object progra
 // Sun-direction control (azimuth + elevation). When sunOverride is on, the editor lights with these instead of the
 // level's SkyAndSun.con; moving them relights terrain + objects + re-renders the shadow map in real time.
 bool sunOverride = false;
+bool sunEdited = false;          // the sun was aimed by hand -> its direction goes into SkyAndSun.con on save
 float sunAzimuthDeg = 135f, sunElevationDeg = 40f;
 float camSpeedMult = 1f;               // user multiplier on WASD fly speed (and scroll dolly)
 // Live correction for where the terrain atlas lands on the ground. Six separate attempts to derive this from the
@@ -1473,6 +1515,17 @@ bool fogEnabled = false; Vector3 fogColor = new(0.72f, 0.83f, 0.83f); float fogS
 float waterLevelLoaded = 30f; bool waterLevelEdited = false;   // live Water Level slider: original for Reset + dirty flag for save
 Vector3 waterColor = new(0.10f, 0.22f, 0.30f); float waterAlpha = 0.6f;   // water surface colour + transparency (from the level's water.color)
 Vector3 deepColor = new(0.16f, 0.35f, 0.55f);   // submerged-terrain tint (from the level's water.deepcolor)
+// The tunnel map's second body has its own colours (waterBelowTerrain.*), edited beside the surface's.
+Vector3 belowColor = new(0.10f, 0.22f, 0.30f), belowDeepColor = new(0.16f, 0.35f, 0.55f);
+float belowAlpha = 0.6f;
+Vector3 shallowColor = new(0.10f, 0.22f, 0.30f), belowShallowColor = new(0.10f, 0.22f, 0.30f);
+float belowAlphaDepth = EnvironmentSettings.DefaultBelowAlphaDepth, belowColorDepth = EnvironmentSettings.DefaultBelowColorDepth;
+// BfVietnam's water is an ANIMATED NORMAL MAP: the shader's `sequence` (texture/Waterseq/test0000..) ripples the
+// surface and is what makes it catch the sky. Without it the editor's flat colour looked nothing like the game.
+uint[] waterSeqTex = System.Array.Empty<uint>();
+float waterSeqCycle = 2f;      // sequenceCycleTime, seconds for the whole loop
+float waterScaleM = 25f;       // waterScale: metres per repeat
+Vector3 waterMatDiffuse = new(0.281f, 0.266f, 0.205f);
 
 Camera cam = Camera.FrameAerial(cfg.WorldSize, (minH + maxH) * 0.5f, opts.Size.X / (float)opts.Size.Y);
 // Start where the LEVEL says to look from. Refractor levels carry the pre-spawn camera in Init.con as
@@ -1694,9 +1747,25 @@ window.Render += dt =>
 };
 window.FramebufferResize += sz => { gl.Viewport(0, 0, (uint)sz.X, (uint)sz.Y); cam.Aspect = sz.X / (float)Math.Max(1, sz.Y); appliedFbSize = sz; };
 window.Run();
+ShutDown();
 return;
 
 // ---------------------------------------------------------------------------
+// Closing the window has to end the PROCESS. It did not: an instance stayed resident with its window already gone,
+// holding the level's files and the editor's own DLLs open, so the next build could not be deployed over it and the
+// map looked locked. There was no shutdown path at all here - the audio devices and the collab socket were simply
+// abandoned - and any one non-background thread left behind keeps a .NET process alive forever.
+//
+// So: hand back what we own, then leave. Nothing is worth waiting for at this point; an editor whose window is gone
+// has no user to serve, and a straggler thread is by definition not doing work anyone asked for.
+void ShutDown()
+{
+    try { soundPlayback?.Dispose(); } catch { }   // stops each voice and closes its WaveOut device
+    try { collab?.Stop(); } catch { }             // drops the relay socket so the peer sees us go
+    try { window.Dispose(); } catch { }
+    Environment.Exit(0);
+}
+
 void SyncMarkers()
 {
     markers = so!.Objects.Select(o => new Vector3(o.Position.X, o.Position.Y, o.Position.Z)).ToArray();
@@ -2686,6 +2755,12 @@ void OnLoad()
         waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);   // the level's water.color
         deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);       // the level's water.deepcolor
         waterAlpha = env.WaterAlpha;
+        belowColor = new Vector3(env.BelowColor.X, env.BelowColor.Y, env.BelowColor.Z);
+        belowDeepColor = new Vector3(env.BelowDeepColor.X, env.BelowDeepColor.Y, env.BelowDeepColor.Z);
+        belowAlpha = env.BelowAlpha;
+        belowAlphaDepth = env.BelowAlphaDepth; belowColorDepth = env.BelowColorDepth;
+        shallowColor = new Vector3(env.ShallowColor.X, env.ShallowColor.Y, env.ShallowColor.Z);
+        belowShallowColor = new Vector3(env.BelowShallowColor.X, env.BelowShallowColor.Y, env.BelowShallowColor.Z);
     }
     waterLevelLoaded = cfg.WaterLevel;   // remember for the Water Level "Reset" button
     // Build the library catalog: objects + a draggable Gameplay category + a Prefabs category (if any).
@@ -2779,6 +2854,15 @@ void OnLoad()
         int atlasCap = Math.Min(8192, mt[0] > 0 ? mt[0] : 8192);
         int atlasSize = Math.Clamp(terrainTex.NativeSize, 2048, atlasCap);
         atlasCpu = terrainTex.BakeAtlas(atlasSize);   // keep the CPU copy so the Texture paint tool can edit + re-upload it
+        // Tiles an older build of this editor wrote (1024x1024 uncompressed, no mips) are not a form the game's
+        // terrain can load - it draws them BLACK. Nothing else ever produced them, so finding one means repairing
+        // it: mark the atlas dirty and the next save re-emits every tile as DXT1 + mips at the shipped size.
+        if (terrainTex.HasLegacyTiles)
+        {
+            atlasPainted = true;
+            Console.WriteLine("Terrain tiles are in a format the game cannot draw (uncompressed / oversized) - they will be re-encoded as DXT1 + mipmaps on the next save.");
+            Toast(Loc.T("This map's terrain tiles are in a format the game draws BLACK. Save (Ctrl+S) to re-encode them."));
+        }
         terrainTexId = UploadTexture(atlasCpu);
         Console.WriteLine($"Baked terrain atlas ({atlasSize}^2, native {terrainTex.NativeSize}) in {sw.ElapsedMilliseconds} ms.");
     }
@@ -2951,6 +3035,7 @@ void OnLoad()
     uTileNW = gl.GetUniformLocation(waterProg, "uTileN");
     uSpecColW = gl.GetUniformLocation(waterProg, "uSpecColor");
     InitWaterTextures();   // resolve + upload the level's water.texLayer1/2 + normalMap (sets haveWaterTex)
+    InitWaterSequence();   // BfVietnam: the levelWater.rs animated normal-map sequence (what the game actually draws)
     {
         float wl = cfg.WaterLevel, wsz = cfg.WorldSize;
         float[] wq = { 0,wl,0,  wsz,wl,0,  wsz,wl,wsz,   0,wl,0,  wsz,wl,wsz,  0,wl,wsz };
@@ -3074,6 +3159,8 @@ void OnLoad()
 
 void OnUpdate(double dt)
 {
+    if (pendingRemoteBake is { } rb) { pendingRemoteBake = null; RunRemoteBake(rb); }
+    BroadcastLightRigIfChanged();
     if (playSounds && soundPlayback is not null) soundPlayback.Update(cam.Position, PlacedSounds(), dt);   // placed-sound preview (no-op when off)
     UpdateWeather(dt);   // advance the weather preview particles (no-op when off)
     if (showEffects) EnsureEffects();   // lazy-build effect instances on first frame the layer is on
@@ -3886,7 +3973,7 @@ void DrawGameplay()
 // plus a name label. Reads the object layer + the loaded SoundLibrary; depth off so the rings read through terrain.
 void DrawSounds()
 {
-    if (!showSounds || so is null || sounds.Count == 0) return;
+    if (!showSounds || so is null) return;
     var fb = window.FramebufferSize;
     var vpFloats = ToFloats(cam.ViewProjection);
     gl.Disable(EnableCap.DepthTest);
@@ -3897,15 +3984,25 @@ void DrawSounds()
     gl.BindVertexArray(brushRingVao);
     foreach (var ob in so.Objects)
     {
-        var em = sounds.Get(ob.Template);
-        if (em is null) continue;
+        if (SoundInfoOf(ob.Template) is not { } si) continue;
         var p = new Vector3(ob.Position.X, ob.Position.Y, ob.Position.Z);
-        if (FogCulled(p)) continue;                          // skip the ring AND its marker once past the fog
+        if (FogCulled(p)) continue;                          // skip the rings AND the marker once past the fog
         pts.Add(p);
-        var m = Matrix4x4.CreateScale(em.MinDistance) * Matrix4x4.CreateTranslation(p.X, p.Y, p.Z);
-        gl.UniformMatrix4(uMvpM, 1, false, ToFloats(m * cam.ViewProjection));
-        gl.Uniform3(uColor, 0.80f, 0.42f, 1f); gl.Uniform1(uSize, 1f);
-        gl.DrawArrays(PrimitiveType.LineLoop, 0, 64);
+        // Two rings: inside the inner one the sound is at full volume, at the outer one it has faded to nothing.
+        // They brighten while the camera is within earshot, so it is obvious where a sound starts and how it builds.
+        float d = Vector3.Distance(cam.Position, p);
+        float vol = SoundVolumeAt(d, si.Near, si.Far, si.Volume);
+        bool audible = vol > 0.001f;
+        void Ring(float radius, float r, float g, float b)
+        {
+            var m = Matrix4x4.CreateScale(radius) * Matrix4x4.CreateTranslation(p.X, p.Y, p.Z);
+            gl.UniformMatrix4(uMvpM, 1, false, ToFloats(m * cam.ViewProjection));
+            gl.Uniform3(uColor, r, g, b); gl.Uniform1(uSize, 1f);
+            gl.DrawArrays(PrimitiveType.LineLoop, 0, 64);
+        }
+        float lit = audible ? 1f : 0.45f;
+        if (si.Near > 0.5f) Ring(si.Near, 0.55f * lit, 1f * lit, 0.72f * lit);       // full volume
+        Ring(si.Far, 0.80f * lit, 0.42f * lit, 1f * lit);                            // silence
     }
     if (pts.Count > 0)
     {
@@ -3927,14 +4024,79 @@ void DrawSounds()
     dl.PushClipRect(vpMin, vpMax, true);
     foreach (var ob in so.Objects)
     {
-        if (!sounds.IsSound(ob.Template)) continue;
+        if (SoundInfoOf(ob.Template) is not { } si) continue;
         var w = new Vector3(ob.Position.X, ob.Position.Y, ob.Position.Z);
         if (FogCulled(w)) continue;
         var s = Gizmo.Project(w, cam.ViewProjection, fb.X, fb.Y);
         if (float.IsNaN(s.X) || s.X < vpMin.X || s.X > vpMax.X || s.Y < vpMin.Y || s.Y > vpMax.Y) continue;
-        dl.AddText(new Vector2(s.X + 8f, s.Y - 6f), col, ob.Template);
+        float d = Vector3.Distance(cam.Position, w);
+        float vol = SoundVolumeAt(d, si.Near, si.Far, si.Volume);
+        // The label says what you would hear standing here: the level it has reached, or why it is silent.
+        string what = !si.AutoPlay ? Loc.T("  (while looked at)")
+                    : vol > 0.001f ? string.Format(Loc.T("  {0:0}%"), vol * 100f)
+                    : Loc.T("  (out of range)");
+        uint c = vol > 0.001f || !si.AutoPlay ? ImGui.GetColorU32(new Vector4(0.60f, 1f, 0.78f, 1f)) : col;
+        dl.AddText(new Vector2(s.X + 8f, s.Y - 6f), c, ob.Template + what);
+        // A little meter under the name so the build-up reads at a glance.
+        if (si.AutoPlay && vol > 0.001f)
+        {
+            var a = new Vector2(s.X + 8f, s.Y + 8f);
+            dl.AddRectFilled(a, new Vector2(a.X + 46f, a.Y + 4f), ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.55f)));
+            dl.AddRectFilled(a, new Vector2(a.X + 46f * Math.Clamp(vol, 0f, 1f), a.Y + 4f), c);
+        }
     }
     dl.PopClipRect();
+}
+
+// Everything the editor knows about one template's sound: its full-volume radius, where it falls silent, whether it
+// is an ambient, and its own volume. Null when the template makes no sound.
+(float Near, float Far, bool AutoPlay, float Volume)? SoundInfoOf(string template)
+{
+    if (soundInfoCache.TryGetValue(template, out var hit)) return hit;
+    (float, float, bool, float)? result = null;
+
+    // A level emitter (Sounds/*.con -> .ssc), which the sound library already parsed.
+    if (sounds.Get(template) is { Script: not null } em)
+    {
+        float near = em.Script.MinDistance;
+        result = (near, em.Script.MaxDistance ?? MathF.Max(near * 4f, near + 25f), true, em.Script.Volume);
+    }
+    // ...or a sound carried by the object template itself (our video screens; the game's generators and speakers).
+    else if (meshLib?.SoundOf(template) is { } os)
+    {
+        var text = FindSoundScriptText(template, os.Script);
+        if (text is not null)
+        {
+            var sc = RefractorForge.Formats.Sound.SoundScript.Parse(text);
+            float near = sc.MinDistance;
+            result = (near, sc.MaxDistance ?? MathF.Max(near * 4f, near + 25f), os.AutoPlay, sc.Volume);
+        }
+        else result = (5f, 60f, os.AutoPlay, 1f);      // it sounds, even if the script is not in this level's files
+    }
+    soundInfoCache[template] = result;
+    return result;
+}
+
+// The .ssc a template names, wherever the level keeps it: beside the object (what the engine reads for an
+// object-local sound), in Sounds/, or under the path the template gave.
+string? FindSoundScriptText(string template, string script)
+{
+    var leaf = script.Replace('\\', '/');
+    leaf = leaf[(leaf.LastIndexOf('/') + 1)..];
+    foreach (var rel in new[] { $"Objects/{template}/{leaf}", $"Sounds/{leaf}", script, leaf })
+    {
+        var t = PendingText(rel) ?? ReadLevelText(rel);
+        if (t is not null) return t;
+    }
+    return null;
+}
+
+/// <summary>How loud a sound is at a point, by the same ramp the engine uses: full inside Near, nothing past Far.</summary>
+static float SoundVolumeAt(float dist, float near, float far, float volume)
+{
+    if (dist <= near) return volume;
+    if (dist >= far || far <= near) return 0f;
+    return volume * (1f - (dist - near) / (far - near));
 }
 
 // Build the collision wireframe overlay: each placed object's decoded .sm collision mesh (verts + tris from the
@@ -4477,7 +4639,7 @@ List<(string Name, byte[] Bytes)> PaintedTileBytes()
     var list = new List<(string Name, byte[] Bytes)>();
     if (!atlasPainted || atlasCpu is null || terrainTex is null) return list;
     foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu))
-        list.Add((fileName, DdsTexture.EncodeUncompressed(tile)));
+        list.Add((fileName, DxtEncoder.EncodeDxt1Mipped(tile)));   // DXT1 + mips: the only form the game's terrain reads
     return list;
 }
 
@@ -4590,6 +4752,9 @@ void DoSave()
 }
 void DoSaveCore()
 {
+    // Tunnel water needs its subshader shipped with it, always - not only when the water panel was opened this
+    // session. Without it the level asserts and crashes the moment the terrain object is created.
+    if (!gameIsBf1942 && cfg.DrawWaterBelowTerrain) { EnsureWaterShaderLoaded(); QueueWaterShader(); }
 
     // Re-emit the painted terrain texture as txCxR.dds tiles (split the atlas back into the level's tile grid,
     // uncompressed DDS - the form the engine reads, same as the generated minimap). Folder levels only for now.
@@ -4603,7 +4768,7 @@ void DoSaveCore()
             System.IO.Directory.CreateDirectory(dir);
             int n = 0;
             foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu))
-            { System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, fileName), DdsTexture.EncodeUncompressed(tile)); n++; }
+            { System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, fileName), DxtEncoder.EncodeDxt1Mipped(tile)); n++; }
             Console.WriteLine($"   Baked {n} terrain texture tile(s) -> {dir}");
             atlasPainted = false;
         }
@@ -5153,6 +5318,17 @@ Vector3 EffectiveSun()
     }
     var s = env is not null ? new Vector3(env.SunDirection.X, env.SunDirection.Y, env.SunDirection.Z) : new Vector3(-0.5f, 0.8f, -0.35f);
     return s.LengthSquared() < 1e-6f ? Vector3.Normalize(new Vector3(-0.5f, 0.8f, -0.35f)) : Vector3.Normalize(s);
+}
+
+// Aiming the sun by hand is a real edit to the level, not just a preview: the bakes already use this direction, so
+// the game has to be told it too or its own lighting will disagree with the shadows we baked.
+void MarkSunEdited()
+{
+    if (env is null || !sunOverride) return;
+    var d = EffectiveSun();
+    env.SunDirection = new Vec3(d.X, d.Y, d.Z);
+    env.WriteSun = true;
+    sunEdited = true;
 }
 
 // Lazily create the sun shadow-map depth target (a depth-only FBO).
@@ -6425,11 +6601,22 @@ void BakeObjectLightmaps()
 {
     if (so is null || meshLib is null || heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
     var es = EffectiveSun(); var sunV = new Vec3(es.X, es.Y, es.Z);
-    // Resolve meshes serially (MeshLibrary's cache isn't thread-safe), then bake in parallel (the baker is pure).
-    var jobs = new List<(StaticObject O, MeshLibrary.Mesh Mesh)>();
+    // One job per LOD MESH of each placed object, because that is how the game files lightmaps: O_HueHouse_B's is
+    // O_HueHouse_B_M1_<pos>.tga (and _M2_ for the far LOD), never O_HueHouse_B_<pos>.tga - a file named after the
+    // placed template is never read, which is why baked lightmaps changed nothing in the game. Each LOD mesh has
+    // its own unwrap, so each is baked on its own mesh. Resolve serially (the library cache is not thread-safe).
+    var jobs = new List<(StaticObject O, string MeshName, MeshLibrary.Mesh Mesh, bool Primary)>();
+    int noSlot = 0;
     foreach (var o in so.Objects)
-        if (meshLib.TryGetRenderMesh(o.Template, out var mesh) && mesh.LightmapUvs is not null)
-            jobs.Add((o, mesh));
+    {
+        bool any = false; int k = 0;
+        foreach (var meshName in meshLib.LodGeometryNames(o.Template))
+        {
+            if (meshLib.TryGet(meshName, out var lm) && lm.LightmapUvs is not null) { jobs.Add((o, meshName, lm, k == 0)); any = true; }
+            k++;
+        }
+        if (!any) noSlot++;
+    }
     if (jobs.Count == 0) { Toast(Loc.T("No placed objects with bakeable lightmap UVs on this map.")); return; }
     var results = new Texture2D?[jobs.Count];
     System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
@@ -6439,27 +6626,47 @@ void BakeObjectLightmaps()
             ambient: 0f, rig: lightRig.Lights.Count > 0 ? lightRig : null));
     var olm = new ObjectLightmaps();
     bakedObjectLightmaps.Clear();
-    int baked = 0, noUnwrap = 0;
+    int baked = 0, noUnwrap = 0, lodMaps = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
+        var (o, meshName, _, primary) = jobs[i];
         // Null = the mesh carries the lightmap-UV slot but no unwrap in it (BfVietnam props and walls ship 0,0 on
         // every vertex). The game's own generator unwraps those itself; we have nothing to write, and writing an
         // all-black map used to turn them black. They stay dynamically lit.
-        if (results[i] is not { } tex) { noUnwrap++; continue; }
-        var o = jobs[i].O;
+        if (results[i] is not { } tex) { if (primary) noUnwrap++; continue; }
         int x = (int)o.Position.X, y = (int)o.Position.Y, z = (int)o.Position.Z;
-        olm.AddBaked(o.Template, x, y, z, tex);
-        bakedObjectLightmaps[$"{o.Template}_{x}-{y}-{z}.tga"] = TgaTexture.EncodeGrayColormapped(tex);
-        baked++;
+        if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
+        bakedObjectLightmaps[$"{meshName}_{x}-{y}-{z}.tga"] = TgaTexture.EncodeGrayColormapped(tex);
     }
+    // The palette the engine loads before the maps: every lightmapped retail level ships one, so a level that
+    // never had lightmaps gets one with its first bake (an existing one - Battlecraft's is a colour palette - is kept).
+    if (!LevelHasLightmapPalette()) bakedObjectLightmaps["Palette.pal"] = TgaTexture.GreyPalettePal();
     objectLightmaps = olm; objectLightmapsLoaded = true;
     sunOverride = false; showObjectLightmaps = true;     // turn off the dynamic-sun preview so the baked result shows
     glObjects?.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
-    int noSlot = so.Objects.Count - jobs.Count;
-    Console.WriteLine($"Baked {baked} object lightmap(s) (256^2) from the editor sun; {noUnwrap} mesh(es) have no lightmap unwrap, {noSlot} no lightmap slot at all (both stay sun-lit in the game).");
+    Console.WriteLine($"Baked {baked} object lightmap(s) (256^2) + {lodMaps} far-LOD map(s) from the editor sun; {noUnwrap} mesh(es) have no lightmap unwrap, {noSlot} no lightmap slot at all (both stay sun-lit in the game).");
     Toast(noUnwrap + noSlot > 0
         ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
         : string.Format(Loc.T("Baked {0} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level."), baked));
+}
+
+// Does the level already ship Objectlightmaps/Palette.pal (folder or any of its archives)?
+bool LevelHasLightmapPalette()
+{
+    try
+    {
+        if (levelDir is not null && Directory.Exists(levelDir))
+            return Directory.EnumerateFiles(levelDir, "Palette.pal", SearchOption.AllDirectories)
+                            .Any(f => (Path.GetDirectoryName(f) ?? "").Contains("lightmap", StringComparison.OrdinalIgnoreCase));
+        foreach (var rp in rfaList)
+        {
+            if (!File.Exists(rp)) continue;
+            var arch = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rp);
+            if (arch.Entries.Any(e => e.Name.Replace('\\', '/').Contains("lightmaps/palette.pal", StringComparison.OrdinalIgnoreCase))) return true;
+        }
+    }
+    catch { }
+    return false;
 }
 
 // One command for the whole lighting bake, because "which of the four bakes do I need" was the question every
@@ -6469,10 +6676,11 @@ void BakeAllLighting()
 {
     if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
     DoBakeShadows();
-    writeShadowLsb = true;
-    if (so is not null && meshLib is not null) BakeObjectLightmaps();
-    if (lightRig.Lights.Count > 0 && atlasCpu is not null) BakeLightsToGround();
+    writeShadowLsb = true; bakedLsb = true;
+    if (so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
+    if (lightRig.Lights.Count > 0 && atlasCpu is not null) { BakeLightsToGround(); bakedGround = true; }
     showShadows = true; showObjectLightmaps = true;
+    BroadcastLightBake();
     Toast(Loc.T("Lighting baked: terrain shadow, object lightmaps and ground pools. Save writes them all."));
 }
 
@@ -6841,7 +7049,25 @@ void OnRender(double dt)
             int us = gl.GetUniformLocation(waterProg, "uSkyCube"); if (us >= 0) gl.Uniform1(us, 3);
             gl.ActiveTexture(TextureUnit.Texture0);
         }
-        bool wtex = haveWaterTex && useWaterTextures && env is not null;
+        // BfVietnam's animated water: pick the two frames to cross-fade from the clock.
+        bool wseq = !gameIsBf1942 && useWaterTextures && waterSeqTex.Length > 1;
+        { int u = gl.GetUniformLocation(waterProg, "uWaterSeq"); if (u >= 0) gl.Uniform1(u, wseq ? 1 : 0); }
+        if (wseq)
+        {
+            float cyc = MathF.Max(0.25f, waterSeqCycle);
+            float f = (float)(appClock / cyc) * waterSeqTex.Length;
+            int fa = (int)MathF.Floor(f), fb = fa + 1;
+            float mix = f - fa;
+            gl.ActiveTexture(TextureUnit.Texture4); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fa % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
+            { int u = gl.GetUniformLocation(waterProg, "uSeqA"); if (u >= 0) gl.Uniform1(u, 4); }
+            gl.ActiveTexture(TextureUnit.Texture5); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fb % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
+            { int u = gl.GetUniformLocation(waterProg, "uSeqB"); if (u >= 0) gl.Uniform1(u, 5); }
+            { int u = gl.GetUniformLocation(waterProg, "uSeqMix"); if (u >= 0) gl.Uniform1(u, mix); }
+            { int u = gl.GetUniformLocation(waterProg, "uWaterScaleM"); if (u >= 0) gl.Uniform1(u, waterScaleM); }
+            { int u = gl.GetUniformLocation(waterProg, "uMatDiffuse"); if (u >= 0) gl.Uniform3(u, waterMatDiffuse.X, waterMatDiffuse.Y, waterMatDiffuse.Z); }
+            gl.ActiveTexture(TextureUnit.Texture0);
+        }
+        bool wtex = !wseq && haveWaterTex && useWaterTextures && env is not null;
         gl.Uniform1(uHasWaterTexW, wtex ? 1 : 0);
         if (wtex)
         {
@@ -6859,7 +7085,14 @@ void OnRender(double dt)
         gl.BindVertexArray(waterVao);
         gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
         // The tunnel water: a second plane at waterBelowLevel, seen through the holes and from underground.
-        if (cfg.DrawWaterBelowTerrain && cfg.WaterBelowLevel is float wbl) { gl.Uniform1(uWaterYW, wbl); gl.DrawArrays(PrimitiveType.Triangles, 0, 6); }
+        if (cfg.DrawWaterBelowTerrain && cfg.WaterBelowLevel is float wbl)
+        {
+            gl.Uniform1(uWaterYW, wbl);
+            gl.Uniform3(uWaterColorW, belowColor.X, belowColor.Y, belowColor.Z);
+            gl.Uniform1(uWaterAlphaW, belowAlpha);
+            { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
+            gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+        }
         gl.DepthMask(true);
         gl.Disable(EnableCap.Blend);
     }
@@ -8179,6 +8412,7 @@ void WindowMenu()
     ImGui.MenuItem(Loc.TL("Layer Tool"), null, ref showLayerTool);
     ImGui.MenuItem(Loc.TL("Model Viewer"), null, ref meshViewerOpen);
     ImGui.MenuItem(Loc.TL("AI Pathmap Preview"), null, ref pathmapPreviewOpen);
+    ImGui.MenuItem(Loc.TL("Import Sound"), null, ref showSoundImport);
     ImGui.Separator();
     ImGui.MenuItem(Loc.TL("User Guide / Controls"), null, ref showHelp);
     ImGui.EndMenu();
@@ -8370,6 +8604,7 @@ void LayersPanel()
     if (sounds.Count > 0)
     {
         ImGui.Checkbox(string.Format(Loc.T("Sounds ({0})"), sounds.Count) + "###soundLayer", ref showSounds);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Where each sound comes from and how far it carries: the inner ring is full volume, the\nouter one is silence, and the label shows what you would hear standing at the camera.\nCovers the level's own emitters and sounds carried by an object (a video screen).\nThe rings brighten while you are within earshot."));
         ImGui.SameLine();
         if (ImGui.Checkbox(Loc.TL("Play##sounds"), ref playSounds))
         {
@@ -8584,7 +8819,7 @@ void ApplyWeatherToLevel()
 // old cloud block first). Game-compatible Cloud system; needs a 'cloud' StandardMesh in-game to actually render.
 void SaveCloudsFolder()
 {
-    if (!cloudsDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
+    if ((!cloudsDirty && !sunEdited) || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveCloudsToEnv();
     var skyPath = System.IO.Directory.EnumerateFiles(levelDir, "SkyAndSun.con", System.IO.SearchOption.AllDirectories).FirstOrDefault();
     try
@@ -8653,9 +8888,11 @@ void ImportCloudMesh()
 
 // The SkyAndSun.con replacement (base content + patched cloud block) for the .rfa save paths; null when clouds
 // aren't being changed or there's no base SkyAndSun.con entry to patch.
+// The level's SkyAndSun.con, patched with whatever the editor now owns in it: the animated-cloud block and, when
+// the sun has been aimed by hand, its direction.
 (string Name, byte[] Bytes)? CloudRfaExtra(string baseRfa)
 {
-    if (!cloudsDirty || env is null) return null;
+    if ((!cloudsDirty && !sunEdited) || env is null) return null;
     SaveCloudsToEnv();
     try
     {
@@ -8856,21 +9093,41 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("TERRAIN"));
     // Water level edits cfg.WaterLevel live: the water plane (uWaterY), terrain water tint (uWater) and ground
     // picking all read it each frame. Saved into Init/Terrain.con on F5. DragFloat = drag or ctrl-click to type.
+    // A map can have TWO water bodies and they are edited apart: the surface the level has always had, and (on a
+    // BfVietnam tunnel map) the second one under the terrain. Each owns its level, its colours and - through
+    // levelWater.rs - how much sky it mirrors and how opaque it is.
+    ImGui.TextDisabled(Loc.T("SURFACE WATER"));
     float wl = cfg.WaterLevel;
     ImGui.SetNextItemWidth(150f);
     if (ImGui.DragFloat(Loc.TL("Water level (m)"), ref wl, 0.25f, -5000f, 5000f, "%.1f")) { cfg.WaterLevel = wl; waterLevelEdited = true; BroadcastWater(); }
     ImGui.SameLine();
     if (ImGui.SmallButton(Loc.TL("Reset##wl")) && env is not null) { cfg.WaterLevel = waterLevelLoaded; waterLevelEdited = false; BroadcastWater(); }
-    // Water surface colour + transparency, and the submerged-terrain (deep) tint - seeded from the level's
-    // water.color / water.deepcolor / waterShallowAlpha.
-    ImGui.ColorEdit3(Loc.TL("Water colour"), ref waterColor);
-    ImGui.ColorEdit3(Loc.TL("Deep colour"), ref deepColor);
+    // Colour + transparency, from (and back to) the level's water.color / water.deepColor / waterShallowAlpha.
+    // These used to be viewport-only: an edit never reached Init.con, which is one reason the game's water looked
+    // nothing like the editor's.
+    var wasWater = waterColor;
+    bool wcol = ImGui.ColorEdit3(Loc.TL("Water colour"), ref waterColor);
+    if (wcol && Vector3.DistanceSquared(shallowColor, wasWater) < 1e-4f) shallowColor = waterColor;   // linked while equal
+    // The colour the game paints where the water is shallow, which on a river is most of its surface. A separate
+    // setting from the one above, and one the editor did not show - so a level whose two disagreed looked one way
+    // here and another in the game.
+    wcol |= ImGui.ColorEdit3(Loc.TL("Shallow colour"), ref shallowColor);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep."));
+    if (Vector3.DistanceSquared(shallowColor, waterColor) > 1e-4f)
+    {
+        ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Shallow water will read as this colour, not the one above."));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("Match##wshallow"))) { shallowColor = waterColor; wcol = true; }
+    }
+    wcol |= ImGui.ColorEdit3(Loc.TL("Deep colour"), ref deepColor);
     ImGui.SetNextItemWidth(150f);
-    SldF(Loc.TL("Water transparency"), ref waterAlpha, 0.08f, 1f, "%.2f");
+    wcol |= SldF(Loc.TL("Water transparency"), ref waterAlpha, 0.08f, 1f, "%.2f");
+    if (wcol) MarkWaterColorsEdited();
     if (ImGui.SmallButton(Loc.TL("Reset##water")) && env is not null)
     {
         waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);
         deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);
+        shallowColor = new Vector3(env.ShallowColor.X, env.ShallowColor.Y, env.ShallowColor.Z);
         waterAlpha = env.WaterAlpha;
     }
     // BfVietnam's water LOOK - how much sky it mirrors, how opaque it is - lives in standardMesh/levelWater.rs,
@@ -8879,7 +9136,6 @@ void EnvironmentPanel()
     if (!gameIsBf1942)
     {
         EnsureWaterShaderLoaded();
-        ImGui.TextDisabled(Loc.T("Water shader (levelWater.rs)"));
         ImGui.SetNextItemWidth(150f);
         bool wchg = SldF(Loc.TL("Reflectivity"), ref waterReflect, 0f, 1f, "%.2f");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
@@ -8887,28 +9143,116 @@ void EnvironmentPanel()
         wchg |= SldF(Loc.TL("Opacity"), ref waterOpacity, 0.05f, 1f, "%.2f");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The .rs 'opacity'. Base game 0.35; the jungle rivers ship 0.5-0.75."));
         if (wchg) QueueWaterShader();
+        ImGui.TextDisabled(waterSeqTex.Length > 1
+            ? string.Format(Loc.T("Animation: {0} frames (the game's own water ripple)"), waterSeqTex.Length)
+            : Loc.T("Animation: the level's water sequence is not in the loaded archives"));
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("BfVietnam animates its water with a sequence of normal maps (texture/Waterseq/test0000...),\nnamed by levelWater.rs. The viewport plays the same ones, so the ripple and the sky\nreflection here are the game's."));
     }
-    // Water TEXTURES (the level's scrolling water.texLayer1/2 + normalMap). Show whether they resolved + let the user
-    // supply their own (base BF1942 maps reference engine-built-in water07/08 that aren't shipped in the .rfa).
-    if (haveWaterTex) ImGui.TextDisabled(Loc.T("Water textures: loaded (level)"));
-    else if (env is not null && env.HasWaterTextures) ImGui.TextDisabled($"Water textures: {env.WaterTexLayer1 ?? env.WaterBaseTex} not in archives");
-    else ImGui.TextDisabled(Loc.T("Water textures: none (color only)"));
-    if (ImGui.SmallButton(Loc.TL("Import water textures..."))) ImportWaterTextures();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick the scrolling water texture(s): diffuse layer 1, then optionally layer 2 + a normal map.\nUse this when the level references water textures that aren't in its archives (most stock BF1942 maps)."));
+    // ---- The second body, on a BfVietnam tunnel map ----
+    if (!gameIsBf1942 && env is not null)
+    {
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("TUNNEL WATER (below the terrain)"));
+        bool twOn2 = cfg.DrawWaterBelowTerrain;
+        if (ImGui.Checkbox(Loc.TL("Separate water level below the terrain##inspector"), ref twOn2))
+        {
+            cfg.DrawWaterBelowTerrain = twOn2; cfg.WriteWaterBelow = true; waterLevelEdited = true;
+            if (twOn2 && cfg.WaterBelowLevel is null) cfg.WaterBelowLevel = SafeBelowWaterLevel();
+            if (twOn2) { env.SeedBelowWaterFromSurface(); belowColor = new Vector3(env.BelowColor.X, env.BelowColor.Y, env.BelowColor.Z); belowDeepColor = new Vector3(env.BelowDeepColor.X, env.BelowDeepColor.Y, env.BelowDeepColor.Z); belowAlpha = env.BelowAlpha; belowAlphaDepth = env.BelowAlphaDepth; belowColorDepth = env.BelowColorDepth; belowShallowColor = new Vector3(env.BelowShallowColor.X, env.BelowShallowColor.Y, env.BelowShallowColor.Z); }
+            env.WriteWaterBelow = true; env.WaterBelowEnabled = twOn2; lightingDirty = true;
+            EnsureWaterShaderLoaded(); QueueWaterShader();   // the subshader ships with the flag or the level crashes
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A tunnel map has its own water under the ground: the river above cannot flood the corridors.\nWrites drawWaterBelowTerrain + waterBelowLevel, the waterBelowTerrain.* colours, and the\nWaterSettingBelowTerrain subshader the engine needs (without it the level crashes on load)."));
+        if (cfg.DrawWaterBelowTerrain)
+        {
+            float twl2 = cfg.WaterBelowLevel ?? SafeBelowWaterLevel();
+            ImGui.SetNextItemWidth(150f);
+            if (ImGui.DragFloat(Loc.TL("Tunnel water level (m)##inspector"), ref twl2, 0.25f, -500f, 500f, "%.1f"))
+            { cfg.WaterBelowLevel = twl2; cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true; }
+            ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface {0:0.0} m"), cfg.WaterLevel));
+            // The second surface is drawn wherever the ground is under it, per terrain patch - so a level above the
+            // map's lowest ground puts a second sheet of water in every dip, with a straight patch-edge seam.
+            float expo = BelowWaterExposure();
+            if (expo > 0.0005f)
+            {
+                ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f),
+                    string.Format(Loc.T("This level is above the ground over {0:0.0}% of the map - the second water surface is drawn there, with a hard edge where the terrain patches stop. Lower it for a dry tunnel."), expo * 100f));
+                ImGui.SameLine();
+                if (ImGui.SmallButton(Loc.TL("Lower it")))
+                { cfg.WaterBelowLevel = SafeBelowWaterLevel(); cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; lightingDirty = true; }
+            }
+            var wasBelow = belowColor;
+            bool bcol = ImGui.ColorEdit3(Loc.TL("Tunnel water colour"), ref belowColor);
+            if (bcol && Vector3.DistanceSquared(belowShallowColor, wasBelow) < 1e-4f) belowShallowColor = belowColor;
+            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
+            ImGui.SetNextItemWidth(150f);
+            // shallowColor is what the game shows in shallow water - most of a flooded tunnel. It is a separate
+            // setting from the colour above, and it was invisible here, so a level whose two disagreed looked right
+            // in the viewport and wrong in the game with no way to tell why.
+            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
+            if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
+            {
+                ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Shallow water will read as this colour, not the one above."));
+                ImGui.SameLine();
+                if (ImGui.SmallButton(Loc.TL("Match##twshallow"))) { belowShallowColor = belowColor; bcol = true; }
+            }
+            bcol |= SldF(Loc.TL("Tunnel water transparency"), ref belowAlpha, 0.08f, 1f, "%.2f");
+            // How fast that transparency runs out with depth. Taking these from the surface is what made a brown,
+            // see-through sewer come out opaque: a surface tuned to hide its bottom hides the tunnel's too.
+            ImGui.SetNextItemWidth(150f);
+            bcol |= SldF(Loc.TL("Tunnel opaque at depth"), ref belowAlphaDepth, 0.1f, 8f, "%.2f m");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep the tunnel water has to be before it stops being see-through.\nSmaller hides the bottom sooner. Saigon68, the only retail tunnel map, uses 0.4 m."));
+            ImGui.SetNextItemWidth(150f);
+            bcol |= SldF(Loc.TL("Tunnel full colour at depth"), ref belowColorDepth, 0.5f, 20f, "%.2f m");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep before the water reaches its deep colour rather than its own colour.\nSaigon68 uses 7.5 m."));
+            if (bcol)
+            {
+                env.BelowColor = new Vec3(belowColor.X, belowColor.Y, belowColor.Z);
+                env.BelowDeepColor = new Vec3(belowDeepColor.X, belowDeepColor.Y, belowDeepColor.Z);
+                env.BelowShallowColor = new Vec3(belowShallowColor.X, belowShallowColor.Y, belowShallowColor.Z);
+                env.HasBelowShallowColor = true;
+                env.BelowAlphaDepth = belowAlphaDepth; env.BelowColorDepth = belowColorDepth;
+                env.BelowAlpha = belowAlpha; env.HasBelowColors = true;
+                env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true;
+                BroadcastWater();
+            }
+            ImGui.SetNextItemWidth(150f);
+            bool bchg = SldF(Loc.TL("Tunnel reflectivity"), ref waterBelowReflect, 0f, 1f, "%.2f");
+            ImGui.SetNextItemWidth(150f);
+            bchg |= SldF(Loc.TL("Tunnel opacity"), ref waterBelowOpacity, 0.05f, 1f, "%.2f");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 and 0.85 - a still, nearly opaque sewer."));
+            if (bchg) QueueWaterShader();
+        }
+    }
+    // Water TEXTURES (BF1942's scrolling water.texLayer1/2 + normalMap; BfVietnam animates its water in the shader
+    // instead). Show whether they resolved + let the user supply their own (base BF1942 maps reference
+    // engine-built-in water07/08 that aren't shipped in the .rfa).
+    if (gameIsBf1942 || haveWaterTex)
+    {
+        ImGui.Separator();
+        if (haveWaterTex) ImGui.TextDisabled(Loc.T("Water textures: loaded (level)"));
+        else if (env is not null && env.HasWaterTextures) ImGui.TextDisabled($"Water textures: {env.WaterTexLayer1 ?? env.WaterBaseTex} not in archives");
+        else ImGui.TextDisabled(Loc.T("Water textures: none (color only)"));
+        if (ImGui.SmallButton(Loc.TL("Import water textures..."))) ImportWaterTextures();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick the scrolling water texture(s): diffuse layer 1, then optionally layer 2 + a normal map.\nUse this when the level references water textures that aren't in its archives (most stock BF1942 maps)."));
+    }
 
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("SUN"));
-    if (ImGui.Checkbox(Loc.TL("Control sun manually"), ref sunOverride)) { shadowMapDirty = true; BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Override the level's SkyAndSun.con direction with the sliders below.\nMoving the sun relights terrain + objects and recasts real-time shadows live."));
+    if (ImGui.Checkbox(Loc.TL("Control sun manually"), ref sunOverride)) { shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Aim the sun yourself instead of using the level's SkyAndSun.con direction.\nIt relights terrain + objects and recasts the shadow map live, the lighting bakes\nuse it, and on save it is written to the level - so the game agrees with the bake."));
     if (sunOverride)
     {
         ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Sun azimuth"), ref sunAzimuthDeg, -180f, 180f, "%.0f deg")) { shadowMapDirty = true; BroadcastLight(); }
+        if (SldF(Loc.TL("Sun azimuth"), ref sunAzimuthDeg, -180f, 180f, "%.0f deg")) { shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
         ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Sun elevation"), ref sunElevationDeg, 2f, 89f, "%.0f deg")) { shadowMapDirty = true; BroadcastLight(); }
+        if (SldF(Loc.TL("Sun elevation"), ref sunElevationDeg, 2f, 89f, "%.0f deg")) { shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
+        if (sunEdited) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Aimed - written to SkyAndSun.con on save."));
         if (ImGui.Button(Loc.TL("Reset sun to level")) && env is not null)
         {
             sunOverride = false;
+            sunEdited = false; env.WriteSun = false;
             var s = EffectiveSun();
             sunElevationDeg = MathF.Asin(Math.Clamp(s.Y, -1f, 1f)) * 180f / MathF.PI;
             sunAzimuthDeg = MathF.Atan2(s.X, s.Z) * 180f / MathF.PI;
@@ -9846,12 +10190,73 @@ void ApplyRemoteGameplay(string payload)
 
 // Water level: not an undoable edit, so it syncs on its own little op. Peers apply it live (the shaders read
 // cfg.WaterLevel each frame) and mark it edited so their save keeps it; the relay seeds it to late joiners.
-void BroadcastWater() => collab?.SendOp($"WATER {cfg.WaterLevel.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+// WATER used to carry one number - the level - so every colour edit was invisible to a peer and whoever saved last
+// won. The level stays token 1 (a peer or a stored session from before this still reads it); everything else is
+// key=value, so the payload can grow again without breaking either end.
+string WaterWire()
+{
+    string V3(Vector3 v) => $"{Inv(v.X)}/{Inv(v.Y)}/{Inv(v.Z)}";
+    var sb = new System.Text.StringBuilder("WATER ").Append(Inv(cfg.WaterLevel));
+    sb.Append(" c=").Append(V3(waterColor)).Append(" s=").Append(V3(shallowColor)).Append(" d=").Append(V3(deepColor))
+      .Append(" a=").Append(Inv(waterAlpha)).Append(" rf=").Append(Inv(waterReflect)).Append(" op=").Append(Inv(waterOpacity));
+    sb.Append(" bon=").Append(cfg.DrawWaterBelowTerrain ? 1 : 0).Append(cfg.WaterBelowLevel is float bwl ? " bl=" + Inv(bwl) : "")
+      .Append(" bc=").Append(V3(belowColor)).Append(" bs=").Append(V3(belowShallowColor)).Append(" bd=").Append(V3(belowDeepColor))
+      .Append(" ba=").Append(Inv(belowAlpha)).Append(" bad=").Append(Inv(belowAlphaDepth)).Append(" bcd=").Append(Inv(belowColorDepth))
+      .Append(" brf=").Append(Inv(waterBelowReflect)).Append(" bop=").Append(Inv(waterBelowOpacity));
+    return sb.ToString();
+}
+void BroadcastWater() => collab?.SendOp(WaterWire());
 void ApplyRemoteWater(string payload)
 {
     var p = payload.Split(' ');
-    if (p.Length >= 2 && float.TryParse(p[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var wl))
-    { cfg.WaterLevel = wl; waterLevelEdited = true; }
+    float PF(string t, float dflt) => float.TryParse(t, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : dflt;
+    if (p.Length >= 2) { cfg.WaterLevel = PF(p[1], cfg.WaterLevel); waterLevelEdited = true; }
+
+    // Everything past the level is key=value, and anything absent keeps what we already had - so an older peer
+    // sending just the level still moves the water without wiping our colours.
+    var kv = new Dictionary<string, string>(StringComparer.Ordinal);
+    for (int i = 2; i < p.Length; i++)
+    {
+        int eq = p[i].IndexOf('=');
+        if (eq > 0) kv[p[i][..eq]] = p[i][(eq + 1)..];
+    }
+    if (kv.Count == 0) return;
+    Vector3 V3(string k, Vector3 dflt)
+    {
+        if (!kv.TryGetValue(k, out var t)) return dflt;
+        var c = t.Split('/');
+        return c.Length == 3 ? new Vector3(PF(c[0], dflt.X), PF(c[1], dflt.Y), PF(c[2], dflt.Z)) : dflt;
+    }
+    float F(string k, float dflt) => kv.TryGetValue(k, out var t) ? PF(t, dflt) : dflt;
+
+    waterColor = V3("c", waterColor); shallowColor = V3("s", shallowColor); deepColor = V3("d", deepColor);
+    waterAlpha = F("a", waterAlpha);
+    belowColor = V3("bc", belowColor); belowShallowColor = V3("bs", belowShallowColor); belowDeepColor = V3("bd", belowDeepColor);
+    belowAlpha = F("ba", belowAlpha); belowAlphaDepth = F("bad", belowAlphaDepth); belowColorDepth = F("bcd", belowColorDepth);
+    if (kv.ContainsKey("bl")) cfg.WaterBelowLevel = F("bl", cfg.WaterBelowLevel ?? 0f);
+    if (kv.TryGetValue("bon", out var bon)) cfg.DrawWaterBelowTerrain = bon != "0";
+
+    // These are MAP DATA: the receiver has to write them out too, or their save would undo the edit.
+    MarkWaterColorsEdited();
+    if (env is not null)
+    {
+        env.BelowColor = new Vec3(belowColor.X, belowColor.Y, belowColor.Z);
+        env.BelowShallowColor = new Vec3(belowShallowColor.X, belowShallowColor.Y, belowShallowColor.Z);
+        env.BelowDeepColor = new Vec3(belowDeepColor.X, belowDeepColor.Y, belowDeepColor.Z);
+        env.BelowAlpha = belowAlpha; env.BelowAlphaDepth = belowAlphaDepth; env.BelowColorDepth = belowColorDepth;
+        env.HasBelowColors = true; env.HasBelowShallowColor = true;
+        env.WaterBelowEnabled = cfg.DrawWaterBelowTerrain; env.WriteWaterBelow = true;
+    }
+    cfg.WriteWaterBelow = true;
+
+    float oldRf = waterReflect, oldOp = waterOpacity, oldBrf = waterBelowReflect, oldBop = waterBelowOpacity;
+    waterReflect = F("rf", waterReflect); waterOpacity = F("op", waterOpacity);
+    waterBelowReflect = F("brf", waterBelowReflect); waterBelowOpacity = F("bop", waterBelowOpacity);
+    // levelWater.rs is only rewritten when something in it actually moved.
+    if (waterReflect != oldRf || waterOpacity != oldOp || waterBelowReflect != oldBrf || waterBelowOpacity != oldBop
+        || kv.ContainsKey("bon"))
+        QueueWaterShader();
+    lightingDirty = true;
 }
 
 // ---- Overgrowth-trees overlay: the tree-generation SETTINGS (on/off + patch size + density) sync over collab so
@@ -9887,6 +10292,66 @@ string LightWire() =>
     $"{Inv(lightDiffuse.X)} {Inv(lightDiffuse.Y)} {Inv(lightDiffuse.Z)} " +
     $"{Inv(lightSpecular.X)} {Inv(lightSpecular.Y)} {Inv(lightSpecular.Z)}";
 void BroadcastLight() => collab?.SendOp(LightWire());
+
+// Placed lights. Every lighting bake reads them, so a peer without them bakes a different map - and they are saved
+// as a sidecar, so an unsynced edit was lost on the next save from the other machine. Full-state, like gameplay:
+// the whole rig each time, so two peers can never hold two different lists. Diffed once per frame rather than
+// hooked into every slider, so the panel, the gizmo, the presets and the AI bridge are all caught the same way.
+string LightRigWire() => "LIGHTRIG " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(lightRig.ToJson()));
+void BroadcastLightRigIfChanged()
+{
+    if (collab is null) { lastRigWire = null; return; }
+    if (applyingRemote) return;
+    var w = LightRigWire();
+    // The first look after connecting only records what we have: the relay's own rig arrives in the initial sync
+    // and must not be overwritten by ours before it lands. Seeding a fresh relay goes through SeedWorld.
+    if (lastRigWire is null) { lastRigWire = w; return; }
+    if (w == lastRigWire) return;
+    lastRigWire = w;
+    collab.SendOp(w);
+}
+void ApplyRemoteLightRig(string payload)
+{
+    int b = payload.IndexOf(' ');
+    if (b < 0) return;
+    lightRig = LightRig.FromJson(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload[(b + 1)..])));
+    lastRigWire = payload;                                   // what we now hold IS what was sent: no echo
+    if (selLight >= lightRig.Lights.Count) selLight = -1;
+    shadowMapDirty = true; lightingDirty = true;
+}
+
+// A lighting bake. Its output for a whole map - one lightmap .tga per object LOD - runs to tens of MB, but the
+// bake is deterministic from inputs that are all synced already (terrain, sun, placed lights, objects), so the
+// peer re-runs the same bakes on its own copy instead. One line on the wire, and a late joiner gets it last,
+// after everything it reads.
+string LightBakeWire() =>
+    $"LIGHTBAKE {(bakedLsb ? 1 : 0)} {(shadowLsbFlipX ? 1 : 0)} {(shadowLsbFlipY ? 1 : 0)} {(bakedObjects ? 1 : 0)} {(bakedGround ? 1 : 0)} {Inv(groundBakeStrength)}";
+void BroadcastLightBake() { if (!applyingRemote && (bakedLsb || bakedObjects || bakedGround)) collab?.SendOp(LightBakeWire()); }
+void ApplyRemoteLightBake(string payload)
+{
+    var p = payload.Split(' ');
+    if (p.Length < 7) return;
+    bool lsb = p[1] != "0", objs = p[4] != "0", ground = p[5] != "0";
+    shadowLsbFlipX = p[2] != "0"; shadowLsbFlipY = p[3] != "0";
+    if (float.TryParse(p[6], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gs)) groundBakeStrength = gs;
+    // Not here: this runs inside the message pump, and a bake is seconds of work that must see every op of the
+    // sync applied first. The next update does it.
+    pendingRemoteBake = (lsb, objs, ground);
+}
+void RunRemoteBake((bool Lsb, bool Objects, bool Ground) rb)
+{
+    if (heightmap is null) return;
+    applyingRemote = true;   // nothing a bake touches may be broadcast back
+    try
+    {
+        if (rb.Lsb) { DoBakeShadows(); writeShadowLsb = true; bakedLsb = true; }
+        if (rb.Objects && so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
+        if (rb.Ground && lightRig.Lights.Count > 0 && atlasCpu is not null) { BakeLightsToGround(); bakedGround = true; }
+        showShadows = true; showObjectLightmaps = true;
+    }
+    finally { applyingRemote = false; }
+    Toast(Loc.T("Lighting re-baked to match a peer's bake. Save writes it here too."));
+}
 void ApplyRemoteLight(string payload)
 {
     var p = payload.Split(' ');
@@ -9901,6 +10366,9 @@ void ApplyRemoteLight(string payload)
     lightSpecular = new Vector3(F(13, lightSpecular.X), F(14, lightSpecular.Y), F(15, lightSpecular.Z));
     lightingDirty = true;    // the receiver must write these out too, or their save would undo the edit
     shadowMapDirty = true;   // the sun moved: recast
+    // The sun is part of that: it now goes into SkyAndSun.con, and lightingDirty only carries the Init.con
+    // colours. Without this a peer's save would drop a sun somebody else aimed - and whoever saves last wins.
+    MarkSunEdited();
 }
 
 // ---- Imported .obj meshes shared over collab: ship the resolved render geometry (positions + uvs + per-part
@@ -9926,6 +10394,39 @@ string? ObjMeshWire(string name)
     return $"OBJMESH {name} {Convert.ToBase64String(ms.ToArray())}";
 }
 void BroadcastObjMesh(string name) { var w = ObjMeshWire(name); if (w is not null) collab?.SendOp(w); }
+
+// A decal or a placed sound is a level-local OBJECT: the placement syncs as an ADD, but the .con / .ssc / .wav /
+// .dds that make it real are generated here and existed only on this machine. Without them the peer holds an
+// object whose template resolves to nothing, and their save would not write its files - so ship them.
+string LevelFilesWire(string template, IEnumerable<(string RelPath, byte[] Bytes)> files)
+{
+    using var ms = new MemoryStream();
+    using var bw = new BinaryWriter(ms);
+    var list = files.ToList();
+    bw.Write(list.Count);
+    foreach (var (rel, bytes) in list) { bw.Write(rel); bw.Write(bytes.Length); bw.Write(bytes); }
+    bw.Flush();
+    return $"LVLFILE {template} {Convert.ToBase64String(ms.ToArray())}";
+}
+void BroadcastLevelFiles(string template, IEnumerable<(string RelPath, byte[] Bytes)> files)
+    => collab?.SendOp(LevelFilesWire(template, files));
+
+void ApplyRemoteLevelFiles(string payload)
+{
+    var p = payload.Split(' ', 3);
+    if (p.Length < 3) return;
+    using var ms = new MemoryStream(Convert.FromBase64String(p[2]));
+    using var br = new BinaryReader(ms);
+    int n = br.ReadInt32();
+    for (int i = 0; i < n; i++)
+    {
+        var rel = br.ReadString();
+        var bytes = br.ReadBytes(br.ReadInt32());
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(rel, StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add((rel, bytes));
+    }
+    Toast(string.Format(Loc.T("Received {0} file(s) for '{1}' from a peer."), n, p[1]));
+}
 void ApplyRemoteObjMesh(string payload)
 {
     if (meshLib is null) return;
@@ -9973,6 +10474,13 @@ void SeedWorld()
     BroadcastNotes();
     foreach (var name in importedObjs.Keys.Concat(remoteMeshNames).Distinct(StringComparer.OrdinalIgnoreCase))
         BroadcastObjMesh(name);
+    // Files generated this session (decals, placed sounds). levelWater.rs and Init.con are derived from settings
+    // that travel on their own ops, so they stay out.
+    var sessionFiles = pendingLevelFiles.Where(f => !f.RelPath.EndsWith("levelWater.rs", StringComparison.OrdinalIgnoreCase)
+                                                 && !f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase)).ToList();
+    if (sessionFiles.Count > 0) BroadcastLevelFiles("__session", sessionFiles);
+    if (lightRig.Lights.Count > 0 || lightRig.NightAmount > 0f) { lastRigWire = LightRigWire(); collab.SendOp(lastRigWire); }
+    BroadcastLightBake();
 }
 
 // Broadcast the WHOLE heightmap as one TERRAIN rect (used after a heightmap import, which is not a brush stroke).
@@ -10010,6 +10518,13 @@ void CollabDrain()
                 var payload = m.Payload;
                 int pv = payload.IndexOf(' ');
                 var pverb = pv < 0 ? payload : payload[..pv];
+                // An inbound op must never be echoed back out. This used to guard only the object edits below,
+                // which was harmless while the ApplyRemote* handlers sent nothing - but WATER now re-broadcasts what
+                // it applies (the colours are map data the receiver must save too), and two peers would have volleyed
+                // it forever. The flag covers the whole dispatch.
+                applyingRemote = true;
+                try
+                {
                 if (pverb == "TERRAIN") { try { ApplyRemoteTerrain(payload); } catch { } }
                 else if (pverb == "ATLAS") { try { ApplyRemoteAtlas(payload); } catch { } }
                 else if (pverb == "MATERIAL") { try { ApplyRemoteMaterial(payload); } catch { } }
@@ -10019,6 +10534,9 @@ void CollabDrain()
                 else if (pverb == "LIGHT") { try { ApplyRemoteLight(payload); } catch { } }
                 else if (pverb == "ANNOT") { try { if (RefractorForge.Formats.Editing.Annotations.TryParseWire(payload, out var aj)) notes.ApplyText(aj); } catch { } }
                 else if (pverb == "OBJMESH") { try { ApplyRemoteObjMesh(payload); changed = true; } catch { } }
+                else if (pverb == "LVLFILE") { try { ApplyRemoteLevelFiles(payload); } catch { } }
+                else if (pverb == "LIGHTRIG") { try { ApplyRemoteLightRig(payload); } catch { } }
+                else if (pverb == "LIGHTBAKE") { try { ApplyRemoteLightBake(payload); } catch { } }
                 else if (so is not null)
                 {
                     try
@@ -10033,6 +10551,8 @@ void CollabDrain()
                     }
                     catch { }
                 }
+                }
+                finally { applyingRemote = false; }
                 break;
             }
             case MsgType.SyncEnd: changed = true; break;
@@ -10118,7 +10638,7 @@ CollabWorldState BuildHostWorld()
         Under = growth?.Under?.Clone(),
         Over = growth?.Over?.Clone(),
         Gameplay = GameplaySync.Serialize(gameplayEdit),
-        Water = cfg.WaterLevel,
+        Water = WaterWire(),
         Overgrowth = OvergrowthWire(),
     };
     foreach (var name in importedObjs.Keys.Concat(remoteMeshNames).Distinct(StringComparer.OrdinalIgnoreCase))
@@ -10641,6 +11161,7 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Map Report"), null, showMapReport, mapReport is not null)) showMapReport = !showMapReport;
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
+            if (ImGui.MenuItem(Loc.TL("Import Sound (MP3/WAV)..."), null, false, so is not null && levelDir is not null)) showSoundImport = true;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
             if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
@@ -10935,6 +11456,7 @@ void BuildUi()
     NotesOverlay();
     MapReportWindow();
     DecalDialog();
+    SoundImportDialog();
     TunnelsWindow();
     PackageDialog();
     LogWindow();
@@ -11363,6 +11885,7 @@ void TunnelsWindow()
             cfg.DrawWaterBelowTerrain = twOn; cfg.WriteWaterBelow = true; waterLevelEdited = true;
             if (twOn && cfg.WaterBelowLevel is null) cfg.WaterBelowLevel = cfg.WaterLevel - 15f;
             env.WriteWaterBelow = true; env.WaterBelowEnabled = twOn; lightingDirty = true;
+            EnsureWaterShaderLoaded(); QueueWaterShader();   // the second body's subshader ships with the flag
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes GeometryTemplate.drawWaterBelowTerrain 1 + waterBelowLevel to Terrain.con and a\nwaterBelowTerrain.* colour block to Init.con (mirroring water.*), exactly as Saigon68 ships.\nKeep this level below the tunnel floor for dry tunnels, or in a sewer for wading."));
         if (twOn)
@@ -11372,6 +11895,7 @@ void TunnelsWindow()
             if (ImGui.DragFloat(Loc.TL("Tunnel water level (m)"), ref twl, 0.25f, -500f, 500f, "%.1f"))
             { cfg.WaterBelowLevel = twl; cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true; }
             ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface water {0:0.0} m"), cfg.WaterLevel));
+            ImGui.TextDisabled(Loc.T("Its colour and look: Inspector > Water."));
         }
         ImGui.Checkbox(Loc.TL("Show entry points in the viewport"), ref showTunnelEntries);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
@@ -11456,15 +11980,67 @@ void EnsureWaterShaderLoaded()
     if (waterRsText is null && meshLib.TryGetRsText("levelWater", out _, out var txt)) waterRsText = txt;
     waterShaderBase = RefractorForge.Formats.Terrain.WaterShader.Parse(waterRsText);
     waterReflect = waterShaderBase.Reflectivity; waterOpacity = waterShaderBase.Opacity;
+    var below = RefractorForge.Formats.Terrain.WaterShader.Parse(waterRsText, RefractorForge.Formats.Terrain.WaterShader.BelowTerrainSubshader);
+    waterBelowReflect = below.Reflectivity; waterBelowOpacity = below.Opacity;
 }
 
-// Queue the override for the save. Everything the author left in the file is kept; only the two values move.
+// Queue the override for the save. Everything the author left in the file is kept; only the values move.
+//
+// A level whose terrain says drawWaterBelowTerrain 1 MUST also ship the WaterSettingBelowTerrain subshader: the base
+// archive has only WaterSetting, and without the second block the engine dies on load with
+// "Can't load or use: StandardMesh/levelWater/WaterSettingBelowTerrain.rs" (WaterPatch.cpp). Saigon68, the one retail
+// tunnel-water level, ships the pair - so whenever tunnel water is on, so do we.
 void QueueWaterShader()
 {
     var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity };
-    var text = RefractorForge.Formats.Terrain.WaterShader.Patch(waterRsText, settings);
+    var below = cfg.DrawWaterBelowTerrain
+        ? RefractorForge.Formats.Terrain.WaterShaderSettings.BelowTerrainDefault with { Reflectivity = waterBelowReflect, Opacity = waterBelowOpacity }
+        : null;
+    var text = RefractorForge.Formats.Terrain.WaterShader.Patch(waterRsText, settings, below);
     pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("StandardMesh/levelWater.rs", StringComparison.OrdinalIgnoreCase));
     pendingLevelFiles.Add(("StandardMesh/levelWater.rs", System.Text.Encoding.Latin1.GetBytes(text)));
+    if (!applyingRemote) BroadcastWater();   // reflectivity / opacity are map data too
+}
+
+// The surface water's colours, from the sliders into the level's own Init.con on the next save.
+void MarkWaterColorsEdited()
+{
+    if (env is null) return;
+    env.WaterColor = new Vec3(waterColor.X, waterColor.Y, waterColor.Z);
+    env.ShallowColor = new Vec3(shallowColor.X, shallowColor.Y, shallowColor.Z);
+    env.HasShallowColor = true;
+    env.DeepColor = new Vec3(deepColor.X, deepColor.Y, deepColor.Z);
+    env.WaterAlpha = waterAlpha;
+    env.WriteWater = true;
+    lightingDirty = true;      // the lighting patch is what carries Init.con edits into the save
+    if (!applyingRemote) BroadcastWater();
+}
+
+// A safe level for the second water body: under the lowest ground on the map, so its surface is never seen from
+// above. Starting from `waterLevel - 15` (the old guess) put it at 6.3 m on a map whose terrain reaches 0 - and the
+// engine then drew that second, near-opaque plane across every dip below it, with a hard patch-edge seam.
+float SafeBelowWaterLevel()
+{
+    float floor = cfg.WaterLevel - 15f;
+    if (heightmap is not null)
+    {
+        var (lo, _) = RefractorForge.Render.TerrainShadow.HeightSpan(heightmap, cfg);
+        floor = MathF.Min(floor, lo - 5f);
+    }
+    return floor;
+}
+
+/// <summary>How much of the map's ground lies UNDER the second water surface - the part where it is drawn, and seen.
+/// 0 means it stays hidden below the terrain, which is what a dry tunnel wants.</summary>
+float BelowWaterExposure()
+{
+    if (heightmap is null || cfg.WaterBelowLevel is not float lvl) return 0f;
+    int n = heightmap.Width * heightmap.Height, under = 0;
+    float ys = cfg.YScale / 256f;
+    for (int y = 0; y < heightmap.Height; y++)
+        for (int x = 0; x < heightmap.Width; x++)
+            if (heightmap.Samples[y * heightmap.Width + x] * ys < lvl) under++;
+    return n == 0 ? 0f : under / (float)n;
 }
 
 // Where a soldier meets water inside the tunnel system: the second body when the level has one, else the river.
@@ -11573,6 +12149,43 @@ void DecalDialog()
             var pth = Picker.File("Pick the decal movie", "Bink movies|*.bik|All files|*.*", levelDir);
             if (pth is not null) decalImagePath = pth;
         }
+        bool converting = bikTask is not null && !bikTask.IsCompleted;
+        ImGui.BeginDisabled(converting);
+        if (ImGui.Button(Loc.TL("Convert a video to .bik...")))
+        {
+            var src = Picker.File("Pick a video to convert", "Videos|*.mp4;*.avi;*.mov;*.mkv;*.webm;*.wmv;*.m4v|All files|*.*", levelDir);
+            if (src is not null)
+            {
+                var dst = Path.ChangeExtension(src, ".bik");
+                bikProgressBytes = 0; bikTaskClock.Restart();
+                int bw = bikWidths[Math.Clamp(bikWidthIdx, 0, bikWidths.Length - 1)];
+                Toast(Loc.T("Converting to Bink - the editor stays usable; this can take a few minutes."));
+                bikTask = System.Threading.Tasks.Task.Run(() =>
+                {
+                    var made = ConvertVideoToBik(src, dst, out var e, bw);
+                    return (made, e);
+                });
+            }
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(110f * uiScale);
+        ImGui.Combo(Loc.TL("Video size"), ref bikWidthIdx, bikWidthNames, bikWidthNames.Length);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bink is not a small format and the file ships inside your map: the game's own background.bik is 320x240 and 5 MB a minute, while an untouched 720p minute is nearly 80 MB. 512 px keeps a screen sharp at the distance anyone reads one from."));
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Turns an mp4 (or any video FFmpeg reads) into the Bink .bik the game plays,\nkeeping its sound. Needs the free RAD Video Tools installed."));
+        if (converting)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.55f, 0.85f, 1f, 1f), string.Format(Loc.T("Converting... {0:0} s, {1:0.0} MB"), bikTaskClock.Elapsed.TotalSeconds, bikProgressBytes / 1048576.0));
+        }
+        // Pick the result up on the UI thread, where the toast and the dialog live.
+        if (bikTask is not null && bikTask.IsCompleted)
+        {
+            var (made, cerr) = bikTask.IsCompletedSuccessfully ? bikTask.Result : (null, bikTask.Exception?.Message ?? "failed");
+            bikTask = null; bikTaskClock.Stop();
+            if (made is not null) { decalImagePath = made; decalInfoPath = ""; Toast(string.Format(Loc.T("Converted to {0}"), Path.GetFileName(made))); }
+            else Toast(Loc.T("Video conversion failed: ") + cerr);
+        }
         RefreshDecalInfo();
         if (decalImgW > 0)
         {
@@ -11580,7 +12193,10 @@ void DecalDialog()
             ImGui.TextDisabled(string.Format(Loc.T("{0} x {1} px  ({2}:{3})"), decalImgW, decalImgH, decalImgW / g, decalImgH / g) + (decalVideo ? Loc.T("  video") : ""));
         }
         else if (decalVideo) ImGui.TextDisabled(Loc.T("Video (size unknown without FFmpeg - 4:3 assumed)"));
-        ImGui.Checkbox(Loc.TL("Preserve aspect ratio"), ref decalKeepAspect);
+        // A video's shape is the video's own: stretching a movie is never what anyone wants, so only its SIZE is
+        // adjustable. A picture keeps the free choice.
+        if (decalVideo) { decalKeepAspect = true; ImGui.TextDisabled(Loc.T("Aspect ratio locked to the video.")); }
+        else ImGui.Checkbox(Loc.TL("Preserve aspect ratio"), ref decalKeepAspect);
         if (decalKeepAspect && decalImgW > 0)
         {
             // One slider: the width; the height follows the picture so it is never squashed.
@@ -11594,7 +12210,38 @@ void DecalDialog()
             ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Height (m)"), ref decalH, 0.1f, 40f, "%.2f");
         }
         ImGui.Checkbox(Loc.TL("Lay flat on the ground (scorch mark) instead of standing up (poster)"), ref decalFlat);
+        // Drawing distance. On its own it just stops a screen being visible from far off; with the look-at sound it is
+        // also the only thing bounding how far that sound carries, so it is offered whatever the sound mode.
+        ImGui.Checkbox(Loc.TL("Stop drawing it past a distance"), ref decalLimitDraw);
+        if (decalLimitDraw)
+        {
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(130f * uiScale); SldF(Loc.TL("m##drawdist"), ref decalLookRange, 20f, 600f, "%.0f");
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine draws the screen out to its far LOD distance - 1000 m unless capped. With the\n'only while you look at it' sound this is ALSO how far the sound carries, so cap it there."));
         if (decalVideo) ImGui.TextWrapped(Loc.T("A video decal: the .bik is copied to the mod's Movies folder and the shader points at it - the same Bink-texture trick the mod movie screens use. It plays in the game with its sound; the editor shows its first frame."));
+        if (decalVideo)
+        {
+            ImGui.Checkbox(Loc.TL("Sound from the video, at the screen"), ref decalSound);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes the movie's audio track as a level sound script on the decal object itself,\nso it plays from the middle of the screen and fades with distance."));
+            if (decalSound)
+            {
+                ImGui.SetNextItemWidth(240f * uiScale);
+                ImGui.Combo(Loc.TL("When it plays"), ref decalSoundMode,
+                            new[] { Loc.T("Always - fades with distance"), Loc.T("Only while you look at it") }, 2);
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Always: the engine's ambient (autoPlaySound), like the game's own speakers and generators -\nit starts with the level and rises as you approach.\nOnly while looking: no autoPlaySound, so the sound follows the object being DRAWN - it snaps\non at full volume when the screen is in view and stops when it leaves."));
+                ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref decalSoundVol, 0.05f, 1f, "%.2f");
+                if (decalSoundMode == 0)
+                {
+                    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref decalSoundNear, 1f, 100f, "%.0f");
+                    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref decalSoundFar, 5f, 400f, "%.0f");
+                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The sound is gone past this - it can never carry across the map. Keep it modest (40-80 m)\nfor a screen you only hear when you are near it, or raise it to cover an area."));
+                    if (decalSoundFar < decalSoundNear + 1f) decalSoundFar = decalSoundNear + 1f;
+                }
+                ImGui.Checkbox(Loc.TL("Stereo"), ref decalSoundStereo);
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The format takes stereo and the game's own scripts use it, but a stereo sample is not placed in\nthe world the way a mono one is. Leave it off for a screen you can walk around."));
+            }
+        }
         ImGui.Spacing();
         if (ImGui.Button(Loc.TL("Create and place")))
         {
@@ -11638,6 +12285,74 @@ Texture2D? BikFirstFrame(string bik)
     catch { return null; }
 }
 
+// RAD's Bink compressor - the only thing that can WRITE .bik (ffmpeg decodes Bink but cannot encode it). It ships
+// with the free RAD Video Tools; without it the editor can still USE a .bik, just not make one.
+string? FindRadVideo() => RefractorForge.Render.BinkEncoder.FindRadVideo();
+
+// Run ffmpeg and hand back what it said on stderr (where it prints stream info as well as errors).
+string RunFfmpeg(string args, int timeoutMs = 180000)
+{
+    var ff = FindFfmpeg();
+    if (ff is null) return "";
+    try
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(ff, "-hide_banner " + args)
+        { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        string err = proc.StandardError.ReadToEnd();
+        proc.WaitForExit(timeoutMs);
+        return err;
+    }
+    catch (Exception ex) { return ex.Message; }
+}
+
+/// <summary>A media file's video size, straight out of ffmpeg's own stream line. (0,0) when it has no video.</summary>
+(int W, int H) ProbeVideoSize(string path)
+{
+    var info = RunFfmpeg($"-i \"{path}\"", 20000);
+    var m = System.Text.RegularExpressions.Regex.Match(info, @"Video:.*?[, ](\d{2,5})x(\d{2,5})");
+    return m.Success ? (int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value)) : (0, 0);
+}
+
+bool MediaHasAudio(string path) => RunFfmpeg($"-i \"{path}\"", 20000).Contains("Audio:");
+
+/// <summary>The media file's sound as a mono 22 kHz PCM wav - the shape the engine's sound folders hold. Null when
+/// the file has no audio track or ffmpeg is missing.</summary>
+byte[]? ExtractWav(string path, bool stereo = false)
+{
+    if (FindFfmpeg() is null || !MediaHasAudio(path)) return null;
+    var tmp = Path.Combine(Path.GetTempPath(), "rf_snd_" + Guid.NewGuid().ToString("N") + ".wav");
+    try
+    {
+        RunFfmpeg($"-y -i \"{path}\" -vn -acodec pcm_s16le -ar 22050 -ac {(stereo ? 2 : 1)} \"{tmp}\"");
+        return File.Exists(tmp) ? File.ReadAllBytes(tmp) : null;
+    }
+    catch { return null; }
+    finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+}
+
+// Convert any video into the Bink .bik the game plays. The work - and the awkward business of waiting for RAD's
+// compressor, which never exits on its own - lives in Render/BinkEncoder so it can be run and checked outside the
+// editor. Safe off the UI thread: it touches no ImGui or GL state.
+string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWidth = 512)
+{
+    error = "";
+    var rad = FindRadVideo();
+    if (rad is null) { error = Loc.T("RAD Video Tools is not installed - it is what writes .bik files (free, from radgametools.com)."); return null; }
+    var ff = FindFfmpeg();
+    if (ff is null) { error = Loc.T("FFmpeg is needed to prepare the video for Bink."); return null; }
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var r = RefractorForge.Render.BinkEncoder.Convert(ff, rad, src, dstBik, b => bikProgressBytes = b, out var err, 30, maxWidth);
+    if (r != RefractorForge.Render.BinkEncoder.Result.Ok)
+    {
+        error = err;
+        Console.WriteLine($"Bink conversion failed ({r}): {err}");
+        return null;
+    }
+    Console.WriteLine($"Bink: wrote {Path.GetFileName(dstBik)} ({new FileInfo(dstBik).Length / 1048576.0:0.0} MB) in {sw.Elapsed.TotalSeconds:0} s.");
+    return dstBik;
+}
+
 // A stand-in picture for a video decal when no frame can be decoded: dark, with a film strip, so it reads as a
 // screen in the viewport rather than a missing texture.
 static Texture2D VideoPlaceholder()
@@ -11664,7 +12379,10 @@ bool CreateDecalObject()
     {
         RefreshDecalInfo();
         bool video = decalVideo;
-        var tex = video ? (BikFirstFrame(decalImagePath) ?? VideoPlaceholder()) : LoadImageAsTexture(decalImagePath);
+        // Keep hold of whether this is the REAL first frame or the stand-in: the UV window below is computed from
+        // the picture's size, and the stand-in's size is not the video's.
+        var realFrame = video ? BikFirstFrame(decalImagePath) : LoadImageAsTexture(decalImagePath);
+        var tex = realFrame ?? (video ? VideoPlaceholder() : null);
         if (tex is null) { Toast(Loc.T("Could not load that image.")); return false; }
 
         // Nothing runs the decal's Objects folder unless Init.con says so, and most levels ship no such line -
@@ -11679,14 +12397,55 @@ bool CreateDecalObject()
         // The texture manager drops any texture that is not power-of-two on both axes, and an object texture
         // wants a mip chain or it shimmers at distance. Uncompressed 32-bit is fine: the engine's own loader
         // picks its format from the bit count alone. A video needs none of this: the shader points at the movie.
-        var texPow2 = DdsTexture.ToPowerOfTwo(tex, 4, 1024);
+        // A still image is RESIZED to a power of two, so it fills the quad. A video is not ours to resize: the engine
+        // decodes each Bink frame into a power-of-two texture and leaves the remainder black, so the quad's UVs have to
+        // stop where the picture does or those black bands show up on the screen in game. The window is worked out from
+        // THIS video's own size, so any resolution comes out right; the preview texture is padded the same way, so what
+        // the editor draws is what the game draws.
+        //
+        // With no real frame to measure (no FFmpeg, or a movie it cannot read) the size is unknown - so the UVs are
+        // left alone rather than cropped to a guess. That is the old behaviour: the padding may show, but nothing is
+        // cut off, and the toast below says why.
+        float uMax = 1f, vMax = 1f;
+        Texture2D texPow2;
+        if (video) texPow2 = realFrame is not null ? DdsTexture.PadToPowerOfTwo(tex, out uMax, out vMax) : tex;
+        else texPow2 = DdsTexture.ToPowerOfTwo(tex, 4, 1024);
+        if (video && realFrame is null)
+            Toast(Loc.T("The video's size could not be read (no FFmpeg), so the screen may show black edges. Install FFmpeg and remake it to fit exactly."));
         byte[]? dds = video ? null : DdsTexture.EncodeUncompressedMipped(texPow2);
         string? movieRef = video ? CopyBikToMovies(decalImagePath) : null;
-        var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub, movieRef);
+
+        // The movie's own audio, as a sound script on the decal object - the engine plays it from the object's
+        // position, which is the middle of the screen.
+        string? soundScript = null;
+        var soundFiles = new List<(string RelPath, byte[] Bytes)>();
+        if (video && decalSound && ExtractWav(decalImagePath, decalSoundStereo) is { } wav)
+        {
+            var snd = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, decalSoundVol, decalSoundNear, decalSoundFar,
+                                                                     loop: true, triggerRadius: decalSoundFar, stereo: decalSoundStereo);
+            soundScript = snd.Template + ".ssc";
+            // Only the script + the wavs: the decal's own template carries the loadSoundScript line, so it needs
+            // neither its own Sounds/*.con nor a run line. The script goes in the OBJECT'S folder, because that is
+            // where the engine looks for it - one written to Sounds/ came back as
+            // "File not found: .../objects/<name>/<name>.ssc" and the decal played silently.
+            foreach (var f in snd.Files)
+            {
+                if (f.RelPath.EndsWith(".con", StringComparison.OrdinalIgnoreCase)) continue;
+                var rel = f.RelPath.EndsWith(".ssc", StringComparison.OrdinalIgnoreCase)
+                    ? RefractorForge.Formats.Sound.SoundObject.ScriptPathFor(name, snd.Template)
+                    : f.RelPath;
+                soundFiles.Add((rel, f.Bytes));
+            }
+        }
+        var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub, movieRef,
+                                                                 soundScript, decalSoundFar, soundAutoPlay: decalSoundMode == 0, uMax: uMax, vMax: vMax,
+                                                                 maxDrawDistance: decalLimitDraw ? decalLookRange : 0f);
+        foreach (var f in soundFiles) pendingLevelFiles.Add(f);
 
         // Queue every file for the save, then the two registration patches. Both patches build on the newest
         // queued copy when there is one, so a second decal adds to the first rather than replacing it.
         foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        BroadcastLevelFiles(built.Template, built.Files);
 
         string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
         pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
@@ -11708,6 +12467,95 @@ bool CreateDecalObject()
         return true;
     }
     catch (Exception ex) { Toast(Loc.T("Decal failed: ") + ex.Message); return false; }
+}
+
+// ---- Importing a sound ------------------------------------------------------------------------------------------
+//
+// The engine plays .wav, so anything else (mp3, ogg, m4a...) is converted on the way in. What gets written is what a
+// retail ambient emitter is made of: the wav under Sound/22khz + Sound/44kHz, a .ssc script that plays it with a
+// distance falloff, a .con that makes it a placeable object, and the run line in Sounds/Environment.con.
+void SoundImportDialog()
+{
+    if (!showSoundImport) return;
+    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Import Sound") + "###sndimport", ref showSoundImport, ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        ImGui.TextWrapped(Loc.T("Adds an ambient sound to the map: the audio, a sound script with its distance falloff, and a placeable object that carries them. The game plays .wav, so an mp3 (or any other format FFmpeg reads) is converted for you."));
+        ImGui.Spacing();
+        ImGui.SetNextItemWidth(300f * uiScale);
+        ImGui.InputText(Loc.TL("Audio file"), ref sndImportPath, 260);
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Browse...")))
+        {
+            var pth = Picker.File("Pick a sound", "Audio|*.mp3;*.wav;*.ogg;*.m4a;*.flac;*.aac;*.wma|All files|*.*", levelDir);
+            if (pth is not null)
+            {
+                sndImportPath = pth;
+                if (sndImportName.Trim().Length == 0) sndImportName = Path.GetFileNameWithoutExtension(pth);
+            }
+        }
+        ImGui.SetNextItemWidth(220f * uiScale);
+        ImGui.InputText(Loc.TL("Name"), ref sndImportName, 40);
+        ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref sndVol, 0.05f, 1f, "%.2f");
+        ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref sndNear, 1f, 200f, "%.0f");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The script's minDistance: inside this radius the sound plays at full volume."));
+        ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref sndFar, 5f, 600f, "%.0f");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Where the Distance->Volume ramp reaches silence, and the object's triggerRadius."));
+        if (sndFar < sndNear + 1f) sndFar = sndNear + 1f;
+        ImGui.Checkbox(Loc.TL("Loop"), ref sndLoop);
+        if (FindFfmpeg() is null && !sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), Loc.T("FFmpeg not found - only .wav can be imported without it."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Create and place")))
+        {
+            if (ImportSoundObject()) showSoundImport = false;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Cancel##snd"))) showSoundImport = false;
+    }
+    ImGui.End();
+}
+
+bool ImportSoundObject()
+{
+    if (so is null || hist is null) { Toast(Loc.T("Load a level first.")); return false; }
+    if (!File.Exists(sndImportPath)) { Toast(Loc.T("Pick an audio file first.")); return false; }
+    try
+    {
+        // .wav goes in as it is; anything else through FFmpeg, to the mono 22 kHz PCM the sound folders hold.
+        byte[]? wav = sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase)
+            ? File.ReadAllBytes(sndImportPath)
+            : ExtractWav(sndImportPath);
+        if (wav is null || wav.Length < 64)
+        {
+            Toast(FindFfmpeg() is null ? Loc.T("FFmpeg is needed to convert that to .wav.") : Loc.T("Could not read any audio from that file."));
+            return false;
+        }
+        var name = sndImportName.Trim().Length > 0 ? sndImportName : Path.GetFileNameWithoutExtension(sndImportPath);
+        var built = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, sndVol, sndNear, sndFar, sndLoop, sndFar);
+        foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        BroadcastLevelFiles(built.Template, built.Files);
+
+        // The level's sound layer has to run the new .con or the template never exists.
+        string? envCon = PendingText("Sounds/Environment.con") ?? ReadLevelText("Sounds/Environment.con");
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Sounds/Environment.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Sounds/Environment.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Sound.SoundObject.PatchEnvironmentCon(envCon, built.RunLine))));
+
+        // Drop it where the camera is looking, like a paste, and select it so it can be dragged straight away.
+        Vec3 at;
+        var fbp = window.FramebufferSize;
+        var pray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbp.X, fbp.Y);
+        if (terrainPick is not null && terrainPick.Raycast(pray, out var ph)) at = new Vec3(ph.X, ph.Y + 1f, ph.Z);
+        else { var c = cam.Position + cam.Forward * 20f; at = new Vec3(c.X, c.Y, c.Z); }
+        var id = Guid.NewGuid().ToString("N");
+        hist.Do(new AddObject(id, built.Template, at, Vec3.Zero));
+        SyncMarkers(); RebuildObjects();
+        selected = so.Objects.FindIndex(o => o.Id == id); multi.Clear(); if (selected >= 0) multi.Add(selected);
+        Toast(string.Format(Loc.T("Sound '{0}' placed. {1} file(s) will be written on save; it plays in game (and in the editor after a reload)."), built.Template, built.Files.Count + 1));
+        return true;
+    }
+    catch (Exception ex) { Toast(Loc.T("Sound import failed: ") + ex.Message); return false; }
 }
 
 // ---- Annotations -----------------------------------------------------------------------------------------------
@@ -13517,6 +14365,32 @@ void InitWaterTextures()
     haveWaterTex = true;
     Console.WriteLine($"Water textures: layer1={(t1 is not null ? env.WaterTexLayer1 : "(miss)")}, " +
                       $"layer2={(t2 is not null ? env.WaterTexLayer2 : "(miss)")}, normal={(tn is not null ? env.WaterNormalMap : "(miss)")} -> textured water ON.");
+}
+
+// BfVietnam's water animation: the `sequence` named by levelWater.rs is a numbered run of NORMAL maps
+// (texture/Waterseq/test0000.dds ...) that the engine cross-fades over sequenceCycleTime. Loading them is what makes
+// the editor's water ripple and mirror the sky the way the game's does, instead of sitting there as flat colour.
+void InitWaterSequence()
+{
+    foreach (var t in waterSeqTex) if (t != 0) gl.DeleteTexture(t);
+    waterSeqTex = System.Array.Empty<uint>();
+    if (gameIsBf1942 || meshLib?.Textures is null) return;
+    EnsureWaterShaderLoaded();
+    var seq = RefractorForge.Formats.Terrain.WaterShader.SequenceOf(waterRsText);
+    if (string.IsNullOrEmpty(seq)) return;
+    waterScaleM = waterShaderBase.WaterScale > 0.5f ? waterShaderBase.WaterScale : 25f;
+    waterMatDiffuse = new Vector3(waterShaderBase.Diffuse.X, waterShaderBase.Diffuse.Y, waterShaderBase.Diffuse.Z);
+    var frames = new List<uint>();
+    for (int i = 0; i < 64; i++)                       // retail ships 32; stop at the first gap
+    {
+        var tex = meshLib.Textures.Resolve(seq + i.ToString("0000"));
+        if (tex is null) break;
+        frames.Add(UploadTiledTexture(tex));
+    }
+    waterSeqTex = frames.ToArray();
+    Console.WriteLine(frames.Count > 1
+        ? $"Water animation: {frames.Count} frames from {seq} (scale {waterScaleM:0} m, cycle {waterSeqCycle:0.#}s)."
+        : $"Water animation: {seq} not in the loaded archives - flat water.");
 }
 
 // Build a tileable procedural cloud-density texture (multi-octave value noise + a coverage curve), grayscale RGBA,

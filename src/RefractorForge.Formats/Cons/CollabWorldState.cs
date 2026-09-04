@@ -21,20 +21,35 @@ public sealed class CollabWorldState
     public MaterialMap? Under { get; set; }       // layer 1 (undergrowth)
     public MaterialMap? Over { get; set; }        // layer 2 (overgrowth)
     public string? Gameplay { get; set; }         // GameplaySync.Serialize(...) text (decoded, not base64)
-    public float? Water { get; set; }             // env water level (Terrain.con waterLevel): synced live + seeded to joiners
+    /// <summary>The whole WATER op, verbatim. It used to be just the level, which meant every water COLOUR - both
+    /// bodies' colour / shallow colour / deep colour / transparency, and the shader's reflectivity and opacity -
+    /// was invisible to a peer. Stored as the op text so the payload can grow without another format here.</summary>
+    public string? Water { get; set; }
     public string? Overgrowth { get; set; }       // overgrowth-tree overlay settings wire ("OVERGROWTH show spacing density")
     /// <summary>Light settings wire, verbatim: sun angle + the four renderer.* colours. These are MAP DATA — the
     /// colours are patched into Init.con on save — so an unsynced edit means whoever saves last silently overwrites
     /// the other person's lighting.</summary>
     public string? Light { get; set; }
+    /// <summary>Placed lights, verbatim <c>LIGHTRIG &lt;b64 json&gt;</c>. Every lighting bake reads them, so a peer
+    /// without them bakes a different map; and they are saved as a sidecar, so an unsynced edit is lost on the
+    /// next save from the other machine.</summary>
+    public string? LightRig { get; set; }
+    /// <summary>The last lighting bake, verbatim <c>LIGHTBAKE ...</c>: which bakes ran and with what settings.
+    /// The bake is deterministic from inputs that are all synced (terrain, sun, placed lights, objects), so a peer
+    /// re-runs it rather than receiving its output - a map's worth of lightmap .tga is tens of MB; this is one line.</summary>
+    public string? LightBake { get; set; }
     /// <summary>Review notes, verbatim <c>ANNOT &lt;b64 json&gt;</c>. Full-state like gameplay, so peers can never
     /// hold two different lists.</summary>
     public string? Annotations { get; set; }
     /// <summary>Imported .obj meshes shared over the wire: template name -> the verbatim "OBJMESH name b64" op that
     /// recreates the render mesh on a peer. Stored so late joiners get imports too.</summary>
     public Dictionary<string, string> ObjMeshes { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>The files a level-local object needs, keyed by template: a placed sound's .con / .ssc / .wav, a
+    /// decal's .con / .rs / .dds. The placement itself already synced as an ADD, but without these the peer holds
+    /// an object whose template resolves to nothing and whose files their save would not write.</summary>
+    public Dictionary<string, string> LevelFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || Water is not null || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0;
+    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || !string.IsNullOrEmpty(Water) || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0 || LevelFiles.Count > 0 || !string.IsNullOrEmpty(LightRig) || !string.IsNullOrEmpty(LightBake);
 
     /// <summary>Apply one streamed op (TERRAIN/MATERIAL/GAMEPLAY) to the canonical state. Returns true if it was a
     /// recognised non-object op (so the caller knows not to treat it as an object edit). Terrain/material rects are
@@ -86,8 +101,7 @@ public sealed class CollabWorldState
             }
             case "WATER":
             {
-                var p = payload.Split(' ');
-                if (p.Length >= 2 && float.TryParse(p[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var wl)) Water = wl;
+                Water = payload;
                 return true;
             }
             case "OVERGROWTH":
@@ -103,6 +117,22 @@ public sealed class CollabWorldState
             case "ANNOT":
             {
                 Annotations = payload;
+                return true;
+            }
+            case "LIGHTRIG":
+            {
+                LightRig = payload;
+                return true;
+            }
+            case "LIGHTBAKE":
+            {
+                LightBake = payload;
+                return true;
+            }
+            case "LVLFILE":
+            {
+                var p = payload.Split(' ');
+                if (p.Length >= 3) LevelFiles[p[1]] = payload;
                 return true;
             }
             case "OBJMESH":
@@ -130,16 +160,23 @@ public sealed class CollabWorldState
             yield return $"MATERIAL 2 0 0 {Over.Width} {Over.Height} {Convert.ToBase64String(Over.Samples)}";
         if (!string.IsNullOrEmpty(Gameplay))
             yield return "GAMEPLAY " + Convert.ToBase64String(Encoding.UTF8.GetBytes(Gameplay));
-        if (Water is float wv)
-            yield return "WATER " + wv.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (!string.IsNullOrEmpty(Water))
+            yield return Water;
+        foreach (var op in LevelFiles.Values)  // a level-local object's files before anything that places it
+            yield return op;
         foreach (var op in ObjMeshes.Values)   // imported meshes BEFORE overgrowth (overgrowth may reference them)
             yield return op;
         if (!string.IsNullOrEmpty(Overgrowth))
             yield return Overgrowth;
         if (!string.IsNullOrEmpty(Light))
             yield return Light;
+        if (!string.IsNullOrEmpty(LightRig))
+            yield return LightRig;
         if (!string.IsNullOrEmpty(Annotations))
             yield return Annotations;
+        // Last: a joiner re-runs the bake, and it needs every input above in place first.
+        if (!string.IsNullOrEmpty(LightBake))
+            yield return LightBake;
     }
 
     /// <summary>Persist the maps + gameplay into a state directory (the relay's own resume format).</summary>
@@ -151,11 +188,14 @@ public sealed class CollabWorldState
         Under?.SaveRaw(Path.Combine(dir, "UnderGrowthMap.raw"));
         Over?.SaveRaw(Path.Combine(dir, "OverGrowthMap.raw"));
         if (!string.IsNullOrEmpty(Gameplay)) File.WriteAllText(Path.Combine(dir, "gameplay.sync"), Gameplay);
-        if (Water is float wv) File.WriteAllText(Path.Combine(dir, "water.txt"), wv.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (!string.IsNullOrEmpty(Water)) File.WriteAllText(Path.Combine(dir, "water.txt"), Water);
         if (!string.IsNullOrEmpty(Overgrowth)) File.WriteAllText(Path.Combine(dir, "overgrowth.txt"), Overgrowth);
         if (!string.IsNullOrEmpty(Light)) File.WriteAllText(Path.Combine(dir, "light.txt"), Light);
         if (!string.IsNullOrEmpty(Annotations)) File.WriteAllText(Path.Combine(dir, "annotations.txt"), Annotations);
         if (ObjMeshes.Count > 0) File.WriteAllLines(Path.Combine(dir, "objmeshes.txt"), ObjMeshes.Values);   // one "OBJMESH ..." op per line
+        if (LevelFiles.Count > 0) File.WriteAllLines(Path.Combine(dir, "levelfiles.txt"), LevelFiles.Values);
+        if (!string.IsNullOrEmpty(LightRig)) File.WriteAllText(Path.Combine(dir, "lightrig.txt"), LightRig);
+        if (!string.IsNullOrEmpty(LightBake)) File.WriteAllText(Path.Combine(dir, "lightbake.txt"), LightBake);
     }
 
     /// <summary>Reload a state directory written by <see cref="Save"/>; null if it holds none of these layers.
@@ -172,11 +212,20 @@ public sealed class CollabWorldState
         var gp = Path.Combine(dir, "gameplay.sync");
         if (File.Exists(gp)) w.Gameplay = File.ReadAllText(gp);
         var wf = Path.Combine(dir, "water.txt");
-        if (File.Exists(wf) && float.TryParse(File.ReadAllText(wf), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var wl)) w.Water = wl;
+        // A state folder written before the op grew holds a bare number; read it as the level-only op it was.
+        if (File.Exists(wf))
+        {
+            var wt = File.ReadAllText(wf).Trim();
+            if (wt.Length > 0) w.Water = wt.StartsWith("WATER", StringComparison.OrdinalIgnoreCase) ? wt : "WATER " + wt;
+        }
         var of = Path.Combine(dir, "overgrowth.txt");
         if (File.Exists(of)) { var t = File.ReadAllText(of).Trim(); if (t.StartsWith("OVERGROWTH", StringComparison.Ordinal)) w.Overgrowth = t; }
         var lf = Path.Combine(dir, "light.txt");
         if (File.Exists(lf)) { var t = File.ReadAllText(lf).Trim(); if (t.StartsWith("LIGHT", StringComparison.Ordinal)) w.Light = t; }
+        var rgf = Path.Combine(dir, "lightrig.txt");
+        if (File.Exists(rgf)) { var t = File.ReadAllText(rgf).Trim(); if (t.StartsWith("LIGHTRIG", StringComparison.Ordinal)) w.LightRig = t; }
+        var bkf = Path.Combine(dir, "lightbake.txt");
+        if (File.Exists(bkf)) { var t = File.ReadAllText(bkf).Trim(); if (t.StartsWith("LIGHTBAKE", StringComparison.Ordinal)) w.LightBake = t; }
         var af = Path.Combine(dir, "annotations.txt");
         if (File.Exists(af)) { var t = File.ReadAllText(af).Trim(); if (t.StartsWith("ANNOT", StringComparison.Ordinal)) w.Annotations = t; }
         var omf = Path.Combine(dir, "objmeshes.txt");
@@ -185,6 +234,13 @@ public sealed class CollabWorldState
             {
                 var p = line.Split(' ', 3);
                 if (p.Length >= 3 && p[0] == "OBJMESH") w.ObjMeshes[p[1]] = line;
+            }
+        var lvf = Path.Combine(dir, "levelfiles.txt");
+        if (File.Exists(lvf))
+            foreach (var line in File.ReadAllLines(lvf))
+            {
+                var p = line.Split(' ', 3);
+                if (p.Length >= 3 && p[0] == "LVLFILE") w.LevelFiles[p[1]] = line;
             }
         return w.Any ? w : null;
     }

@@ -55,6 +55,7 @@ public static class Picker
             }
             if (d.ShowDialog() == DialogResult.OK) result = d.FileNames;
         });
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
@@ -80,6 +81,7 @@ public static class Picker
     public static void Error(string message, string title = "RefractorForge")
     {
         var t = new Thread(() => MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Warning));
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
@@ -91,6 +93,7 @@ public static class Picker
         bool yes = false;
         var t = new Thread(() => yes = MessageBox.Show(message, title, MessageBoxButtons.YesNo,
                                                       MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
@@ -101,6 +104,7 @@ public static class Picker
     {
         string? result = null;
         var t = new Thread(() => result = show());
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

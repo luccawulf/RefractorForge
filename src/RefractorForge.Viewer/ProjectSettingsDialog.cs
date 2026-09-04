@@ -83,6 +83,7 @@ internal static class ProjectSettingsDialog
                 ok = true;
             }
         }) { Name = "projsettings" };
+        t.IsBackground = true;   // never let a dialog thread keep the editor resident
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();

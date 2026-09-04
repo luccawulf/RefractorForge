@@ -38,6 +38,10 @@ Your BF1942/BFV levels typically live under the game's `Mods\<mod>\Archives\…\
 - **Object Library** (left): a searchable tree of every placeable object, grouped by category
   (Structures, Vegetation, Land/Water/Air Vehicles, Stationary Weapons, Hand Weapons, Soldiers,
   Effects, Props, Gameplay, Sounds, …).
+- **Sounds layer** (Inspector ▸ Layers, or Layer ▸ Sounds): every sound on the map shows its source, an inner ring
+  where it is at full volume and an outer ring where it falls silent. The label reads out what you would hear standing
+  at the camera — a percentage and a little meter that fills as you approach, or *(while looked at)* for a sound tied
+  to its object being drawn. It covers the level's own emitters and sounds carried by an object, such as a video screen.
 - **Mini-Map** (floating): top-down overview; **Refresh** to rebake. Toggle with the **Map** button. It opens
   below the mapper's option row, and can be dragged anywhere.
 - **Inspector** (right): context panel — the selected object's transform, the **Layers** visibility
@@ -118,8 +122,38 @@ default) the **Size** slider sets the width and the height follows. Non-power-of
 the engine silently drops them.
 
 **Video (.bik)…** does the same with a Bink movie: the `.bik` is copied to the mod's `Movies` folder and the
-object's shader points at it — the trick the mod's own movie screens use — so it plays in the game, with its
-sound. The editor shows the first frame when FFmpeg is on the PATH (otherwise a placeholder, 4:3 assumed).
+object's shader points at it — the trick the mod's own movie screens use — so it plays in the game. A video keeps
+**its own aspect ratio**, always: only the size is adjustable, because a stretched movie is nobody's intention.
+
+**Convert a video to .bik…** turns an mp4 (or anything else FFmpeg reads) into the Bink file the game plays,
+audio included. Bink can only be *written* by RAD's own compressor, so this needs the free
+[RAD Video Tools](http://www.radgametools.com/bnkdown.htm) installed; FFmpeg prepares the video for it. It runs in
+the background — the editor stays usable and shows the elapsed time and size as it goes — and a long video can take
+minutes. **Video size** caps the width (512 px by default): the file ships inside your map, and Bink is not a small
+format — the game's own `background.bik` is 320×240 and about 5 MB a minute, while an untouched 720p minute is
+nearly 80 MB.
+
+**Sound from the video** attaches the movie's audio to the decal object itself, so it plays from the middle of the
+screen. **When it plays** picks between the two things the engine can do:
+
+- **Always — fades with distance** writes `autoPlaySound`, the ambient every retail speaker and generator uses: it
+  starts with the level and rises as you approach. **Volume**, **Full volume within** and **Silent beyond** shape it.
+- **Only while you look at it** leaves that line out, so the sound follows the object being *drawn* — it snaps on at
+  full volume when the screen comes into view and stops when it leaves. Because it lasts exactly as long as the screen
+  is drawn, **Stops beyond** caps the draw distance, and with it how far away the sound can be heard; without that a
+  screen is audible from across the map the moment you glance at it.
+
+**Stereo** is offered because the format takes it (276 of the game's own scripts declare it), but a stereo sample is
+not placed in the world the way a mono one is — leave it off for a screen you can walk around.
+
+### Importing a sound (Tools ▸ Import Sound (MP3/WAV)…)
+
+Adds an ambient sound to the map as a placeable object. Pick an **mp3** (or wav, ogg, m4a, flac…) — the game plays
+`.wav`, so anything else is converted on the way in — set its **Volume**, the radius it stays at **full volume**
+within, the distance it goes **silent** beyond, and whether it **loops**; the sound is placed where the camera is
+looking and can be dragged like any object. What ships is exactly what a retail ambient emitter is made of: the wav
+under `Sound/22khz` and `Sound/44kHz`, a `.ssc` script with a Distance→Volume ramp, a `.con` that makes it
+placeable, and the `run` line in `Sounds/Environment.con`.
 
 ---
 
@@ -192,14 +226,26 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
 
 ## 7. Environment & lighting (Inspector)
 
-- **Water** — level, surface colour, deep colour, transparency; optional scrolling **Textured** water
-  (BF1942) or procedural colour (BFV). Import water textures if the engine's built-ins aren't shipped.
+- **Water** — a map can have **two** bodies and each is edited on its own:
+  - **Surface water** — level, colour, deep colour, transparency (written to the level's `water.*` lines), and on
+    BfVietnam **Reflectivity** and **Opacity** from `levelWater.rs`. The viewport plays the game's own water
+    **animation** (the sequence of normal maps `levelWater.rs` names), so the ripple and the sky reflection you see
+    are the ones the game draws — flat coloured water in the editor was never what the game showed.
+  - **Tunnel water (below the terrain)** — the second body a BFV tunnel map has, with its own level, colour, deep
+    colour, transparency, reflectivity and opacity. Switching it on writes everything the engine needs, including
+    the `WaterSettingBelowTerrain` subshader (without which the level crashes on load). It starts from the surface
+    water's look and then goes its own way.
+  - BF1942's scrolling **Textured** water is still there for 1942 maps; import the textures when the level
+    references engine built-ins its archive doesn't ship.
 - **Water shader** (BFV) — **Reflectivity** is how much of the sky cubemap the surface mirrors (retail ships
   0.18 on Fall of Saigon, 0.25 on Con Thien, 0.3 on Ho Chi Minh Trail; the base game 0.2), **Opacity** the
   surface's own. They are written to `StandardMesh/levelWater.rs` inside the level on save — the override the
   retail levels ship. The viewport mirrors the level's sky cubemap in the water, so the slider reads live.
-- **Sun** — tick **Control sun manually** to drive azimuth / elevation; the real-time shadow map
-  follows. **Sun Shadows (real-time)** in Layers toggles the display.
+- **Sun** — tick **Control sun manually** to aim it by azimuth / elevation. It relights the terrain and objects,
+  recasts the real-time shadow map, is what every lighting bake uses, and **on save it is written to the level's
+  `SkyAndSun.con`** — so the game's own lighting agrees with the shadows you baked. The panel says so once you have
+  moved it; **Reset sun to level** hands the direction back to the level and stops the editor writing it.
+  **Sun Shadows (real-time)** in Layers toggles the display.
 - **Fog** — colour, start / end distance.
 - **Sky** — use the level's cubemap, set sky rotation, or **Import skybox…** (6 faces named `…_01`–`_06`).
 - **Animated Clouds** — coverage, scale, drift X/Y, colour; import a cloud texture or mesh.
@@ -224,7 +270,14 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
     unwraps and take the lights.
   - A light placed *after* a bake still shows on a lightmapped object in the viewport (combined by maximum with
     the map, so a light that is already baked is not doubled); bake again to ship it.
+  - The files go out the way the game files them: one map per **LOD mesh** (`O_HueHouse_B_M1_<x>-<y>-<z>.tga`
+    and `_M2_` for the far LOD, never one named after the placed template), plus `Objectlightmaps/Palette.pal`
+    when the level has none. Painted or light-baked ground goes back as **DXT1 terrain tiles with mipmaps at
+    the shipped size** (256² in every retail level) - the only form the game's terrain loads.
   - **Layer ▸ Object Lightmaps** / **Sun Shadows (real-time)** toggle the display.
+  - **Black ground in game?** A build of this editor before v0.13.1 saved terrain tiles as 1024² uncompressed DDS
+    with no mipmaps, which the engine's terrain cannot draw. Opening such a map now says so, and the next save
+    re-encodes every tile as DXT1 + mipmaps at the shipped size — the form every retail tile is in.
   - **Tools ▸ Generate Minimap** — the in-game map + thumbnail.
 - **Placed lights** (Inspector ▸ PLACED LIGHTS). Refractor has no dynamic point lights, so a placed light is
   authoring data: it lights the viewport live so you can aim it, then **Bake into ground** burns it into the
@@ -273,9 +326,12 @@ height, which is why a tunnel under water "hits the water everywhere". Tick **TU
 drag the level: it writes the two Terrain.con lines and a `waterBelowTerrain.*` colour block into Init.con (a
 mirror of the level's `water.*` lines — exactly what Saigon68 ships, the one retail level that uses it). Keep the
 level below the tunnel floor for a dry tunnel, or in a sewer for wading; the viewport draws the second plane.
-Cedar Falls does without it by keeping its whole tunnel above the river. Maps that crashed on this had the
-colour block without the Terrain.con switch, or a `waterBelowTerrain.level` — there is none: the level is
-`waterBelowLevel` in Terrain.con, the colours are in Init.con, in that order.
+Cedar Falls does without it by keeping its whole tunnel above the river.
+
+The second body also needs its own **shader**: `StandardMesh/levelWater.rs` with a `WaterSettingBelowTerrain`
+subshader. The base game's file has only the surface one, so a map that sets the flag without shipping that file
+**crashes as the level loads**. The editor writes it with the flag (and re-checks on every save); *Tunnel water
+reflectivity* and *opacity* in the same window set how that body looks, starting from Saigon68's values.
 
 **Where the switch happens.** **Layer ▸ Tunnel entry points** draws each entrance's `entrance` child as a sphere
 of `Game.entryPointRadius`: the soldier goes underground when they are touching the entrance object *and* inside

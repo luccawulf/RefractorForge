@@ -42,7 +42,9 @@ public static class DecalObject
     /// makes a video decal: the texture loader plays Bink paths, the trick the mod movie-screens use.</param>
     public static Built Build(string levelName, string name, float widthMeters, float heightMeters,
                               string textureName, byte[]? ddsBytes, bool flat = false, bool doubleSided = true,
-                              string baseSub = "bf1942", string? textureRef = null)
+                              string baseSub = "bf1942", string? textureRef = null,
+                              string? soundScript = null, float soundRadius = 0f, bool soundAutoPlay = true,
+                              float uMax = 1f, float vMax = 1f, float maxDrawDistance = 0f)
     {
         name = Sanitize(name);
         textureName = Sanitize(textureName);
@@ -50,7 +52,7 @@ public static class DecalObject
         // global registry — so follow DICE's <Mesh>_MaterialN convention rather than naming it after the user's
         // picture, which could collide with a mod's material.
         string material = name + "_Material0";
-        var mesh = Quad(widthMeters, heightMeters, material, flat, doubleSided);
+        var mesh = Quad(widthMeters, heightMeters, material, flat, doubleSided, uMax, vMax);
 
         var files = new List<(string, byte[])>();
         var crlf = new UTF8Encoding(false);
@@ -72,21 +74,40 @@ public static class DecalObject
 
         // The full 0..5 LOD ramp every shipped Geometries.con writes; the last entry is the far distance, so a
         // truncated ramp makes the decal stop drawing long before the level's view distance.
+        //
+        // That last number matters for more than drawing when the object carries a look-at sound: with no
+        // autoPlaySound the engine plays the sound while the object is DRAWN, so the far LOD distance is also how far
+        // away it can be heard. Left at 1000 a screen is audible from across the map the moment you glance at it.
+        float far = maxDrawDistance > 0f ? maxDrawDistance : 1000f;
+        string F1(float v) => v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         string geom =
             $"GeometryTemplate.create StandardMesh {name}\r\n" +
             $"GeometryTemplate.file ../{baseSub}/levels/{levelName}/StandardMesh/{name}\r\n" +
             "GeometryTemplate.setLodDistance 0 0\r\n" +
-            "GeometryTemplate.setLodDistance 1 100\r\n" +
-            "GeometryTemplate.setLodDistance 2 200\r\n" +
-            "GeometryTemplate.setLodDistance 3 400\r\n" +
-            "GeometryTemplate.setLodDistance 4 600\r\n" +
-            "GeometryTemplate.setLodDistance 5 1000\r\n\r\n";
+            $"GeometryTemplate.setLodDistance 1 {F1(far * 0.1f)}\r\n" +
+            $"GeometryTemplate.setLodDistance 2 {F1(far * 0.2f)}\r\n" +
+            $"GeometryTemplate.setLodDistance 3 {F1(far * 0.4f)}\r\n" +
+            $"GeometryTemplate.setLodDistance 4 {F1(far * 0.6f)}\r\n" +
+            $"GeometryTemplate.setLodDistance 5 {F1(far)}\r\n\r\n";
         files.Add(($"Objects/{name}/Geometries.con", crlf.GetBytes(geom)));
 
+        // A sound script on the object itself is how the engine gives a thing a voice, and it puts the sound exactly
+        // where the object is - the middle of a video screen. No triggerRadius: that belongs to AreaObject, and on a
+        // SimpleObject the engine rejects it ("unknown function triggerRadius"). How far the sound carries comes from
+        // the script's minDistance and its Distance->Volume ramp instead.
+        //
+        // autoPlaySound is what makes it an AMBIENT: started with the level and heard by distance. Every retail object
+        // that hums, broadcasts or plays music has it (o_gen_sound_m1, the Hue speakers, the PA system). WITHOUT it the
+        // sound rides the object's visibility - it starts when the object is drawn and stops when you look away, at
+        // full volume either way. That is a real effect and worth keeping as a choice, so it is a parameter.
+        string sound = soundScript is { Length: > 0 }
+            ? (soundAutoPlay ? "ObjectTemplate.autoPlaySound 1\r\n" : "") + $"ObjectTemplate.loadSoundScript {soundScript}\r\n"
+            : "";
         string obj =
             $"ObjectTemplate.create SimpleObject {name}\r\n" +
             $"ObjectTemplate.geometry {name}\r\n" +
-            "ObjectTemplate.setHasCollisionPhysics 0\r\n\r\n";
+            "ObjectTemplate.setHasCollisionPhysics 0\r\n" +
+            sound + "\r\n";
         files.Add(($"Objects/{name}/Objects.con", crlf.GetBytes(obj)));
 
         files.Add(($"Objects/{name}/{name}.con", crlf.GetBytes("run Objects\r\nrun Geometries\r\n")));
@@ -125,7 +146,12 @@ public static class DecalObject
         return string.Join("\r\n", lines) + "\r\n";
     }
 
-    private static ObjMesh Quad(float w, float h, string material, bool flat, bool doubleSided)
+    /// <param name="uMax">How much of the texture's width the picture actually fills. A still image is resized to a
+    /// power of two so it fills all of it (1.0); a VIDEO is not - the engine decodes Bink frames into a power-of-two
+    /// texture and leaves the rest black, so a 1920x800 movie fills 1920/2048 across and 800/1024 down. Mapping the
+    /// quad 0..1 over that showed the padding as black bands along two edges.</param>
+    private static ObjMesh Quad(float w, float h, string material, bool flat, bool doubleSided,
+                                float uMax = 1f, float vMax = 1f)
     {
         var mesh = new ObjMesh();
         var sub = new ObjSubMesh { Material = material };
@@ -145,7 +171,8 @@ public static class DecalObject
             pos = new[] { new Vec3(-hw, 0f, 0f), new Vec3(hw, 0f, 0f), new Vec3(hw, h, 0f), new Vec3(-hw, h, 0f) };
             n = new Vec3(0, 0, -1);
         }
-        (float, float)[] uv = { (0f, 1f), (1f, 1f), (1f, 0f), (0f, 0f) };
+        float um = uMax > 0f ? uMax : 1f, vm = vMax > 0f ? vMax : 1f;
+        (float, float)[] uv = { (0f, vm), (um, vm), (um, 0f), (0f, 0f) };
 
         void AddQuad(bool reverse)
         {
