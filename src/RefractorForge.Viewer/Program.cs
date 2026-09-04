@@ -635,6 +635,7 @@ int decalSoundMode = 0;                     // 0 = ambient (by distance), 1 = on
 bool decalLimitDraw = false;                // stop drawing the screen past a distance...
 float decalLookRange = 120f;                // ...this one. In look-at mode it is also how far the sound carries.
 bool decalSoundStereo = false;              // mono places the sound at the screen; stereo is fuller but not positional
+int decalAudioRate = 22050;                  // 22050 or 44100: the .bik's track and the sound object's wav alike
 // Bink conversion runs on a worker: a real video takes minutes, and doing it on the UI thread froze the editor.
 System.Threading.Tasks.Task<(string? Path, string Error)>? bikTask = null;
 int bikWidthIdx = 1;                                   // how big the converted video should be
@@ -645,6 +646,7 @@ long bikProgressBytes = 0;
 // Importing an ordinary sound (mp3/wav) as a placeable ambient emitter.
 string sndImportPath = "", sndImportName = "";
 float sndVol = 0.7f, sndNear = 20f, sndFar = 120f; bool sndLoop = true; bool showSoundImport = false;
+bool sndStereo = false; int sndAudioRate = 22050;   // the imported sound's channels and rate
 bool lightDragging = false;     // dragging the selected light in the viewport
 float lightDragOffset = 0f;     // its height above the ground when the drag began, so a drag follows terrain
 bool lightDragVertical = false; // Shift-drag raises and lowers instead of moving across the ground
@@ -12207,6 +12209,18 @@ void DecalDialog()
         }
         bool converting = bikTask is not null && !bikTask.IsCompleted;
         ImGui.BeginDisabled(converting);
+        // The audio the conversion produces - the .bik's own track and the sound object's wav alike.
+        {
+            int chIdx = decalSoundStereo ? 1 : 0, rateIdx = decalAudioRate >= 44100 ? 1 : 0;
+            ImGui.SetNextItemWidth(110f * uiScale);
+            if (ImGui.Combo(Loc.TL("Audio"), ref chIdx, "Mono\0Stereo\0")) decalSoundStereo = chIdx == 1;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Mono is placed in the world at the screen and fades with distance. Stereo is fuller\nbut is not positioned the way a mono sample is - the game's own scripts use both."));
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(110f * uiScale);
+            if (ImGui.Combo(Loc.TL("Sample rate"), ref rateIdx, "22 kHz\044 kHz\0")) decalAudioRate = rateIdx == 1 ? 44100 : 22050;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The game has two sound-quality tiers, Sound/22khz and Sound/44kHz, and plays the one its settings\nchoose. 44 kHz writes a real 44.1 kHz file for the high tier and a 22 kHz one for the low tier;\n22 kHz writes the same 22 kHz file to both. The .bik's own track uses the rate chosen too."));
+        }
+        int aRate = decalAudioRate, aCh = decalSoundStereo ? 2 : 1;
         if (ImGui.Button(Loc.TL("Convert a video to .bik...")))
         {
             var src = Picker.File("Pick a video to convert", "Videos|*.mp4;*.avi;*.mov;*.mkv;*.webm;*.wmv;*.m4v|All files|*.*", levelDir);
@@ -12218,7 +12232,7 @@ void DecalDialog()
                 Toast(Loc.T("Converting to Bink - the editor stays usable; this can take a few minutes."));
                 bikTask = System.Threading.Tasks.Task.Run(() =>
                 {
-                    var made = ConvertVideoToBik(src, dst, out var e, bw);
+                    var made = ConvertVideoToBik(src, dst, out var e, bw, aRate, aCh);
                     return (made, e);
                 });
             }
@@ -12294,8 +12308,7 @@ void DecalDialog()
                     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The sound is gone past this - it can never carry across the map. Keep it modest (40-80 m)\nfor a screen you only hear when you are near it, or raise it to cover an area."));
                     if (decalSoundFar < decalSoundNear + 1f) decalSoundFar = decalSoundNear + 1f;
                 }
-                ImGui.Checkbox(Loc.TL("Stereo"), ref decalSoundStereo);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The format takes stereo and the game's own scripts use it, but a stereo sample is not placed in\nthe world the way a mono one is. Leave it off for a screen you can walk around."));
+                ImGui.TextDisabled(string.Format(Loc.T("Audio: {0}, {1} - set beside the Convert button above."), decalSoundStereo ? Loc.T("stereo") : Loc.T("mono"), decalAudioRate >= 44100 ? "44 kHz" : "22 kHz"));
             }
         }
         ImGui.Spacing();
@@ -12374,13 +12387,23 @@ bool MediaHasAudio(string path) => RunFfmpeg($"-i \"{path}\"", 20000).Contains("
 
 /// <summary>The media file's sound as a mono 22 kHz PCM wav - the shape the engine's sound folders hold. Null when
 /// the file has no audio track or ffmpeg is missing.</summary>
-byte[]? ExtractWav(string path, bool stereo = false)
+// The game's two sound folders are its quality tiers: Sound/22khz and Sound/44kHz. A 22 kHz file always goes
+// to the first; the second gets a real 44.1 kHz file when that was asked for, else the same 22 kHz one.
+(byte[] Wav22, byte[]? Wav44)? ExtractWavPair(string path, bool stereo, int rate)
+{
+    var w22 = ExtractWav(path, stereo, 22050);
+    if (w22 is null) return null;
+    var w44 = rate >= 44100 ? ExtractWav(path, stereo, 44100) : null;
+    return (w22, w44);
+}
+
+byte[]? ExtractWav(string path, bool stereo = false, int rate = 22050)
 {
     if (FindFfmpeg() is null || !MediaHasAudio(path)) return null;
     var tmp = Path.Combine(Path.GetTempPath(), "rf_snd_" + Guid.NewGuid().ToString("N") + ".wav");
     try
     {
-        RunFfmpeg($"-y -i \"{path}\" -vn -acodec pcm_s16le -ar 22050 -ac {(stereo ? 2 : 1)} \"{tmp}\"");
+        RunFfmpeg($"-y -i \"{path}\" -vn -acodec pcm_s16le -ar {rate} -ac {(stereo ? 2 : 1)} \"{tmp}\"");
         return File.Exists(tmp) ? File.ReadAllBytes(tmp) : null;
     }
     catch { return null; }
@@ -12390,7 +12413,7 @@ byte[]? ExtractWav(string path, bool stereo = false)
 // Convert any video into the Bink .bik the game plays. The work - and the awkward business of waiting for RAD's
 // compressor, which never exits on its own - lives in Render/BinkEncoder so it can be run and checked outside the
 // editor. Safe off the UI thread: it touches no ImGui or GL state.
-string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWidth = 512)
+string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1)
 {
     error = "";
     var rad = FindRadVideo();
@@ -12398,7 +12421,7 @@ string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWi
     var ff = FindFfmpeg();
     if (ff is null) { error = Loc.T("FFmpeg is needed to prepare the video for Bink."); return null; }
     var sw = System.Diagnostics.Stopwatch.StartNew();
-    var r = RefractorForge.Render.BinkEncoder.Convert(ff, rad, src, dstBik, b => bikProgressBytes = b, out var err, 30, maxWidth);
+    var r = RefractorForge.Render.BinkEncoder.Convert(ff, rad, src, dstBik, b => bikProgressBytes = b, out var err, 30, maxWidth, audioRate, audioChannels);
     if (r != RefractorForge.Render.BinkEncoder.Result.Ok)
     {
         error = err;
@@ -12475,10 +12498,10 @@ bool CreateDecalObject()
         // position, which is the middle of the screen.
         string? soundScript = null;
         var soundFiles = new List<(string RelPath, byte[] Bytes)>();
-        if (video && decalSound && ExtractWav(decalImagePath, decalSoundStereo) is { } wav)
+        if (video && decalSound && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } wavs)
         {
-            var snd = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, decalSoundVol, decalSoundNear, decalSoundFar,
-                                                                     loop: true, triggerRadius: decalSoundFar, stereo: decalSoundStereo);
+            var snd = RefractorForge.Formats.Sound.SoundObject.Build(name, wavs.Wav22, decalSoundVol, decalSoundNear, decalSoundFar,
+                                                                     loop: true, triggerRadius: decalSoundFar, stereo: decalSoundStereo, wav44kBytes: wavs.Wav44);
             soundScript = snd.Template + ".ssc";
             // Only the script + the wavs: the decal's own template carries the loadSoundScript line, so it needs
             // neither its own Sounds/*.con nor a run line. The script goes in the OBJECT'S folder, because that is
@@ -12559,6 +12582,15 @@ void SoundImportDialog()
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Where the Distance->Volume ramp reaches silence, and the object's triggerRadius."));
         if (sndFar < sndNear + 1f) sndFar = sndNear + 1f;
         ImGui.Checkbox(Loc.TL("Loop"), ref sndLoop);
+        {
+            int chIdx = sndStereo ? 1 : 0, rateIdx = sndAudioRate >= 44100 ? 1 : 0;
+            ImGui.SetNextItemWidth(110f * uiScale);
+            if (ImGui.Combo(Loc.TL("Audio##snd"), ref chIdx, "Mono\0Stereo\0")) sndStereo = chIdx == 1;
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(110f * uiScale);
+            if (ImGui.Combo(Loc.TL("Sample rate##snd"), ref rateIdx, "22 kHz\044 kHz\0")) sndAudioRate = rateIdx == 1 ? 44100 : 22050;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A .wav you supply is used as it is. Anything else is converted at this rate and channel count;\n44 kHz also writes a real 44.1 kHz file for the game's high-quality tier."));
+        }
         if (FindFfmpeg() is null && !sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
             ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), Loc.T("FFmpeg not found - only .wav can be imported without it."));
         ImGui.Spacing();
@@ -12579,16 +12611,17 @@ bool ImportSoundObject()
     try
     {
         // .wav goes in as it is; anything else through FFmpeg, to the mono 22 kHz PCM the sound folders hold.
+        byte[]? wav44 = null;
         byte[]? wav = sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase)
             ? File.ReadAllBytes(sndImportPath)
-            : ExtractWav(sndImportPath);
+            : ExtractWavPair(sndImportPath, sndStereo, sndAudioRate) is { } pair ? (wav44 = pair.Wav44) is var _ ? pair.Wav22 : pair.Wav22 : null;
         if (wav is null || wav.Length < 64)
         {
             Toast(FindFfmpeg() is null ? Loc.T("FFmpeg is needed to convert that to .wav.") : Loc.T("Could not read any audio from that file."));
             return false;
         }
         var name = sndImportName.Trim().Length > 0 ? sndImportName : Path.GetFileNameWithoutExtension(sndImportPath);
-        var built = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, sndVol, sndNear, sndFar, sndLoop, sndFar);
+        var built = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, sndVol, sndNear, sndFar, sndLoop, sndFar, stereo: sndStereo, wav44kBytes: wav44);
         foreach (var f in built.Files) pendingLevelFiles.Add(f);
         BroadcastLevelFiles(built.Template, built.Files);
 

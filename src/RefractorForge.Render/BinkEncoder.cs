@@ -39,8 +39,20 @@ public static class BinkEncoder
     /// A decal is a texture on a wall, and Bink is not a small format: the game's own <c>background.bik</c> is
     /// 320x240 and 5 MB a minute, while an untouched 720p minute comes out at nearly 80 MB - too big to ship inside
     /// a map. 512 keeps a screen sharp at the distance anyone reads one from.</param>
+    /// <summary>The FFmpeg command that makes RAD's intermediate: MJPEG video, PCM audio at the rate and channel
+    /// count asked for. Its own function so the choice can be checked without running anything.</summary>
+    public static string FfmpegArgs(string src, string avi, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1)
+    {
+        // -2 on the height keeps the aspect and lands on an even number, which the yuv420p intermediate needs.
+        string scale = maxWidth > 0 ? $"-vf \"scale='min(iw,{maxWidth})':-2\" " : "";
+        return $"-hide_banner -y -i \"{src}\" {scale}-c:v mjpeg -q:v 3 -pix_fmt yuvj420p -c:a pcm_s16le -ar {audioRate} -ac {Math.Clamp(audioChannels, 1, 2)} \"{avi}\"";
+    }
+
+    /// <param name="audioRate">Sample rate of the .bik's audio track: 22050 (the game's 22khz tier) or 44100.</param>
+    /// <param name="audioChannels">1 for mono, 2 for stereo.</param>
     public static Result Convert(string ffmpegExe, string radExe, string src, string dstBik,
-                                 Action<long>? progress, out string error, int maxMinutes = 30, int maxWidth = 512)
+                                 Action<long>? progress, out string error, int maxMinutes = 30, int maxWidth = 512,
+                                 int audioRate = 22050, int audioChannels = 1)
     {
         error = "";
         if (!File.Exists(ffmpegExe) || !File.Exists(radExe)) { error = "FFmpeg or RAD Video Tools is missing."; return Result.NoTools; }
@@ -51,10 +63,8 @@ public static class BinkEncoder
         try
         {
             // MJPEG + PCM in an AVI: RAD reads it, it is faithful enough as an intermediate, and the audio survives
-            // into the .bik.
-            // -2 on the height keeps the aspect and lands on an even number, which the yuv420p intermediate needs.
-            string scale = maxWidth > 0 ? $"-vf \"scale='min(iw,{maxWidth})':-2\" " : "";
-            RunQuiet(ffmpegExe, $"-hide_banner -y -i \"{src}\" {scale}-c:v mjpeg -q:v 3 -pix_fmt yuvj420p -c:a pcm_s16le -ar 22050 -ac 1 \"{avi}\"", 30 * 60 * 1000);
+            // into the .bik at the rate and channel count chosen.
+            RunQuiet(ffmpegExe, FfmpegArgs(src, avi, maxWidth, audioRate, audioChannels), 30 * 60 * 1000);
             if (!File.Exists(avi) || new FileInfo(avi).Length < 1024) { error = "FFmpeg could not read that video."; return Result.SourceUnreadable; }
 
             Del(dstBik); Del(tmp);

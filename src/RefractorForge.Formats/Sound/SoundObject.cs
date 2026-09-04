@@ -43,7 +43,7 @@ public static class SoundObject
     /// walk around - mono is what places a sound in the world.</param>
     public static Built Build(string name, byte[] wavBytes, float volume = 0.6f, float minDistance = 20f,
                               float maxDistance = 120f, bool loop = true, float? triggerRadius = null,
-                              bool stereo = false)
+                              bool stereo = false, byte[]? wav44kBytes = null)
     {
         if (wavBytes is null || wavBytes.Length == 0) throw new ArgumentException("no wav data", nameof(wavBytes));
         string tpl = Sanitize(name);
@@ -77,8 +77,10 @@ public static class SoundObject
         {
             // Both quality folders: the engine substitutes @RTD from the player's sound setting, and a level that
             // ships only one is silent for everyone on the other.
+            // @RTD: the game reads the folder matching its sound-quality setting. With a 44.1 kHz file supplied the
+            // high tier gets it and the low tier keeps the 22 kHz one; without, both folders get the same file.
             ($"Sound/22khz/{tpl}.wav", wavBytes),
-            ($"Sound/44kHz/{tpl}.wav", wavBytes),
+            ($"Sound/44kHz/{tpl}.wav", wav44kBytes ?? wavBytes),
             ($"Sounds/{tpl}.ssc", Encoding.Latin1.GetBytes(ssc.ToString())),
             ($"Sounds/{tpl}.con", Encoding.Latin1.GetBytes(con.ToString())),
         };
