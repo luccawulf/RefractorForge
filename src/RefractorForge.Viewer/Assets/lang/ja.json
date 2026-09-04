@@ -1182,5 +1182,12 @@
  "The session had no objects, so your {0} were kept.": "セッションにオブジェクトがなかったため、あなたの {0} 個をそのまま保持しました。",
  "The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer.": "2 つ目の水面専用の WaterSettingBelowTerrain サブシェーダーです。製品版で唯一のトンネルマップ\nSaigon68 では 0.1（静かな下水道）です。",
  "  NO RIVER beside it in game: its terrain block reaches {0:0.0} m under the water, wet ground {1:0} m from the hole": "  ゲーム内でこの横に川が描かれません: この地形ブロックは水面より {0:0.0} m 下まで達しており、穴から {1:0} m の位置に水没地形があります",
- "{0} entrance(s) sit on a shoreline terrain block. The game gives a block that holds a hole the TUNNEL water level, so the river is not drawn on it - a clear rectangle appears beside the entrance in game. Move those entrances inland (about {1:0} m per block) or raise the shore under them above {2:0.0} m.": "{0} 個の入口が岸辺の地形ブロック上にあります。ゲームは穴を含むブロックにトンネル水位を適用するため、そのブロックには川が描かれず、入口の横に透明な四角形が現れます。入口を内陸側へ（ブロック 1 つあたり約 {1:0} m）移動するか、その下の岸を {2:0.0} m より高くしてください。"
+ "{0} entrance(s) sit on a shoreline terrain block. The game gives a block that holds a hole the TUNNEL water level, so the river is not drawn on it - a clear rectangle appears beside the entrance in game. Move those entrances inland (about {1:0} m per block) or raise the shore under them above {2:0.0} m.": "{0} 個の入口が岸辺の地形ブロック上にあります。ゲームは穴を含むブロックにトンネル水位を適用するため、そのブロックには川が描かれず、入口の横に透明な四角形が現れます。入口を内陸側へ（ブロック 1 つあたり約 {1:0} m）移動するか、その下の岸を {2:0.0} m より高くしてください。",
+ "Select {0} buried": "埋まっている {0} 個を選択",
+ "Seat {0} buried on the ground": "埋まっている {0} 個を地面に置く",
+ "Moves each one up until its bottom rests on the terrain. Objects that belong underground\n(tunnels, sewers) are left alone. One undo step (Ctrl+Z).": "それぞれの底面が地形に接するまで持ち上げます。地下にあるべきオブジェクト\n（トンネル、下水道）はそのままにします。元に戻す操作は 1 回です (Ctrl+Z)。",
+ "Select {0} floating": "浮いている {0} 個を選択",
+ "Seat {0} floating on the ground": "浮いている {0} 個を地面に置く",
+ "Select {0} missing": "見つからない {0} 個を選択",
+ "Objects whose template no loaded archive declares - invisible here and in game.\nSelect them to delete them, or bring the objects in: the lines above say which mod has each one.": "読み込まれたどのアーカイブにもテンプレートが宣言されていないオブジェクトです。エディターでもゲームでも表示されません。\n選択して削除するか、オブジェクトを取り込んでください。上の行に、それぞれがどの Mod にあるかが示されています。"
 }

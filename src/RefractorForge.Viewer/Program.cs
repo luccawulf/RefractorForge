@@ -960,6 +960,7 @@ CollabSession? collab = null;   // the collaboration session (set via the Collab
 // Set while an inbound edit is being pushed onto the undo stack. The push fires hist.OnDo, which is what normally
 // broadcasts an edit - and broadcasting an edit we just received would echo it straight back to the sender.
 bool applyingRemote = false;
+Dictionary<string, List<string>>? modTemplateIndex = null;   // template -> installed mods that carry it; built on the first map check
 List<StaticObject>? syncHeld = null;   // our objects, held aside while a join sync decides whether there is a document to adopt
 int syncAdds = 0;                      // objects the sync actually delivered
 string? lastRigWire = null;             // the placed lights as last sent or received, so an edit goes out once
@@ -13171,9 +13172,91 @@ void RunMapValidation()
         Objects = so, Gameplay = gameplayEdit, Heightmap = heightmap, Config = cfg,
         CombatArea = env?.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize),
         Bounds = TemplateBoundsOf,
-        TemplateExists = meshLib is null ? null : TemplateExistsAnywhere,
+        // An ammo spawner, an effect or a sound has no mesh but the game creates it; only a name nothing declares is missing.
+        TemplateExists = meshLib is null ? null : (t => TemplateExistsAnywhere(t) || meshLib.KnowsTemplate(t)),
     });
+    AddMissingTemplateAdvice(r);
     ShowReport(r);
+}
+
+// The Mods folder this level lives under, and which mod - from the archive it was opened from.
+(string? ModsDir, string? ModName) ModsRootOf()
+{
+    string? start = rfaList.Length > 0 ? rfaList[0] : levelDir;
+    if (string.IsNullOrEmpty(start)) return (null, null);
+    try
+    {
+        var d = new DirectoryInfo(File.Exists(start) ? Path.GetDirectoryName(Path.GetFullPath(start))! : Path.GetFullPath(start));
+        for (var q = d; q?.Parent is not null; q = q.Parent)
+            if (q.Parent.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) return (q.Parent.FullName, q.Name);
+    }
+    catch { }
+    return (null, null);
+}
+
+// A map merged from one mod into another drags its objects' NAMES along, not the objects. Saying "missing" and
+// stopping sent people hunting; the useful answer is which installed mod has the object and the line to add.
+void AddMissingTemplateAdvice(RefractorForge.Formats.Validation.LevelReport r)
+{
+    if (so is null) return;
+    var groups = r.Issues.Where(i => i.Category == "Missing template" && i.ObjectId is not null)
+        .Select(i => so.Objects.FirstOrDefault(o => string.Equals(o.Id, i.ObjectId, StringComparison.OrdinalIgnoreCase))?.Template)
+        .Where(t => t is not null).GroupBy(t => t!, StringComparer.OrdinalIgnoreCase).OrderByDescending(g => g.Count()).ToList();
+    if (groups.Count == 0) return;
+    var (modsDir, modName) = ModsRootOf();
+    if (modTemplateIndex is null && modsDir is not null)
+    {
+        try { modTemplateIndex = RefractorForge.Formats.Validation.TemplateLocator.IndexMods(modsDir); }
+        catch { modTemplateIndex = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase); }
+    }
+    var advice = new List<RefractorForge.Formats.Validation.LevelIssue>();
+    foreach (var g in groups)
+    {
+        var found = modTemplateIndex is not null && modTemplateIndex.TryGetValue(g.Key, out var l)
+            ? l.Where(m => !m.Equals(modName, StringComparison.OrdinalIgnoreCase)).ToList()
+            : new List<string>();
+        advice.Add(new RefractorForge.Formats.Validation.LevelIssue(RefractorForge.Formats.Validation.IssueSeverity.Error, "Missing template",
+            $"{g.Count()} x " + RefractorForge.Formats.Validation.TemplateLocator.Advice(g.Key, found, modName)));
+    }
+    r.Issues.InsertRange(0, advice);   // the summary lines first, the per-object lines after
+}
+
+// The objects behind a report category, as selection indices. "Buried" leaves out what is underground on purpose:
+// a sewer piece flagged as buried must not be yanked to the surface by the one-click fix.
+List<int> IssueObjectIndices(RefractorForge.Formats.Validation.LevelReport r, string category)
+{
+    var idx = new List<int>();
+    if (so is null) return idx;
+    foreach (var i in r.Issues)
+    {
+        if (i.Category != category || i.ObjectId is null) continue;
+        int ix = so.Objects.FindIndex(o => string.Equals(o.Id, i.ObjectId, StringComparison.OrdinalIgnoreCase));
+        if (ix < 0 || idx.Contains(ix)) continue;
+        if (category == "Buried" && meshLib?.TunnelInfoOf(so.Objects[ix].Template) is { BelowGround: true }) continue;
+        idx.Add(ix);
+    }
+    return idx;
+}
+void SelectIssueObjects(RefractorForge.Formats.Validation.LevelReport r, string category)
+{
+    var idx = IssueObjectIndices(r, category);
+    multi.Clear(); multi.AddRange(idx); selected = idx.Count > 0 ? idx[0] : -1;
+    SyncTransformEdit();
+}
+// Seats each object so its BOTTOM rests on the terrain - unlike Drop to ground, which puts the origin there and
+// leaves anything whose origin is mid-body half buried still. One undo step.
+void SeatOnGround(IEnumerable<int> indices)
+{
+    if (so is null || hist is null || terrainPick is null) return;
+    var cmds = new List<IEditCommand>();
+    foreach (var i in indices)
+    {
+        var o = so.Objects[i];
+        float ground = terrainPick.HeightAt(o.Position.X, o.Position.Z);
+        float bottomOff = TemplateBoundsOf(o.Template) is { } b ? b.Min.Y * (o.Scale ?? 1f) : 0f;
+        cmds.Add(new MoveObject(o.Id, new Vec3(o.Position.X, ground - bottomOff, o.Position.Z)));
+    }
+    if (cmds.Count > 0) { hist.Do(new CompositeCommand(cmds)); SyncMarkers(); glObjects?.Sync(so); UploadMarkers(); }
 }
 
 void RunReachability()
@@ -13295,6 +13378,33 @@ void MapReportWindow()
             else if (r.Title.StartsWith("Performance")) RunPerformanceBudget();
             else if (r.Title.StartsWith("Dependencies")) RunDependencyCheck();
             else if (r.Title.StartsWith("Server")) RunServerClientSplit();
+        }
+        if (r.Title.StartsWith("Map check") && so is not null)
+        {
+            int nBuried = IssueObjectIndices(r, "Buried").Count, nFloat = IssueObjectIndices(r, "Floating").Count, nMissing = IssueObjectIndices(r, "Missing template").Count;
+            bool any = false;
+            if (nBuried > 0)
+            {
+                if (ImGui.Button(string.Format(Loc.T("Select {0} buried"), nBuried))) SelectIssueObjects(r, "Buried");
+                ImGui.SameLine();
+                if (ImGui.Button(string.Format(Loc.T("Seat {0} buried on the ground"), nBuried))) { SeatOnGround(IssueObjectIndices(r, "Buried")); RunMapValidation(); }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Moves each one up until its bottom rests on the terrain. Objects that belong underground\n(tunnels, sewers) are left alone. One undo step (Ctrl+Z)."));
+                any = true;
+            }
+            if (nFloat > 0)
+            {
+                if (any) ImGui.SameLine();
+                if (ImGui.Button(string.Format(Loc.T("Select {0} floating"), nFloat))) SelectIssueObjects(r, "Floating");
+                ImGui.SameLine();
+                if (ImGui.Button(string.Format(Loc.T("Seat {0} floating on the ground"), nFloat))) { SeatOnGround(IssueObjectIndices(r, "Floating")); RunMapValidation(); }
+                any = true;
+            }
+            if (nMissing > 0)
+            {
+                if (any) ImGui.SameLine();
+                if (ImGui.Button(string.Format(Loc.T("Select {0} missing"), nMissing))) SelectIssueObjects(r, "Missing template");
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Objects whose template no loaded archive declares - invisible here and in game.\nSelect them to delete them, or bring the objects in: the lines above say which mod has each one."));
+            }
         }
 
         if (ImGui.BeginTable("##issues", 3, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV))

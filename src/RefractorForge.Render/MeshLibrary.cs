@@ -913,6 +913,15 @@ public sealed class MeshLibrary
     /// the local positions of those children (the hole object has three shafts, the hut one).</summary>
     public sealed record TunnelInfo(bool BelowGround, bool EntryPoint, bool HasMap, IReadOnlyList<Vector3> EntryOffsets);
 
+    /// <summary>Whether ANY loaded .con declares this template, mesh or not. An ammo spawner, an effect or a sound
+    /// has nothing to draw, but it exists and the game creates it; only a name nothing declares is missing. The map
+    /// check used to call both "missing", which sent people hunting for objects that were never lost.</summary>
+    public bool KnowsTemplate(string template)
+    {
+        EnsureAllTemplates();
+        return _allTemplates is not null && _allTemplates.ContainsKey(template);
+    }
+
     public TunnelInfo? TunnelInfoOf(string template)
     {
         EnsureAllTemplates();
