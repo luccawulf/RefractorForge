@@ -4,7 +4,13 @@ namespace RefractorForge.Formats.Terrain;
 public enum BrushFalloff { Smooth, Linear, Constant, Gaussian }
 
 /// <summary>Heightmap sculpt operations, mirroring the staples of Battlecraft's terrain tools.</summary>
-public enum BrushMode { Raise, Lower, Smooth, Flatten, Set }
+/// <summary>
+/// <c>Hole</c> and <c>FillHole</c> are the tunnel brushes. A hole is a heightmap sample of exactly 0: with
+/// <c>Game.isTunnelMap 1</c> BfVietnam draws and collides nothing on a cell that touches one, which is how a
+/// soldier drops through the ground into a tunnel entrance. The brush footprint is applied as a hard edge -
+/// a hole is either there or not - so falloff does not apply to these two.
+/// </summary>
+public enum BrushMode { Raise, Lower, Smooth, Flatten, Set, Hole, FillHole }
 
 /// <summary>
 /// A terrain sculpt brush. <see cref="Strength"/> means metres-at-centre per dab for
@@ -184,6 +190,26 @@ public sealed class TerrainStroke
                 if (w <= 0f) continue;
 
                 int idx = y * _hm.Width + x;
+
+                // The tunnel brushes: hard-edged, and a fill only touches cells that ARE holes, restoring them
+                // from the ground around so the surface closes over seamlessly.
+                if (brush.Mode == BrushMode.Hole)
+                {
+                    if (_hm.Samples[idx] == 0) continue;
+                    if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(x, y); }
+                    _hm.Samples[idx] = 0;
+                    continue;
+                }
+                if (brush.Mode == BrushMode.FillHole)
+                {
+                    if (_hm.Samples[idx] != 0) continue;
+                    int fill = NonHoleNeighbourAverage(x, y);
+                    if (fill <= 0) continue;                     // nothing solid nearby to borrow a height from
+                    if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(x, y); }
+                    _hm.Samples[idx] = (ushort)fill;
+                    continue;
+                }
+
                 if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(x, y); }
 
                 float cur = _hm.Samples[idx];
@@ -201,6 +227,33 @@ public sealed class TerrainStroke
                 }
                 _hm.Samples[idx] = (ushort)Math.Clamp((int)MathF.Round(nv), 0, ushort.MaxValue);
             }
+    }
+
+    /// <summary>The mean of the solid (non-zero) samples in the 5x5 block around a cell, or 0 when there are none.
+    /// Reads the live heightmap, so filling a wide hole works inward from its rim as the dab sweeps across.</summary>
+    private int NonHoleNeighbourAverage(int cx, int cy)
+    {
+        long sum = 0; int n = 0;
+        for (int y = Math.Max(0, cy - 2); y <= Math.Min(_hm.Height - 1, cy + 2); y++)
+            for (int x = Math.Max(0, cx - 2); x <= Math.Min(_hm.Width - 1, cx + 2); x++)
+            {
+                ushort v = _hm[x, y];
+                if (v == 0) continue;
+                sum += v; n++;
+            }
+        return n == 0 ? 0 : (int)(sum / n);
+    }
+
+    /// <summary>Punch one cell: the tunnel tool's "hole under this entrance". Same bookkeeping as a dab.</summary>
+    public void SetHole(int gx, int gy, bool hole)
+    {
+        if (gx < 0 || gy < 0 || gx >= _hm.Width || gy >= _hm.Height) return;
+        int idx = gy * _hm.Width + gx;
+        ushort target = hole ? (ushort)0 : (ushort)NonHoleNeighbourAverage(gx, gy);
+        if (!hole && target == 0) return;
+        if (_hm.Samples[idx] == target) return;
+        if (!_orig.ContainsKey(idx)) { _orig[idx] = _hm.Samples[idx]; Grow(gx, gy); }
+        _hm.Samples[idx] = target;
     }
 
     // ---- Per-vertex editing (Battlecraft's point manipulation) ----

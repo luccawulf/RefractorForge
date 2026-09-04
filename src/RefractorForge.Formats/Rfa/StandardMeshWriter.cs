@@ -20,6 +20,7 @@ namespace RefractorForge.Formats.Rfa;
 /// reader flips it back to (a,b,c).</item>
 /// <item>No collision meshes and a zeroed qflag/material-settings: enough for a placeable visual mesh. (In-game
 /// collision + textured materials are a later pass; an imported mesh renders, you just walk through it.)</item>
+/// <item>An empty trailing section (<c>u32 0; u32 0</c>) closes the file, as every shipped mesh is closed.</item>
 /// </list>
 /// </remarks>
 public static class StandardMeshWriter
@@ -69,6 +70,13 @@ public static class StandardMeshWriter
             }
             foreach (var (a, b, c) in s.Faces) { w.Write((ushort)c); w.Write((ushort)b); w.Write((ushort)a); }   // reversed winding
         }
+
+        // The trailing section every DICE-authored mesh ends with: u32 flag, u32 size, then size bytes. All 1,997
+        // meshes in BfVietnam's standardMesh.rfa carry one (699 of them exactly this empty form), and a loader that
+        // reads it unconditionally hits end-of-file on a mesh that stops at the geometry. Cheap insurance for a
+        // generated mesh the game has to take on trust.
+        w.Write((uint)0);
+        w.Write((uint)0);
 
         w.Flush();
         return ms.ToArray();

@@ -33,6 +33,19 @@ public sealed class EnvironmentSettings
     // Which of the four the level actually declared. Only declared keys are written back on a patch save, so a map
     // that deliberately leaves one out - Operation_Irving ships globalAmbientColor commented out - does not silently
     // gain one just because the editor has a default for it. Setting a flag is how the UI says "the user chose this".
+    /// <summary><c>renderer.LMambientColor</c>: what the engine ADDS to every lightmapped surface. Retail object
+    /// lightmaps go all the way to 0 in shadow (Cedar Falls' means sit at 32-85 of 255), so this is the only thing
+    /// keeping a shadowed wall from being black in the game - and it has to be added in the editor the same way.
+    /// Cedar Falls .25, Saigon68 .2. Accepts the single-float form as well as a triple.</summary>
+    public Vec3 LMAmbientColor { get; set; } = new(0.25f, 0.25f, 0.25f);
+    public bool HasLMAmbient { get; set; }
+
+    /// <summary>The colour block of the second, below-terrain water (<c>waterBelowTerrain.*</c>, the console object
+    /// BfVietnam registers beside <c>water</c>). Saigon68 copies its surface water's block wholesale, so that is what
+    /// an edit writes: the level's own <c>water.*</c> colour lines, mirrored. <c>WriteWaterBelow</c> marks the edit;
+    /// <c>WaterBelowEnabled</c> false removes the block.</summary>
+    public bool WriteWaterBelow { get; set; }
+    public bool WaterBelowEnabled { get; set; }
     public bool HasGlobalAmbient { get; set; }
     public bool HasAmbient { get; set; }
     public bool HasDiffuse { get; set; }
@@ -76,6 +89,45 @@ public sealed class EnvironmentSettings
     /// <see cref="Validation.CombatArea"/> for why the order matters.</summary>
     public Validation.CombatArea? CombatArea { get; set; }
     public bool HasCombatArea => CombatArea is not null;
+
+    // ---- The BfVietnam 1.2 tunnel system, as Init.con declares it ----
+    //
+    // Operation Cedar Falls is the reference:  Game.isTunnelMap 1 / Game.useBelowGroundCulling 1 /
+    // Game.entryPointRadius 3.5 / mapManager.addObjectMap o_tunnelsA TunnelsAMap 886/871/328/327.
+    // isTunnelMap switches the system on (Battlecraft wrote it as 0 into every custom map, which is why tunnels
+    // "never worked" in them); the object map binds an underground minimap texture (Textures/<MapName>.dds) to
+    // a below-ground object template over a world rectangle (x, z, width, height in metres); entryPointRadius
+    // is how close a soldier has to be to an entry point to pass through the terrain.
+
+    /// <summary><c>Game.isTunnelMap</c>: the level uses holes in the heightmap and below-ground objects.</summary>
+    public bool IsTunnelMap { get; set; }
+    /// <summary><c>Game.useBelowGroundCulling</c>: do not draw the surface world while the camera is underground.</summary>
+    public bool UseBelowGroundCulling { get; set; }
+    /// <summary><c>Game.entryPointRadius</c>, metres. Retail uses 3.5 (Cedar Falls) and 5 (Saigon68).</summary>
+    public float EntryPointRadius { get; set; } = 3.5f;
+    /// <summary>Every <c>mapManager.addObjectMap</c> line: template, map texture name, world rectangle.</summary>
+    public List<ObjectMap> ObjectMaps { get; } = new();
+    /// <summary>Set when the tunnel settings were edited, so the patcher rewrites them.</summary>
+    public bool WriteTunnel { get; set; }
+
+    public sealed record ObjectMap(string Template, string MapName, float X, float Z, float Width, float Height)
+    {
+        public string ToConLine() => string.Format(CultureInfo.InvariantCulture,
+            "mapManager.addObjectMap {0} {1} {2:0.###}/{3:0.###}/{4:0.###}/{5:0.###}", Template, MapName, X, Z, Width, Height);
+
+        public static ObjectMap? Parse(string val)
+        {
+            var parts = val.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 3) return null;
+            var r = parts[2].Split('/');
+            if (r.Length < 4) return null;
+            if (!float.TryParse(r[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var x) ||
+                !float.TryParse(r[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var z) ||
+                !float.TryParse(r[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var w) ||
+                !float.TryParse(r[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var h)) return null;
+            return new ObjectMap(parts[0], parts[1], x, z, w, h);
+        }
+    }
 
     // Water surface look (from Init.con: water.color / water.waterShallowAlpha).
     /// <summary>Water surface colour, RGB 0..1 (water.color).</summary>
@@ -199,6 +251,13 @@ public sealed class EnvironmentSettings
                 {
                     case "renderer.globalambientcolor": if (TryVec(val, out var gac)) { e.GlobalAmbientColor = gac; e.HasGlobalAmbient = true; } break;
                     case "renderer.ambientcolor": if (TryVec(val, out var amc)) { e.AmbientColor = amc; e.HasAmbient = true; } break;
+                    case "renderer.lmambientcolor":
+                        if (TryVec(val, out var lma)) { e.LMAmbientColor = lma; e.HasLMAmbient = true; }
+                        else if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var lm1)) { e.LMAmbientColor = new Vec3(lm1, lm1, lm1); e.HasLMAmbient = true; }
+                        break;
+                    case "waterbelowterrain.color": case "waterbelowterrain.shallowcolor": case "waterbelowterrain.deepcolor":
+                    case "waterbelowterrain.wateralphadepth": case "waterbelowterrain.watershallowalpha": case "waterbelowterrain.watercolordepth":
+                        e.WaterBelowEnabled = true; break;
                     case "renderer.diffusecolor": if (TryVec(val, out var dfc)) { e.DiffuseColor = dfc; e.HasDiffuse = true; } break;
                     case "renderer.specularcolor": if (TryVec(val, out var spc)) { e.SpecularColor = spc; e.HasSpecular = true; } break;
                     case "renderer.vertexfogenable": e.FogEnabled = val.StartsWith("1"); break;
@@ -208,6 +267,10 @@ public sealed class EnvironmentSettings
                     case "game.viewdistance":
                     case "game.setviewdistance": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var vd)) e.ViewDistance = vd; break;
                     case "game.setactivecombatarea": if (Validation.CombatArea.TryParse(line, out var caA)) e.CombatArea = caA; break;
+                    case "game.istunnelmap": e.IsTunnelMap = val.StartsWith("1"); break;
+                    case "game.usebelowgroundculling": e.UseBelowGroundCulling = val.StartsWith("1"); break;
+                    case "game.entrypointradius": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var epr)) e.EntryPointRadius = epr; break;
+                    case "mapmanager.addobjectmap": if (ObjectMap.Parse(val) is { } om) e.ObjectMaps.Add(om); break;
                     case "water.color": if (TryVec(val, out var wcl)) e.WaterColor = wcl; break;
                     case "water.deepcolor": if (TryVec(val, out var wdc)) e.DeepColor = wdc; break;
                     case "water.watershallowalpha": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var wal)) e.WaterAlpha = Math.Clamp(wal, 0.08f, 1f); break;
@@ -376,15 +439,22 @@ public sealed class EnvironmentSettings
             ("renderer.fogend",             $"renderer.fogend {F(FogEnd)}",                         WriteFog),
             ("game.setviewdistance",        $"Game.setViewDistance {F(ViewDistance)}",              WriteViewDistance),
             ("game.setactivecombatarea",    CombatArea?.ToConLine() ?? "",                          HasCombatArea),
+            ("game.istunnelmap",            $"Game.isTunnelMap {(IsTunnelMap ? 1 : 0)}",             WriteTunnel),
+            ("game.usebelowgroundculling",  $"Game.useBelowGroundCulling {(UseBelowGroundCulling ? 1 : 0)}", WriteTunnel),
+            ("game.entrypointradius",       $"Game.entryPointRadius {F(EntryPointRadius)}",         WriteTunnel && IsTunnelMap),
         };
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var outLines = new List<string>();
-        int lastRenderer = -1;
+        int lastRenderer = -1, tunnelAt;
         foreach (var rawLine in existing)
         {
             var t = rawLine.Trim();
             int sp = t.IndexOf(' ');
             var key = (sp < 0 ? t : t[..sp]).ToLowerInvariant();
+            // The object maps are rewritten as a set (below), so the old ones go - including the pair of dummy
+            // lines Battlecraft put in every map, which bind textures that do not exist.
+            if (WriteTunnel && key == "mapmanager.addobjectmap") continue;
+            if (WriteTunnel && !IsTunnelMap && key == "game.entrypointradius") continue;   // meaningless with the system off
             int w = Array.FindIndex(wanted, x => x.Key == key);
             // A rem'd line reads as key "rem", so a commented-out setting is left exactly as it is.
             if (w >= 0 && wanted[w].Want) { outLines.Add(wanted[w].Line); seen.Add(key); }
@@ -393,6 +463,35 @@ public sealed class EnvironmentSettings
         }
         var missing = wanted.Where(x => x.Want && !seen.Contains(x.Key)).Select(x => x.Line).ToList();
         if (missing.Count > 0) outLines.InsertRange(lastRenderer >= 0 ? lastRenderer + 1 : 0, missing);
+        if (WriteTunnel && IsTunnelMap && ObjectMaps.Count > 0)
+        {
+            // Directly after the isTunnelMap line, wherever that ended up, so the block reads as one setting.
+            tunnelAt = outLines.FindIndex(l => l.TrimStart().StartsWith("Game.isTunnelMap", StringComparison.OrdinalIgnoreCase));
+            outLines.InsertRange(tunnelAt >= 0 ? tunnelAt + 1 : outLines.Count, ObjectMaps.Select(m => m.ToConLine()));
+        }
+        if (WriteWaterBelow)
+        {
+            outLines.RemoveAll(l => l.TrimStart().StartsWith("waterBelowTerrain.", StringComparison.OrdinalIgnoreCase));
+            if (WaterBelowEnabled)
+            {
+                // Mirror the surface water's colour lines, the way Saigon68 is written. Only the colour keys: a
+                // BF1942 level's texLayer / scroll lines have no meaning on the second body.
+                string[] keys = { "color", "shallowcolor", "deepcolor", "wateralphadepth", "watershallowalpha", "watercolordepth" };
+                var mirror = new List<string>(); int lastWater = -1;
+                for (int i = 0; i < outLines.Count; i++)
+                {
+                    var t = outLines[i].TrimStart();
+                    if (!t.StartsWith("water.", StringComparison.OrdinalIgnoreCase)) continue;
+                    int sp = t.IndexOf(' ');
+                    var prop = (sp < 0 ? t[6..] : t[6..sp]).ToLowerInvariant();
+                    if (!keys.Contains(prop)) continue;
+                    lastWater = i;
+                    mirror.Add("waterBelowTerrain." + t[6..]);
+                }
+                if (mirror.Count == 0) mirror.Add($"waterBelowTerrain.color {V(WaterColor)}");
+                outLines.InsertRange(lastWater >= 0 ? lastWater + 1 : outLines.Count, mirror);
+            }
+        }
         return outLines;
     }
 

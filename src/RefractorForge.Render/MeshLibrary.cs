@@ -868,6 +868,27 @@ public sealed class MeshLibrary
         public Vector3 RotSpeed;                               // setContinousRotationSpeed (deg/s, per axis)
         public Vector3 Pivot;                                  // setPivotPosition (local pivot for the spin)
         public readonly List<(string Child, Vector3 Pos, Vector3 Rot)> Children = new();
+        // The BfVietnam 1.2 tunnel system's three template flags (o_tunnelsA / o_Tunnel_Hole_m1 and friends).
+        public bool IsBelowGround;                             // isBelowGround 1: lives under the terrain, culled with it
+        public bool IsEntryPoint;                              // isEntryPoint 1: soldiers may pass the terrain near it
+        public bool HasMap;                                    // hasMap 1: an underground minimap is bound to it
+    }
+
+    /// <summary>What a placed object means to the tunnel system, resolved through the whole template registry:
+    /// an entrance is either flagged itself or carries an <c>entrance</c> child that is. <c>EntryOffsets</c> are
+    /// the local positions of those children (the hole object has three shafts, the hut one).</summary>
+    public sealed record TunnelInfo(bool BelowGround, bool EntryPoint, bool HasMap, IReadOnlyList<Vector3> EntryOffsets);
+
+    public TunnelInfo? TunnelInfoOf(string template)
+    {
+        EnsureAllTemplates();
+        if (_allTemplates is null || !_allTemplates.TryGetValue(template, out var t)) return null;
+        var offs = new List<Vector3>();
+        bool entry = t.IsEntryPoint;
+        foreach (var (child, pos, _) in t.Children)
+            if (_allTemplates.TryGetValue(child, out var ct) && ct.IsEntryPoint) { entry = true; offs.Add(pos); }
+        if (!t.IsBelowGround && !entry && !t.HasMap) return null;
+        return new TunnelInfo(t.IsBelowGround, entry, t.HasMap, offs);
     }
 
     /// <summary>The first ObjectTemplate.create name in a single .con entry (the main Objects.con's root), or null.</summary>
@@ -929,6 +950,9 @@ public sealed class MeshLibrary
             // apply to the template itself (not a child), so no pendingChildIdx guard. Note the engine's spelling
             // "Continous". View-only: surfaced via TryGetAnimatedParts and spun per-frame in the editor.
             else if (cmd.Equals("setContinousRotationSpeed", StringComparison.OrdinalIgnoreCase)) cur.RotSpeed = ParseVec(arg);
+            else if (cmd.Equals("isBelowGround", StringComparison.OrdinalIgnoreCase)) cur.IsBelowGround = arg.StartsWith("1");
+            else if (cmd.Equals("isEntryPoint", StringComparison.OrdinalIgnoreCase)) cur.IsEntryPoint = arg.StartsWith("1");
+            else if (cmd.Equals("hasMap", StringComparison.OrdinalIgnoreCase)) cur.HasMap = arg.StartsWith("1");
             else if (cmd.Equals("setPivotPosition", StringComparison.OrdinalIgnoreCase)) cur.Pivot = ParseVec(arg);
             else if (cmd.Equals("setObjectTemplate", StringComparison.OrdinalIgnoreCase))
             {

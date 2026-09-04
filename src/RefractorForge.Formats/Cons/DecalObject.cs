@@ -37,9 +37,12 @@ public static class DecalObject
     /// <param name="doubleSided">Emit a second, reversed quad so it is visible from behind.</param>
     /// <param name="baseSub">The game's archive mount root: "bf1942" or "BfVietnam". The two games share no
     /// namespace, so a BF1942 path resolves to nothing in Vietnam and the object silently gets no mesh.</param>
+    /// <param name="textureRef">When set, the shader points at this reference VERBATIM instead of the level's
+    /// <c>Texture/</c> folder, and no picture file is emitted. A Bink movie path (<c>Mods/&lt;mod&gt;/Movies/x.bik</c>)
+    /// makes a video decal: the texture loader plays Bink paths, the trick the mod movie-screens use.</param>
     public static Built Build(string levelName, string name, float widthMeters, float heightMeters,
-                              string textureName, byte[] ddsBytes, bool flat = false, bool doubleSided = true,
-                              string baseSub = "bf1942")
+                              string textureName, byte[]? ddsBytes, bool flat = false, bool doubleSided = true,
+                              string baseSub = "bf1942", string? textureRef = null)
     {
         name = Sanitize(name);
         textureName = Sanitize(textureName);
@@ -59,12 +62,13 @@ public static class DecalObject
         // is folder-qualified — all 4,406 shipped references are, and a bare name resolves at the archive root
         // instead of the level's Texture folder. `transparent false` + alphatestref is retail's cut-out recipe
         // (blending would also need `depthWrite false`, and a photo is opaque anyway).
+        string texLine = textureRef is not null ? textureRef : "texture/" + textureName;
         string rs = $"subshader \"{material}\" \"StandardMesh/Default\"\r\n{{\r\n" +
                     "\tlighting true;\r\n\tlightingSpecular false;\r\n\tmaterialDiffuse 1 1 1;\r\n" +
                     "\ttransparent false;\r\n\talphaTestRef 0.5;\r\n\ttwosided true;\r\n" +
-                    $"\ttexture \"texture/{textureName}\";\r\n}}\r\n";
+                    $"\ttexture \"{texLine}\";\r\n}}\r\n";
         files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(rs)));
-        files.Add(($"Texture/{textureName}.dds", ddsBytes));
+        if (textureRef is null && ddsBytes is not null) files.Add(($"Texture/{textureName}.dds", ddsBytes));
 
         // The full 0..5 LOD ramp every shipped Geometries.con writes; the last entry is the far distance, so a
         // truncated ramp makes the decal stop drawing long before the level's view distance.
@@ -162,6 +166,13 @@ public static class DecalObject
         float minX = pos.Min(p => p.X), maxX = pos.Max(p => p.X);
         float minY = pos.Min(p => p.Y), maxY = pos.Max(p => p.Y);
         float minZ = pos.Min(p => p.Z), maxZ = pos.Max(p => p.Z);
+        // A quad is flat, so one axis of its box has zero thickness. Retail sign meshes carry a centimetre or so
+        // there (Easter Island's Sign_Credits: z from -0.01 to 0.01); a degenerate box is the kind of thing a
+        // culling or bounding-sphere routine divides by, so give it the same small thickness.
+        const float pad = 0.02f;
+        if (maxX - minX < pad) { minX -= pad; maxX += pad; }
+        if (maxY - minY < pad) { minY -= pad; maxY += pad; }
+        if (maxZ - minZ < pad) { minZ -= pad; maxZ += pad; }
         mesh.BoundingBox[0] = minX; mesh.BoundingBox[1] = minY; mesh.BoundingBox[2] = minZ;
         mesh.BoundingBox[3] = maxX; mesh.BoundingBox[4] = maxY; mesh.BoundingBox[5] = maxZ;
         return mesh;

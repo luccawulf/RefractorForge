@@ -328,14 +328,20 @@ public static class LevelSaver
 
     private static string? FindEntry(RefractorFlatArchive a, string suffix, bool preferConquest)
     {
-        string? first = null;
+        // The SHALLOWEST match wins, not the first in archive order. A level carries several files of the same
+        // leaf name (Init.con at the root and under Menu/ and Animations/; StaticObjects.con per game mode), and
+        // the root one is the level's own - the loader picks it the same way. Archive order is whatever the
+        // packer wrote, so "first" could quietly aim an Init.con patch at Menu/init.con, where the game never
+        // reads a renderer or tunnel setting.
+        string? best = null; int bestDepth = int.MaxValue;
         foreach (var e in a.Entries)
         {
             if (!e.Name.EndsWith(suffix, System.StringComparison.OrdinalIgnoreCase)) continue;
             if (preferConquest && e.Name.ToLowerInvariant().Contains("conquest")) return e.Name;
-            first ??= e.Name;
+            int depth = e.Name.Count(c => c == '/' || c == '\\');
+            if (depth < bestDepth) { bestDepth = depth; best = e.Name; }
         }
-        return first;
+        return best;
     }
 
     /// <summary>EVERY entry ending in <paramref name="suffix"/>. A packed level carries one copy of each gameplay

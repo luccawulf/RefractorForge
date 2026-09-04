@@ -188,7 +188,9 @@ void main(){
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
     vec3 d = uAmbLight + uDifLight*max(0.0, dot(n, normalize(uLightDir)))*vis;
     d = mix(d, uNightAmb, uNight);                 // night pulls the sun down toward moonlight
-    vec3 c = baseCol * (d + placedLights(vWorld, n));
+    // A texel cannot hold more than white, so a pool can never be brighter than the scene light itself. Showing
+    // the same ceiling live is what makes a bake look like the preview instead of a surprise.
+    vec3 c = min(baseCol * (d + placedLights(vWorld, n)), d);
     if (vH < uWater) {                              // shallow shows the riverbed, deep reads as water
         float depth = clamp((uWater - vH)/8.0, 0.0, 1.0);
         c = mix(c, uDeepColor, 0.45 + 0.45*depth);
@@ -250,6 +252,7 @@ uniform sampler2D uTexL1; uniform sampler2D uTexL2; uniform sampler2D uNormal;
 uniform vec2 uScroll1; uniform vec2 uScroll2; uniform vec2 uScrollN;   // direction * speed (UV/sec)
 uniform float uTile1; uniform float uTile2; uniform float uTileN;     // water.tileLayer*
 uniform vec3 uSpecColor;
+uniform float uReflect; uniform int uHasSkyCube; uniform samplerCube uSkyCube;   // levelWater.rs 'reflectivity', mirrored off the level's own sky
 void main(){
     vec3 viewDir = normalize(uCamPos - vWorld);
     vec3 n; vec3 col; float alpha;
@@ -277,6 +280,10 @@ void main(){
         col = mix(col, uFogColor, fres*0.35);                                   // grazing-angle reflection of the sky/haze
         alpha = mix(uWaterAlpha, 1.0, fres*0.4);                          // transparent looking down, opaque at grazing
     }
+    // Sky reflection: the levelWater.rs reflectivity knob, off the real cubemap when the level has one, else the haze.
+    vec3 refl = (uHasSkyCube==1) ? texture(uSkyCube, reflect(-viewDir, n)).rgb : uFogColor;
+    float fr = pow(1.0 - max(dot(n, viewDir), 0.0), 2.0);
+    col = mix(col, refl, clamp(uReflect * (0.5 + 0.5*fr), 0.0, 1.0));
     if (uFogEnable==1) {                              // fade into the fog like the land, at the SAME distance
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
         col = mix(col, uFogColor, fog);
@@ -429,6 +436,7 @@ uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
 uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
 uniform float uAlphaRef;   // 0 = this material never discards
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
+uniform vec3 uLmAmbient;                                  // renderer.LMambientColor: added to every lightmapped surface, as the engine does
 uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
 // ---- Placed lights -------------------------------------------------------------------------------
 // Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
@@ -488,8 +496,18 @@ void main(){
     if (uAlphaEnable==1 && uAlphaRef > 0.0 && a < uAlphaRef) discard;
     vec3 c;
     if (uHasLightmap==1) {
-        vec3 lm = texture(uLightmap, vLmUv).rgb;          // baked lighting already has shadows baked in -> no shadow map
-        c = base * uTint * (0.08 + 0.92*lm);              // 8% ambient floor so deep shadow stays readable in-editor
+        // The engine's own formula (effects/RaShaderPPLSTs1DifLmp.fx): the map is Prelight, a SUN-VISIBILITY mask,
+        //   colour = saturate(2 * (Prelight * sunColour * N.L + LMambient)) * texture
+        // so it scales the sun term and N.L is still applied here; LMambient (renderer.LMambientColor) is what a
+        // shadowed texel keeps. A placed light is baked into the mask as extra visibility, so it shows here the same
+        // way - combined by max(), not added, so a light already in the map is not counted twice and one placed after
+        // the bake still appears. The editor's light pair is normalised, so the 2x is folded into the ambient only.
+        vec3 ln = normalize(vN);
+        float pl = dot(placedLights(vWorld, ln), vec3(0.2126, 0.7152, 0.0722));
+        float lm = max(texture(uLightmap, vLmUv).b, pl);
+        float ndl = abs(dot(ln, normalize(uLightDir)));
+        vec3 d = lm * uDifLight * ndl + min(2.0 * uLmAmbient, vec3(0.6));
+        c = base * uTint * min(d, vec3(1.0));
     } else {
         vec3 n = normalize(vN);
         float vis = shadowVis(vWorld, n);                 // real-time sun cast-shadow
@@ -584,6 +602,15 @@ RefractorForge.Formats.Validation.IssueSeverity mapReportMin = RefractorForge.Fo
 Dictionary<uint, int[]> plLocs = new();
 int selLight = -1;              // index into lightRig.Lights, -1 = none
 bool showLightGizmos = true;
+bool groundLightsLive = true;     // draw the placed lights on the terrain live; a ground bake turns this off (the pool is in the texture then)
+float groundBakeStrength = 1f;    // scales the pool a ground bake burns in
+bool showTunnels = false;         // the Tunnels (BFV 1.2) window
+bool showTunnelEntries = true;    // draw the entry-point spheres: where a soldier passes through the terrain
+// The BFV water shader (standardMesh/levelWater.rs): reflectivity + opacity, shipped as a level-side override.
+float waterReflect = 0.20f, waterOpacity = 0.35f; bool waterShaderLoaded = false; string? waterRsText = null;
+RefractorForge.Formats.Terrain.WaterShaderSettings waterShaderBase = RefractorForge.Formats.Terrain.WaterShaderSettings.RetailDefault;
+// Decal dialog: the picture's own size, aspect lock, and the video path.
+bool decalKeepAspect = true; int decalImgW = 0, decalImgH = 0; string decalInfoPath = ""; bool decalVideo = false;
 bool lightDragging = false;     // dragging the selected light in the viewport
 float lightDragOffset = 0f;     // its height above the ground when the drag began, so a drag follows terrain
 bool lightDragVertical = false; // Shift-drag raises and lowers instead of moving across the ground
@@ -806,6 +833,7 @@ if (rfaList.Length > 0)
     materialMap = lvl.Material;
     growth = lvl.Growth;
     env = lvl.Environment;
+    if (env.IsTunnelMap) mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1, holes: true);   // a tunnel map: its holes are real
     sounds = lvl.Sounds ?? SoundLibrary.Empty;   // .rfa levels edit sounds too (saved back into the repack/patch)
     loadedShadowBits = lvl.Shadow;               // the level's baked terrain sun-shadow (display via the Shadows toggle)
     // NOTE: object lightmaps are loaded LAZILY (EnsureObjectLightmaps) on first enable - decoding them here re-opens
@@ -841,6 +869,7 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     if (matFile is not null) materialMap = MaterialMap.LoadForMaterialSize(matFile, cfg.MaterialSize);
     growth = GrowthMaps.LoadFolder(levelDir);
     env = EnvironmentSettings.LoadFolder(levelDir);
+    if (env.IsTunnelMap) mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1, holes: true);   // a tunnel map: its holes are real
     lightRig = LightRig.Load(levelDir);   // sidecar; never packed (LevelSaver.IsEditorOnlyFile)
     objGroups = RefractorForge.Formats.Editing.ObjectGroups.Load(levelDir);
     groupsDirty = true;
@@ -1166,6 +1195,10 @@ bool showAnimations = true;                                  // spin RotationalB
 float foliageSpacing = 12.5f;                                // patch grid size (m) -- the game uses ~12.5 m; drives the game-matched density
 float foliageDensity = 1f;                                   // density multiplier on the per-patch tree count (1.0 = game-matched)
 bool foliageDirty = true;                                    // rebuild the foliage overlay (toggled on / params changed / level loaded)
+bool showUnderFoliage = false;                               // undergrowth overlay (underGrowth.wst grass/bushes), the same model as the trees
+float underSpacing = 17.5f;                                  // BfVietnam.exe spaces under-growth patches 17.5 m (over-growth 12.5 m)
+float underDensity = 1f;
+int underFoliageCount = 0;
 int foliageCount = 0;                                        // instances currently in the overlay (for the Layers readout)
 // Weather (rain/snow/dust): a view-only preview overlay + optional generate-into-level on save.
 bool showWeather = false;                                    // preview overlay on/off
@@ -1223,6 +1256,17 @@ int captureResIdx = 1;           // index into captureSizes
 bool captureImport = true;       // also drop the captured texture into the active slot
 int[] captureSizes = { 128, 256, 512, 1024 };
 string[] captureSizeNames = { "128", "256", "512", "1024" };
+bool captureSaveFile = true;     // also write the captured square to a .dds (else it is only kept as the stamp)
+// Surface stamp: a captured square of the painted ground kept at its WORLD size, pasted back 1:1 (or scaled and
+// turned) anywhere - on this map or, exported, on another. The brush tiles its texture every few metres; a stamp is
+// the opposite: one copy, exactly as big as the ground it was taken from.
+Texture2D? stampTex = null;
+float stampMeters = 64f;         // the ground size the stamp stands for
+string stampName = "";
+bool stampMode = false;          // click the terrain to paste the stamp there
+int stampRot = 0;                // quarter turns
+float stampScale = 1f, stampOpacity = 1f, stampFeather = 0.08f;
+uint stampGlTex = 0;             // inspector thumbnail (0 = none)
 // Surface names for the bundled Default ("GRASSY") texture set, straight from its index.dat (texture order 0..15).
 string[] surfNames = { "Default", "Water", "Dry Grass", "Wet Grass", "Dry Dirt", "Damp Dirt", "Mud", "Outside Map",
                        "Gravel", "Frozen Ground", "Dry Sand", "Wet Sand", "Rock Surface", "Sand Road", "Dirt Road", "Paved Road" };
@@ -1294,9 +1338,9 @@ int sculptModeIdx = 0;                  // Sculpt tool: 0 Raise, 1 Lower, 2 Flat
 int falloffIdx = 0;                     // 0 Smooth, 1 Linear, 2 Constant, 3 Gaussian (== BrushFalloff order)
 bool flattenLockGround = true;          // Flatten/Set: lock target to the height under the cursor at stroke start
 float flattenTarget = 30f;              // explicit Flatten/Set target height (m) when not locked
-string[] sculptModeLabels = { "Raise", "Lower", "Flatten", "Set" };
+string[] sculptModeLabels = { "Raise", "Lower", "Flatten", "Set", "Hole", "Fill hole" };
 string[] falloffLabels = { "Smooth", "Linear", "Constant", "Gaussian" };
-BrushMode[] sculptModes = { BrushMode.Raise, BrushMode.Lower, BrushMode.Flatten, BrushMode.Set };
+BrushMode[] sculptModes = { BrushMode.Raise, BrushMode.Lower, BrushMode.Flatten, BrushMode.Set, BrushMode.Hole, BrushMode.FillHole };
 bool lrSculpt = false;                  // Sculpt option: LEFT mouse raises, RIGHT mouse lowers (instead of picking a Mode)
 int activeStrokeDir = 0;                // +1 raise / -1 lower while an L/R-button sculpt stroke is live (0 = use the Mode)
 bool alphaTransparency = true;          // render object/foliage texture alpha as transparency (cutout + soft blend)
@@ -1613,6 +1657,7 @@ int vertSmoothRadius = 2;              // cells blended around a moved vertex, s
 float vertNudgeStep = 0.5f;            // metres per PageUp/PageDown press
 float vertHeightField = 0f;            // Inspector: type an exact height for the selected vertex
 int rotAxisDrag = -1; float rotAxisStartY = 0f;   // vertical-drag rotation about the locked axis
+bool rotBodyDrag = false; int rotBodyChannel = 0; float rotBodyStartX = 0f, rotBodyStartY = 0f;   // free rotate by dragging the object itself
 HashSet<int> lockedIdxScratch = new();   // reused per frame; top-level locals cannot be readonly
 // rotate-gizmo drag state
 int rotDragChannel = -1, rotHover = -1;
@@ -1801,6 +1846,25 @@ void OnLoad()
                 var dv = axis * delta;
                 foreach (var (idx, p, _, _) in dragSnap)
                     so.Objects[idx].Position = SnapXZ(new Vec3(p.X + dv.X, p.Y + dv.Y, p.Z + dv.Z));
+                SyncTransformEdit();
+                return;
+            }
+            // Free rotate by dragging the object itself (Rotate tool, no axis button): sideways spins the yaw,
+            // Ctrl pitches and Alt rolls with an up/down drag. 2 px = 1 degree; Snap rounds to 15 degrees.
+            if (rotBodyDrag && so is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            {
+                float bdeg = rotBodyChannel == 0 ? (pos.X - rotBodyStartX) * 0.5f : (rotBodyStartY - pos.Y) * 0.5f;
+                if (snapOn) bdeg = MathF.Round(bdeg / 15f) * 15f;
+                foreach (var (idx, _, r0, _) in dragSnap)
+                {
+                    if ((uint)idx >= (uint)so.Objects.Count) continue;
+                    so.Objects[idx].Rotation = rotBodyChannel switch
+                    {
+                        0 => new Vec3(r0.X + bdeg, r0.Y, r0.Z),
+                        1 => new Vec3(r0.X, r0.Y + bdeg, r0.Z),
+                        _ => new Vec3(r0.X, r0.Y, r0.Z + bdeg),
+                    };
+                }
                 SyncTransformEdit();
                 return;
             }
@@ -2098,6 +2162,21 @@ void OnLoad()
                 if (cmds.Count > 0) hist.Do(new CompositeCommand(cmds));
                 dragSnap.Clear(); SyncTransformEdit();
             }
+            else if (rotBodyDrag)
+            {
+                rotBodyDrag = false;
+                if (so is null || hist is null) { dragSnap.Clear(); return; }
+                var cmds = new List<IEditCommand>();
+                foreach (var (idx, _, rot, _) in dragSnap)
+                {
+                    if (idx < 0 || idx >= so.Objects.Count) continue;
+                    var final = so.Objects[idx].Rotation;
+                    so.Objects[idx].Rotation = rot;                 // revert so the command captures the pre-drag angle
+                    cmds.Add(new RotateObject(so.Objects[idx].Id, final));
+                }
+                if (cmds.Count > 0) hist.Do(new CompositeCommand(cmds));
+                dragSnap.Clear(); SyncTransformEdit();
+            }
             else if (rotAxisDrag >= 0)
             {
                 rotAxisDrag = -1;
@@ -2292,6 +2371,12 @@ void OnLoad()
             if ((toolNames[tool] == "Sculpt" || toolNames[tool] == "Smooth")
                 && terrainEd is not null && terrainPick is not null && terrainPick.Raycast(ray, out var thit))
             {
+                // Painting a hole switches the level's tunnel system on, or the hole would only ever be a pit.
+                if (CurBrushMode() == BrushMode.Hole && env is { IsTunnelMap: false })
+                {
+                    env.IsTunnelMap = true; env.UseBelowGroundCulling = true; MarkTunnelEdited();
+                    Toast(Loc.T("Game.isTunnelMap switched on for this level (see Window > Tunnels)."));
+                }
                 stroke = terrainEd.BeginStroke();
                 activeStrokeDir = (lrSculpt && toolNames[tool] == "Sculpt") ? 1 : 0;   // left = raise when the L/R option is on
                 stroke.Dab(thit.X, thit.Z, MakeBrush());
@@ -2304,6 +2389,7 @@ void OnLoad()
             {
                 bool alt = kb is not null && (kb.IsKeyPressed(Key.AltLeft) || kb.IsKeyPressed(Key.AltRight));
                 if (alt) { EyedropAt(phit.X, phit.Z); return; }
+                if (paintLayer == 3 && stampMode && stampTex is not null && atlasCpu is not null) { PasteStampAt(phit.X, phit.Z); return; }
                 if (paintLayer == 3 && captureMode && atlasCpu is not null) { CaptureSurfaceAt(phit.X, phit.Z); return; }
             }
 
@@ -2338,40 +2424,46 @@ void OnLoad()
                 return;
             }
 
-            // Move tool: grab an axis handle of the selected object's gizmo to start a constrained drag,
-            // OR grab the object body to free-drag it across the terrain (mouse follows the ground).
-            if (toolNames[tool] == "Move" && selected >= 0 && so is not null)
+            // Move tool. The gizmo handles still work for a constrained slide, but the Battlecraft way is the
+            // default: click ANY object and drag it. A click on an object that is not selected selects it first
+            // (Shift adds it to the selection), so there is no separate "select, then hunt for the handle" step.
+            if (toolNames[tool] == "Move" && so is not null)
             {
-                var gp = SelPos(); float len = GizmoLen(gp);
-                int ax = IsObjectLocked(selected) ? -1 : Gizmo.PickAxis(ray, gp, len, len * 0.18f);   // locked = no drag handle
-                if (ax >= 0)
+                if (selected >= 0)
                 {
-                    if (CaptureDragSnapshot() == 0) return;
-                    dragAxis = ax;
-                    gizmoStartPos = so.Objects[selected].Position;
-                    gizmoStartT = Gizmo.ClosestAxisParam(ray, gp, Gizmo.Axis(ax));
-                    return;
+                    var gp = SelPos(); float len = GizmoLen(gp);
+                    int ax = IsObjectLocked(selected) ? -1 : Gizmo.PickAxis(ray, gp, len, len * 0.18f);   // locked = no drag handle
+                    if (ax >= 0)
+                    {
+                        if (CaptureDragSnapshot() == 0) return;
+                        dragAxis = ax;
+                        gizmoStartPos = so.Objects[selected].Position;
+                        gizmoStartT = Gizmo.ClosestAxisParam(ray, gp, Gizmo.Axis(ax));
+                        return;
+                    }
                 }
-                // Battlecraft's per-axis move buttons: with X, Y or Z picked you drag the object BODY and it slides
-                // along that world axis only - no need to hit a thin gizmo handle. Same maths as the handle drag.
-                int bodyHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
-                if (axisLock >= 0 && (bodyHit == selected || (bodyHit >= 0 && multi.Contains(bodyHit))))
+                // A spawn or control-point handle drawn over an object still wins: those are handled further down.
+                int bodyHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                if (bodyHit >= 0)
                 {
+                    GrabObject(bodyHit);
                     if (CaptureDragSnapshot() == 0) return;
-                    dragAxis = axisLock;
-                    gizmoStartPos = so.Objects[selected].Position;
-                    gizmoStartT = Gizmo.ClosestAxisParam(ray, gp, Gizmo.Axis(axisLock));
-                    return;
-                }
-                // No axis grabbed: if the click lands on the selected object's mesh, start a free ground-drag.
-                int rayHit = bodyHit;
-                bool onSelected = rayHit == selected || (rayHit >= 0 && multi.Contains(rayHit));
-                if (onSelected && terrainPick is not null && terrainPick.Raycast(ray, out var fg))
-                {
-                    if (CaptureDragSnapshot() == 0) return;
-                    freeDragging = true;
-                    freeDragGround = new Vector3(fg.X, fg.Y, fg.Z);   // ground point under the cursor at grab time
-                    return;
+                    // Battlecraft's per-axis move buttons: with X, Y or Z picked the body slides along that world
+                    // axis only. Same maths as the handle drag.
+                    if (axisLock >= 0)
+                    {
+                        dragAxis = axisLock;
+                        gizmoStartPos = so.Objects[selected].Position;
+                        gizmoStartT = Gizmo.ClosestAxisParam(ray, SelPos(), Gizmo.Axis(axisLock));
+                        return;
+                    }
+                    if (terrainPick is not null && terrainPick.Raycast(ray, out var fg))
+                    {
+                        freeDragging = true;
+                        freeDragGround = new Vector3(fg.X, fg.Y, fg.Z);   // ground point under the cursor at grab time
+                        return;
+                    }
+                    return;   // off the terrain: nothing to drag against, but the click still selected it
                 }
             }
 
@@ -2404,13 +2496,14 @@ void OnLoad()
                 }
             }
 
-            // Battlecraft's per-axis rotate buttons: pick X, Y or Z, then hold the left button and move the mouse
-            // up or down (guide 8.G.3). No ring to hit, and it works on the whole selection.
-            if (toolNames[tool] == "Rotate" && axisLock >= 0 && selected >= 0 && so is not null)
+            // Battlecraft's per-axis rotate buttons: pick X, Y or Z, then hold the left button on ANY object and
+            // move the mouse up or down (guide 8.G.3). No ring to hit, and it works on the whole selection.
+            if (toolNames[tool] == "Rotate" && axisLock >= 0 && so is not null)
             {
-                int rHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
-                if (rHit == selected || (rHit >= 0 && multi.Contains(rHit)))
+                int rHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                if (rHit >= 0)
                 {
+                    GrabObject(rHit);
                     if (CaptureDragSnapshot() == 0) return;
                     rotAxisDrag = axisLock;
                     rotAxisStartY = lastMouse.Y;
@@ -2434,13 +2527,40 @@ void OnLoad()
                 }
             }
 
-            // Scale tool: grab the handle near the object on screen for uniform scaling.
-            if (toolNames[tool] == "Scale" && selected >= 0 && so is not null)
+            // Free rotate without the rings: grab ANY object and drag sideways to spin it (2 px = 1 degree; the
+            // Snap toggle rounds to 15 degrees). Ctrl pitches it and Alt rolls it, with an up/down drag.
+            if (toolNames[tool] == "Rotate" && so is not null)
             {
-                var sp = Gizmo.Project(SelPos(), cam.ViewProjection, fb.X, fb.Y);
-                if (!float.IsNaN(sp.X) && Vector2.Distance(sp, lastMouse) <= 22f)
+                int bHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                if (bHit >= 0)
                 {
+                    GrabObject(bHit);
                     if (CaptureDragSnapshot() == 0) return;
+                    bool ctl = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight));
+                    bool altk = kb is not null && (kb.IsKeyPressed(Key.AltLeft) || kb.IsKeyPressed(Key.AltRight));
+                    rotBodyChannel = altk ? 2 : ctl ? 1 : 0;
+                    rotBodyDrag = true; rotBodyStartX = lastMouse.X; rotBodyStartY = lastMouse.Y;
+                    return;
+                }
+            }
+
+            // Scale tool: the handle near the selected object, or - the Battlecraft way - ANY object's body. Drag
+            // away from the object to grow it, toward it to shrink it.
+            if (toolNames[tool] == "Scale" && so is not null)
+            {
+                bool onHandle = false;
+                if (selected >= 0)
+                {
+                    var sp0 = Gizmo.Project(SelPos(), cam.ViewProjection, fb.X, fb.Y);
+                    onHandle = !float.IsNaN(sp0.X) && Vector2.Distance(sp0, lastMouse) <= 22f;
+                }
+                int sHit = onHandle || OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                if (onHandle || sHit >= 0)
+                {
+                    if (sHit >= 0) GrabObject(sHit);
+                    if (CaptureDragSnapshot() == 0) return;
+                    var sp = Gizmo.Project(SelPos(), cam.ViewProjection, fb.X, fb.Y);
+                    if (float.IsNaN(sp.X)) return;
                     scaleDragging = true;
                     scaleStartScale = so.Objects[selected].Scale ?? 1f;
                     scaleStartDist = MathF.Max(8f, Vector2.Distance(sp, lastMouse));
@@ -2938,6 +3058,7 @@ void OnLoad()
                              ? $" (capped at {GlObjects.MaxObjectTexture}px, saved {glObjects.TextureBytesSaved / 1048576} MB)"
                              : " at the map's own resolution (Environment > Object texture detail lowers it)"));
     }
+    ResetGrowthSettingsToMap(); // a new map starts from ITS defaults, not the previous map's sliders
     LoadOvergrowthSettings();   // restore the per-map overgrowth overlay config (spacing + on/off), if saved
     RefreshTextureLibrary();    // scan the bundled/user Texture Library folder for the Surface painter + Layer Tool
     // Seed the sun azimuth/elevation from the level's SkyAndSun.con so manual sun control starts where the level is,
@@ -3105,6 +3226,20 @@ Vector3 SelPos() => selected >= 0 && so is not null
     ? new Vector3(so.Objects[selected].Position.X, so.Objects[selected].Position.Y, so.Objects[selected].Position.Z)
     : default;
 float GizmoLen(Vector3 at) => MathF.Max(2f, Vector3.Distance(cam.Position, at) * 0.13f);
+
+// Battlecraft-style grab: the object under the cursor becomes the selection (Shift adds it to what is selected),
+// so a drag can begin on it in the same click. Nothing to hunt for first.
+void GrabObject(int hit)
+{
+    bool shift = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
+    if (shift) { multi.Add(hit); selected = hit; }
+    else if (!multi.Contains(hit)) { multi.Clear(); multi.Add(hit); selected = hit; }
+    else selected = hit;
+    SyncTransformEdit();
+}
+
+// A spawn / control-point handle under the cursor takes precedence over the object it may be drawn over.
+bool OverGameplayHandle() => gameplayEdit.Count > 0 && TryPickGameplay(lastMouse, out _, out _);
 
 // Pick the visible gameplay handle nearest the cursor in screen space (within a pixel radius).
 bool TryPickGameplay(Vector2 px, out GpKind kind, out int index)
@@ -4535,69 +4670,98 @@ void DoSaveCore()
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
         return;
     }
-    // Loaded from a packed .rfa: PATCH-FIRST SAVE. The base archive is NEVER modified — repacking edits into the
-    // base while _NNN patches stay mounted meant the patches kept overriding the user's saved files in-game (the
-    // classic "my saved map is corrupted" trap: half the edits show, half silently revert), and it permanently
-    // altered retail archives. Instead the save goes to <stem>_NNN.rfa beside the base: a NEW number when the
-    // highest patch is retail/foreign, or REWRITING our own working patch (header fingerprint) on repeat saves.
-    // The engine and the editor's auto-mount both layer it on top, so the saved state is exactly what loads.
+    // Loaded from a packed .rfa: SAVE THE LEVEL. The edits go back into the archive the user opened, the way a
+    // folder save writes the folder - Save means "save this map". A patch is a separate, deliberate thing:
+    // File > Save as Patch .rfa... exports one when that is what you want.
+    //
+    // Two safeguards, because this rewrites a real file. The archive is only ever replaced through a temp file
+    // (RepackToFile), so a failure part-way leaves the original intact; and every entry of the result is decoded
+    // again before the save reports success. File > Auto-backup on save keeps a timestamped copy as well.
+    //
+    // The one thing that can still hide a good save: a <Level>_NNN.rfa beside the base is mounted OVER it by the
+    // engine, so ITS copy of a file wins over the one just written. Those are named in the log when they exist.
     if (levelDir is not null && LevelArchive.IsRfa(levelDir))
     {
         string baseRfa = SaveBaseRfa() ?? levelDir;
         var sndScripts = sounds.DirtyScripts();
         var extras = new List<(string Name, byte[] Bytes)>(sndScripts);
-        var tiles = PaintedTileBytes();                 // painted surface tiles -> into the patch
+        var tiles = PaintedTileBytes();                 // painted surface tiles
         extras.AddRange(tiles);
-        if (DetailDdsBytes() is { } detd) extras.Add(detd);   // imported detail texture -> Textures/detail.dds (override)
-        var navFiles = DirtyNavFiles();                 // painted AI navmaps -> into the patch
+        if (DetailDdsBytes() is { } detd) extras.Add(detd);   // imported detail texture -> Textures/detail.dds
+        var navFiles = DirtyNavFiles();                 // painted AI navmaps
         var (wxFiles, wxInit) = WeatherRfaPieces(baseRfa);    // weather: new Effects files + Init run-include
         if (wxInit is { } we) extras.Add(we);
         // Navmaps UPSERT, they do not merely override. Plenty of levels ship no Pathfinding/ folder at all
         // (Interstate's Akina_Mountain has zero such entries), and an override-only write matched nothing and
-        // silently dropped every painted map - which is exactly the "pathmaps do not save when I open by mod" bug.
-        // Adding them under the level's archive prefix is what the engine reads, same as a level that shipped them.
+        // silently dropped every painted map. Adding them under the level's own prefix is what the engine reads.
         foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
         if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
-        if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
-        foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // baked object lightmaps -> upsert (override existing OR add new)
-        foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides: same-named .dds / override .rs (+ .bik copied beside the game)
+        // Lighting AND the tunnel settings ride this one: both are Init.con lines, patched into the level's own
+        // Init.con. Leaving it out is what silently dropped Game.isTunnelMap on an in-place save.
+        if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }
+        foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // upsert
+        foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
 
-        string outPatch = RefractorForge.Formats.LevelSaver.NextPatchPath(baseRfa);
-        var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPatch, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
-        if (names.Count == 0) { Toast(Loc.T("Nothing changed - no patch written.")); return; }
-        if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
+        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
+        if (names.Count == 0) { Toast(Loc.T("Nothing changed - nothing written.")); return; }
 
-        // POST-SAVE VALIDATION: decode every entry of the written patch with the independent engine-validated
+        // POST-SAVE VALIDATION: decode every entry of the written archive with the independent engine-validated
         // decoder. A save that fails never reports success, and the dirty flags stay set.
-        var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(outPatch);
+        var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(baseRfa);
         if (verr is not null)
         {
-            Console.WriteLine($"SAVE VALIDATION FAILED for {outPatch}: {verr}");
-            Toast(Loc.T("SAVE FAILED VALIDATION - do not use this file. See Log / Errors.")); showLog = true;
+            Console.WriteLine($"SAVE VALIDATION FAILED for {baseRfa}: {verr}");
+            Toast(Loc.T("SAVE FAILED VALIDATION - use the auto-backup. See Log / Errors.")); showLog = true;
             return;
         }
 
-        Console.WriteLine($"Saved patch {outPatch} ({names.Count} file(s); base archive untouched, verified OK):");
+        Console.WriteLine($"Saved {names.Count} file(s) into {Path.GetFileName(baseRfa)} (verified OK):");
         foreach (var nm in names) Console.WriteLine("   " + nm);
         if (sndScripts.Count > 0) sounds.MarkAllSaved();
-        // Only clear the dirty flag / report success for assets that ACTUALLY matched a base archive entry
-        // (extraFiles silently drops names with no Textures//Pathfinding/ entry to override) -- so the editor
-        // never claims a save it didn't make, and unmatched edits stay dirty for a folder save.
+        // Only clear a dirty flag for an asset that ACTUALLY matched an entry (extraFiles silently drops a name
+        // with no entry to override), so the editor never claims a save it did not make.
         int tileOk = tiles.Count > 0 ? tiles.Count(t => names.Any(n => n.EndsWith(t.Name, StringComparison.OrdinalIgnoreCase))) : 0;
-        if (tileOk > 0) { atlasPainted = false; Console.WriteLine($"   Baked {tileOk} terrain texture tile(s) into the patch."); }
-        else if (tiles.Count > 0) Console.WriteLine("   (painted surface tiles NOT saved: the base .rfa has no Textures/ tiles to override -- save to a folder level)");
+        if (tileOk > 0) { atlasPainted = false; Console.WriteLine($"   Wrote {tileOk} terrain texture tile(s)."); }
+        else if (tiles.Count > 0) Console.WriteLine("   (painted surface tiles NOT saved: this archive ships no Textures/ tiles to overwrite)");
         int navOk = navFiles.Count > 0 ? navFiles.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase))) : 0;
-        if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Baked {navOk} AI navmap file(s) into the patch."); PreviewSavedNav(); }
-        else if (navFiles.Count > 0) { Console.WriteLine("   AI navmaps FAILED to write into the patch."); Toast(Loc.T("AI navmaps failed to save - see Log / Errors.")); showLog = true; }
+        if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Wrote {navOk} AI navmap file(s)."); PreviewSavedNav(); }
+        else if (navFiles.Count > 0) { Console.WriteLine("   AI navmaps FAILED to write."); Toast(Loc.T("AI navmaps failed to save - see Log / Errors.")); showLog = true; }
         if (skyFaceAssign.Count > 0) skyFacesDirty = false;
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
-        Toast(string.Format(Loc.T("Saved patch {0} ({1} files) - verified OK, base untouched."), Path.GetFileName(outPatch), names.Count));
+        int shadowing = WarnAboutShadowingPatches(baseRfa);
+        Toast(shadowing > 0
+            ? string.Format(Loc.T("Saved {0} file(s) into {1} - but {2} patch archive(s) beside it override it in game. See Log / Errors."), names.Count, Path.GetFileName(baseRfa), shadowing)
+            : string.Format(Loc.T("Saved {0} file(s) into {1} - verified OK."), names.Count, Path.GetFileName(baseRfa)));
         return;
     }
     // Otherwise (explicit path / no folder): fall back to a loose StaticObjects.con beside the source.
     if (soPath is not null) { so.Save(soPath); Console.WriteLine($"Saved {so.Objects.Count} objects -> {soPath}"); }
+}
+
+// A <Level>_NNN.rfa beside the base is mounted OVER it, so after writing the base its copy of any file still
+// wins in game. Name them rather than let a good save look like it did nothing. Returns how many there are.
+int WarnAboutShadowingPatches(string baseRfa)
+{
+    try
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(baseRfa));
+        if (dir is null) return 0;
+        var stem = Path.GetFileNameWithoutExtension(baseRfa);
+        var m = System.Text.RegularExpressions.Regex.Match(stem, @"^(.*?)_(\d{3})$");
+        if (m.Success) return 0;                     // the user opened a patch: nothing above it to worry about
+        var over = Directory.EnumerateFiles(dir, stem + "_*.rfa")
+                            .Where(f => System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileNameWithoutExtension(f), @"_\d{3}$"))
+                            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+        if (over.Count == 0) return 0;
+        Console.WriteLine($"   WARNING: {over.Count} patch archive(s) sit beside this map and the engine mounts them OVER it,");
+        Console.WriteLine( "   so their copy of any file wins over what was just saved. Delete or rename them to see these edits:");
+        foreach (var f in over) Console.WriteLine("      " + Path.GetFileName(f));
+        showLog = true;
+        return over.Count;
+    }
+    catch { return 0; }
 }
 
 // Save edits as a PATCH .rfa to a user-chosen path: a small archive of only the changed files, named with the
@@ -4656,35 +4820,6 @@ void DoSavePatch(bool serverSideOnly = false)
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
     }
     catch (Exception ex) { Toast(Loc.T("Patch save failed: ") + ex.Message); }
-}
-
-// ADVANCED, explicit-only: repack the edited files INTO the base archive itself. Ctrl+S deliberately never does
-// this any more — an edited base under mounted _NNN patches gets overridden in-game, and retail archives should
-// stay pristine. This remains for the rare "I really want a single self-contained .rfa" case.
-void DoRepackBaseInPlace()
-{
-    if (so is null || levelDir is null || !LevelArchive.IsRfa(levelDir)) { Toast(Loc.T("Only for .rfa-loaded levels.")); return; }
-    if (rfaList.Length > 1)
-        Toast(Loc.T("Warning: patches are mounted over this base - they will keep overriding the repacked files in-game."));
-    try
-    {
-        var sndScripts = sounds.DirtyScripts();
-        var extras = new List<(string Name, byte[] Bytes)>(sndScripts);
-        extras.AddRange(PaintedTileBytes());
-        if (DetailDdsBytes() is { } detd) extras.Add(detd);
-        var (wxFiles, wxInit) = WeatherRfaPieces(levelDir);
-        if (wxInit is { } we) extras.Add(we);
-        foreach (var (name, bytes) in DirtyNavFiles()) wxFiles.Add(($"Pathfinding/{name}", bytes));   // UPSERT, see DoSaveCore
-        foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));
-        foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
-        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(levelDir, levelDir, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
-        var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(levelDir);
-        if (verr is not null) { Console.WriteLine($"REPACK VALIDATION FAILED: {verr}"); Toast(Loc.T("SAVE FAILED VALIDATION - do not use this file. See Log / Errors.")); showLog = true; return; }
-        if (sndScripts.Count > 0) sounds.MarkAllSaved();
-        Toast(string.Format(Loc.T("Repacked {0} file(s) into the base archive (verified OK)."), names.Count));
-        Console.WriteLine($"Re-packed {names.Count} edited file(s) into {levelDir} (verified OK).");
-    }
-    catch (Exception ex) { Toast(Loc.T("Repack failed: ") + ex.Message); }
 }
 
 // Generate the level's minimap (ingame HUD map) + menu thumbnail from the current heightmap/terrain.
@@ -5205,7 +5340,7 @@ int CaptureDragSnapshot()
 void RebuildTerrain()
 {
     if (heightmap is null) return;
-    mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1);
+    mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1, holes: TunnelHolesOn());
     float ws2 = cfg.WorldSize <= 0 ? 1f : cfg.WorldSize;
     var v = new float[mesh.Positions.Length * 8];
     for (int i = 0; i < mesh.Positions.Length; i++)
@@ -5456,7 +5591,15 @@ void CaptureSurfaceAt(float wx, float wz)
             rgba[o + 2] = (byte)Math.Clamp(c.Z * 255f, 0, 255); rgba[o + 3] = 255;
         }
     var cap = new Texture2D(res, res, rgba);
-    var f = Picker.Save("Save captured terrain as a surface texture", "DDS texture|*.dds", "captured_surface.dds", null);
+    // Whatever else happens to it, the capture is now the stamp: copy, then click to paste.
+    SetStamp(cap, captureMeters, $"ground_{wx:0}_{wz:0}");
+    if (!captureSaveFile)
+    {
+        stampMode = true; captureMode = false;
+        Toast(string.Format(Loc.T("Copied {0:0} m of ground as the stamp - click where to paste it (Paste mode)."), captureMeters));
+        return;
+    }
+    var f = Picker.Save("Save captured terrain as a surface texture", "DDS texture|*.dds", $"ground_{captureMeters:0}m.dds", null);
     if (f is null) return;
     try
     {
@@ -5465,6 +5608,102 @@ void CaptureSurfaceAt(float wx, float wz)
         Toast($"Captured {captureMeters:0} m -> {res}x{res} -> {Path.GetFileName(f)}{(captureImport ? " (imported)" : "")}");
     }
     catch (Exception ex) { Toast($"Capture save failed: {ex.Message}"); }
+}
+
+void SetStamp(Texture2D tex, float meters, string name)
+{
+    stampTex = tex; stampMeters = meters; stampName = name;
+    if (stampGlTex != 0) { gl.DeleteTexture(stampGlTex); stampGlTex = 0; }
+    stampGlTex = UploadTexture(tex);
+}
+
+// Paste the stamp centred on a world point: every atlas texel under the (scaled, turned) square samples the stamp
+// at the matching spot, so 100 m of captured ground lands as 100 m of ground - not as a tile repeated per cell.
+// One undoable rect edit, like a brush stroke.
+void PasteStampAt(float wx, float wz)
+{
+    if (atlasCpu is null || stampTex is null) return;
+    float ws = cfg.WorldSize; int n = atlasCpu.Width;
+    float half = stampMeters * stampScale * 0.5f;
+    int x0 = Math.Clamp((int)MathF.Floor((wx - half) / ws * n), 0, n - 1), x1 = Math.Clamp((int)MathF.Ceiling((wx + half) / ws * n), 0, n - 1);
+    int y0 = Math.Clamp((int)MathF.Floor((wz - half) / ws * n), 0, n - 1), y1 = Math.Clamp((int)MathF.Ceiling((wz + half) / ws * n), 0, n - 1);
+    int w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w <= 0 || h <= 0) return;
+    var px = atlasCpu.Rgba;
+    var before = new byte[w * h * 4];
+    for (int yy = 0; yy < h; yy++) System.Buffer.BlockCopy(px, ((y0 + yy) * n + x0) * 4, before, yy * w * 4, w * 4);
+    float feather = Math.Clamp(stampFeather, 0f, 0.5f);
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+        {
+            float u = (x0 + xx + 0.5f) / n * ws, v = (y0 + yy + 0.5f) / n * ws;    // atlas texel -> world, the bake's mapping
+            float sx = (u - wx) / (2f * half) + 0.5f, sy = (v - wz) / (2f * half) + 0.5f;   // 0..1 across the stamp
+            if (sx < 0f || sx > 1f || sy < 0f || sy > 1f) continue;
+            float edge = MathF.Min(MathF.Min(sx, 1f - sx), MathF.Min(sy, 1f - sy));
+            float wgt = (feather <= 0f ? 1f : Math.Clamp(edge / feather, 0f, 1f)) * stampOpacity;
+            if (wgt <= 0f) continue;
+            float rs = sx, rt = sy;
+            switch (stampRot & 3)
+            {
+                case 1: rs = sy; rt = 1f - sx; break;
+                case 2: rs = 1f - sx; rt = 1f - sy; break;
+                case 3: rs = 1f - sy; rt = sx; break;
+            }
+            var c = stampTex.SampleRGBA(rs, rt);
+            int o = ((y0 + yy) * n + (x0 + xx)) * 4;
+            px[o]     = (byte)Math.Clamp(px[o]     + (c.X * 255f - px[o])     * wgt, 0f, 255f);
+            px[o + 1] = (byte)Math.Clamp(px[o + 1] + (c.Y * 255f - px[o + 1]) * wgt, 0f, 255f);
+            px[o + 2] = (byte)Math.Clamp(px[o + 2] + (c.Z * 255f - px[o + 2]) * wgt, 0f, 255f);
+        }
+    var after = new byte[w * h * 4];
+    for (int yy = 0; yy < h; yy++) System.Buffer.BlockCopy(px, ((y0 + yy) * n + x0) * 4, after, yy * w * 4, w * 4);
+    var cmd = new AtlasStrokeCommand(atlasCpu, x0, y0, w, h, before, after, UploadAtlasRectMips);
+    atlasPainted = true;
+    if (hist is not null) hist.Do(cmd); else UploadAtlasRectMips(x0, y0, w, h);
+    Toast(string.Format(Loc.T("Pasted {0} ({1:0} m) at {2:0}, {3:0}. Z undoes it."), stampName, stampMeters * stampScale, wx, wz));
+}
+
+// A stamp travels as the picture plus its ground size: a .dds and a .stamp.json beside it (a _NNm suffix in the
+// name is the fallback), so it pastes at the same size on another map.
+void ExportStamp()
+{
+    if (stampTex is null) { Toast(Loc.T("No stamp to export - capture a square of ground first.")); return; }
+    string safe = string.IsNullOrWhiteSpace(stampName) ? "stamp" : stampName;
+    var f = Picker.Save("Export stamp", "DDS texture|*.dds", $"{safe}_{stampMeters:0}m.dds", null);
+    if (f is null) return;
+    try
+    {
+        File.WriteAllBytes(f, DdsTexture.EncodeUncompressed(stampTex));
+        File.WriteAllText(f + ".stamp.json", System.Text.Json.JsonSerializer.Serialize(new { meters = stampMeters, name = safe, width = stampTex.Width, height = stampTex.Height }));
+        Toast(string.Format(Loc.T("Exported stamp {0} ({1:0} m) + .stamp.json"), Path.GetFileName(f), stampMeters));
+    }
+    catch (Exception ex) { Toast(Loc.T("Export stamp failed: ") + ex.Message); }
+}
+
+void ImportStamp()
+{
+    var f = Picker.File("Import stamp", "Images|*.dds;*.png;*.tga;*.bmp;*.jpg|All files|*.*", null);
+    if (f is null) return;
+    var tex = LoadImageAsTexture(f);
+    if (tex is null) { Toast(Loc.T("Could not read that image.")); return; }
+    float meters = stampMeters;
+    try
+    {
+        if (File.Exists(f + ".stamp.json"))
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(f + ".stamp.json"));
+            if (doc.RootElement.TryGetProperty("meters", out var m) && m.TryGetSingle(out var mv) && mv > 0f) meters = mv;
+        }
+        else
+        {
+            var mm = System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(f), @"_(\d+(?:\.\d+)?)m$");
+            if (mm.Success && float.TryParse(mm.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pv) && pv > 0f) meters = pv;
+        }
+    }
+    catch { }
+    SetStamp(tex, meters, Path.GetFileNameWithoutExtension(f));
+    stampMode = true; captureMode = false;
+    Toast(string.Format(Loc.T("Stamp {0}: {1}x{2} for {3:0} m of ground - click where to paste it."), stampName, tex.Width, tex.Height, meters));
 }
 
 Texture2D? LoadImageAsTexture(string imgPath)
@@ -6194,14 +6433,19 @@ void BakeObjectLightmaps()
     if (jobs.Count == 0) { Toast(Loc.T("No placed objects with bakeable lightmap UVs on this map.")); return; }
     var results = new Texture2D?[jobs.Count];
     System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
+        // Ambient 0: shadow goes to black in the file, as in every retail lightmap, and renderer.LMambientColor is
+        // what lifts it - in the game and in this viewport alike. Baking a floor in as well lit everything twice.
         results[i] = ObjectLightmapBaker.Bake(jobs[i].Mesh, LevelScene.MeshWorld(jobs[i].O), heightmap, cfg, sunV, 256,
-            rig: lightRig.Lights.Count > 0 ? lightRig : null));
+            ambient: 0f, rig: lightRig.Lights.Count > 0 ? lightRig : null));
     var olm = new ObjectLightmaps();
     bakedObjectLightmaps.Clear();
-    int baked = 0;
+    int baked = 0, noUnwrap = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
-        if (results[i] is not { } tex) continue;
+        // Null = the mesh carries the lightmap-UV slot but no unwrap in it (BfVietnam props and walls ship 0,0 on
+        // every vertex). The game's own generator unwraps those itself; we have nothing to write, and writing an
+        // all-black map used to turn them black. They stay dynamically lit.
+        if (results[i] is not { } tex) { noUnwrap++; continue; }
         var o = jobs[i].O;
         int x = (int)o.Position.X, y = (int)o.Position.Y, z = (int)o.Position.Z;
         olm.AddBaked(o.Template, x, y, z, tex);
@@ -6211,8 +6455,25 @@ void BakeObjectLightmaps()
     objectLightmaps = olm; objectLightmapsLoaded = true;
     sunOverride = false; showObjectLightmaps = true;     // turn off the dynamic-sun preview so the baked result shows
     glObjects?.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
-    Console.WriteLine($"Baked {baked} object lightmap(s) (256^2) from the editor sun.");
-    Toast($"Baked {baked} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level.");
+    int noSlot = so.Objects.Count - jobs.Count;
+    Console.WriteLine($"Baked {baked} object lightmap(s) (256^2) from the editor sun; {noUnwrap} mesh(es) have no lightmap unwrap, {noSlot} no lightmap slot at all (both stay sun-lit in the game).");
+    Toast(noUnwrap + noSlot > 0
+        ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
+        : string.Format(Loc.T("Baked {0} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level."), baked));
+}
+
+// One command for the whole lighting bake, because "which of the four bakes do I need" was the question every
+// time. The terrain sun-shadow (the .lsb the game reads), every object's lightmap (sun + placed lights, as
+// intensity) and the placed lights' colour in the ground texture - shown at once, and Save writes them all.
+void BakeAllLighting()
+{
+    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    DoBakeShadows();
+    writeShadowLsb = true;
+    if (so is not null && meshLib is not null) BakeObjectLightmaps();
+    if (lightRig.Lights.Count > 0 && atlasCpu is not null) BakeLightsToGround();
+    showShadows = true; showObjectLightmaps = true;
+    Toast(Loc.T("Lighting baked: terrain shadow, object lightmaps and ground pools. Save writes them all."));
 }
 
 // Lazily decode + match the level's per-object lightmaps the first time the layer is enabled. The decode re-opens the
@@ -6539,7 +6800,7 @@ void OnRender(double dt)
     // Overgrowth foliage overlay (a VIEW of the .wst trees; ephemeral, never saved). Distance-culled so a dense
     // map stays interactive. Rebuilt lazily when toggled on / the spacing changed (foliageDirty).
     Stage("foliage");
-    if (glObjects is not null && showFoliage && !painting)
+    if (glObjects is not null && (showFoliage || showUnderFoliage) && !painting)
     {
         if (foliageDirty) BuildOvergrowthFoliage();
         if (glObjects.FoliageInstanceCount > 0)
@@ -6572,6 +6833,14 @@ void OnRender(double dt)
         gl.Uniform1(uWaterYW, cfg.WaterLevel);          // live: follows the Water Level slider
         gl.Uniform3(uWaterColorW, waterColor.X, waterColor.Y, waterColor.Z);   // level's water.color
         gl.Uniform1(uWaterAlphaW, waterAlpha);                                  // level's transparency
+        { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
+        { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
+        if (skyCubeTex != 0)
+        {
+            gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.TextureCubeMap, skyCubeTex);
+            int us = gl.GetUniformLocation(waterProg, "uSkyCube"); if (us >= 0) gl.Uniform1(us, 3);
+            gl.ActiveTexture(TextureUnit.Texture0);
+        }
         bool wtex = haveWaterTex && useWaterTextures && env is not null;
         gl.Uniform1(uHasWaterTexW, wtex ? 1 : 0);
         if (wtex)
@@ -6589,6 +6858,8 @@ void OnRender(double dt)
         SetFogUniforms(waterProg);                      // fade distant water into the fog like the terrain
         gl.BindVertexArray(waterVao);
         gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+        // The tunnel water: a second plane at waterBelowLevel, seen through the holes and from underground.
+        if (cfg.DrawWaterBelowTerrain && cfg.WaterBelowLevel is float wbl) { gl.Uniform1(uWaterYW, wbl); gl.DrawArrays(PrimitiveType.Triangles, 0, 6); }
         gl.DepthMask(true);
         gl.Disable(EnableCap.Blend);
     }
@@ -6745,7 +7016,9 @@ void OnRender(double dt)
             bool squareBitmap = !surfacePaint && !aiPath && brushShapeIdx > 0 && brushShapeIdx < brushShapeNames.Length
                                 && brushShapeNames[brushShapeIdx].IndexOf("square", StringComparison.OrdinalIgnoreCase) >= 0;
             bool sqPrev = squareBitmap || (squareBrush && (surfacePaint || aiPath || brushShapeIdx == 0));
-            DrawDrapedBrushOutline(bp.X, bp.Z, brushRadius, sqPrev);   // follows the terrain + hovers above it, like the grid
+            bool stampCursor = surfacePaint && stampMode && stampTex is not null, captureCursor = surfacePaint && captureMode;
+            float ringR = stampCursor ? stampMeters * stampScale * 0.5f : captureCursor ? captureMeters * 0.5f : brushRadius;
+            DrawDrapedBrushOutline(bp.X, bp.Z, ringR, sqPrev || stampCursor || captureCursor);   // follows the terrain + hovers above it, like the grid
             gl.Enable(EnableCap.DepthTest);
 
             // Identify the active material/foliage as a floating label on the ground at the brush cursor.
@@ -6756,7 +7029,9 @@ void OnRender(double dt)
                 {
                     int mslot = matToSurf[activeMaterial & 15] & 15;   // material index -> its surface (real name + colour)
                     string lbl = paintLayer == 3
-                        ? $"{(activeTexture < surfNames.Length ? surfNames[activeTexture] : "?")}  #{activeTexture}"
+                        ? (stampMode && stampTex is not null ? $"Stamp {stampName}  {stampMeters * stampScale:0} m"
+                           : captureMode ? $"Capture {captureMeters:0} m"
+                           : $"{(activeTexture < surfNames.Length ? surfNames[activeTexture] : "?")}  #{activeTexture}")
                         : paintLayer == 0
                             ? $"{(mslot < surfNames.Length ? surfNames[mslot] : "?")}  #{activeMaterial}"
                             : $"{(paintLayer == 1 ? "Undergrowth" : "Overgrowth")}  #{activeFoliage}{(activeFoliage == 0 ? " (clear)" : "")}";
@@ -7157,9 +7432,9 @@ void MapperSubToolbar()
     else if (mapper == 2)
     {
         IconTool(0, GiSelect, "Select"); ImGui.SameLine();
-        IconTool(1, GiMove,   "Move");   ImGui.SameLine();
-        IconTool(2, GiRotate, "Rotate"); ImGui.SameLine();
-        IconTool(3, GiScale,  "Scale");  ImGui.SameLine();
+        IconTool(1, GiMove,   "Move: click and drag any object (handles or the X/Y/Z buttons constrain it)");   ImGui.SameLine();
+        IconTool(2, GiRotate, "Rotate: drag any object sideways to spin it (Ctrl pitches, Alt rolls; Snap = 15 degree steps)"); ImGui.SameLine();
+        IconTool(3, GiScale,  "Scale: drag any object away from its centre to grow it, toward it to shrink");  ImGui.SameLine();
         IconTool(4, GiPlace,  "Place"); ImGui.SameLine();
         IconTool(9, GiNudge,  "Nudge: drag any object along the ground (hold Ctrl for fine movement)");
         // Battlecraft's game-type dropdown (guide figure 21): show the gameplay of one mode, or all of them.
@@ -7448,16 +7723,44 @@ void Inspector()
                 }
                 else ImGui.TextDisabled(Loc.T("No detail texture (adds crisp close-up tiling)."));
                 ImGui.Spacing();
-                ImGui.Checkbox(Loc.TL("Capture mode"), ref captureMode);
+                ImGui.Separator();
+                ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Copy / paste ground (stamp)"));
+                if (ImGui.Checkbox(Loc.TL("Capture mode"), ref captureMode) && captureMode) stampMode = false;
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Click the terrain to copy a square of the painted ground. It becomes the stamp\nbelow, kept at its real size, so it pastes back 1:1 - here or on another map."));
                 if (captureMode)
                 {
-                    SldF(Loc.TL("Capture size (m)"), ref captureMeters, 8f, 256f, "%.0f");
+                    SldF(Loc.TL("Capture size (m)"), ref captureMeters, 8f, 1024f, "%.0f");
                     ImGui.Combo(Loc.TL("Capture res"), ref captureResIdx, captureSizeNames, captureSizeNames.Length);
-                    ImGui.Checkbox(Loc.TL("Also import into this slot"), ref captureImport);
-                    ImGui.TextDisabled(Loc.T("Click the terrain to save that square as a .dds."));
+                    ImGui.Checkbox(Loc.TL("Save as .dds file"), ref captureSaveFile);
+                    if (captureSaveFile) ImGui.Checkbox(Loc.TL("Also import into this slot"), ref captureImport);
                 }
+                if (stampTex is not null)
+                {
+                    if (stampGlTex != 0) { ImGui.Image((IntPtr)stampGlTex, new Vector2(64, 64)); ImGui.SameLine(); }
+                    ImGui.BeginGroup();
+                    ImGui.TextWrapped($"{stampName}  {stampTex.Width}x{stampTex.Height}");
+                    ImGui.TextDisabled(string.Format(Loc.T("{0:0} m of ground"), stampMeters));
+                    ImGui.EndGroup();
+                    if (ImGui.Checkbox(Loc.TL("Paste mode (click to stamp)"), ref stampMode) && stampMode) captureMode = false;
+                    ImGui.SetNextItemWidth(150f);
+                    SldF(Loc.TL("Stamp size (m)"), ref stampMeters, 4f, 2048f, "%.0f");
+                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The ground size the picture stands for. A capture sets it; an imported picture\ntakes it from its .stamp.json, or from a _NNm suffix in its name."));
+                    ImGui.SetNextItemWidth(150f);
+                    SldF(Loc.TL("Scale x"), ref stampScale, 0.25f, 4f, "%.2f");
+                    ImGui.SetNextItemWidth(150f);
+                    SldF(Loc.TL("Opacity##stamp"), ref stampOpacity, 0.05f, 1f, "%.2f");
+                    ImGui.SetNextItemWidth(150f);
+                    SldF(Loc.TL("Edge feather"), ref stampFeather, 0f, 0.5f, "%.2f");
+                    if (ImGui.Button(Loc.TL("Rotate 90"))) stampRot = (stampRot + 1) & 3;
+                    ImGui.SameLine(); ImGui.TextDisabled($"{stampRot * 90} deg");
+                }
+                else ImGui.TextDisabled(Loc.T("No stamp yet: capture a square of ground above, or import one."));
+                if (ImGui.Button(Loc.TL("Export stamp..."))) ExportStamp();
+                ImGui.SameLine(); if (ImGui.Button(Loc.TL("Import stamp..."))) ImportStamp();
                 ImGui.Spacing();
-                ImGui.BulletText(Loc.T(captureMode ? "Click terrain to capture a square as a texture." : "Drag on terrain to paint the surface."));
+                if (stampMode && stampTex is not null) ImGui.BulletText(Loc.T("Click terrain to paste the stamp there, 1:1."));
+                else if (captureMode) ImGui.BulletText(Loc.T("Click terrain to copy a square of ground."));
+                else ImGui.BulletText(Loc.T("Drag on terrain to paint the surface."));
                 ImGui.BulletText(Loc.T("Alt-click picks the surface under the cursor."));
                 ImGui.BulletText(Loc.T("Wheel resizes; Z / Y undo and redo."));
                 ImGui.BulletText(Loc.T("Ctrl+S bakes it into the level's terrain tiles."));
@@ -7829,6 +8132,58 @@ void Inspector()
     }
 }
 
+// The Layer menu: the same visibility switches as the Inspector's LAYERS block, reachable from the menu bar.
+void LayerMenu()
+{
+    if (!ImGui.BeginMenu(Loc.TL("Layer"))) return;
+    ImGui.MenuItem(Loc.TL("Terrain"), null, ref showTerrain);
+    ImGui.MenuItem(Loc.TL("Static Objects"), "Tab", ref showObjects);
+    ImGui.MenuItem(Loc.TL("Texture transparency"), null, ref alphaTransparency);
+    if (ImGui.MenuItem(Loc.TL("Collision (wireframe)"), null, ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
+    ImGui.Separator();
+    ImGui.MenuItem(Loc.TL("Vehicles"), null, ref showVehicles);
+    ImGui.MenuItem(Loc.TL("Control Points"), null, ref showControlPoints);
+    ImGui.MenuItem(Loc.TL("Spawn Points"), null, ref showSpawns);
+    ImGui.MenuItem(Loc.TL("Spawn Links"), null, ref showSpawnLinks);
+    ImGui.MenuItem(Loc.TL("Sounds"), null, ref showSounds);
+    ImGui.MenuItem(Loc.TL("Combat Area"), null, ref showCombatArea);
+    ImGui.MenuItem(Loc.TL("Notes"), null, ref showNotes);
+    ImGui.MenuItem(Loc.TL("Light markers"), null, ref showLightGizmos);
+    if (!gameIsBf1942) ImGui.MenuItem(Loc.TL("Tunnel entry points"), null, ref showTunnelEntries);
+    ImGui.Separator();
+    if (!gameIsBf1942 && growth?.Over is not null && growth.OverPalette is not null)
+        if (ImGui.MenuItem(Loc.TL("Overgrowth Trees"), null, ref showFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
+    if (!gameIsBf1942 && growth?.Under is not null && growth.UnderPalette is not null)
+        if (ImGui.MenuItem(Loc.TL("Undergrowth"), null, ref showUnderFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
+    ImGui.MenuItem(Loc.TL("Effects"), null, ref showEffects);
+    ImGui.MenuItem(Loc.TL("Weather"), null, ref showWeather);
+    ImGui.MenuItem(Loc.TL("Animations"), null, ref showAnimations);
+    ImGui.Separator();
+    ImGui.MenuItem(Loc.TL("Water"), null, ref showWater);
+    ImGui.MenuItem(Loc.TL("Sky"), null, ref showSky);
+    if (ImGui.MenuItem(Loc.TL("Sun Shadows (real-time)"), null, ref showShadows) && showShadows) shadowMapDirty = true;
+    if (ImGui.MenuItem(Loc.TL("Object Lightmaps"), null, ref showObjectLightmaps) && showObjectLightmaps) EnsureObjectLightmaps();
+    ImGui.MenuItem(Loc.TL("Mini-map objects"), null, ref showMinimapObjects);
+    ImGui.EndMenu();
+}
+
+// The Window menu: every panel and floating window the editor has, so none is reachable only by accident.
+void WindowMenu()
+{
+    if (!ImGui.BeginMenu(Loc.TL("Window"))) return;
+    ImGui.MenuItem(Loc.TL("Level Tree"), null, ref showLevelTree);
+    ImGui.MenuItem(Loc.TL("Log / Errors"), null, ref showLog);
+    ImGui.MenuItem(Loc.TL("Mini-Map"), null, ref showMinimap);
+    ImGui.Separator();
+    ImGui.MenuItem(Loc.TL("Texture Library"), null, ref showTexLibrary);
+    ImGui.MenuItem(Loc.TL("Layer Tool"), null, ref showLayerTool);
+    ImGui.MenuItem(Loc.TL("Model Viewer"), null, ref meshViewerOpen);
+    ImGui.MenuItem(Loc.TL("AI Pathmap Preview"), null, ref pathmapPreviewOpen);
+    ImGui.Separator();
+    ImGui.MenuItem(Loc.TL("User Guide / Controls"), null, ref showHelp);
+    ImGui.EndMenu();
+}
+
 // Layer visibility toggles - always shown at the bottom of the Inspector panel.
 // The resolved overgrowth scatter: the .wst geometry scattered per cell (OvergrowthFoliage.Scatter), each dropped
 // to ground height (skipping underwater) and kept only if its mesh resolves in the loaded library. SHARED by the
@@ -7847,19 +8202,38 @@ List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterOv
     return outp;
 }
 
-// Rebuild the overgrowth foliage overlay (a VIEW only - never saved as part of the level). Builds GL instances
-// from the shared resolved scatter and hands them to GlObjects.
+// The undergrowth (grass, bushes, small plants from underGrowth.wst) scattered the same way, from its own map and
+// palette, at the game's wider patch spacing.
+List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterUndergrowthResolved()
+{
+    var outp = new List<(string, float, float, float, float, float)>();
+    if (meshLib is null || growth?.Under is null || growth.UnderPalette is null || terrainPick is null) return outp;
+    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, underSpacing, underDensity, over: false))
+    {
+        if (!meshLib.TryGet(fi.Geometry, out _)) continue;
+        float y = terrainPick.HeightAt(fi.WorldX, fi.WorldZ);
+        if (y < cfg.WaterLevel) continue;
+        outp.Add((fi.Geometry, fi.WorldX, y, fi.WorldZ, fi.YawDeg, fi.Scale));
+    }
+    return outp;
+}
+
+// Rebuild the foliage overlay (a VIEW only - never saved as part of the level): the overgrowth trees and the
+// undergrowth, each from its own scatter, in one instance list for GlObjects.
 void BuildOvergrowthFoliage()
 {
     foliageDirty = false;
-    foliageCount = 0;
+    foliageCount = 0; underFoliageCount = 0;
     if (glObjects is null) return;
-    var inst = ScatterOvergrowthResolved();
-    var gi = new List<(string, Matrix4x4)>(inst.Count);
+    var inst = showFoliage ? ScatterOvergrowthResolved() : new();
+    var under = showUnderFoliage ? ScatterUndergrowthResolved() : new();
+    var gi = new List<(string, Matrix4x4)>(inst.Count + under.Count);
     foreach (var (t, x, y, z, yaw, s) in inst)
         gi.Add((t, Matrix4x4.CreateScale(s) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z)));
+    foreach (var (t, x, y, z, yaw, s) in under)
+        gi.Add((t, Matrix4x4.CreateScale(s) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z)));
     glObjects.SetFoliage(gl, gi, meshLib!);
-    foliageCount = glObjects.FoliageInstanceCount;
+    foliageCount = inst.Count; underFoliageCount = under.Count;
 }
 
 // Per-map overlay settings (spacing + on/off): a tiny JSON sidecar beside the level (in the folder, or next to the
@@ -7873,13 +8247,23 @@ string? OvergrowthSettingsPath()
     return Path.Combine(d, Path.GetFileNameWithoutExtension(full) + ".overgrowth.json");
 }
 
+// What the game itself does: over-growth patches every 12.5 m, under-growth every 17.5 m (both hard-coded in
+// BfVietnam.exe's generator), at x1.0. A freshly opened map shows those, and only a sidecar it saved earlier moves them.
+void ResetGrowthSettingsToMap()
+{
+    foliageSpacing = 12.5f; foliageDensity = 1f; showFoliage = false;
+    underSpacing = 17.5f; underDensity = 1f; showUnderFoliage = false;
+    foliageDirty = true;
+}
+
 void SaveOvergrowthSettings()
 {
     var p = OvergrowthSettingsPath();
     if (p is null) { Toast(Loc.T("Open a level first.")); return; }
     try
     {
-        File.WriteAllText(p, System.Text.Json.JsonSerializer.Serialize(new { show = showFoliage, spacing = foliageSpacing, density = foliageDensity }));
+        File.WriteAllText(p, System.Text.Json.JsonSerializer.Serialize(new { show = showFoliage, spacing = foliageSpacing, density = foliageDensity,
+                                                                           underShow = showUnderFoliage, underSpacing = underSpacing, underDensity = underDensity }));
         Toast($"Saved overgrowth settings -> {Path.GetFileName(p)}");
     }
     catch (Exception ex) { Toast(Loc.T("Save overgrowth settings failed: ") + ex.Message); }
@@ -7896,9 +8280,27 @@ void LoadOvergrowthSettings()
         if (root.TryGetProperty("spacing", out var sp) && sp.TryGetSingle(out var spv)) foliageSpacing = Math.Clamp(spv, 6f, 32f);
         if (root.TryGetProperty("density", out var dn) && dn.TryGetSingle(out var dnv)) foliageDensity = Math.Clamp(dnv, 0.25f, 1.5f);
         if (root.TryGetProperty("show", out var sh)) showFoliage = sh.GetBoolean();
+        if (root.TryGetProperty("underSpacing", out var usp) && usp.TryGetSingle(out var uspv)) underSpacing = Math.Clamp(uspv, 6f, 40f);
+        if (root.TryGetProperty("underDensity", out var udn) && udn.TryGetSingle(out var udnv)) underDensity = Math.Clamp(udnv, 0.25f, 1.5f);
+        if (root.TryGetProperty("underShow", out var ush)) showUnderFoliage = ush.GetBoolean();
         foliageDirty = true;
     }
     catch { }
+}
+
+// The map's own growth definition, as the game reads it from the .wst: per terrain material, which geometries
+// grow there and how likely each is. Read-only - it is what the sliders above scatter.
+void GrowthDefinitionTree(RefractorForge.Formats.Terrain.FoliagePalette pal, string id)
+{
+    int mats = 0; foreach (var m in pal.Materials) if (m.Types.Count > 0) mats++;
+    if (!ImGui.TreeNode(string.Format(Loc.T("Map definition: {0} materials, {1} types, view {2:0} m"), mats, pal.TypeCount, pal.ViewDistance) + "###" + id)) return;
+    foreach (var m in pal.Materials)
+    {
+        if (m.Types.Count == 0) continue;
+        ImGui.TextColored(new Vector4(0.49f, 0.86f, 0.55f, 1f), m.Name);
+        foreach (var t in m.Types) ImGui.BulletText($"{t.GeometryName}   p {t.Probability:0.##}   scale {t.Scale}");
+    }
+    ImGui.TreePop();
 }
 
 // Export the level's native overgrowth definition (the painted OverGrowthMap.raw + the overGrowth.wst palette,
@@ -7980,7 +8382,7 @@ void LayersPanel()
     // BFV-only feature (BF1942 has no overgrowth system), so hide it for a BF1942 target.
     if (!gameIsBf1942 && growth?.Over is not null && growth.OverPalette is not null)
     {
-        if (ImGui.Checkbox($"Overgrowth Trees ({foliageCount})###foliageLayer", ref showFoliage)) { if (showFoliage) foliageDirty = true; BroadcastOvergrowth(); }
+        if (ImGui.Checkbox($"Overgrowth Trees ({foliageCount})###foliageLayer", ref showFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
         if (showFoliage)
         {
             // Patch size + density use the game's patch model (default 12.5 m / x1.0 = the density BfVietnam generates).
@@ -7989,6 +8391,23 @@ void LayersPanel()
             ImGui.SetNextItemWidth(150f);
             // Density tops out at 1.5x: x1.0 is already the game-matched density, so the useful range is a small over/under.
             if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = 12.5f; foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Back to what the game generates for this map: 12.5 m patches at x1.0."));
+            GrowthDefinitionTree(growth.OverPalette, "overdef");
+        }
+    }
+    if (!gameIsBf1942 && growth?.Under is not null && growth.UnderPalette is not null)
+    {
+        if (ImGui.Checkbox($"Undergrowth ({underFoliageCount})###underLayer", ref showUnderFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
+        if (showUnderFoliage)
+        {
+            ImGui.SetNextItemWidth(150f);
+            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, 6f, 40f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            ImGui.SetNextItemWidth(150f);
+            if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = 17.5f; underDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Back to what the game generates for this map: 17.5 m patches at x1.0."));
+            GrowthDefinitionTree(growth.UnderPalette, "underdef");
         }
     }
     ImGui.Checkbox(Loc.TL("Water"), ref showWater);
@@ -8288,6 +8707,17 @@ void ImportCloudMesh()
     return (amb, dif);
 }
 
+// What the game multiplies the ground by once the level's own Init.con lighting is in force: ambient plus the sun's
+// diffuse over an average slope. The night preview pulls the editor's always-readable lighting toward THIS, so a
+// dark level previews exactly as dark as it will be in the game and no darker. The fixed "moonlight" constant it
+// replaces sat at about half of a real night preset, which is why a ground bake came out looking black: the pools
+// had been baked against a scene twice as dark as the one the game would light them with.
+Vector3 NightSceneLight()
+{
+    var v = lightGlobalAmb + lightAmb + lightDiffuse * 0.75f;
+    return new Vector3(MathF.Max(v.X, 0.02f), MathF.Max(v.Y, 0.02f), MathF.Max(v.Z, 0.02f));
+}
+
 void SetLightUniforms(int ambLoc, int difLoc, uint prog = 0)
 {
     var (a, d) = SceneLight();
@@ -8316,12 +8746,15 @@ void UploadPlacedLights(uint prog)
             gl.GetUniformLocation(prog, "uPlParam"),
             gl.GetUniformLocation(prog, "uNight"),
             gl.GetUniformLocation(prog, "uNightAmb"),
+            gl.GetUniformLocation(prog, "uLmAmbient"),
         };
         plLocs[prog] = loc;
     }
     if (loc[0] < 0) return;   // shader without the block (markers, sky, water)
 
-    var near = lightRig.Lights.Count == 0
+    // The terrain gets no live lights once they are baked into its texture (groundLightsLive off), or the pool
+    // would show twice; objects keep them, because their lightmaps are a separate bake.
+    var near = lightRig.Lights.Count == 0 || (prog == terrainProg && !groundLightsLive)
         ? new List<PointLight>()
         : lightRig.Nearest(cam.Position.X, cam.Position.Y, cam.Position.Z, MaxPl);
 
@@ -8335,7 +8768,8 @@ void UploadPlacedLights(uint prog)
         if (loc[3] >= 0) gl.Uniform2(gl.GetUniformLocation(prog, $"uPlParam[{i}]"), l.Radius, l.Falloff);
     }
     if (loc[4] >= 0) gl.Uniform1(loc[4], lightRig.NightAmount);
-    if (loc[5] >= 0) gl.Uniform3(loc[5], lightRig.NightR, lightRig.NightG, lightRig.NightB);
+    if (loc[5] >= 0) { var na = NightSceneLight(); gl.Uniform3(loc[5], na.X, na.Y, na.Z); }
+    if (loc[6] >= 0) { var la = env?.LMAmbientColor ?? new Vec3(0.25f, 0.25f, 0.25f); gl.Uniform3(loc[6], la.X, la.Y, la.Z); }
 }
 
 // Copy the edited lighting back onto the EnvironmentSettings, flagging each key as declared so the patcher writes it.
@@ -8377,13 +8811,30 @@ void SaveLightingFolder()
     if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
     try
     {
-        var arch = new RefractorFlatArchive(baseRfa);
-        var e = arch.Entries.Where(x => x.Name.EndsWith("Init.con", StringComparison.OrdinalIgnoreCase))
-                            .OrderBy(x => x.Name.Count(c => c == '/')).FirstOrDefault();
-        if (e is null) return null;
-        var text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
+        // A decal made this session already holds a newer Init.con in the pending queue (its registration lines).
+        // Patch THAT copy and leave it queued: handing the archive's copy back as an extra as well meant two
+        // writers of one entry, and whichever the patcher applied last silently threw the other's lines away -
+        // the lighting on one save, the decal registration on the next.
+        string? pending = PendingText("Init.con");
+        string text;
+        if (pending is not null) text = pending;
+        else
+        {
+            var arch = new RefractorFlatArchive(baseRfa);
+            var e = arch.Entries.Where(x => x.Name.EndsWith("Init.con", StringComparison.OrdinalIgnoreCase))
+                                .OrderBy(x => x.Name.Count(c => c == '/')).FirstOrDefault();
+            if (e is null) return null;
+            text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
+        }
         var lines = text.Replace("\r\n", "\n").Split("\n"[0]);
         var patched = string.Join("\r\n", env.PatchInitConLines(lines)) + "\r\n";
+        if (pending is not null)
+        {
+            pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+            pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(patched)));
+            lightingDirty = false;
+            return null;
+        }
         return ("Init.con", System.Text.Encoding.Latin1.GetBytes(patched));
     }
     catch { return null; }
@@ -8421,6 +8872,21 @@ void EnvironmentPanel()
         waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);
         deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);
         waterAlpha = env.WaterAlpha;
+    }
+    // BfVietnam's water LOOK - how much sky it mirrors, how opaque it is - lives in standardMesh/levelWater.rs,
+    // not in Init.con. Retail levels override it level-side (Fall of Saigon 0.18, Con Thien 0.25, Ho Chi Minh
+    // Trail 0.3), and that is exactly what an edit here ships: the level's own StandardMesh/levelWater.rs.
+    if (!gameIsBf1942)
+    {
+        EnsureWaterShaderLoaded();
+        ImGui.TextDisabled(Loc.T("Water shader (levelWater.rs)"));
+        ImGui.SetNextItemWidth(150f);
+        bool wchg = SldF(Loc.TL("Reflectivity"), ref waterReflect, 0f, 1f, "%.2f");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
+        ImGui.SetNextItemWidth(150f);
+        wchg |= SldF(Loc.TL("Opacity"), ref waterOpacity, 0.05f, 1f, "%.2f");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The .rs 'opacity'. Base game 0.35; the jungle rivers ship 0.5-0.75."));
+        if (wchg) QueueWaterShader();
     }
     // Water TEXTURES (the level's scrolling water.texLayer1/2 + normalMap). Show whether they resolved + let the user
     // supply their own (base BF1942 maps reference engine-built-in water07/08 that aren't shipped in the .rfa).
@@ -9391,7 +9857,7 @@ void ApplyRemoteWater(string payload)
 // ---- Overgrowth-trees overlay: the tree-generation SETTINGS (on/off + patch size + density) sync over collab so
 // every participant sees the same scatter (it's a view of the in-game foliage, derived from the synced OverGrowthMap).
 static string Inv(float v) => v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
-string OvergrowthWire() => $"OVERGROWTH {(showFoliage ? 1 : 0)} {Inv(foliageSpacing)} {Inv(foliageDensity)}";
+string OvergrowthWire() => $"OVERGROWTH {(showFoliage ? 1 : 0)} {Inv(foliageSpacing)} {Inv(foliageDensity)} {(showUnderFoliage ? 1 : 0)} {Inv(underSpacing)} {Inv(underDensity)}";
 void BroadcastOvergrowth() => collab?.SendOp(OvergrowthWire());
 void ApplyRemoteOvergrowth(string payload)
 {
@@ -9401,6 +9867,12 @@ void ApplyRemoteOvergrowth(string payload)
         showFoliage = p[1] != "0";
         if (float.TryParse(p[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sp)) foliageSpacing = Math.Clamp(sp, 6f, 32f);
         if (float.TryParse(p[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var dn)) foliageDensity = Math.Clamp(dn, 0.25f, 1.5f);
+        if (p.Length >= 7)
+        {
+            showUnderFoliage = p[4] != "0";
+            if (float.TryParse(p[5], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var usp)) underSpacing = Math.Clamp(usp, 6f, 40f);
+            if (float.TryParse(p[6], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var udn)) underDensity = Math.Clamp(udn, 0.25f, 1.5f);
+        }
         foliageDirty = true;   // OnRender re-scatters the overlay from the (now matching) settings + maps
     }
 }
@@ -9966,7 +10438,8 @@ void MeshViewerWindow()
 void MinimapPanel()
 {
     if (!showMinimap || minimapTexId == 0) return;
-    ImGui.SetNextWindowPos(new Vector2(uiLeftW + 10f, uiMenuH + uiToolH + 10f), ImGuiCond.FirstUseEver);
+    // 60 px under the ribbon, not 10: at 10 the map sat on the mapper's own option row and hid it.
+    ImGui.SetNextWindowPos(new Vector2(uiLeftW + 10f, uiMenuH + uiToolH + 60f), ImGuiCond.FirstUseEver);
     ImGui.SetNextWindowSize(new Vector2(232f, 262f), ImGuiCond.FirstUseEver);
     if (ImGui.Begin(Loc.TL("Mini-Map"), ref showMinimap, ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoSavedSettings))
     {
@@ -10061,14 +10534,14 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("New Map..."))) OpenNewMap();
             if (ImGui.MenuItem(Loc.TL("Open Level / .rfa..."), "Ctrl+O")) OpenLevel();
             if (ImGui.MenuItem(Loc.TL("Open Mod..."))) OpenMod();
-            if (ImGui.MenuItem(Loc.TL("Save"), "Ctrl+S", false, so is not null && soPath is not null)) DoSave();
+            if (ImGui.MenuItem(Loc.TL("Save"), "Ctrl+S", false, so is not null && (soPath is not null || levelDir is not null))) DoSave();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Save the level itself: a folder level is written back to its folder, a .rfa level\nback into that .rfa (through a temp file, verified, with an auto-backup first)."));
             if (ImGui.MenuItem(Loc.TL("Test This Level (in-game)"), "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads."));
             if (ImGui.MenuItem(Loc.TL("Save as Patch .rfa..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Export ONLY the changed files as an overlay archive the engine mounts over this map.\nPlain Save writes the map itself; this is for shipping an update on top of one."));
             if (ImGui.MenuItem(Loc.TL("Save as SSM Patch (server-side only)..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch(serverSideOnly: true);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A server-side-mod patch: only gameplay .con files, no textures/sounds. Drop it in the server's levels folder - clients need nothing."));
-            if (ImGui.MenuItem(Loc.TL("Repack base .rfa in place (advanced)..."), null, false, so is not null && levelDir is not null && LevelArchive.IsRfa(levelDir))) DoRepackBaseInPlace();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes edits INTO the base archive. Normally Ctrl+S saves a _NNN patch instead and never touches the base."));
             if (ImGui.MenuItem(Loc.TL("Auto-backup on save"), null, autoBackup)) autoBackup = !autoBackup;
             if (ImGui.MenuItem(Loc.TL("Import .obj..."), null, false, meshLib is not null && so is not null)) DoImportObj();
             if (ImGui.MenuItem(Loc.TL("Import treeMesh.rfa..."), null, false, meshLib is not null && so is not null)) DoImportTreeMesh();
@@ -10076,17 +10549,6 @@ void BuildUi()
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Play a Bink (.bik) movie from the mod's movies/ folder (or anywhere) inside the editor.\nDecoded with FFmpeg if present, else opened in the RAD Bink player."));
             if (ImGui.MenuItem(Loc.TL("Play map video (.bik in this map)..."), null, false, rfaList.Length > 0)) DoPlayMapBik();
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Find + play any .bik video embedded in the loaded map's .rfa."));
-            if (ImGui.MenuItem(Loc.TL("Generate Minimap"), null, false, heightmap is not null)) DoGenerateMinimap();
-            if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows"), null, false, heightmap is not null)) DoBakeShadows();
-            if (ImGui.MenuItem(Loc.TL("Reload Level Lightmap (display)"), null, false, heightmap is not null)) InitTerrainShadowOnLoad();
-            if (ImGui.MenuItem(Loc.TL("Save / Generate AI Navmaps"), null, false, heightmap is not null)) DoGenerateNavmaps();
-            if (ImGui.MenuItem(Loc.TL("Open AI Pathmap (.raw)..."))) OpenPathmapFile();
-            if (ImGui.MenuItem(Loc.TL("Scatter Objects..."), null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
-            if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
-            // Flips correct a mirrored shadow for BOTH the on-screen lightmap display AND the .lsb write-back; toggling
-            // re-displays the loaded lightmap immediately so you can see which orientation is right.
-            if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
-            if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Exit"))) window.Close();
             ImGui.EndMenu();
@@ -10113,7 +10575,6 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Paste (at the cursor)"), "Ctrl+V", false, objClipboard.Count > 0)) PasteClipboard();
             if (ImGui.MenuItem(Loc.TL("Duplicate"), "Ctrl+D", false, multi.Count > 0)) DuplicateSelected();
             if (ImGui.MenuItem(Loc.TL("Drop to ground"), "G", false, multi.Count > 0)) DropSelectedToGround();
-            if (ImGui.MenuItem(Loc.TL("Delete"), "Del", false, multi.Count > 0 || gpIndex >= 0)) OnKeyDown(kb!, Key.Delete, 0);
             ImGui.Separator();
             // Battlecraft's lock buttons. A locked object still selects and inspects; it just cannot be moved,
             // rotated, dropped or deleted - so you can work around a finished area without disturbing it.
@@ -10123,29 +10584,10 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Unlock All Objects"), null, false, lockedObjectIds.Count > 0)) SetAllLocked(false);
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu(Loc.TL("Terrain View")))
-        {
-            // Battlecraft's J/K/L terrain view buttons.
-            if (ImGui.MenuItem(Loc.TL("Wireframe"), "J", terrainView == 1)) terrainView = 1;
-            if (ImGui.MenuItem(Loc.TL("Textured"), "K", terrainView == 0)) terrainView = 0;
-            if (ImGui.MenuItem(Loc.TL("Textured wireframe"), "L", terrainView == 2)) terrainView = 2;
-            ImGui.Separator();
-            if (ImGui.MenuItem(Loc.TL("Hide objects"), "Tab", !showObjects)) showObjects = !showObjects;
-            ImGui.Separator();
-            // Battlecraft's three camera buttons.
-            if (ImGui.MenuItem(Loc.TL("Camera: on terrain"), "I", groundCam)) SetGroundCam(true);
-            if (ImGui.MenuItem(Loc.TL("Camera: fly"), "O", !groundCam)) SetGroundCam(false);
-            if (ImGui.MenuItem(Loc.TL("Camera: top-down"), "P")) TopDownCamera();
-            ImGui.EndMenu();
-        }
         if (ImGui.BeginMenu(Loc.TL("Tools")))
         {
             if (ImGui.MenuItem(Loc.TL("Road tool"), null, roadMode)) { roadMode = !roadMode; if (roadMode) measureMode = false; roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; }
             if (ImGui.MenuItem(Loc.TL("Measure"), null, measureMode)) { measureMode = !measureMode; if (measureMode) roadMode = false; measurePts.Clear(); }
-            if (ImGui.MenuItem(Loc.TL("Validate map..."))) { validateReport = ValidateMap(); validateRequest = true; }
-            ImGui.Separator();
-            if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
-            if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.Separator();
             if (ImGui.BeginMenu(Loc.TL("Arrange Selection")))
             {
@@ -10153,8 +10595,34 @@ void BuildUi()
                 ImGui.EndMenu();
             }
             ImGui.Separator();
-            if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps (from sun)"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+            if (ImGui.BeginMenu(Loc.TL("Lighting")))
+            {
+                if (ImGui.MenuItem(Loc.TL("Bake Lightmaps (sun + placed lights)"), null, false, heightmap is not null)) BakeAllLighting();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Everything the game reads for light, in one go: the terrain sun-shadow (.lsb), every\nobject's lightmap (sun + your placed lights) and the placed lights' colour in the ground\ntexture. Shown at once; Save writes it all. Set the sun and lights first."));
+                ImGui.Separator();
+                if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain)"), null, false, heightmap is not null)) DoBakeShadows();
+                if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Each object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor."));
+                if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
+                ImGui.Separator();
+                if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
+                if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
+                if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
+                if (ImGui.MenuItem(Loc.TL("Show the level's baked terrain shadow (.lsb)"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showShadows = true; }
+                ImGui.EndMenu();
+            }
+            if (ImGui.BeginMenu(Loc.TL("AI")))
+            {
+                if (ImGui.MenuItem(Loc.TL("Save / Generate AI Navmaps"), null, false, heightmap is not null)) DoGenerateNavmaps();
+                if (ImGui.MenuItem(Loc.TL("Open AI Pathmap (.raw)..."))) OpenPathmapFile();
+                ImGui.EndMenu();
+            }
+            if (ImGui.MenuItem(Loc.TL("Generate Minimap"), null, false, heightmap is not null)) DoGenerateMinimap();
+            if (ImGui.MenuItem(Loc.TL("Scatter Objects..."), null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
             ImGui.Separator();
+            if (!gameIsBf1942 && ImGui.MenuItem(Loc.TL("Tunnels (BFV 1.2)..."), null, false, heightmap is not null)) showTunnels = true;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Holes, entrances, below-ground objects and the underground map - the whole BFV 1.2 tunnel system,\nwith the Init.con switches Battlecraft never set."));
             if (ImGui.BeginMenu(Loc.TL("Check Map")))
             {
                 if (ImGui.MenuItem(Loc.TL("Validate Map"), null, false, so is not null)) RunMapValidation();
@@ -10177,11 +10645,6 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
             ImGui.Separator();
-            if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false,
-                    heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey-palette and carry brightness only.\nThis edits the terrain texture, so keep a backup or use Undo before saving."));
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bake each building/object's lighting (sun + terrain shadow) into its lightmap from the\ncurrent sun, then Save to ship them to the game. Pair with File > 'Write LightmapShadowBits.lsb'\nfor the terrain shadow. Set the sun first in the Environment > Sun panel."));
-            ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Convert TGA -> DDS..."))) DoConvertTgaToDds();
             if (ImGui.MenuItem(Loc.TL("Batch TGA -> DDS (folder)..."))) DoBatchTgaToDds();
             ImGui.Separator();
@@ -10195,10 +10658,13 @@ void BuildUi()
         {
             if (ImGui.MenuItem(Loc.TL("Import Heightmap.raw..."), null, false, heightmap is not null)) DoImportHeightmap();
             if (ImGui.MenuItem(Loc.TL("Export Heightmap.raw..."), null, false, heightmap is not null)) DoExportHeightmap();
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
+            if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
             ImGui.EndMenu();
         }
-        foreach (var m in new[] { "Layer", "Window" })
-            if (ImGui.BeginMenu(Loc.TL(m) + "##stub_" + m)) { ImGui.MenuItem(Loc.TL("(coming soon)"), null, false, false); ImGui.EndMenu(); }
+        LayerMenu();
+        WindowMenu();
         if (ImGui.BeginMenu(Loc.TL("Collab")))
         {
             if (collab is null)
@@ -10233,8 +10699,14 @@ void BuildUi()
         }
         if (ImGui.BeginMenu(Loc.TL("View")))
         {
-            ImGui.MenuItem(Loc.TL("Level Tree"), null, ref showLevelTree);
-            ImGui.MenuItem(Loc.TL("Log / Errors"), null, ref showLog);
+            // Battlecraft's J/K/L terrain view buttons and its three camera buttons.
+            if (ImGui.MenuItem(Loc.TL("Wireframe"), "J", terrainView == 1)) terrainView = 1;
+            if (ImGui.MenuItem(Loc.TL("Textured"), "K", terrainView == 0)) terrainView = 0;
+            if (ImGui.MenuItem(Loc.TL("Textured wireframe"), "L", terrainView == 2)) terrainView = 2;
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Camera: on terrain"), "I", groundCam)) SetGroundCam(true);
+            if (ImGui.MenuItem(Loc.TL("Camera: fly"), "O", !groundCam)) SetGroundCam(false);
+            if (ImGui.MenuItem(Loc.TL("Camera: top-down"), "P")) TopDownCamera();
             ImGui.Separator();
             // How a level is ASSEMBLED. Both pull in content the opened .rfa doesn't itself contain, which is what
             // the game does - but while authoring it can be confusing, so both can be switched off. Reopen to apply.
@@ -10458,10 +10930,12 @@ void BuildUi()
     ValidateModal();
     PointToolOverlay();
     LightGizmos();
+    TunnelGizmos();
     CombatAreaOverlay();
     NotesOverlay();
     MapReportWindow();
     DecalDialog();
+    TunnelsWindow();
     PackageDialog();
     LogWindow();
     TextureLibraryWindow();
@@ -10639,6 +11113,363 @@ void WritePendingLevelFiles(string dir, List<string> written)
         Toast(string.Format(Loc.T("{0} level file(s) could not be written - still queued."), pendingLevelFiles.Count));
 }
 
+// ---- Tunnels (BfVietnam 1.2) ------------------------------------------------------------------------------------
+//
+// How the game does tunnels, worked out from Operation Cedar Falls, Saigon68, Battlecraft's own strings and
+// BfVietnam.exe: a HOLE is a heightmap sample of exactly 0, which the engine neither draws nor collides while
+// Game.isTunnelMap is 1; the tunnel is an ordinary placed mesh whose template says isBelowGround 1; the
+// entrances (hut, hole, bunker, ladder) say isEntryPoint 1 and are what let a soldier pass the terrain within
+// Game.entryPointRadius; and mapManager.addObjectMap binds an underground minimap texture to the tunnel
+// template over its world rectangle. Battlecraft's tunnel tool was a hole brush plus a map generator - and it
+// wrote game.isTunnelMap 0 into every custom map, which is why tunnels made with it never worked.
+
+bool TunnelHolesOn() => env is { IsTunnelMap: true };
+
+void MarkTunnelEdited()
+{
+    if (env is null) return;
+    env.WriteTunnel = true;
+    lightingDirty = true;      // the Init.con patcher writes the tunnel lines together with the renderer ones
+    terrainDirty = true;       // holes appear or disappear with the switch
+}
+
+// A hole lives on a terrain VERTEX: the sample at (x, z) = (i*spacing, j*spacing), whose incident triangles
+// the engine drops. Cedar Falls' holes sit on the vertex nearest each entrance shaft, not on the cell that
+// contains the object's origin, so everything here works in vertices around a world point.
+(int X, int Y) NearestVertex(float wx, float wz)
+{
+    float csp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+    return ((int)MathF.Round(wx / csp), (int)MathF.Round(wz / csp));
+}
+
+// The four grid vertices around a world point that lie within <paramref name="reach"/> metres of it, nearest first.
+List<(int X, int Y)> VerticesNear(float wx, float wz, float reach)
+{
+    float csp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
+    int x0 = (int)MathF.Floor(wx / csp), y0 = (int)MathF.Floor(wz / csp);
+    var found = new List<(float D, int X, int Y)>();
+    for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            float vx = (x0 + dx) * csp, vz = (y0 + dy) * csp;
+            float dd = MathF.Sqrt((vx - wx) * (vx - wx) + (vz - wz) * (vz - wz));
+            found.Add((dd, x0 + dx, y0 + dy));
+        }
+    found.Sort((a, b) => a.D.CompareTo(b.D));
+    var outList = new List<(int X, int Y)> { (found[0].X, found[0].Y) };
+    foreach (var f in found.Skip(1)) if (f.D <= reach) outList.Add((f.X, f.Y));
+    return outList;
+}
+
+// Where an entrance object lets soldiers through: its `entrance` children in world space (the hole object has
+// three shafts, the hut one), or the object's own origin when the template carries the flag itself.
+List<Vector3> EntrancePoints(StaticObject eObj, MeshLibrary.TunnelInfo eInfo)
+{
+    var pts = new List<Vector3>();
+    var world = RefractorForge.Render.LevelScene.MeshWorld(eObj);
+    foreach (var off in eInfo.EntryOffsets) pts.Add(Vector3.Transform(off, world));
+    if (pts.Count == 0) pts.Add(new Vector3(eObj.Position.X, eObj.Position.Y, eObj.Position.Z));
+    return pts;
+}
+
+bool IsHoleAt(float wx, float wz)
+{
+    if (heightmap is null) return false;
+    foreach (var (hx, hy) in VerticesNear(wx, wz, 3f))
+        if (hx >= 0 && hy >= 0 && hx < heightmap.Width && hy < heightmap.Height && heightmap[hx, hy] == 0) return true;
+    return false;
+}
+
+// Cedar Falls' hole object has three shafts and ONE hole vertex between them, so one is enough.
+bool EntranceHasHole(StaticObject eObj, MeshLibrary.TunnelInfo eInfo)
+    => EntrancePoints(eObj, eInfo).Any(pt => IsHoleAt(pt.X, pt.Z));
+
+// The lowest point of a placed mesh, in world metres: where a tunnel's floor is.
+float? PlacedFloorY(StaticObject fObj)
+{
+    if (meshLib is null || !meshLib.TryGet(fObj.Template, out var fMesh) || fMesh is null || fMesh.Positions.Length == 0) return null;
+    var world = RefractorForge.Render.LevelScene.MeshWorld(fObj);
+    float lo = float.MaxValue;
+    foreach (var pv in fMesh.Positions) { float y = Vector3.Transform(pv, world).Y; if (y < lo) lo = y; }
+    return lo;
+}
+
+// Punch the vertex nearest every entrance shaft, and any other corner of its cell within three metres - an
+// entrance near a cell edge gets both, which is how Cedar Falls' hut and Saigon68's paired cells came about.
+// One undo step.
+void PunchHolesUnderEntrances()
+{
+    if (so is null || meshLib is null || terrainEd is null || heightmap is null || hist is null) return;
+    var holeStroke = terrainEd.BeginStroke();
+    int tEntries = 0;
+    foreach (var tObj in so.Objects)
+    {
+        var tInfo = meshLib.TunnelInfoOf(tObj.Template);
+        if (tInfo is null || !tInfo.EntryPoint) continue;
+        tEntries++;
+        if (EntranceHasHole(tObj, tInfo)) continue;             // already done, by hand or by an earlier press
+        foreach (var ept in EntrancePoints(tObj, tInfo))
+            foreach (var (hcx, hcy) in VerticesNear(ept.X, ept.Z, 3f))
+                holeStroke.SetHole(hcx, hcy, true);
+    }
+    var holeEdit = holeStroke.Finish();
+    if (holeEdit is not null) { hist.Do(new TerrainStrokeCommand(holeEdit, heightmap, RebuildTerrain)); terrainDirty = true; }
+    if (env is not null && !env.IsTunnelMap) { env.IsTunnelMap = true; env.UseBelowGroundCulling = true; }
+    MarkTunnelEdited();
+    Toast(tEntries == 0 ? Loc.T("No entrance objects placed (hut, hole, bunker or ladder from the Tunnels category).")
+                        : string.Format(Loc.T("Holes punched under {0} entrance(s) - Z undoes it."), tEntries));
+}
+
+// One underground map per below-ground TEMPLATE (that is how the engine binds them), covering every instance:
+// rendered top-down into Textures/<Template>Map.dds and registered with a mapManager.addObjectMap line.
+void GenerateUndergroundMaps()
+{
+    if (so is null || meshLib is null || env is null) return;
+    var byTemplate = new Dictionary<string, List<StaticObject>>(StringComparer.OrdinalIgnoreCase);
+    foreach (var tObj in so.Objects)
+    {
+        var tInfo = meshLib.TunnelInfoOf(tObj.Template);
+        if (tInfo is null || !tInfo.BelowGround) continue;
+        if (!byTemplate.TryGetValue(tObj.Template, out var tList)) byTemplate[tObj.Template] = tList = new List<StaticObject>();
+        tList.Add(tObj);
+    }
+    if (byTemplate.Count == 0) { Toast(Loc.T("No below-ground objects placed (o_tunnelsA or o_sewers_A_M1 from the Tunnels category).")); return; }
+
+    env.ObjectMaps.Clear();
+    int tMade = 0;
+    foreach (var (tTemplate, tList) in byTemplate)
+    {
+        var tPieces = new List<(MeshLibrary.Mesh Mesh, Matrix4x4 World)>();
+        foreach (var tObj in tList)
+            if (meshLib.TryGet(tObj.Template, out var tMesh) && tMesh is not null)
+                tPieces.Add((tMesh, RefractorForge.Render.LevelScene.MeshWorld(tObj)));
+        if (tPieces.Count == 0) continue;
+        var tRect = TunnelMap.Squared(TunnelMap.Union(tPieces.Select(pc => TunnelMap.WorldRect(pc.Mesh, pc.World))));
+        if (tRect.W <= 0 || tRect.H <= 0) continue;
+        var tTex = TunnelMap.Render(tPieces, tRect, 512);
+        string tMapName = RefractorForge.Formats.Con.DecalObject.Sanitize(tTemplate + "Map");
+        string tRel = "Textures/" + tMapName + ".dds";
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(tRel, StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add((tRel, DdsTexture.EncodeUncompressed(tTex)));
+        env.ObjectMaps.Add(new EnvironmentSettings.ObjectMap(tTemplate, tMapName, tRect.X, tRect.Z, tRect.W, tRect.H));
+        tMade++;
+        Console.WriteLine($"Underground map {tRel}: {tTemplate} x{tList.Count} over {tRect.X:0.#}/{tRect.Z:0.#}/{tRect.W:0.#}/{tRect.H:0.#}");
+    }
+    if (!env.IsTunnelMap) { env.IsTunnelMap = true; env.UseBelowGroundCulling = true; }
+    MarkTunnelEdited();
+    Toast(string.Format(Loc.T("{0} underground map(s) rendered and registered - written on save."), tMade));
+}
+
+// Where a soldier actually passes through the terrain, drawn.
+//
+// The engine's test (ResponsePhysics::calculateTunnelSpecifics) is a plain 3D distance: while touching an
+// entrance object, if the player is within Game.entryPointRadius of one of its `entrance` points, they switch to
+// below-ground. That point is invisible in the game and Battlecraft never drew it, which is why lining a tunnel
+// up with its hut is guesswork. So: a sphere at the real radius, green when it will work, red when it will not,
+// and where the water surface cuts that sphere - because a soldier who meets the water on the way down swims
+// instead of dropping through.
+void TunnelGizmos()
+{
+    if (!showTunnelEntries || gameIsBf1942 || so is null || meshLib is null || env is null) return;
+    var teFb = window.FramebufferSize; var teVp = cam.ViewProjection;
+    var teDl = ImGui.GetBackgroundDrawList();
+    float teRadius = MathF.Max(env.EntryPointRadius, 0.25f);
+    float teWater = EffectiveTunnelWater();
+
+    // One great circle of a sphere, projected: plane 0 = horizontal, 1 and 2 = the two vertical ones.
+    void TeRing(Vector3 centre, float r, int plane, uint colour, float thick)
+    {
+        const int seg = 28;
+        Vector2 prev = default; bool have = false;
+        for (int i = 0; i <= seg; i++)
+        {
+            float a = i / (float)seg * MathF.PI * 2f;
+            float ca = MathF.Cos(a) * r, sa = MathF.Sin(a) * r;
+            var wp = plane switch
+            {
+                0 => new Vector3(centre.X + ca, centre.Y, centre.Z + sa),
+                1 => new Vector3(centre.X + ca, centre.Y + sa, centre.Z),
+                _ => new Vector3(centre.X, centre.Y + sa, centre.Z + ca),
+            };
+            var sp = Gizmo.Project(wp, teVp, teFb.X, teFb.Y);
+            if (float.IsNaN(sp.X)) { have = false; continue; }
+            if (have) teDl.AddLine(prev, sp, colour, thick);
+            prev = sp; have = true;
+        }
+    }
+
+    foreach (var teObj in so.Objects)
+    {
+        var teInfo = meshLib.TunnelInfoOf(teObj.Template);
+        if (teInfo is null || !teInfo.EntryPoint) continue;
+        foreach (var tePt in EntrancePoints(teObj, teInfo))
+        {
+            if (Vector3.Distance(tePt, cam.Position) > 500f) continue;
+            bool teHole = IsHoleAt(tePt.X, tePt.Z);
+            bool teDry = tePt.Y + teRadius >= teWater + 0.5f;
+            bool teOn = env.IsTunnelMap;
+            bool teOk = teOn && teHole && teDry;
+            uint teCol = ImGui.GetColorU32(teOk ? new Vector4(0.35f, 0.92f, 0.45f, 0.95f) : new Vector4(1f, 0.42f, 0.32f, 0.95f));
+            TeRing(tePt, teRadius, 0, teCol, 2f);
+            TeRing(tePt, teRadius, 1, teCol, 1.3f);
+            TeRing(tePt, teRadius, 2, teCol, 1.3f);
+            // The water line through the sphere: everything above it is dry, everything below is a swim.
+            float teDy = teWater - tePt.Y;
+            if (MathF.Abs(teDy) < teRadius)
+                TeRing(new Vector3(tePt.X, teWater, tePt.Z), MathF.Sqrt(MathF.Max(teRadius * teRadius - teDy * teDy, 0f)),
+                       0, ImGui.GetColorU32(new Vector4(0.35f, 0.68f, 1f, 0.95f)), 2.5f);
+
+            var teSp = Gizmo.Project(tePt, teVp, teFb.X, teFb.Y);
+            if (float.IsNaN(teSp.X)) continue;
+            teDl.AddCircleFilled(teSp, 3.5f, teCol);
+            string teTxt = !teOn ? Loc.T("isTunnelMap OFF") : !teHole ? Loc.T("no hole above") : !teDry ? Loc.T("under water") : Loc.T("entry point");
+            teDl.AddText(teSp + new Vector2(10f, -7f), ImGui.GetColorU32(new Vector4(0, 0, 0, 0.85f)), teTxt);
+            teDl.AddText(teSp + new Vector2(9f, -8f), teCol, teTxt);
+        }
+    }
+}
+
+void TunnelsWindow()
+{
+    if (!showTunnels) return;
+    // A sized window that wraps its text - auto-resize let the longest warning line set the width, which ran the
+    // window off the right of the screen.
+    ImGui.SetNextWindowSize(new Vector2(560f * uiScale, 600f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(420f * uiScale, 240f * uiScale), new Vector2(760f * uiScale, 4000f));
+    if (ImGui.Begin(Loc.TL("Tunnels (BFV 1.2)") + "###tunnelswin", ref showTunnels))
+    {
+        if (env is null || heightmap is null) { ImGui.TextDisabled(Loc.T("Load a level first.")); ImGui.End(); return; }
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextWrapped(Loc.T("How the game does tunnels: a HOLE is a terrain cell of height exactly 0 (the Hole brush in the Terrain mapper, or the button below); the tunnel is a below-ground object (o_tunnelsA, o_sewers_A_M1); the entrances (hut, hole, bunker, ladder) let soldiers through the terrain near them; and an underground map is bound to the tunnel object. Battlecraft wrote isTunnelMap 0 into every custom map, which is why its tunnels never worked."));
+        ImGui.Spacing();
+        bool tOn = env.IsTunnelMap;
+        if (ImGui.Checkbox("Game.isTunnelMap", ref tOn)) { env.IsTunnelMap = tOn; if (tOn) env.UseBelowGroundCulling = true; MarkTunnelEdited(); }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The master switch. Off, holes are ordinary pits and nobody gets underground."));
+        bool tCull = env.UseBelowGroundCulling;
+        if (ImGui.Checkbox("Game.useBelowGroundCulling", ref tCull)) { env.UseBelowGroundCulling = tCull; MarkTunnelEdited(); }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Do not draw the surface world while the camera is underground. Every retail tunnel map sets it."));
+        float tRad = env.EntryPointRadius;
+        ImGui.SetNextItemWidth(160f * uiScale);
+        if (SldF("Game.entryPointRadius", ref tRad, 1f, 10f, "%.1f m")) { env.EntryPointRadius = tRad; MarkTunnelEdited(); }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How close to an entrance a soldier must be to pass through the terrain. Cedar Falls 3.5, Saigon68 5."));
+        // The second water. With drawWaterBelowTerrain on, every point under the terrain surface - and every hole
+        // cell - uses waterBelowLevel instead of the river. Without it the river fills every hole and tunnel, which
+        // is the swim on the way in. Saigon68 is the reference: river 7.5 m, sewers flooded to -7.1 m.
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("TUNNEL WATER"));
+        bool twOn = cfg.DrawWaterBelowTerrain;
+        if (ImGui.Checkbox(Loc.TL("Separate water level below the terrain"), ref twOn))
+        {
+            cfg.DrawWaterBelowTerrain = twOn; cfg.WriteWaterBelow = true; waterLevelEdited = true;
+            if (twOn && cfg.WaterBelowLevel is null) cfg.WaterBelowLevel = cfg.WaterLevel - 15f;
+            env.WriteWaterBelow = true; env.WaterBelowEnabled = twOn; lightingDirty = true;
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes GeometryTemplate.drawWaterBelowTerrain 1 + waterBelowLevel to Terrain.con and a\nwaterBelowTerrain.* colour block to Init.con (mirroring water.*), exactly as Saigon68 ships.\nKeep this level below the tunnel floor for dry tunnels, or in a sewer for wading."));
+        if (twOn)
+        {
+            float twl = cfg.WaterBelowLevel ?? (cfg.WaterLevel - 15f);
+            ImGui.SetNextItemWidth(160f * uiScale);
+            if (ImGui.DragFloat(Loc.TL("Tunnel water level (m)"), ref twl, 0.25f, -500f, 500f, "%.1f"))
+            { cfg.WaterBelowLevel = twl; cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true; }
+            ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface water {0:0.0} m"), cfg.WaterLevel));
+        }
+        ImGui.Checkbox(Loc.TL("Show entry points in the viewport"), ref showTunnelEntries);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
+        ImGui.Separator();
+
+        int tEntries = 0, tHoled = 0, tBelow = 0, tMapped = 0, tWet = 0;
+        float tWater = EffectiveTunnelWater();
+        var tLines = new List<string>();
+        if (so is not null && meshLib is not null)
+            foreach (var tObj in so.Objects)
+            {
+                var tInfo = meshLib.TunnelInfoOf(tObj.Template);
+                if (tInfo is null) continue;
+                string tWhere = string.Format("  ({0:0}, {1:0})", tObj.Position.X, tObj.Position.Z);
+                if (tInfo.EntryPoint)
+                {
+                    tEntries++;
+                    bool tHole = EntranceHasHole(tObj, tInfo);
+                    if (tHole) tHoled++;
+                    // The switch to below-ground happens within entryPointRadius of the entrance point. A soldier
+                    // who meets the water surface on the way down swims instead - so the point, plus the radius,
+                    // has to sit above the water. Cedar Falls: entrances 9.8-23.5 m over a 4 m water level.
+                    float tEntY = EntrancePoints(tObj, tInfo).Max(pt => pt.Y);
+                    float tClear = tEntY + env.EntryPointRadius - tWater;
+                    bool tDry = tClear >= 0.5f;
+                    if (!tDry) tWet++;
+                    string tNote = tDry ? "" : string.Format(Loc.T("  entrance point {0:0.0} m UNDER the water ({1:0.0} m): soldiers swim before the switch"), tWater - tEntY, tWater);
+                    tLines.Add((tHole && tDry ? "[ok]  " : "[!!]  ") + tObj.Template + tWhere + (tHole ? Loc.T("  hole under it") : Loc.T("  NO hole under it")) + tNote);
+                }
+                if (tInfo.BelowGround)
+                {
+                    tBelow++;
+                    bool tHasMap = env.ObjectMaps.Any(m => m.Template.Equals(tObj.Template, StringComparison.OrdinalIgnoreCase));
+                    if (tHasMap) tMapped++;
+                    float? tFloor = PlacedFloorY(tObj);
+                    bool tFloorWet = tFloor is { } fy && fy < tWater - 0.5f;
+                    if (tFloorWet) tWet++;
+                    string tNote = tFloorWet ? string.Format(Loc.T("  floor at {0:0.0} m is {1:0.0} m under the water"), tFloor!.Value, tWater - tFloor.Value) : "";
+                    tLines.Add((tHasMap && !tFloorWet ? "[ok]  " : "[!!]  ") + tObj.Template + tWhere + (tHasMap ? Loc.T("  underground map registered") : Loc.T("  no underground map yet")) + tNote);
+                }
+            }
+        if (!env.IsTunnelMap && (tEntries > 0 || tBelow > 0))
+            ImGui.TextColored(new Vector4(1f, 0.45f, 0.35f, 1f), Loc.T("Game.isTunnelMap is OFF: holes are pits and nobody gets underground. Tick it above."));
+        ImGui.Text(string.Format(Loc.T("Entrances: {0} ({1} with a hole)   Below-ground objects: {2} ({3} mapped)"), tEntries, tHoled, tBelow, tMapped));
+        if (tWet > 0)
+        {
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), string.Format(Loc.T("{0} object(s) sit under the water level ({1:0.0} m). The one retail tunnel map, Cedar Falls, keeps its whole tunnel above the water (lowest floor 3.7 m over a 4.0 m water level); a soldier who reaches the water surface on the way in swims. Raise the tunnel and its entrances, or lower the water (Inspector > Water)."), tWet, tWater));
+        }
+        if (tLines.Count > 0 && ImGui.BeginListBox("##tunnellist", new Vector2(ImGui.GetContentRegionAvail().X, Math.Min(8, tLines.Count) * 18f + 6f)))
+        {
+            for (int ti = 0; ti < tLines.Count; ti++) ImGui.Selectable(tLines[ti] + "##tl" + ti, false);
+            ImGui.EndListBox();
+        }
+        if (tEntries == 0 && tBelow == 0) ImGui.TextDisabled(Loc.T("Place a tunnel (o_tunnelsA) and entrances (o_Tunnel_Hut_m1, o_Tunnel_Hole_m1, o_tunnel_Bunker_M1)\nfrom the Object Library's Tunnels category first."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Punch holes under entrances"))) PunchHolesUnderEntrances();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sets the terrain cell under every entrance object to a hole, the way Cedar Falls and\nSaigon68 are built. The Hole / Fill hole brushes in the Terrain mapper do it by hand."));
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Generate underground map(s)"))) GenerateUndergroundMaps();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Renders each below-ground object top-down into Textures/<Template>Map.dds and writes the\nmapManager.addObjectMap line that binds it. Replaces the maps registered so far."));
+        if (env.ObjectMaps.Count > 0)
+        {
+            ImGui.Spacing();
+            ImGui.TextDisabled(Loc.T("Registered underground maps:"));
+            foreach (var tm in env.ObjectMaps) ImGui.BulletText(tm.ToConLine());
+        }
+        if (env.WriteTunnel) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+        ImGui.PopTextWrapPos();
+    }
+    ImGui.End();
+}
+
+// ---- Water shader (BfVietnam) --------------------------------------------------------------------------------
+
+// Read the level's water shader once the mesh library is up: the level's own StandardMesh/levelWater.rs when it
+// ships one (the library resolves level archives first), else the base game's.
+void EnsureWaterShaderLoaded()
+{
+    if (waterShaderLoaded || meshLib is null) return;
+    waterShaderLoaded = true;
+    waterRsText = PendingText("StandardMesh/levelWater.rs");
+    if (waterRsText is null && meshLib.TryGetRsText("levelWater", out _, out var txt)) waterRsText = txt;
+    waterShaderBase = RefractorForge.Formats.Terrain.WaterShader.Parse(waterRsText);
+    waterReflect = waterShaderBase.Reflectivity; waterOpacity = waterShaderBase.Opacity;
+}
+
+// Queue the override for the save. Everything the author left in the file is kept; only the two values move.
+void QueueWaterShader()
+{
+    var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity };
+    var text = RefractorForge.Formats.Terrain.WaterShader.Patch(waterRsText, settings);
+    pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("StandardMesh/levelWater.rs", StringComparison.OrdinalIgnoreCase));
+    pendingLevelFiles.Add(("StandardMesh/levelWater.rs", System.Text.Encoding.Latin1.GetBytes(text)));
+}
+
+// Where a soldier meets water inside the tunnel system: the second body when the level has one, else the river.
+float EffectiveTunnelWater() => cfg.DrawWaterBelowTerrain ? (cfg.WaterBelowLevel ?? cfg.WaterLevel) : cfg.WaterLevel;
+
 // ---- Decal objects ---------------------------------------------------------------------------------------------
 
 // The archive a save must be aimed at: the level the USER opened, never a base-game archive that was layered
@@ -10721,24 +11552,49 @@ string? PendingText(string relPath)
 void DecalDialog()
 {
     if (!showDecalDialog) return;
-    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.FirstUseEver);
     if (ImGui.Begin(Loc.TL("Create Decal Object") + "###decaldlg", ref showDecalDialog, ImGuiWindowFlags.AlwaysAutoResize))
     {
-        ImGui.TextWrapped(Loc.T("Refractor has no decal primitive: posters, signs and scorch marks in retail maps are ordinary objects with a flat mesh. This makes one from your image and registers it as a level-local object, so it ships inside the map and needs nothing from the mod."));
+        ImGui.TextWrapped(Loc.T("Refractor has no decal primitive: posters, signs and scorch marks in retail maps are ordinary objects with a flat mesh. This makes one from your image - or a Bink video - and registers it as a level-local object, so it ships inside the map and needs nothing from the mod."));
         ImGui.Spacing();
         ImGui.SetNextItemWidth(220f * uiScale);
         ImGui.InputText(Loc.TL("Template name"), ref decalName, 40);
         ImGui.SetNextItemWidth(300f * uiScale);
-        ImGui.InputText(Loc.TL("Image"), ref decalImagePath, 260);
+        ImGui.InputText(Loc.TL("Image / video"), ref decalImagePath, 260);
         ImGui.SameLine();
-        if (ImGui.Button(Loc.TL("Browse...")))
+        if (ImGui.Button(Loc.TL("Image...")))
         {
             var pth = Picker.File("Pick the decal image", "Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.dds|All files|*.*", levelDir);
             if (pth is not null) decalImagePath = pth;
         }
-        ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Width (m)"), ref decalW, 0.1f, 40f, "%.2f");
-        ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Height (m)"), ref decalH, 0.1f, 40f, "%.2f");
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Video (.bik)...")))
+        {
+            var pth = Picker.File("Pick the decal movie", "Bink movies|*.bik|All files|*.*", levelDir);
+            if (pth is not null) decalImagePath = pth;
+        }
+        RefreshDecalInfo();
+        if (decalImgW > 0)
+        {
+            int g = Gcd(decalImgW, decalImgH);
+            ImGui.TextDisabled(string.Format(Loc.T("{0} x {1} px  ({2}:{3})"), decalImgW, decalImgH, decalImgW / g, decalImgH / g) + (decalVideo ? Loc.T("  video") : ""));
+        }
+        else if (decalVideo) ImGui.TextDisabled(Loc.T("Video (size unknown without FFmpeg - 4:3 assumed)"));
+        ImGui.Checkbox(Loc.TL("Preserve aspect ratio"), ref decalKeepAspect);
+        if (decalKeepAspect && decalImgW > 0)
+        {
+            // One slider: the width; the height follows the picture so it is never squashed.
+            ImGui.SetNextItemWidth(160f * uiScale); SldF(Loc.TL("Size (m, width)"), ref decalW, 0.1f, 40f, "%.2f");
+            decalH = decalW * decalImgH / decalImgW;
+            ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("height {0:0.00} m"), decalH));
+        }
+        else
+        {
+            ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Width (m)"), ref decalW, 0.1f, 40f, "%.2f");
+            ImGui.SetNextItemWidth(120f * uiScale); SldF(Loc.TL("Height (m)"), ref decalH, 0.1f, 40f, "%.2f");
+        }
         ImGui.Checkbox(Loc.TL("Lay flat on the ground (scorch mark) instead of standing up (poster)"), ref decalFlat);
+        if (decalVideo) ImGui.TextWrapped(Loc.T("A video decal: the .bik is copied to the mod's Movies folder and the shader points at it - the same Bink-texture trick the mod movie screens use. It plays in the game with its sound; the editor shows its first frame."));
         ImGui.Spacing();
         if (ImGui.Button(Loc.TL("Create and place")))
         {
@@ -10750,13 +11606,65 @@ void DecalDialog()
     ImGui.End();
 }
 
+static int Gcd(int a, int b) { while (b != 0) { (a, b) = (b, a % b); } return Math.Max(a, 1); }
+
+// Read the picture's size (or the movie's first frame) whenever the path changes, so the dialog can keep its shape.
+void RefreshDecalInfo()
+{
+    if (decalInfoPath == decalImagePath) return;
+    decalInfoPath = decalImagePath;
+    decalImgW = decalImgH = 0;
+    decalVideo = decalImagePath.EndsWith(".bik", StringComparison.OrdinalIgnoreCase);
+    if (!System.IO.File.Exists(decalImagePath)) return;
+    var t = decalVideo ? BikFirstFrame(decalImagePath) : LoadImageAsTexture(decalImagePath);
+    if (t is not null) { decalImgW = t.Width; decalImgH = t.Height; }
+    if (decalKeepAspect && decalImgW > 0) decalH = decalW * decalImgH / decalImgW;
+}
+
+// The first frame of a Bink movie, through FFmpeg when it is around; null when it is not.
+Texture2D? BikFirstFrame(string bik)
+{
+    try
+    {
+        var ff = FindFfmpeg();
+        if (ff is null) return null;
+        var outPng = Path.Combine(Path.GetTempPath(), "rf_bik_first.png");
+        var psi = new System.Diagnostics.ProcessStartInfo(ff, $"-hide_banner -y -i \"{bik}\" -frames:v 1 \"{outPng}\"")
+        { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        proc.StandardError.ReadToEnd(); proc.WaitForExit(20000);
+        return System.IO.File.Exists(outPng) ? LoadPngRgba(outPng) : null;
+    }
+    catch { return null; }
+}
+
+// A stand-in picture for a video decal when no frame can be decoded: dark, with a film strip, so it reads as a
+// screen in the viewport rather than a missing texture.
+static Texture2D VideoPlaceholder()
+{
+    const int w = 64, h = 48;
+    var px = new byte[w * h * 4];
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            int o = (y * w + x) * 4;
+            bool strip = y < 6 || y >= h - 6;
+            bool hole = strip && (x / 6) % 2 == 0;
+            byte v = hole ? (byte)210 : strip ? (byte)30 : (byte)(40 + 30 * ((x / 16 + y / 12) % 2));
+            px[o] = v; px[o + 1] = v; px[o + 2] = (byte)Math.Min(255, v + 20); px[o + 3] = 255;
+        }
+    return new Texture2D(w, h, px);
+}
+
 bool CreateDecalObject()
 {
     if (so is null || meshLib is null || levelDir is null) return false;
-    if (!System.IO.File.Exists(decalImagePath)) { Toast(Loc.T("Pick an image first.")); return false; }
+    if (!System.IO.File.Exists(decalImagePath)) { Toast(Loc.T("Pick an image or a .bik first.")); return false; }
     try
     {
-        var tex = LoadImageAsTexture(decalImagePath);
+        RefreshDecalInfo();
+        bool video = decalVideo;
+        var tex = video ? (BikFirstFrame(decalImagePath) ?? VideoPlaceholder()) : LoadImageAsTexture(decalImagePath);
         if (tex is null) { Toast(Loc.T("Could not load that image.")); return false; }
 
         // Nothing runs the decal's Objects folder unless Init.con says so, and most levels ship no such line -
@@ -10770,10 +11678,11 @@ bool CreateDecalObject()
 
         // The texture manager drops any texture that is not power-of-two on both axes, and an object texture
         // wants a mip chain or it shimmers at distance. Uncompressed 32-bit is fine: the engine's own loader
-        // picks its format from the bit count alone.
+        // picks its format from the bit count alone. A video needs none of this: the shader points at the movie.
         var texPow2 = DdsTexture.ToPowerOfTwo(tex, 4, 1024);
-        var dds = DdsTexture.EncodeUncompressedMipped(texPow2);
-        var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub);
+        byte[]? dds = video ? null : DdsTexture.EncodeUncompressedMipped(texPow2);
+        string? movieRef = video ? CopyBikToMovies(decalImagePath) : null;
+        var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub, movieRef);
 
         // Queue every file for the save, then the two registration patches. Both patches build on the newest
         // queued copy when there is one, so a second decal adds to the first rather than replacing it.
@@ -10791,7 +11700,7 @@ bool CreateDecalObject()
         // Show it now: register the render mesh under the template name, exactly as an imported .obj is.
         meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, texPow2)));
         importedObjs[built.Template] = built.Mesh;
-        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (name + "_Material0", texName, Vector3.One) };
+        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (name + "_Material0", video ? Path.GetFileNameWithoutExtension(decalImagePath) : texName, Vector3.One) };
         BroadcastObjMesh(built.Template);
         RebuildCatalog();
         browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
@@ -11555,16 +12464,36 @@ void BakeLightsToGround()
         // extra detail is finer than the heightmap the occlusion is traced against anyway.
         int size = Math.Min(atlasCpu.Width, 2048);
         var ground = LightBake.BakeGround(heightmap, cfg, lightRig, size);
-        LightBake.BurnIntoAtlas(atlasCpu, ground, 1f);
 
-        // Same bookkeeping the road paint does: mark the atlas painted so a save re-emits the terrain tiles
-        // with the light baked in, and push the whole thing back to the GPU so it is visible at once.
-        atlasPainted = true;
-        UploadAtlasRectMips(0, 0, atlasCpu.Width, atlasCpu.Height);
+        // The scene the pool is measured against is the one the viewport lit the ground with - the level's
+        // ambient and sun, pulled toward moonlight by the night-preview slider exactly as the terrain shader does -
+        // so the pool goes into the texture at the ratio you were looking at.
+        var (amb, dif) = SceneLight();
+        float night = Math.Clamp(lightRig.NightAmount, 0f, 1f);
+        var ambN = amb * (1f - night) + NightSceneLight() * night;
+        var difN = dif * (1f - night);
+        var sun = EffectiveSun();
+        var scene = LightBake.SceneLight(heightmap, cfg, size, new Vec3(ambN.X, ambN.Y, ambN.Z), new Vec3(difN.X, difN.Y, difN.Z), new Vec3(sun.X, sun.Y, sun.Z));
 
-        Toast(string.Format(Loc.T("Baked {0} light(s) into the ground texture in {1:0.0}s - save to write it out."),
+        // One undoable atlas edit, uploaded and flagged for save like the road and layer bakes.
+        AtlasFullEdit(() => LightBake.MultiplyIntoAtlas(atlasCpu!, ground, scene, size, groundBakeStrength));
+        // The pool is in the texture now. Drawing the lights live on top would show it twice over, so the live
+        // ground lighting goes off - what you see after a bake is what the game shows.
+        groundLightsLive = false;
+
+        Toast(string.Format(Loc.T("Baked {0} light(s) into the ground texture in {1:0.0}s - Z undoes it, save writes it."),
             enabled, sw.Elapsed.TotalSeconds));
-        Console.WriteLine($"Ground light bake: {enabled} light(s) at {size}x{size} in {sw.Elapsed.TotalSeconds:0.0}s.");
+        Console.WriteLine($"Ground light bake: {enabled} light(s) at {size}x{size}, strength {groundBakeStrength:0.00}, night {night:0.00}, in {sw.Elapsed.TotalSeconds:0.0}s.");
+
+        // A pool baked against the night preview only looks the same in the game if the LEVEL is that dark too.
+        var lvl = lightGlobalAmb + lightAmb + lightDiffuse;
+        float levelLum = 0.299f * lvl.X + 0.587f * lvl.Y + 0.114f * lvl.Z;
+        if (night > 0.3f && levelLum > 0.6f)
+        {
+            Console.WriteLine("   The night preview is editor-only and this level's Init.con lighting is still daylight: in the game the");
+            Console.WriteLine("   ground around the pools will be bright. Apply the Night preset (Lights panel) so the level is as dark as the preview.");
+            Toast(Loc.T("Note: the level's lighting is still daylight - apply the Night preset for the game to match the preview."));
+        }
     }
     catch (Exception ex)
     {
@@ -11670,11 +12599,21 @@ void LightsPanel()
         ImGui.SetTooltip(Loc.T("Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads."));
 
     ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);
+    ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Live on ground"), ref groundLightsLive);
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
+    if (ImGui.Button(Loc.TL("Bake Lightmaps (sun + placed lights)"))) BakeAllLighting();
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Terrain sun-shadow, every object's lightmap (with these lights) and the ground pools, in one go.\nShown at once; Save writes them. Also under Tools > Lighting."));
+    ImGui.SetNextItemWidth(150f);
+    SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
 
     float night = lightRig.NightAmount;
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Editor-side only: pulls the sun down toward moonlight so the placed\nlights are visible. It does NOT change the level - use Night preset\nfor that, which writes the renderer colours the game reads."));
+    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Editor-side only: shows the level's REAL light level (its Init.con ambient and diffuse)\ninstead of the editor's always-readable lighting, so placed lights read as they will\nin the game. Apply a Night preset first - on a daylight level there is nothing to darken."));
 
     ImGui.TextDisabled(Loc.T("Time of day"));
     foreach (var tod in RefractorForge.Formats.Terrain.TimeOfDayPreset.All)

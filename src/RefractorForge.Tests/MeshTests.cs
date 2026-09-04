@@ -20,7 +20,7 @@ public class MeshTests
 
         var sm = StandardMesh.Parse(StandardMeshWriter.Write(om));
         Assert.True(sm.Version == 10 && sm.NumLods == 1 && sm.Lods.Count == 1, "wrote v10 single-LOD mesh");
-        Assert.True(sm.Consumed == sm.Total, $"reader consumed every byte ({sm.Consumed}/{sm.Total})");
+        Assert.True(sm.Total - sm.Consumed == 8, $"reader consumed everything but the 8-byte trailing section ({sm.Consumed}/{sm.Total})");
         var mat = sm.Lods[0][0];
         Assert.True(sm.Lods[0].Count == 1 && mat.NumVertices == 4 && mat.Faces.Length == 2, "round-trips 1 section, 4 verts, 2 tris");
         Assert.True(mat.Faces[0] == (0, 1, 2) && mat.Faces[1] == (0, 2, 3), "triangle winding preserved");
@@ -103,7 +103,7 @@ public class MeshTests
             string quad = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0 0 1\nf 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n";
             var om = ObjMesh.Parse(quad);
             var withCol = StandardMesh.Parse(StandardMeshWriter.Write(om, gsec));
-            Assert.True(withCol.NumCollisionMeshes == 1 && withCol.Consumed == withCol.Total && StandardMesh.TryParseCollision(withCol.CollisionSections[0], out _, out var ei) && ei.Length == 6, ".sm embeds + re-reads collision");
+            Assert.True(withCol.NumCollisionMeshes == 1 && withCol.Total - withCol.Consumed == 8 && StandardMesh.TryParseCollision(withCol.CollisionSections[0], out _, out var ei) && ei.Length == 6, ".sm embeds + re-reads collision");
         }
     }
 }

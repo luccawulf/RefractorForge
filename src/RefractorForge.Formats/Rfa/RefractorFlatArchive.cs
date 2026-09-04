@@ -405,7 +405,8 @@ public sealed class RefractorFlatArchive
 
     /// <summary>Stream a repack straight to a file (low memory, no array-size ceiling).
     /// Writes to a sibling temp file first so the original is never locked while being read,
-    /// then atomically replaces <paramref name="path"/>.</summary>
+    /// then atomically replaces <paramref name="path"/>. Names in <paramref name="replacements"/> that the
+    /// archive already has REPLACE those entries in place; names it does not have are appended.</summary>
     public static void RepackToFile(
         string path,
         RefractorFlatArchive original,
@@ -414,21 +415,39 @@ public sealed class RefractorFlatArchive
         var ci = new Dictionary<string, byte[]>(replacements, StringComparer.OrdinalIgnoreCase);
         var ents = original.Entries;
 
+        // A name the archive does not carry yet is APPENDED, not dropped. A repack IS a save, and a save has to
+        // be able to add a file: a level-local object - a decal's mesh, shader, texture and its four .con files -
+        // is nothing but new names. Dropping them silently produced an archive that validated, reported success,
+        // and had a StaticObjects.con placing an object whose every file was missing.
+        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in ents) known.Add(e.Name);
+        var added = new List<string>();
+        foreach (var k in ci.Keys) if (!known.Contains(k)) added.Add(k);
+        added.Sort(StringComparer.OrdinalIgnoreCase);        // deterministic order; entries are addressed by name
+
         string tmp = path + ".rfatmp";
         try
         {
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
                 StreamArchive(
                     fs,
-                    ents.Count,
-                    i => ents[i].Name,
-                    i => ci.TryGetValue(ents[i].Name, out var rep)
-                        ? (BuildRegion(rep, original.IsCompressed), rep.Length)
-                        : (original.RawRegion(ents[i]), ents[i].UncompressedSize),
+                    ents.Count + added.Count,
+                    i => i < ents.Count ? ents[i].Name : added[i - ents.Count],
+                    i =>
+                    {
+                        if (i >= ents.Count)
+                        {
+                            var fresh = ci[added[i - ents.Count]];
+                            return (BuildRegion(fresh, original.IsCompressed), fresh.Length);
+                        }
+                        return ci.TryGetValue(ents[i].Name, out var rep)
+                            ? (BuildRegion(rep, original.IsCompressed), rep.Length)
+                            : (original.RawRegion(ents[i]), ents[i].UncompressedSize);
+                    },
                     original.IsCompressed,
                     original.XPackId,
                     original._descriptor,
-                    i => original._entryTrailers is { } t && t.TryGetValue(ents[i].Name, out var tr) ? tr : null,
+                    i => i < ents.Count && original._entryTrailers is { } t && t.TryGetValue(ents[i].Name, out var tr) ? tr : null,
                     original._tocTail
                 );
             File.Move(tmp, path, overwrite: true);
