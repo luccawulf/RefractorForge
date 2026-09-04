@@ -49,6 +49,12 @@ public sealed class CollabWorldState
     /// an object whose template resolves to nothing and whose files their save would not write.</summary>
     public Dictionary<string, string> LevelFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Whether this is a LEVEL rather than a few settings: terrain, materials or gameplay. A relay decides
+    /// from this whether it still needs a client to seed it. <see cref="Any"/> is not the right question there - a
+    /// session that received only water and light ops (what a wiped client sent) counted as seeded, so the relay
+    /// never asked again and every later join was wiped too.</summary>
+    public bool HasLevelContent => Height is not null || Material is not null || !string.IsNullOrEmpty(Gameplay);
+
     public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || !string.IsNullOrEmpty(Water) || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0 || LevelFiles.Count > 0 || !string.IsNullOrEmpty(LightRig) || !string.IsNullOrEmpty(LightBake);
 
     /// <summary>Apply one streamed op (TERRAIN/MATERIAL/GAMEPLAY) to the canonical state. Returns true if it was a

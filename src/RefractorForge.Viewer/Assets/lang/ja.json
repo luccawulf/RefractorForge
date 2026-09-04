@@ -1178,5 +1178,6 @@
  "What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep.": "水深が浅い場所での見え方です。川ならほぼ全体がこの色になります。\n水が深くなるまで、ゲームは上の色ではなくこちらを使います。",
  "What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep.": "トンネルの水が浅い場所での見え方です。水没したトンネルでは、\nほとんどがこの色になります。水が深くなるまで、ゲームは上の色ではなく\nこちらを使います。",
  "Received {0} file(s) for '{1}' from a peer.": "ピアから '{1}' 用のファイルを {0} 個受信しました。",
- "Lighting re-baked to match a peer's bake. Save writes it here too.": "ピアのベイクに合わせてライティングを再ベイクしました。保存するとこちらにも書き込まれます。"
+ "Lighting re-baked to match a peer's bake. Save writes it here too.": "ピアのベイクに合わせてライティングを再ベイクしました。保存するとこちらにも書き込まれます。",
+ "The session had no objects, so your {0} were kept.": "セッションにオブジェクトがなかったため、あなたの {0} 個をそのまま保持しました。"
 }

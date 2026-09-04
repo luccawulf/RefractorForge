@@ -960,6 +960,8 @@ CollabSession? collab = null;   // the collaboration session (set via the Collab
 // Set while an inbound edit is being pushed onto the undo stack. The push fires hist.OnDo, which is what normally
 // broadcasts an edit - and broadcasting an edit we just received would echo it straight back to the sender.
 bool applyingRemote = false;
+List<StaticObject>? syncHeld = null;   // our objects, held aside while a join sync decides whether there is a document to adopt
+int syncAdds = 0;                      // objects the sync actually delivered
 string? lastRigWire = null;             // the placed lights as last sent or received, so an edit goes out once
 (bool Lsb, bool Objects, bool Ground)? pendingRemoteBake = null;   // a peer baked: re-run the same bakes next update
 bool bakedLsb = false, bakedObjects = false, bakedGround = false;  // which bakes have run this session (what a joiner re-runs)
@@ -10510,7 +10512,11 @@ void CollabDrain()
         switch (m.Type)
         {
             case MsgType.SyncBegin:
-                if (!collab.IsHost && so is not null) { so.Objects.Clear(); changed = true; }   // joiner adopts host doc
+                // A joiner adopts the relay's document - but only once the sync has shown there IS one. Clearing
+                // here and adopting whatever came was how connecting to an empty relay wiped the level: nothing
+                // arrived, then the relay asked this very client to seed it, and it uploaded its now-empty list.
+                // The objects are held aside and either replaced by the sync or handed back at SyncEnd.
+                if (!collab.IsHost && so is not null) { syncHeld = so.Objects.ToList(); so.Objects.Clear(); syncAdds = 0; changed = true; }
                 break;
             case MsgType.SyncObj:
             case MsgType.Op:
@@ -10546,7 +10552,7 @@ void CollabDrain()
                         // Ctrl+Z take back what the AI bridge (or another mapper) just did. A SYNCOBJ is the
                         // initial adoption of the host's document, not an edit, and must NOT be undoable.
                         if (m.Type == MsgType.Op && hist is not null) remoteEdits.Add(rcmd);
-                        else rcmd.Apply(so);
+                        else { rcmd.Apply(so); if (m.Type == MsgType.SyncObj && pverb == "ADD") syncAdds++; }
                         changed = true;
                     }
                     catch { }
@@ -10555,7 +10561,20 @@ void CollabDrain()
                 finally { applyingRemote = false; }
                 break;
             }
-            case MsgType.SyncEnd: changed = true; break;
+            case MsgType.SyncEnd:
+                if (syncHeld is not null)
+                {
+                    // Nothing to adopt: the relay is empty (or was seeded with nothing). Keep our level - and if the
+                    // relay now asks us to seed it, this is what it gets. Adopting an empty document is never right.
+                    if (syncAdds == 0 && so is not null && syncHeld.Count > 0)
+                    {
+                        so.Objects.AddRange(syncHeld);
+                        Toast(string.Format(Loc.T("The session had no objects, so your {0} were kept."), syncHeld.Count));
+                    }
+                    syncHeld = null;
+                }
+                changed = true;
+                break;
             case MsgType.SeedRequest:
                 // We're the first client on a fresh central relay: upload our WHOLE level so the server (and every
                 // later joiner) starts from our document - objects + terrain + material/foliage + gameplay + water +

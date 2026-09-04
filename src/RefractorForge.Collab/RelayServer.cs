@@ -29,7 +29,10 @@ public sealed class RelayServer
         _doc = initial?.Clone() ?? new StaticObjectsFile();
         _world = world;
         _password = string.IsNullOrEmpty(password) ? null : password;
-        _seedClaimed = _doc.Objects.Count > 0 || (world?.Any ?? false);   // already seeded -> never ask
+        // Already holding a LEVEL -> never ask. Judged on objects / terrain / materials / gameplay, not on "any op at
+        // all": a session that had only received water and light settings counted as seeded, so after a restart
+        // the relay never asked again and handed every joiner an empty document to adopt.
+        _seedClaimed = _doc.Objects.Count > 0 || (world?.HasLevelContent ?? false);
     }
 
     /// <summary>Whether a password must be presented (via an AUTH line) before JOIN.</summary>
