@@ -13240,7 +13240,7 @@ List<int> IssueObjectIndices(RefractorForge.Formats.Validation.LevelReport r, st
 void SelectIssueObjects(RefractorForge.Formats.Validation.LevelReport r, string category)
 {
     var idx = IssueObjectIndices(r, category);
-    multi.Clear(); multi.AddRange(idx); selected = idx.Count > 0 ? idx[0] : -1;
+    multi.Clear(); foreach (var ix in idx) multi.Add(ix); selected = idx.Count > 0 ? idx[0] : -1;
     SyncTransformEdit();
 }
 // Seats each object so its BOTTOM rests on the terrain - unlike Drop to ground, which puts the origin there and
