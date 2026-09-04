@@ -4780,7 +4780,7 @@ void DoSaveCore()
     // Loaded from a folder: write the whole edited level back to disk (objects + terrain + material + gameplay).
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
-        var written = RefractorForge.Formats.LevelSaver.SaveFolder(levelDir, so, soPath, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null);
+        var written = RefractorForge.Formats.LevelSaver.SaveFolder(levelDir, so, soPath, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null);
         WritePendingLevelFiles(levelDir, written);
         Console.WriteLine($"Saved level to {levelDir} ({written.Count} files):");
         foreach (var w in written) Console.WriteLine("   " + w);
@@ -4871,7 +4871,7 @@ void DoSaveCore()
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
 
-        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles);
+        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles);
         if (names.Count == 0) { Toast(Loc.T("Nothing changed - nothing written.")); return; }
 
         // POST-SAVE VALIDATION: decode every entry of the written archive with the independent engine-validated
@@ -4962,7 +4962,7 @@ void DoSavePatch(bool serverSideOnly = false)
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
-        var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), waterLevelEdited ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
+        var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
         if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
         if (names.Count == 0) { Toast(Loc.T("Nothing edited yet -- no patch written.")); return; }
         var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(outPath);
@@ -9141,9 +9141,6 @@ void EnvironmentPanel()
         ImGui.SetNextItemWidth(150f);
         bool wchg = SldF(Loc.TL("Reflectivity"), ref waterReflect, 0f, 1f, "%.2f");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
-        ImGui.SetNextItemWidth(150f);
-        wchg |= SldF(Loc.TL("Opacity"), ref waterOpacity, 0.05f, 1f, "%.2f");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The .rs 'opacity'. Base game 0.35; the jungle rivers ship 0.5-0.75."));
         if (wchg) QueueWaterShader();
         ImGui.TextDisabled(waterSeqTex.Length > 1
             ? string.Format(Loc.T("Animation: {0} frames (the game's own water ripple)"), waterSeqTex.Length)
@@ -9221,9 +9218,7 @@ void EnvironmentPanel()
             }
             ImGui.SetNextItemWidth(150f);
             bool bchg = SldF(Loc.TL("Tunnel reflectivity"), ref waterBelowReflect, 0f, 1f, "%.2f");
-            ImGui.SetNextItemWidth(150f);
-            bchg |= SldF(Loc.TL("Tunnel opacity"), ref waterBelowOpacity, 0.05f, 1f, "%.2f");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 and 0.85 - a still, nearly opaque sewer."));
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer."));
             if (bchg) QueueWaterShader();
         }
     }
@@ -11725,6 +11720,38 @@ bool IsHoleAt(float wx, float wz)
 bool EntranceHasHole(StaticObject eObj, MeshLibrary.TunnelInfo eInfo)
     => EntrancePoints(eObj, eInfo).Any(pt => IsHoleAt(pt.X, pt.Z));
 
+// The game draws its water per terrain block, and PatchTerrain::getWaterLevel treats a hole vertex as "below the
+// terrain" - so a block that holds an entrance's hole gets the TUNNEL water level, not the river's. Where that
+// block also reaches under the river, the river simply is not drawn there: a clear rectangle beside the entrance,
+// seen in game on a map whose shoreline entrances sat on such blocks. The exact block size is the engine's; 16
+// cells matches what was observed, and every affected entrance on that map showed at 8, 16 and 32 alike.
+const int WaterBlockCells = 16;
+(bool Reaches, float Deepest, float NearestWetM)? HoleBlockReachesWater(StaticObject eObj, MeshLibrary.TunnelInfo eInfo)
+{
+    if (heightmap is null) return null;
+    float cell = cfg.WorldSize / (float)heightmap.Width;
+    (int X, int Y)? hole = null;
+    foreach (var pt in EntrancePoints(eObj, eInfo))
+    {
+        foreach (var v in VerticesNear(pt.X, pt.Z, 3f))
+            if (v.X >= 0 && v.Y >= 0 && v.X < heightmap.Width && v.Y < heightmap.Height && heightmap[v.X, v.Y] == 0) { hole = v; break; }
+        if (hole is not null) break;
+    }
+    if (hole is not { } h) return null;
+    int bx0 = h.X / WaterBlockCells * WaterBlockCells, by0 = h.Y / WaterBlockCells * WaterBlockCells;
+    float deepest = float.MaxValue, nearest = float.MaxValue;
+    for (int y = by0; y < Math.Min(heightmap.Height, by0 + WaterBlockCells); y++)
+        for (int x = bx0; x < Math.Min(heightmap.Width, bx0 + WaterBlockCells); x++)
+        {
+            if (heightmap[x, y] == 0) continue;                          // the hole itself is not "wet ground"
+            float hy = heightmap[x, y] * cfg.YScale / 256f;
+            if (hy >= cfg.WaterLevel) continue;
+            deepest = Math.Min(deepest, hy);
+            nearest = Math.Min(nearest, MathF.Sqrt((x - h.X) * (x - h.X) + (y - h.Y) * (y - h.Y)) * cell);
+        }
+    return deepest == float.MaxValue ? (false, 0f, 0f) : (true, cfg.WaterLevel - deepest, nearest);
+}
+
 // The lowest point of a placed mesh, in world metres: where a tunnel's floor is.
 float? PlacedFloorY(StaticObject fObj)
 {
@@ -11920,7 +11947,7 @@ void TunnelsWindow()
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
         ImGui.Separator();
 
-        int tEntries = 0, tHoled = 0, tBelow = 0, tMapped = 0, tWet = 0;
+        int tEntries = 0, tHoled = 0, tBelow = 0, tMapped = 0, tWet = 0, tShore = 0;
         float tWater = EffectiveTunnelWater();
         var tLines = new List<string>();
         if (so is not null && meshLib is not null)
@@ -11942,7 +11969,10 @@ void TunnelsWindow()
                     bool tDry = tClear >= 0.5f;
                     if (!tDry) tWet++;
                     string tNote = tDry ? "" : string.Format(Loc.T("  entrance point {0:0.0} m UNDER the water ({1:0.0} m): soldiers swim before the switch"), tWater - tEntY, tWater);
-                    tLines.Add((tHole && tDry ? "[ok]  " : "[!!]  ") + tObj.Template + tWhere + (tHole ? Loc.T("  hole under it") : Loc.T("  NO hole under it")) + tNote);
+                    var tBlock = tHole ? HoleBlockReachesWater(tObj, tInfo) : null;
+                    bool tShoreHit = tBlock is { Reaches: true };
+                    if (tShoreHit) { tShore++; tNote += string.Format(Loc.T("  NO RIVER beside it in game: its terrain block reaches {0:0.0} m under the water, wet ground {1:0} m from the hole"), tBlock!.Value.Deepest, tBlock.Value.NearestWetM); }
+                    tLines.Add((tHole && tDry && !tShoreHit ? "[ok]  " : "[!!]  ") + tObj.Template + tWhere + (tHole ? Loc.T("  hole under it") : Loc.T("  NO hole under it")) + tNote);
                 }
                 if (tInfo.BelowGround)
                 {
@@ -11959,6 +11989,12 @@ void TunnelsWindow()
         if (!env.IsTunnelMap && (tEntries > 0 || tBelow > 0))
             ImGui.TextColored(new Vector4(1f, 0.45f, 0.35f, 1f), Loc.T("Game.isTunnelMap is OFF: holes are pits and nobody gets underground. Tick it above."));
         ImGui.Text(string.Format(Loc.T("Entrances: {0} ({1} with a hole)   Below-ground objects: {2} ({3} mapped)"), tEntries, tHoled, tBelow, tMapped));
+        if (tShore > 0)
+        {
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), string.Format(Loc.T("{0} entrance(s) sit on a shoreline terrain block. The game gives a block that holds a hole the TUNNEL water level, so the river is not drawn on it - a clear rectangle appears beside the entrance in game. Move those entrances inland (about {1:0} m per block) or raise the shore under them above {2:0.0} m."), tShore, WaterBlockCells * (cfg.WorldSize / (float)(heightmap?.Width ?? 256)), tWater));
+            ImGui.PopTextWrapPos();
+        }
         if (tWet > 0)
         {
             ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), string.Format(Loc.T("{0} object(s) sit under the water level ({1:0.0} m). The one retail tunnel map, Cedar Falls, keeps its whole tunnel above the water (lowest floor 3.7 m over a 4.0 m water level); a soldier who reaches the water surface on the way in swims. Raise the tunnel and its entrances, or lower the water (Inspector > Water)."), tWet, tWater));

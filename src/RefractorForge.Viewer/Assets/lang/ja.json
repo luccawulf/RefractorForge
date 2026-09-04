@@ -1179,5 +1179,8 @@
  "What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep.": "トンネルの水が浅い場所での見え方です。水没したトンネルでは、\nほとんどがこの色になります。水が深くなるまで、ゲームは上の色ではなく\nこちらを使います。",
  "Received {0} file(s) for '{1}' from a peer.": "ピアから '{1}' 用のファイルを {0} 個受信しました。",
  "Lighting re-baked to match a peer's bake. Save writes it here too.": "ピアのベイクに合わせてライティングを再ベイクしました。保存するとこちらにも書き込まれます。",
- "The session had no objects, so your {0} were kept.": "セッションにオブジェクトがなかったため、あなたの {0} 個をそのまま保持しました。"
+ "The session had no objects, so your {0} were kept.": "セッションにオブジェクトがなかったため、あなたの {0} 個をそのまま保持しました。",
+ "The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer.": "2 つ目の水面専用の WaterSettingBelowTerrain サブシェーダーです。製品版で唯一のトンネルマップ\nSaigon68 では 0.1（静かな下水道）です。",
+ "  NO RIVER beside it in game: its terrain block reaches {0:0.0} m under the water, wet ground {1:0} m from the hole": "  ゲーム内でこの横に川が描かれません: この地形ブロックは水面より {0:0.0} m 下まで達しており、穴から {1:0} m の位置に水没地形があります",
+ "{0} entrance(s) sit on a shoreline terrain block. The game gives a block that holds a hole the TUNNEL water level, so the river is not drawn on it - a clear rectangle appears beside the entrance in game. Move those entrances inland (about {1:0} m per block) or raise the shore under them above {2:0.0} m.": "{0} 個の入口が岸辺の地形ブロック上にあります。ゲームは穴を含むブロックにトンネル水位を適用するため、そのブロックには川が描かれず、入口の横に透明な四角形が現れます。入口を内陸側へ（ブロック 1 つあたり約 {1:0} m）移動するか、その下の岸を {2:0.0} m より高くしてください。"
 }
