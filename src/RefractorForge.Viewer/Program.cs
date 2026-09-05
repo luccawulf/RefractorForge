@@ -246,9 +246,28 @@ uniform float uReflect; uniform int uHasSkyCube; uniform samplerCube uSkyCube;  
 // BfVietnam: the levelWater.rs `sequence` - 32 animated NORMAL maps, cross-faded, tiled every waterScale metres.
 uniform int uWaterSeq; uniform sampler2D uSeqA; uniform sampler2D uSeqB; uniform float uSeqMix;
 uniform float uWaterScaleM; uniform vec3 uMatDiffuse;
+// The level's THREE water colours and the depth they run over. The engine picks by how deep the water is, which is
+// why a river can read one colour in the editor and another in game: shallowColor at the edge, color through the
+// middle, deepColor once the bottom drops past waterColorDepth. A stray deepColor is invisible until you look at
+// deep water - Saigon68 carried 0.498/0.298/0.008 and its river came out orange.
+uniform vec3 uShallowColor; uniform vec3 uDeepColor; uniform float uColorDepth;
+uniform sampler2D uHeightTex;      // terrain height, r = raw/65535, sampled by world XZ
+uniform float uWorldSizeM; uniform float uYScaleM; uniform float uWaterLevelM;
+uniform int uHasHeight;
 void main(){
     vec3 viewDir = normalize(uCamPos - vWorld);
     vec3 n; vec3 col; float alpha;
+
+    // How deep the water is here, from the terrain underneath - the same quantity the engine coloures by.
+    vec3 waterTint = uWaterColor;
+    if (uHasHeight == 1 && uColorDepth > 0.01) {
+        float ground = texture(uHeightTex, vWorld.xz / max(uWorldSizeM, 1.0)).r * 65535.0 * uYScaleM / 256.0;
+        float depth = max(uWaterLevelM - ground, 0.0);
+        float t = clamp(depth / uColorDepth, 0.0, 1.0);
+        // shallow -> the level's own colour -> deep, so all three settings are visible where the engine shows them
+        waterTint = (t < 0.5) ? mix(uShallowColor, uWaterColor, t * 2.0)
+                              : mix(uWaterColor, uDeepColor, (t - 0.5) * 2.0);
+    }
     if (uWaterSeq == 1) {
         // The game's own water: ripple normals from the animated sequence (tangent space, z up -> world Y),
         // the level's water.color tinted by the shader's materialDiffuse, and the sky reflection below does the
@@ -258,7 +277,7 @@ void main(){
         vec3 nb = texture(uSeqB, w).rgb * 2.0 - 1.0;
         vec3 nm = normalize(mix(na, nb, uSeqMix));
         n = normalize(vec3(nm.x, 4.0, nm.y));
-        col = uWaterColor * uMatDiffuse * 2.2;
+        col = waterTint * uMatDiffuse * 2.2;
         float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0);
         vec3 h = normalize(normalize(uLightDir) + viewDir);
         col += uSpecColor * pow(max(dot(n, h), 0.0), 90.0) * 0.85;      // sun glint off the ripples
@@ -270,7 +289,7 @@ void main(){
         vec3 t1 = texture(uTexL1, w * (uTile1*0.04) + uScroll1*uTime).rgb;
         vec3 t2 = texture(uTexL2, w * (uTile2*0.04) + uScroll2*uTime).rgb;
         vec3 tex = (t1 + t2) * 0.5;
-        col = uWaterColor * (0.35 + 1.3 * tex);                                           // tint the water textures by water.color
+        col = waterTint * (0.35 + 1.3 * tex);                                             // tint the water textures by the depth-blended colour
         float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0);
         vec3 h = normalize(normalize(uLightDir) + viewDir);
         col += uSpecColor * pow(max(dot(n,h),0.0), 80.0) * 0.9;                           // sun glint along the ripple normal
@@ -281,7 +300,7 @@ void main(){
         float w = sin(p.x + uTime*0.8) + sin(p.y*1.3 - uTime*0.6) + 0.5*sin((p.x+p.y)*2.1 + uTime*1.3);
         n = normalize(vec3(0.08*cos(p.x + uTime*0.8), 1.0, 0.08*cos(p.y*1.3 - uTime*0.6)));
         float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0);
-        col = uWaterColor * (0.8 + 0.45 * clamp(0.5 + 0.4*w, 0.0, 1.0));   // the level's water.color + ripple variation
+        col = waterTint * (0.8 + 0.45 * clamp(0.5 + 0.4*w, 0.0, 1.0));     // the depth-blended colour + ripple variation
         vec3 h = normalize(normalize(uLightDir) + viewDir);
         col += vec3(1.0,0.96,0.82) * pow(max(dot(n,h),0.0), 64.0) * 0.7;        // sun glint
         col = mix(col, uFogColor, fres*0.35);                                   // grazing-angle reflection of the sky/haze
@@ -1444,6 +1463,9 @@ int uHasDetail = -1, uDetailScale = -1;
 // water surface (translucent plane at the water level) + gradient sky background
 uint waterProg = 0, waterVao = 0, waterVbo = 0;
 uint skyProg = 0, skyVao = 0, skyVbo = 0, skyCubeTex = 0;   // skyCubeTex 0 = no real cubemap loaded -> procedural
+// The heightmap as a texture, so the WATER shader can tell how deep it is over any point and colour itself the way
+// the engine does (shallowColor / color / deepColor). Rebuilt whenever the terrain is.
+uint heightTexId = 0;
 int uMvpW = -1, uLightW = -1, uCamW = -1, uTimeW = -1, uWaterYW = -1, uWaterColorW = -1, uWaterAlphaW = -1;
 // Textured-water uniforms + state (the level's water.texLayer1/2 + normalMap, resolved on load).
 int uHasWaterTexW = -1, uTexL1W = -1, uTexL2W = -1, uNormalW = -1, uScroll1W = -1, uScroll2W = -1, uScrollNW = -1, uTile1W = -1, uTile2W = -1, uTileNW = -1, uSpecColW = -1;
@@ -3148,6 +3170,7 @@ void OnLoad()
         gl.VertexAttribPointer(4, 1, VertexAttribPointerType.Float, false, 8 * sizeof(float), (void*)(7 * sizeof(float))); gl.EnableVertexAttribArray(4);
     }
     gl.BindVertexArray(0);
+    UploadHeightTexture();   // the water colours itself by depth, which needs the terrain height on the GPU
     LoadSkyCubemap();
     BuildSkyBoxCatalogue();
     LoadSkyboxMesh();   // the level's real skybox mesh (e.g. Sky_Bocage_m1 = Immersed's underwater surface)
@@ -5527,6 +5550,43 @@ void DoBakeShadows(bool announce = true)
 }
 // Re-sync GPU buffers after a transform change (no geometry change).
 void SyncTransformEdit() { SyncMarkers(); glObjects?.Sync(so!); UploadMarkers(); }
+
+// Upload the heightmap as a single-channel texture for the water shader. R16 keeps the raw value exactly as the
+// .raw holds it, and the shader turns it back into metres with the level's own yScale.
+unsafe void UploadHeightTexture()
+{
+    if (heightmap is null) return;
+    if (heightTexId == 0) heightTexId = gl.GenTexture();
+    gl.BindTexture(TextureTarget.Texture2D, heightTexId);
+    fixed (ushort* p = heightmap.Samples)
+        gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.R16, (uint)heightmap.Width, (uint)heightmap.Height,
+                      0, PixelFormat.Red, PixelType.UnsignedShort, p);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+    gl.BindTexture(TextureTarget.Texture2D, 0);
+}
+
+// Everything the water shader needs to colour itself by depth, for whichever body is being drawn.
+void SetWaterDepthUniforms(Vector3 shallow, Vector3 deep, float colorDepth, float surfaceY)
+{
+    int l;
+    if ((l = gl.GetUniformLocation(waterProg, "uShallowColor")) >= 0) gl.Uniform3(l, shallow.X, shallow.Y, shallow.Z);
+    if ((l = gl.GetUniformLocation(waterProg, "uDeepColor")) >= 0) gl.Uniform3(l, deep.X, deep.Y, deep.Z);
+    if ((l = gl.GetUniformLocation(waterProg, "uColorDepth")) >= 0) gl.Uniform1(l, MathF.Max(colorDepth, 0.01f));
+    if ((l = gl.GetUniformLocation(waterProg, "uWorldSizeM")) >= 0) gl.Uniform1(l, (float)cfg.WorldSize);
+    if ((l = gl.GetUniformLocation(waterProg, "uYScaleM")) >= 0) gl.Uniform1(l, cfg.YScale);
+    if ((l = gl.GetUniformLocation(waterProg, "uWaterLevelM")) >= 0) gl.Uniform1(l, surfaceY);
+    if ((l = gl.GetUniformLocation(waterProg, "uHasHeight")) >= 0) gl.Uniform1(l, heightTexId != 0 ? 1 : 0);
+    if (heightTexId != 0 && (l = gl.GetUniformLocation(waterProg, "uHeightTex")) >= 0)
+    {
+        gl.ActiveTexture(TextureUnit.Texture4);
+        gl.BindTexture(TextureTarget.Texture2D, heightTexId);
+        gl.Uniform1(l, 4);
+        gl.ActiveTexture(TextureUnit.Texture0);
+    }
+}
 // Soldier-spawn marker mesh: a simple soldier-sized box (0.6 w x 1.8 h x 0.4 d), base on the ground, built once.
 // 24 verts (per-face) so normals come out flat/crisp; depth slightly less than width so its yaw reads.
 MeshLibrary.Mesh SoldierBoxMesh()
@@ -5589,6 +5649,7 @@ int CaptureDragSnapshot()
 void RebuildTerrain()
 {
     if (heightmap is null) return;
+    UploadHeightTexture();   // the water reads this to know how deep it is; sculpting must not leave it stale
     mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1, holes: TunnelHolesOn());
     float ws2 = cfg.WorldSize <= 0 ? 1f : cfg.WorldSize;
     var v = new float[mesh.Positions.Length * 8];
@@ -7112,6 +7173,7 @@ void OnRender(double dt)
         gl.Uniform1(uWaterYW, cfg.WaterLevel);          // live: follows the Water Level slider
         gl.Uniform3(uWaterColorW, waterColor.X, waterColor.Y, waterColor.Z);   // level's water.color
         gl.Uniform1(uWaterAlphaW, waterAlpha);                                  // level's transparency
+        SetWaterDepthUniforms(shallowColor, deepColor, env?.ColorDepth ?? 20f, cfg.WaterLevel);
         { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
         { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
         if (skyCubeTex != 0)
@@ -7160,6 +7222,7 @@ void OnRender(double dt)
         {
             gl.Uniform1(uWaterYW, wbl);
             gl.Uniform3(uWaterColorW, belowColor.X, belowColor.Y, belowColor.Z);
+            SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater());
             gl.Uniform1(uWaterAlphaW, belowAlpha);
             { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
             gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
@@ -9086,10 +9149,16 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
     // Ship the level's sky AS the stock cube map's own faces. The .rcm stays the base game's, untouched, because
     // the engine reads it from there - it is the FACES that resolve level-first. Same size and format as the
     // shipped ones (128px DXT1 with a full mip chain = 11,064 bytes) so nothing about the load path changes.
+    // The sky MESH and the cube map do not number their sides the same way round: face _01 of a skybox comes out
+    // where the cube map expects -Z, not +Z. Left as a straight copy the reflection is a half turn out, which is
+    // what it looked like in game. So the opposing side faces swap; up and down are unaffected by a yaw.
+    //   cube 01(+Z) <- sky 03,  cube 02(+X) <- sky 04,  cube 03(-Z) <- sky 01,  cube 04(-X) <- sky 02
+    int[] fromSkyFace = { 2, 3, 0, 1, 4, 5 };      // 0-based: cube face i takes sky face fromSkyFace[i]
+
     const int Side = 128;
     for (int i = 0; i < 6; i++)
     {
-        var src = faces[i]!;
+        var src = faces[fromSkyFace[i]]!;
         var rgba = new byte[Side * Side * 4];
         for (int y = 0; y < Side; y++)
             for (int x = 0; x < Side; x++)
@@ -9439,6 +9508,9 @@ void EnvironmentPanel()
     // setting from the one above, and one the editor did not show - so a level whose two disagreed looked one way
     // here and another in the game.
     wcol |= ImGui.ColorEdit3(Loc.TL("Shallow colour"), ref shallowColor);
+    wcol |= ImGui.ColorEdit3(Loc.TL("Deep colour"), ref deepColor);
+    if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(Loc.T("What the water turns into where it is DEEP - past 'full colour at depth' below.\nIt is easy to miss because the editor shows it only under deep water, and a stray\nvalue here is what makes a river read as orange in game."));
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep."));
     if (Vector3.DistanceSquared(shallowColor, waterColor) > 1e-4f)
     {
@@ -9514,6 +9586,7 @@ void EnvironmentPanel()
             // in the viewport and wrong in the game with no way to tell why.
             FitLabel(Loc.TL("Tunnel shallow colour"));
             bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
+            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
             if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
             {

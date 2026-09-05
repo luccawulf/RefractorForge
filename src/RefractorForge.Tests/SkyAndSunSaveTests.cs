@@ -192,3 +192,37 @@ public class SkyBoxSwitchTests
         Assert.Single(outLines.Where(l => l.TrimStart().StartsWith("GeometryTemplate.file Sky_", StringComparison.OrdinalIgnoreCase)));
     }
 }
+
+/// <summary>The surface body's own depth scales were parsed and discarded, so the editor could not show the
+/// level's real colour ramp - which is how an orange deepColor stayed invisible in the editor while the game
+/// showed an orange river. Saigon68 carries waterColorDepth 7.5 and deepColor 0.498/0.298/0.008.</summary>
+public class SurfaceWaterDepthTests
+{
+    private static string[] Init(params string[] extra) => new[] { "renderer.diffuseColor 1/1/1" }.Concat(extra).ToArray();
+
+    [Fact]
+    public void The_surface_depth_scales_are_kept()
+    {
+        var e = EnvironmentSettings.Parse(null, null, Init(
+            "water.waterColorDepth 7.5", "water.waterAlphaDepth 0.4"));
+        Assert.Equal(7.5f, e.ColorDepth, 3);
+        Assert.Equal(0.4f, e.AlphaDepth, 3);
+    }
+
+    [Fact]
+    public void A_level_that_names_neither_gets_the_retail_default()
+    {
+        var e = EnvironmentSettings.Parse(null, null, Init());
+        Assert.Equal(20f, e.ColorDepth, 3);
+        Assert.Equal(20f, e.AlphaDepth, 3);
+    }
+
+    [Fact]
+    public void The_deep_colour_is_read_and_kept()
+    {
+        // It is real and it is visible in game; treating it as decorative is what let an orange river through.
+        var e = EnvironmentSettings.Parse(null, null, Init("water.deepColor 0.498039/0.298039/0.007843"));
+        Assert.Equal(0.498039f, e.DeepColor.X, 4);
+        Assert.Equal(0.007843f, e.DeepColor.Z, 4);
+    }
+}

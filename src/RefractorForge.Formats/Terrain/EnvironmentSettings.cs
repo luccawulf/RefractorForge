@@ -162,6 +162,12 @@ public sealed class EnvironmentSettings
     /// <summary>waterBelowTerrain.waterAlphaDepth / waterColorDepth - how quickly the second body reaches full
     /// opacity and full colour with depth. Saigon68's values, which is the only shipped example.</summary>
     public const float DefaultBelowAlphaDepth = 0.4f;
+    /// <summary>water.waterAlphaDepth / water.waterColorDepth for the SURFACE body: how deep the water has to be
+    /// before it stops being see-through, and before it reaches <see cref="DeepColor"/>. Retail writes 20 for the
+    /// colour ramp; Saigon68 uses 7.5, which is why its orange deepColor is so visible.</summary>
+    public float AlphaDepth { get; set; } = 20f;
+    public float ColorDepth { get; set; } = 20f;
+
     public const float DefaultBelowColorDepth = 7.5f;
     public float BelowAlphaDepth { get; set; } = DefaultBelowAlphaDepth;
     public float BelowColorDepth { get; set; } = DefaultBelowColorDepth;
@@ -359,7 +365,10 @@ public sealed class EnvironmentSettings
         // these values instead of guessing at them. A body that names no shallowColor simply takes its own colour.
         if (!e.HasShallowColor) e.ShallowColor = e.WaterColor;
         if (!e.HasBelowShallowColor) e.BelowShallowColor = e.BelowColor;
-        _ = surfAlphaDepth; _ = surfColorDepth;
+        // The SURFACE body's own depth scales were parsed and thrown away, so the editor could neither show
+        // the level's real colour ramp nor tell you what it was. Keep them; the writer is unchanged.
+        if (surfAlphaDepth is float surfAd) e.AlphaDepth = surfAd;
+        if (surfColorDepth is float scd2) e.ColorDepth = scd2;
 
         return e;
     }
