@@ -639,6 +639,10 @@ int decalAudioRate = 22050;                  // 22050 or 44100: the .bik's track
 // A decal whose sound is an AMBIENT carries its audio on a separate AreaObject emitter, because a sound hung on the
 // visible object is only heard while that object is DRAWN. Placing the decal places the emitter with it.
 Dictionary<string, string> decalSoundCompanion = new(StringComparer.OrdinalIgnoreCase);
+// Which template is a video screen, which .bik it shows, and how far its sound should carry. The engine does not
+// place these objects through a transform the bink patch can read, so the patch cannot work out where a screen is
+// on its own - the editor knows, and writes it out on save (see WriteVideoScreensFile).
+Dictionary<string, (string Bik, float Near, float Far)> videoScreens = new(StringComparer.OrdinalIgnoreCase);
 // Bink conversion runs on a worker: a real video takes minutes, and doing it on the UI thread froze the editor.
 System.Threading.Tasks.Task<(string? Path, string Error)>? bikTask = null;
 int bikWidthIdx = 1;                                   // how big the converted video should be
@@ -9042,6 +9046,7 @@ void SaveLightingFolder()
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveLightingToEnv();
     if (levelDir is not null) { lightRig.Save(levelDir); objGroups.Save(levelDir); notes.Save(levelDir); }   // sidecars, never packed
+    WriteVideoScreensFile();   // for the bink patch; beside the mod, not in the level
     try
     {
         var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
@@ -12566,6 +12571,8 @@ bool CreateDecalObject()
         BroadcastObjMesh(built.Template);
         RebuildCatalog();
         if (companionSound is not null) decalSoundCompanion[built.Template] = companionSound;
+        if (video && movieRef is not null)
+            videoScreens[built.Template] = (Path.GetFileName(movieRef), decalSoundNear, decalSoundFar);
         browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
         Toast(string.Format(Loc.T("Decal '{0}' ready - click to place it. {1} file(s) will be written on save."), built.Template, built.Files.Count + 2));
         return true;
@@ -14358,6 +14365,57 @@ List<(string RelPath, byte[] Bytes)> SkyFacePieces()
 // Copy a .bik to <gameRoot>\Mods\<Mod>\Movies so the engine's Bink texture loader finds it (movies load loose
 // from disk, not from archives - raised_fist ships movies\background.bik the same way). Returns the texture
 // reference to write into the .rs; falls back to a relative Movies/ ref + a toast when no install is found.
+// Where each video screen stands, for the bink DLL patch (Downloads/.../bfv_bink_always). It keeps a video playing
+// while nothing draws it, and fades its sound with distance - but BFVietnam does not position these objects through
+// any transform the patch can read, so every screen came back at the origin when it tried. This is the editor
+// telling it, from the placements it already owns. Harmless without the patch: nothing else reads the file.
+void WriteVideoScreensFile()
+{
+    if (so is null) return;
+    var modDir = ModsRootOf();
+    if (modDir.ModsDir is null || modDir.ModName is null) return;
+
+    // Screens this session did not create - a level opened with decals already in it - are recovered from the
+    // shader the editor wrote for them, which names the movie verbatim. Their distances come from the values
+    // currently set in the decal dialog, since the level itself does not record any.
+    if (meshLib is not null)
+        foreach (var tmpl in so.Objects.Select(o => o.Template).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (videoScreens.ContainsKey(tmpl)) continue;
+            if (!meshLib.TryGetRsText(tmpl, out _, out var rsText)) continue;
+            var m = System.Text.RegularExpressions.Regex.Match(rsText, @"texture\s+""([^""]*\.bik)""",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) continue;
+            videoScreens[tmpl] = (Path.GetFileName(m.Groups[1].Value), decalSoundNear, decalSoundFar);
+        }
+    if (videoScreens.Count == 0) return;
+
+    // template -> the instances of it that are actually placed
+    var lines = new List<string>();
+    foreach (var kv in videoScreens)
+    {
+        var places = so.Objects.Where(o => o.Template.Equals(kv.Key, StringComparison.OrdinalIgnoreCase))
+                       .Select(o => $"{Inv(o.Position.X)}/{Inv(o.Position.Y)}/{Inv(o.Position.Z)}").Take(8).ToList();
+        if (places.Count == 0) continue;
+        lines.Add($"{kv.Value.Bik}={Inv(kv.Value.Near)} {Inv(kv.Value.Far)} {string.Join(" ", places)}");
+    }
+    if (lines.Count == 0) return;
+
+    try
+    {
+        var path = Path.Combine(modDir.ModsDir, modDir.ModName, "bfv_bink_always.ini");
+        var text = new System.Text.StringBuilder();
+        text.Append("; Written by RefractorForge: where each video screen stands, and how far its sound carries.\r\n");
+        text.Append("; Read by the bink DLL patch, which keeps a video playing while nothing is drawing it.\r\n");
+        text.Append("; <movie.bik>=<full volume within m> <silent beyond m> <x>/<y>/<z> [more placements]\r\n");
+        text.Append("\r\n[screens]\r\n");
+        foreach (var line in lines) text.Append(line).Append("\r\n");
+        File.WriteAllText(path, text.ToString(), System.Text.Encoding.Latin1);
+        Console.WriteLine($"   Video screen positions -> {path} ({lines.Count} screen(s))");
+    }
+    catch (Exception ex) { Console.WriteLine($"   Could not write the video screen positions: {ex.Message}"); }
+}
+
 string CopyBikToMovies(string bikPath)
 {
     var leaf = Path.GetFileName(bikPath);
