@@ -90,6 +90,13 @@ public sealed class EnvironmentSettings
     public Validation.CombatArea? CombatArea { get; set; }
     public bool HasCombatArea => CombatArea is not null;
 
+    /// <summary>
+    /// Delete the level's <c>game.setActiveCombatArea</c> line on save. A null <see cref="CombatArea"/> only means
+    /// "the editor is not writing one", which leaves whatever the file already had - so removing an area a mapper
+    /// no longer wants needs saying out loud. Most retail levels declare none: the whole world is playable.
+    /// </summary>
+    public bool RemoveCombatArea { get; set; }
+
     // ---- The BfVietnam 1.2 tunnel system, as Init.con declares it ----
     //
     // Operation Cedar Falls is the reference:  Game.isTunnelMap 1 / Game.useBelowGroundCulling 1 /
@@ -604,6 +611,7 @@ public sealed class EnvironmentSettings
             // The object maps are rewritten as a set (below), so the old ones go - including the pair of dummy
             // lines Battlecraft put in every map, which bind textures that do not exist.
             if (WriteTunnel && key == "mapmanager.addobjectmap") continue;
+            if (RemoveCombatArea && key == "game.setactivecombatarea") continue;   // asked for explicitly, see above
             if (WriteTunnel && !IsTunnelMap && key == "game.entrypointradius") continue;   // meaningless with the system off
             int w = Array.FindIndex(wanted, x => x.Key == key);
             // A rem'd line reads as key "rem", so a commented-out setting is left exactly as it is.

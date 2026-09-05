@@ -635,7 +635,7 @@ int selGroup = -1;
 // Combat area editing: drag the corners of the rectangle in the viewport.
 bool showCombatArea = true;
 int combatDragCorner = -1;                  // 0 = min corner, 1 = max corner, 2 = whole box
-Vector2 combatDragStart;
+Vector2 combatDragStart = default;   // read by the drag threshold, so it must be provably assigned
 RefractorForge.Formats.Validation.CombatArea combatDragOrig = default;   // assigned before use, but straight-line code cannot prove it
 bool combatAreaDirty = false;
 bool showMapReport = false;
@@ -2065,6 +2065,10 @@ void OnLoad()
             // Dragging a combat-area corner across the ground.
             if (combatDragCorner >= 0 && env is not null && terrainPick is not null && mouse!.IsButtonPressed(MouseButton.Left))
             {
+                // Only once the cursor has actually travelled. The handle grabs any click that lands within 14px of
+                // a corner, so selecting an object near one used to re-write the area with whatever the ground was
+                // under the cursor - Saigon68's drifted a third of a metre per session, silently, every save.
+                if (Vector2.Distance(pos, combatDragStart) < 4f * uiScale) return;
                 var cray = Picking.ScreenToRay(cam, pos.X, pos.Y, window.FramebufferSize.X, window.FramebufferSize.Y);
                 if (terrainPick.Raycast(cray, out var cg))
                 {
@@ -9480,8 +9484,14 @@ void SaveLightingFolder()
             if (e is null) return null;
             text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
         }
-        var lines = text.Replace("\r\n", "\n").Split("\n"[0]);
-        var patched = string.Join("\r\n", env.PatchInitConLines(lines)) + "\r\n";
+        var norm = text.Replace("\r\n", "\n");
+        bool trailingNewline = norm.EndsWith("\n", StringComparison.Ordinal);
+        var lines = norm.Split("\n"[0]);
+        // A trailing newline terminates the last line, it does not begin another one. Splitting says otherwise, and
+        // passing that phantom element through the patcher (then appending a newline as well) added a blank line
+        // per pass - two per save, unbounded, on a file that is real gameplay.
+        if (trailingNewline && lines.Length > 0) System.Array.Resize(ref lines, lines.Length - 1);
+        var patched = string.Join("\r\n", env.PatchInitConLines(lines)) + (trailingNewline ? "\r\n" : "");
         if (pending is not null)
         {
             pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
@@ -13702,15 +13712,31 @@ void CombatAreaPanel()
         if (ImGui.Button(Loc.TL("Declare one")))
         {
             env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(cfg.WorldSize * 0.25f, cfg.WorldSize * 0.25f, cfg.WorldSize * 0.5f, cfg.WorldSize * 0.5f);
+            env.RemoveCombatArea = false;
             combatAreaDirty = true; lightingDirty = true;
         }
     }
-    else if (ImGui.Button(Loc.TL("Square it")))
+    else
     {
-        // Grow the short side rather than crop the long one: whatever was inside the rectangle stays inside it.
-        float sz = MathF.Max(ca.Width, ca.Height);
-        env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(ca.X, ca.Z, sz, sz);
-        combatAreaDirty = true; lightingDirty = true;
+        if (ImGui.Button(Loc.TL("Square it")))
+        {
+            // Grow the short side rather than crop the long one: whatever was inside the rectangle stays inside it.
+            float sz = MathF.Max(ca.Width, ca.Height);
+            env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(ca.X, ca.Z, sz, sz);
+            combatAreaDirty = true; lightingDirty = true;
+        }
+        ImGui.SameLine();
+        // Most retail levels declare no combat area at all - the whole world is playable - and until now the editor
+        // could only ever add one. A level that got a too-small area by accident had no way back, and aircraft died
+        // out of bounds over their own map.
+        if (ImGui.Button(Loc.TL("Remove")))
+        {
+            env.CombatArea = null;
+            env.RemoveCombatArea = true;
+            combatAreaDirty = true; lightingDirty = true;
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(Loc.T("Delete the line, making the whole world playable - what most retail levels do.\nThe in-game map then covers the whole terrain again."));
     }
     if (combatAreaDirty)
     {
