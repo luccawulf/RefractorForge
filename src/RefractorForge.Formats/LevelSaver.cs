@@ -362,8 +362,16 @@ public static class LevelSaver
         return names;
     }
 
+    // Splitting on '\n' turns a file that ends in a newline into one with a trailing EMPTY line, and every gameplay
+    // patcher rejoins with a separator and appends a newline of its own - so each save added one blank line to each
+    // file, for ever. Ctf/ControlPoints.con walked 498 -> 506 -> 512 -> 514 bytes over four saves of this map.
+    // Dropping that one empty element makes a zero-edit save byte-identical again; no .con parser can tell.
     private static string[] EntryLines(RefractorFlatArchive a, string name)
-        => Encoding.Latin1.GetString(a.Read(a.Entries.First(e => e.Name == name))).Split('\n');
+    {
+        var lines = Encoding.Latin1.GetString(a.Read(a.Entries.First(e => e.Name == name))).Split('\n');
+        if (lines.Length > 0 && lines[^1].Length == 0) System.Array.Resize(ref lines, lines.Length - 1);
+        return lines;
+    }
 
     /// <summary>Compute the name->bytes substitutions for the edited files against a base archive: each edited
     /// asset is matched to its existing entry (by trailing file name) so the replacement reuses the archive's
