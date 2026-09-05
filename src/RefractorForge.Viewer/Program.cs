@@ -9104,8 +9104,12 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
     }
     Console.WriteLine($"Water reflection: '{b}' re-emitted as {Side}px DXT1 cube faces '{faceBase}_0N.dds'.");
 
+    // The faces ship INSIDE the level, so the .rcm has to name them by their whole path from the mod root - the
+    // same way the level's own sky shader names its faces. "texture\..." would aim at the base archive.
+    var (modRoot, lvlName) = LevelIdentity();
     outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.RelPathFor(b),
-              System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Terrain.CubeMapFile.Text(faceBase))));
+              System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Terrain.CubeMapFile.Text(
+                  faceBase, RefractorForge.Formats.Terrain.CubeMapFile.FaceFolder(modRoot, lvlName)))));
     return outp;
 }
 

@@ -40,20 +40,33 @@ public static class CubeMapFile
     public static string FaceRelPath(string faceBaseName, int face1To6) =>
         $"Texture/{Sanitise(faceBaseName)}_0{face1To6}.dds";
 
-    /// <summary>The file body: the six faces of <paramref name="skyBaseName"/>, in the engine's own order.</summary>
-    public static string Text(string skyBaseName)
+    /// <summary>The folder a face lives in, as the engine names it. A texture shipped INSIDE a level is referred to
+    /// by its whole path from the mod root - the level's own sky shader writes
+    /// <c>bfvietnam/levels/Saigon68/Texture/Sky_Stalingrad_05</c> - NOT as <c>texture/...</c>, which resolves to the
+    /// base archive. Naming level-local faces <c>texture\x.dds</c> pointed the cube map at six files that do not
+    /// exist, and an incomplete cube map kills the map on its first drawn frame.</summary>
+    public static string FaceFolder(string modRoot, string levelName) =>
+        $"{modRoot}\\levels\\{levelName}\\Texture";
+
+    /// <summary>The folder the game's own faces live in, for a cube map that names stock textures.</summary>
+    public const string StockFaceFolder = "texture";
+
+    /// <summary>The file body: the six faces of <paramref name="skyBaseName"/>, in the engine's own order, inside
+    /// <paramref name="faceFolder"/> (see <see cref="FaceFolder"/> - level-local faces need the full path).</summary>
+    public static string Text(string skyBaseName, string? faceFolder = null)
     {
+        var dir = string.IsNullOrWhiteSpace(faceFolder) ? StockFaceFolder : faceFolder!.Replace('/', '\\').TrimEnd('\\');
         var b = Sanitise(skyBaseName);
         if (b.Length == 0) throw new ArgumentException("a cube map needs a skybox base name", nameof(skyBaseName));
         // Backslashes and CRLF, as both shipped files are written - the parser is the game's own INI reader and
         // there is no reason to hand it anything it has not already been reading since 2004.
         return "[CubeMap]\r\n"
-             + $"PositiveX = texture\\{b}_02.dds\r\n"
-             + $"NegativeX = texture\\{b}_04.dds\r\n"
-             + $"PositiveY = texture\\{b}_05.dds\r\n"
-             + $"NegativeY = texture\\{b}_06.dds\r\n"
-             + $"PositiveZ = texture\\{b}_01.dds\r\n"
-             + $"NegativeZ = texture\\{b}_03.dds\r\n";
+             + $"PositiveX = {dir}\\{b}_02.dds\r\n"
+             + $"NegativeX = {dir}\\{b}_04.dds\r\n"
+             + $"PositiveY = {dir}\\{b}_05.dds\r\n"
+             + $"NegativeY = {dir}\\{b}_06.dds\r\n"
+             + $"PositiveZ = {dir}\\{b}_01.dds\r\n"
+             + $"NegativeZ = {dir}\\{b}_03.dds\r\n";
     }
 
     /// <summary>Is this sky just the stock one? Then the level's water can keep pointing at the shipped .rcm rather

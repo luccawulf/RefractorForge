@@ -138,6 +138,28 @@ public class WaterCubeMapTests
     }
 
     [Fact]
+    public void Level_local_faces_are_named_by_their_whole_path()
+    {
+        // A texture shipped inside a level is referred to from the mod root - the level's own sky shader writes
+        // "bfvietnam/levels/Saigon68/Texture/Sky_Stalingrad_05". Writing "texture\x.dds" aims at the BASE archive,
+        // where a level-local face does not exist, and six missing faces make the cube map incomplete - which
+        // killed the map on its first drawn frame.
+        var folder = CubeMapFile.FaceFolder("bfvietnam", "Saigon68");
+        Assert.Equal(@"bfvietnam\levels\Saigon68\Texture", folder);
+
+        var text = CubeMapFile.Text("Sky_HCMT2_env", folder);
+        Assert.Contains(@"PositiveX = bfvietnam\levels\Saigon68\Texture\Sky_HCMT2_env_02.dds", text);
+        Assert.Contains(@"NegativeY = bfvietnam\levels\Saigon68\Texture\Sky_HCMT2_env_06.dds", text);
+        Assert.DoesNotContain(@"= texture\", text);
+    }
+
+    [Fact]
+    public void With_no_folder_it_still_names_the_stock_one()
+    {
+        Assert.Contains(@"PositiveX = texture\env_default_02.dds", CubeMapFile.Text("env_default"));
+    }
+
+    [Fact]
     public void The_water_shader_can_be_pointed_at_it()
     {
         var s = WaterShaderSettings.RetailDefault with { Cubemap = CubeMapFile.RefFor("Sky_OI") };
