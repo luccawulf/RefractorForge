@@ -329,7 +329,9 @@ uniform vec3 uNightSky;
 void main(){
     vec3 d = normalize(vDir);
     float cr = cos(uRot), sr = sin(uRot);
-    vec3 dr = vec3(cr*d.x + sr*d.z, d.y, -sr*d.x + cr*d.z);   // rotate sampling dir around Y
+    // INVERSE of the mesh path's rotation: turning the box by +a is the same as sampling with -a, and the two
+    // previews have to agree or the saved angle depends on which one was on screen.
+    vec3 dr = vec3(cr*d.x - sr*d.z, d.y, sr*d.x + cr*d.z);
     vec3 sky;
     if (uHasCube == 1) { sky = texture(uCube, dr).rgb; }
     else {
@@ -9712,6 +9714,14 @@ void EnvironmentPanel()
     }
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Sky rotation (deg)"), ref skyRotDeg, -180f, 180f, "%.0f");
+    // The slider is an OFFSET on top of whatever the level declared, so show the number the level will be given.
+    if (env is not null)
+    {
+        float eff = env.SkyRotationAngle + skyRotDeg;
+        eff -= 360f * MathF.Floor((eff + 180f) / 360f);
+        ImGui.SameLine();
+        ImGui.TextDisabled(string.Format(Loc.T("level: {0:0} deg"), eff));
+    }
     if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
     if (ImGui.IsItemHovered())
         ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));

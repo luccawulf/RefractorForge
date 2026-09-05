@@ -1239,5 +1239,6 @@
  "Put back##sky": "元に戻す",
  "Sky set to {0}. Save writes it to SkyAndSun.con.": "空を {0} に設定しました。保存すると SkyAndSun.con に書き込まれます。",
  "Water mirrors this level's sky (experimental)": "水面がこのレベルの空を映す（実験的）",
- "changed from {0}": "{0} から変更されています"
+ "changed from {0}": "{0} から変更されています",
+ "level: {0:0} deg": "レベル: {0:0} 度"
 }
