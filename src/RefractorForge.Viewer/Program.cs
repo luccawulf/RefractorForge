@@ -13821,6 +13821,22 @@ void CombatAreaPanel()
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(Loc.T("Delete the line, making the whole world playable - what most retail levels do.\nThe in-game map then covers the whole terrain again."));
     }
+    // Tunnel maps and sub-rectangles do not mix. Of the seven levels in a stock BFV install that set
+    // Game.isTunnelMap 1, Operation_Cedar_Falls declares no combat area and my_lai_massacre plus world_i_i..iv all
+    // declare the WHOLE world - not one uses a smaller rectangle. Saigon68 tried, and the out-of-combat-area
+    // warning fired hundreds of metres inside the box it had been given, over and over, at every size.
+    if (env.IsTunnelMap && env.CombatArea is { } tca
+        && !SameArea(tca, RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize)))
+    {
+        ImGui.TextColored(new Vector4(1f, 0.55f, 0.4f, 1f),
+            Loc.T("This is a tunnel map. Every tunnel map in a stock install uses the whole world or\nno area at all - a smaller one reports out-of-bounds well inside itself."));
+        if (ImGui.Button(Loc.TL("Use the whole world")))
+        {
+            NoteCombatAreaBaseline();
+            env.CombatArea = RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
+            combatAreaDirty = true; lightingDirty = true;
+        }
+    }
     if (env.CombatArea is { } live)
     {
         var outside = PlacedSpawns().Where(s => s.Pos.X < live.X || s.Pos.X > live.X1 || s.Pos.Z < live.Z || s.Pos.Z > live.Z1).ToList();
