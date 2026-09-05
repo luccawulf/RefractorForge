@@ -9079,16 +9079,14 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
     for (int i = 0; i < 6; i++) faces[i] = RFace($"{b}_0{i + 1}");
     if (faces.Any(f => f is null))
     {
-        Console.WriteLine($"Water reflection: skybox '{b}' has no full set of _01.._06 faces - keeping the stock cube map.");
+        Console.WriteLine($"Water reflection: skybox '{b}' has no full set of _01.._06 faces - left alone.");
         return outp;
     }
 
-    // ALWAYS re-emit the faces, in the form the game's own cube map is in: 128px square, DXT1, FULL mip chain
-    // (env_default_0N.dds is 11,064 bytes, which is exactly that). The first attempt referenced the skybox faces
-    // where they lay, or copied them uncompressed and un-mipped, and the map died on its first drawn frame - the
-    // same shape as the terrain tiles that came out black until they were re-emitted as 256px DXT1 with mips.
+    // Ship the level's sky AS the stock cube map's own faces. The .rcm stays the base game's, untouched, because
+    // the engine reads it from there - it is the FACES that resolve level-first. Same size and format as the
+    // shipped ones (128px DXT1 with a full mip chain = 11,064 bytes) so nothing about the load path changes.
     const int Side = 128;
-    string faceBase = b + "_env";
     for (int i = 0; i < 6; i++)
     {
         var src = faces[i]!;
@@ -9101,17 +9099,11 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
                 rgba[o] = (byte)(c.X * 255f); rgba[o + 1] = (byte)(c.Y * 255f);
                 rgba[o + 2] = (byte)(c.Z * 255f); rgba[o + 3] = 255;
             }
-        outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.FaceRelPath(faceBase, i + 1),
+        outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.StockFaceRelPath(i + 1),
                   DxtEncoder.EncodeDxt1Mipped(new Texture2D(Side, Side, rgba))));
     }
-    Console.WriteLine($"Water reflection: '{b}' re-emitted as {Side}px DXT1 cube faces '{faceBase}_0N.dds'.");
-
-    // The faces ship INSIDE the level, so the .rcm has to name them by their whole path from the mod root - the
-    // same way the level's own sky shader names its faces. "texture\..." would aim at the base archive.
-    var (modRoot, lvlName) = LevelIdentity();
-    outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.RelPathFor(b),
-              System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Terrain.CubeMapFile.Text(
-                  faceBase, RefractorForge.Formats.Terrain.CubeMapFile.FaceFolder(modRoot, lvlName)))));
+    Console.WriteLine($"Water reflection: '{b}' shipped as the level's own {RefractorForge.Formats.Terrain.CubeMapFile.StockFaceBase}_0N.dds "
+                    + $"({Side}px DXT1); everything in this level that mirrors the sky now mirrors THIS one.");
     return outp;
 }
 
@@ -9725,10 +9717,10 @@ void EnvironmentPanel()
     if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
     if (ImGui.IsItemHovered())
         ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
-    if (ImGui.Checkbox(Loc.TL("Water mirrors this level's sky (KNOWN TO CRASH)"), ref waterMirrorsLevelSky))
+    if (ImGui.Checkbox(Loc.TL("Water mirrors this level's own sky"), ref waterMirrorsLevelSky))
     { EnsureWaterShaderLoaded(); QueueWaterShader(); }
     if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("LEAVE THIS OFF unless you are testing it. Turning it on has crashed a real map on its\nfirst drawn frame every time - even with faces byte-identical to the game's own and the\npaths written the way the level's own shaders write theirs.\n\nZERO of the 97 retail levels ship a cube map of their own; every one points its water at\ntexture/env_default.rcm in the base archive, so the engine may simply not read a .rcm from\ninside a level. To change what water reflects across a whole MOD, replace that file in the\nmod's own texture archive instead - that is the route the game itself uses."));
+        ImGui.SetTooltip(Loc.T("Ships this level's skybox as its own copy of the stock cube map's six faces\n(Texture/env_default_01..06.dds, 128px DXT1). The water shader keeps naming\ntexture/env_default.rcm - the engine reads that from the base archive - and the\nFACES resolve level-first, so only this map is affected.\n\nIt is the cube map for the whole level, so anything else that mirrors the sky\n- vehicle glass, canopies - mirrors this one too."));
     if (ImGui.Button(Loc.TL("Import skybox..."))) ImportSkybox();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
 
@@ -12476,16 +12468,9 @@ void QueueWaterShader()
 {
     // Mirror the level's OWN sky when it has one. Both shipped .rcm files name the same generic sky, so without
     // this a map with a custom skybox reflected clouds that are nowhere in it.
-    string cube;
-    if (!waterMirrorsLevelSky || RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName))
-        cube = waterShaderBase.Cubemap;
-    else
-    {
-        // The .rcm ships INSIDE the level, so the shader has to name its whole path - exactly as the faces inside
-        // it do. "texture/x.rcm" reads the base archive, finds nothing, and the water gets no cube map at all.
-        var (modRoot, lvlName) = LevelIdentity();
-        cube = RefractorForge.Formats.Terrain.CubeMapFile.RefFor(skyCubeBaseName!, modRoot, lvlName);
-    }
+    // ALWAYS the stock .rcm. A level changes what its water reflects by overriding that cube map's FACES
+    // (see SkyCubemapPieces), never by naming a cube map of its own - the engine will not read one from a level.
+    var cube = waterShaderBase.Cubemap;
     var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity, Cubemap = cube };
     var below = cfg.DrawWaterBelowTerrain
         ? RefractorForge.Formats.Terrain.WaterShaderSettings.BelowTerrainDefault with { Reflectivity = waterBelowReflect, Opacity = waterBelowOpacity }

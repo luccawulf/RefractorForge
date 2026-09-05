@@ -23,6 +23,19 @@ public static class CubeMapFile
     /// <summary>The .rcm every retail level's water points at. Same generic sky, different file.</summary>
     public const string LevelCubemap = "texture/env_default.rcm";
 
+    /// <summary>The face names <see cref="LevelCubemap"/> lists. A level changes what its water reflects by
+    /// shipping its OWN copies of these SIX names - not by introducing a cube map of its own.
+    /// <para>
+    /// This is the whole trick, and it is the only thing that works: the .rcm is read from the base archive, but
+    /// the faces it names go through the ordinary texture resolver, which prefers a level's own copy. Shipping a
+    /// new .rcm inside a level crashes the map on its first drawn frame however correctly it is written - the
+    /// cube-map loader does not search a level. Operation_Flaming_Dart does it this way and works.
+    /// </para></summary>
+    public const string StockFaceBase = "env_default";
+
+    /// <summary>Where a level's override of one stock cube face goes, level-relative.</summary>
+    public static string StockFaceRelPath(int face1To6) => $"Texture/{StockFaceBase}_0{face1To6}.dds";
+
     /// <summary>Where a level-local cube map for <paramref name="skyBaseName"/> lives, as the engine refers to it
     /// (forward slashes, no extension games). Shipping the file at <c>Texture/&lt;leaf&gt;</c> inside the level makes
     /// the level's copy win, the same way a map overrides a hi-res skybox face.

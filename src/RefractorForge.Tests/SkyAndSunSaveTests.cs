@@ -93,98 +93,53 @@ public class SkyAndSunSaveTests
     }
 }
 
-/// <summary>The water mirrors whatever <c>.rcm</c> its shader names, and the two the game ships name the same
-/// generic sky - so a map with its own skybox reflected clouds that were nowhere in it.</summary>
+/// <summary>
+/// How a level changes what its water reflects. NOT by shipping a cube map of its own - that crashes the map on
+/// its first drawn frame however correctly the .rcm is written, because the engine reads the .rcm from the base
+/// archive and never looks inside a level. It works by shipping the level's OWN copies of the six faces that the
+/// stock cube map already names, which DO resolve level-first through the ordinary texture resolver.
+/// Operation_Flaming_Dart does exactly this: six Texture/env_default_0N.dds inside the level, no .rcm, and its
+/// levelWater.rs still says cubemap "texture/env_default.rcm".
+/// </summary>
 public class WaterCubeMapTests
 {
     [Fact]
-    public void The_faces_are_in_the_engines_own_order()
+    public void The_water_keeps_naming_the_stock_cube_map()
     {
-        // Matched against both shipped .rcm files AND the editor's cube-map upload, which maps
-        // GL +X,-X,+Y,-Y,+Z,-Z from faces _02,_04,_05,_06,_01,_03.
-        var text = CubeMapFile.Text("Sky_OI");
-        Assert.Contains("PositiveX = texture\\Sky_OI_02.dds", text);
-        Assert.Contains("NegativeX = texture\\Sky_OI_04.dds", text);
-        Assert.Contains("PositiveY = texture\\Sky_OI_05.dds", text);
-        Assert.Contains("NegativeY = texture\\Sky_OI_06.dds", text);
-        Assert.Contains("PositiveZ = texture\\Sky_OI_01.dds", text);
-        Assert.Contains("NegativeZ = texture\\Sky_OI_03.dds", text);
-        Assert.StartsWith("[CubeMap]", text);
+        // The shader must NOT be repointed - that is what broke it. Only the faces change.
+        var text = WaterShader.Patch(null, WaterShaderSettings.RetailDefault, null);
+        Assert.Contains("cubemap \"texture/env_default.rcm\"", text);
     }
 
     [Fact]
-    public void The_stock_sky_needs_no_level_copy()
+    public void The_faces_a_level_overrides_are_the_stock_names()
+    {
+        Assert.Equal("env_default", CubeMapFile.StockFaceBase);
+        Assert.Equal("Texture/env_default_01.dds", CubeMapFile.StockFaceRelPath(1));
+        Assert.Equal("Texture/env_default_06.dds", CubeMapFile.StockFaceRelPath(6));
+    }
+
+    [Fact]
+    public void A_level_on_the_stock_sky_needs_no_override_at_all()
     {
         Assert.True(CubeMapFile.IsStockSky("env_default"));
         Assert.True(CubeMapFile.IsStockSky("default_env"));
         Assert.True(CubeMapFile.IsStockSky(null));
         Assert.True(CubeMapFile.IsStockSky("  "));
         Assert.False(CubeMapFile.IsStockSky("Sky_OI"));
-        Assert.False(CubeMapFile.IsStockSky("Sky_Bocage"));
+        Assert.False(CubeMapFile.IsStockSky("Sky_HCMT2"));
     }
 
     [Fact]
-    public void The_reference_and_the_path_agree()
+    public void The_face_order_is_still_the_engines_own()
     {
-        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("Sky_OI"));
-        Assert.Equal("Texture/Sky_OI_env.rcm", CubeMapFile.RelPathFor("Sky_OI"));
-    }
-
-    [Fact]
-    public void A_mesh_shaped_name_is_reduced_to_a_filename()
-    {
-        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("some/path/Sky_OI"));
-        Assert.Contains("texture\\SkyOI_01.dds", CubeMapFile.Text("Sky OI"));    // a space is dropped, not turned into _
-    }
-
-    [Fact]
-    public void Level_local_faces_are_named_by_their_whole_path()
-    {
-        // A texture shipped inside a level is referred to from the mod root - the level's own sky shader writes
-        // "bfvietnam/levels/Saigon68/Texture/Sky_Stalingrad_05". Writing "texture\x.dds" aims at the BASE archive,
-        // where a level-local face does not exist, and six missing faces make the cube map incomplete - which
-        // killed the map on its first drawn frame.
-        var folder = CubeMapFile.FaceFolder("bfvietnam", "Saigon68");
-        Assert.Equal(@"bfvietnam\levels\Saigon68\Texture", folder);
-
-        var text = CubeMapFile.Text("Sky_HCMT2_env", folder);
-        Assert.Contains(@"PositiveX = bfvietnam\levels\Saigon68\Texture\Sky_HCMT2_env_02.dds", text);
-        Assert.Contains(@"NegativeY = bfvietnam\levels\Saigon68\Texture\Sky_HCMT2_env_06.dds", text);
-        Assert.DoesNotContain(@"= texture\", text);
-    }
-
-    [Fact]
-    public void The_rcm_itself_is_named_by_its_whole_path_too()
-    {
-        // The same rule as the faces, one level up: a shader naming a level-local cube map as "texture/x.rcm"
-        // reads the BASE archive, finds nothing, and the water never gets a cube map at all.
-        var levelRef = CubeMapFile.RefFor("Sky_HCMT2", "BfVietnam", "Saigon68");
-        Assert.Equal("BfVietnam/levels/Saigon68/Texture/Sky_HCMT2_env.rcm", levelRef);
-
-        var text = WaterShader.Patch(null, WaterShaderSettings.RetailDefault with { Cubemap = levelRef }, null);
-        Assert.Contains("cubemap \"BfVietnam/levels/Saigon68/Texture/Sky_HCMT2_env.rcm\"", text);
-    }
-
-    [Fact]
-    public void Without_a_level_it_still_names_the_stock_place()
-    {
-        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("Sky_OI"));
-        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("Sky_OI", null, "Saigon68"));
-    }
-
-    [Fact]
-    public void With_no_folder_it_still_names_the_stock_one()
-    {
-        Assert.Contains(@"PositiveX = texture\env_default_02.dds", CubeMapFile.Text("env_default"));
-    }
-
-    [Fact]
-    public void The_water_shader_can_be_pointed_at_it()
-    {
-        var s = WaterShaderSettings.RetailDefault with { Cubemap = CubeMapFile.RefFor("Sky_OI") };
-        var text = WaterShader.Patch(null, s, null);
-        Assert.Contains("cubemap \"texture/Sky_OI_env.rcm\"", text);
-        Assert.DoesNotContain("env_default.rcm", text);
+        // Kept because the numbering is what makes an override land on the right face: the stock .rcm maps
+        // _01=+Z, _02=+X, _03=-Z, _04=-X, _05=+Y up, _06=-Y down, and a skybox numbers its faces the same way -
+        // so <sky>_0N copies straight onto env_default_0N.
+        var text = CubeMapFile.Text("env_default");
+        Assert.Contains(@"PositiveZ = texture\env_default_01.dds", text);
+        Assert.Contains(@"PositiveX = texture\env_default_02.dds", text);
+        Assert.Contains(@"NegativeY = texture\env_default_06.dds", text);
     }
 }
 
