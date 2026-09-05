@@ -5094,6 +5094,16 @@ void DoSavePatch(bool serverSideOnly = false)
     catch (Exception ex) { Toast(Loc.T("Patch save failed: ") + ex.Message); }
 }
 
+// Every placed thing the engine spawns, as flat positions. The combat area kills what starts outside it, so this
+// answers "did I just draw the box across a spawn point?" - which by eye is impossible to see.
+IEnumerable<(string What, Vec3 Pos)> PlacedSpawns()
+{
+    if (gameplayEdit is null) yield break;
+    foreach (var c in gameplayEdit.ControlPoints) yield return (c.Name, c.Position);
+    foreach (var v in gameplayEdit.VehicleSpawns) yield return (string.IsNullOrEmpty(v.Vehicle) ? v.Name : v.Vehicle, v.Position);
+    foreach (var d in gameplayEdit.SoldierSpawns) yield return (d.Name, d.Position);
+}
+
 // The rectangle the level's in-game map image was drawn for, remembered the moment before it stops being true.
 void NoteCombatAreaBaseline()
 {
@@ -13810,6 +13820,39 @@ void CombatAreaPanel()
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(Loc.T("Delete the line, making the whole world playable - what most retail levels do.\nThe in-game map then covers the whole terrain again."));
+    }
+    if (env.CombatArea is { } live)
+    {
+        var outside = PlacedSpawns().Where(s => s.Pos.X < live.X || s.Pos.X > live.X1 || s.Pos.Z < live.Z || s.Pos.Z > live.Z1).ToList();
+        if (outside.Count > 0)
+        {
+            // Not a style note: the engine destroys these the moment they spawn. It looks like a broken vehicle,
+            // not like a boundary, which is why it is worth naming the worst one rather than just counting.
+            var worst = outside.OrderByDescending(o => MathF.Max(MathF.Max(live.X - o.Pos.X, o.Pos.X - live.X1),
+                                                                MathF.Max(live.Z - o.Pos.Z, o.Pos.Z - live.Z1))).First();
+            float by = MathF.Max(MathF.Max(live.X - worst.Pos.X, worst.Pos.X - live.X1),
+                                 MathF.Max(live.Z - worst.Pos.Z, worst.Pos.Z - live.Z1));
+            ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f),
+                string.Format(Loc.T("{0} spawn(s) are OUTSIDE this area and will be destroyed on spawn."), outside.Count));
+            ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f),
+                string.Format(Loc.T("Furthest: {0} at {1:0}/{2:0}, {3:0} m out."), worst.What, worst.Pos.X, worst.Pos.Z, by));
+            if (ImGui.Button(Loc.TL("Fit to spawns")))
+            {
+                NoteCombatAreaBaseline();
+                float mnX = PlacedSpawns().Min(o => o.Pos.X), mxX = PlacedSpawns().Max(o => o.Pos.X);
+                float mnZ = PlacedSpawns().Min(o => o.Pos.Z), mxZ = PlacedSpawns().Max(o => o.Pos.Z);
+                // Square, with room to move: a spawn point exactly on the edge is a coin toss.
+                const float pad = 48f;
+                float side = MathF.Max(mxX - mnX, mxZ - mnZ) + pad * 2f;
+                float cx = (mnX + mxX) * 0.5f, cz = (mnZ + mxZ) * 0.5f;
+                float nx = Math.Clamp(cx - side * 0.5f, 0f, MathF.Max(0f, cfg.WorldSize - side));
+                float nz = Math.Clamp(cz - side * 0.5f, 0f, MathF.Max(0f, cfg.WorldSize - side));
+                env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(nx, nz, side, side);
+                combatAreaDirty = true; lightingDirty = true;
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(Loc.T("Grow the area to a square holding every control point, vehicle spawner and\nsoldier spawn, with 48 m to spare."));
+        }
     }
     if (combatAreaDirty)
     {
