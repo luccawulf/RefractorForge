@@ -1477,6 +1477,7 @@ string? cloudMeshImportPath = null;    // imported cloud .sm/.obj to ship into t
 bool skyUseCubemap = true;              // use the level's real cubemap when loaded (else the procedural sun-sky)
 float skyRotDeg = 0f;                   // user yaw offset added to the level's Sky.setRotAngle
 bool skyRotEdited = false;              // the offset was folded into the level -> SkyAndSun.con is rewritten on save
+string? skyCubeBaseName = null;         // the level's own skybox face base (Sky_OI), so the water can mirror IT
 bool clearFoliageRequest = false;       // menu -> confirm popup next frame (clearing a whole map's growth is not small)
 byte[]? foliageUnderBackup = null, foliageOverBackup = null;   // what "Clear" replaced, so it can be put straight back
 bool unbakeLighting = false;            // write a FULLY LIT terrain shadow on save instead of a baked one
@@ -4858,7 +4859,7 @@ void DoSaveCore()
             PreviewSavedNav();   // re-read + show the saved map for a few seconds (verify)
         }
         // Skybox faces: same-named .dds overrides / the override .rs, written straight into the level folder.
-        foreach (var (rel, bytes) in SkyFacePieces())
+        foreach (var (rel, bytes) in SkyCubemapPieces().Concat(SkyFacePieces()))
         {
             var pth = System.IO.Path.Combine(levelDir, rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
             System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(pth)!);
@@ -4897,7 +4898,10 @@ void DoSaveCore()
         // silently dropped every painted map. Adding them under the level's own prefix is what the engine reads.
         foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
-        if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
+        if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; skyRotEdited = false; }   // clouds/sun/sky rotation -> patched SkyAndSun.con
+        else if (SkyAndSunNewEntry(baseRfa) is { } sn) { wxFiles.Add(sn); cloudsDirty = false; skyRotEdited = false; }   // ...or added, for a level that ships none
+        foreach (var cm in SkyCubemapPieces()) wxFiles.Add(cm);   // the level's own sky as a cube map, for the water
+        if (TerrainConNewEntry(baseRfa) is { } tn) wxFiles.Add(tn);   // water levels, for a level that ships no Terrain.con
         // Lighting AND the tunnel settings ride this one: both are Init.con lines, patched into the level's own
         // Init.con. Leaving it out is what silently dropped Game.isTunnelMap on an in-place save.
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }
@@ -4993,7 +4997,10 @@ void DoSavePatch(bool serverSideOnly = false)
         if (wxInit is { } we) extras.Add(we);
         foreach (var (name, bytes) in navFiles) wxFiles.Add(($"Pathfinding/{name}", bytes));
         if (CloudMeshNewEntry() is { } cme) wxFiles.Add(cme);   // ship the imported cloud mesh
-        if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; }   // clouds -> patched SkyAndSun.con
+        if (CloudRfaExtra(baseRfa) is { } cx) { extras.Add(cx); cloudsDirty = false; skyRotEdited = false; }   // clouds/sun/sky rotation -> patched SkyAndSun.con
+        else if (SkyAndSunNewEntry(baseRfa) is { } sn) { wxFiles.Add(sn); cloudsDirty = false; skyRotEdited = false; }   // ...or added, for a level that ships none
+        foreach (var cm in SkyCubemapPieces()) wxFiles.Add(cm);   // the level's own sky as a cube map, for the water
+        if (TerrainConNewEntry(baseRfa) is { } tn) wxFiles.Add(tn);   // water levels, for a level that ships no Terrain.con
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
@@ -8945,6 +8952,133 @@ void ImportCloudMesh()
 // aren't being changed or there's no base SkyAndSun.con entry to patch.
 // The level's SkyAndSun.con, patched with whatever the editor now owns in it: the animated-cloud block and, when
 // the sun has been aimed by hand, its direction.
+// A .con the level actually loads, from whichever mounted archive supplies it. rfaList is ordered with the base
+// map PREPENDED, so the level's own files are at the END - read it backwards. Within one archive an Init/ copy
+// wins, for the same reason the saver prefers it: retail Saigon68 keeps a BACKUP_SAIGON_TERRAIN/Terrain.con too.
+string[]? LayeredConLines(string suffix)
+{
+    for (int i = rfaList.Length - 1; i >= 0; i--)
+    {
+        try
+        {
+            var a = new RefractorFlatArchive(rfaList[i]);
+            var hits = a.Entries.Where(x => x.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (hits.Count == 0) continue;
+            var e = hits.FirstOrDefault(x => x.Name.Replace('\\', '/').Contains("/init/", StringComparison.OrdinalIgnoreCase))
+                    ?? hits[0];
+            return System.Text.Encoding.Latin1.GetString(a.Read(e)).Replace("\r\n", "\n").Split('\n');
+        }
+        catch { }
+    }
+    if (levelDir is not null && System.IO.Directory.Exists(levelDir))
+    {
+        var f = System.IO.Directory.EnumerateFiles(levelDir, suffix, System.IO.SearchOption.AllDirectories)
+                    .OrderByDescending(x => x.Replace('\\', '/').Contains("/Init/", StringComparison.OrdinalIgnoreCase))
+                    .FirstOrDefault();
+        if (f is not null) { try { return System.IO.File.ReadAllLines(f); } catch { } }
+    }
+    return null;
+}
+
+// Same hole as the sky: a level can ship no Terrain.con of its own and still HAVE terrain, out of a layered
+// archive. The water levels are patched into an EXISTING Terrain.con, so on a level without one the tunnel water
+// height went nowhere - which is exactly what echo's Saigon68 is, an archive of gameplay .con files.
+(string RelPath, byte[] Bytes)? TerrainConNewEntry(string baseRfa)
+{
+    if (!waterLevelEdited && !cfg.WriteWaterBelow) return null;
+    try
+    {
+        var arch = new RefractorFlatArchive(baseRfa);
+        if (arch.Entries.Any(x => x.Name.EndsWith("Terrain.con", StringComparison.OrdinalIgnoreCase)))
+            return null;                       // it IS here - the terrainConfig patch rewrites it in place
+        if (LayeredConLines("Terrain.con") is not { } lines) return null;
+        var patched = string.Join("\r\n", cfg.PatchConLines(lines)) + "\r\n";
+        Console.WriteLine("This level ships no Terrain.con - adding one under Init/ with the water levels.");
+        return ("Init/Terrain.con", System.Text.Encoding.Latin1.GetBytes(patched));
+    }
+    catch { return null; }
+}
+
+// A level can ship no SkyAndSun.con of its own and still HAVE a sky: Init.con runs one out of a layered archive.
+// Overriding a file that is not in this archive matches nothing and the extras path drops it in silence - which is
+// why turning the sky saved nothing on maps like Saigon68, whose archive holds only gameplay .con files. So when
+// the level does not have the file, ADD it under the level's own prefix, built from the sky it actually loads.
+(string RelPath, byte[] Bytes)? SkyAndSunNewEntry(string baseRfa)
+{
+    if ((!cloudsDirty && !sunEdited && !skyRotEdited) || env is null) return null;
+    try
+    {
+        var arch = new RefractorFlatArchive(baseRfa);
+        if (arch.Entries.Any(x => x.Name.EndsWith("SkyAndSun.con", StringComparison.OrdinalIgnoreCase)))
+            return null;                       // it IS here - CloudRfaExtra rewrites it in place instead
+        SaveCloudsToEnv();
+        var lines = LayeredConLines("SkyAndSun.con") ?? env.ToSkyAndSunConLines().ToArray();
+        var patched = string.Join("\r\n", env.PatchSkyAndSunConLines(lines)) + "\r\n";
+        Console.WriteLine("This level ships no SkyAndSun.con - adding one under Init/ with the sky settings.");
+        return ("Init/SkyAndSun.con", System.Text.Encoding.Latin1.GetBytes(patched));
+    }
+    catch { return null; }
+}
+
+// The level's own skybox as a cube map the WATER can mirror. Both .rcm files the game ships name the same generic
+// sky, so a map with its own skybox reflected somebody else's clouds; this ships one naming the level's own faces.
+//
+// A cube texture is INCOMPLETE - every sample comes back black - unless all six faces are one size, and BF skyboxes
+// routinely are not (Sky_OI's down face is 32px against 512 for the rest; the stock env_default's six are all
+// exactly the same size, which is the giveaway). So the faces are only referenced where they already live when
+// they happen to match; otherwise square copies are generated and shipped beside the .rcm.
+List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
+{
+    var outp = new List<(string, byte[])>();
+    var cm = typeof(RefractorForge.Formats.Terrain.CubeMapFile);
+    if (RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName) || meshLib?.Textures is null) return outp;
+    string b = skyCubeBaseName!;
+
+    var levelTex = rfaList.Length > 0 ? TextureLibrary.Open(rfaList.Where(File.Exists).ToArray()) : null;
+    Texture2D? RFace(string n) => levelTex?.Resolve(n) ?? meshLib.Textures.Resolve(n);
+    var faces = new Texture2D?[6];
+    for (int i = 0; i < 6; i++) faces[i] = RFace($"{b}_0{i + 1}");
+    if (faces.Any(f => f is null))
+    {
+        Console.WriteLine($"Water reflection: skybox '{b}' has no full set of _01.._06 faces - keeping the stock cube map.");
+        return outp;
+    }
+
+    // Same size everywhere? Then the engine can read the level's own faces directly and nothing needs copying.
+    int w = faces[0]!.Width, h = faces[0]!.Height;
+    bool uniform = faces.All(f => f!.Width == w && f.Height == h && f.Width == f.Height);
+    string faceBase = b;
+    if (!uniform)
+    {
+        // Square, one size, and small: this is a reflection, not the sky itself. The stock cube map's faces are
+        // tiny for exactly that reason.
+        const int Side = 128;
+        faceBase = b + "_env";
+        for (int i = 0; i < 6; i++)
+        {
+            var src = faces[i]!;
+            var rgba = new byte[Side * Side * 4];
+            for (int y = 0; y < Side; y++)
+                for (int x = 0; x < Side; x++)
+                {
+                    var c = src.SampleRGBA((x + 0.5f) / Side, (y + 0.5f) / Side);
+                    int o = (y * Side + x) * 4;
+                    rgba[o] = (byte)(c.X * 255f); rgba[o + 1] = (byte)(c.Y * 255f);
+                    rgba[o + 2] = (byte)(c.Z * 255f); rgba[o + 3] = 255;
+                }
+            outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.FaceRelPath(faceBase, i + 1),
+                      DdsTexture.EncodeUncompressed(new Texture2D(Side, Side, rgba))));
+        }
+        Console.WriteLine($"Water reflection: skybox '{b}' faces differ in size - shipping {Side}px square copies as '{faceBase}_0N.dds'.");
+    }
+    else Console.WriteLine($"Water reflection: pointing the water at the level's own sky '{b}' ({w}px faces).");
+
+    outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.RelPathFor(b),
+              System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Terrain.CubeMapFile.Text(faceBase))));
+    _ = cm;
+    return outp;
+}
+
 (string Name, byte[] Bytes)? CloudRfaExtra(string baseRfa)
 {
     if ((!cloudsDirty && !sunEdited && !skyRotEdited) || env is null) return null;
@@ -12271,7 +12405,12 @@ void EnsureWaterShaderLoaded()
 // tunnel-water level, ships the pair - so whenever tunnel water is on, so do we.
 void QueueWaterShader()
 {
-    var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity };
+    // Mirror the level's OWN sky when it has one. Both shipped .rcm files name the same generic sky, so without
+    // this a map with a custom skybox reflected clouds that are nowhere in it.
+    var cube = RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName)
+        ? waterShaderBase.Cubemap
+        : RefractorForge.Formats.Terrain.CubeMapFile.RefFor(skyCubeBaseName!);
+    var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity, Cubemap = cube };
     var below = cfg.DrawWaterBelowTerrain
         ? RefractorForge.Formats.Terrain.WaterShaderSettings.BelowTerrainDefault with { Reflectivity = waterBelowReflect, Opacity = waterBelowOpacity }
         : null;
@@ -14725,6 +14864,7 @@ unsafe void LoadSkyCubemap()
         if (RFace(stem + "_01") is not null) baseName = stem;
     }
     if (baseName is null && RFace("env_default_01") is not null) baseName = "env_default";
+    skyCubeBaseName = baseName;          // what the water should mirror, if the level brought its own sky
     if (baseName is null) return;
 
     var faces = new Texture2D?[6];

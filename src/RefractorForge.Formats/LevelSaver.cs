@@ -333,13 +333,19 @@ public static class LevelSaver
         // the root one is the level's own - the loader picks it the same way. Archive order is whatever the
         // packer wrote, so "first" could quietly aim an Init.con patch at Menu/init.con, where the game never
         // reads a renderer or tunnel setting.
-        string? best = null; int bestDepth = int.MaxValue;
+        // At EQUAL depth, one under Init/ wins. Retail Saigon68 ships both Init/Terrain.con and
+        // BACKUP_SAIGON_TERRAIN/Terrain.con at the same depth, and taking the first in archive order aimed every
+        // tunnel-water edit at the backup - a file the game never reads, so the level looked like it had not saved.
+        // Init/ is what the level's own `run Init/Terrain` names.
+        string? best = null; int bestDepth = int.MaxValue; bool bestInInit = false;
         foreach (var e in a.Entries)
         {
             if (!e.Name.EndsWith(suffix, System.StringComparison.OrdinalIgnoreCase)) continue;
             if (preferConquest && e.Name.ToLowerInvariant().Contains("conquest")) return e.Name;
             int depth = e.Name.Count(c => c == '/' || c == '\\');
-            if (depth < bestDepth) { bestDepth = depth; best = e.Name; }
+            bool inInit = e.Name.Replace('\\', '/').Contains("/init/", System.StringComparison.OrdinalIgnoreCase);
+            if (depth < bestDepth || (depth == bestDepth && inInit && !bestInInit))
+            { bestDepth = depth; best = e.Name; bestInInit = inInit; }
         }
         return best;
     }
