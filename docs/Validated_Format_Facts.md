@@ -80,3 +80,36 @@ BF1942's `128_planes`). Full byte layout in **[RFA_Format_Notes.md](RFA_Format_N
 The headless `RefractorForge.Demo` harness and `RefractorForge.TerrainTests` exercise these formats — e.g.
 `rfaroundtrip` (archive byte-exactness), `lsbroundtrip` (lightmap byte-exactness), `foliageedit`, `minimap`,
 and `shadowbake`. See [BUILD_AND_RUN.md](BUILD_AND_RUN.md) for the commands.
+
+
+## Out of bounds: the combat area is only half of it - material 7 is `deathMaterial`
+
+Cracked from `BfVietnam.exe` (static disassembly, 2026-09-06) after a custom map kept reporting OUT OF COMBAT AREA
+hundreds of metres inside every rectangle it was given.
+
+`Game::isOutsideWorld(x, z)` - `Game` vtable slot 23, impl `0x004F9060`, reached through the Game singleton at
+`[0xD45950]` - decides "outside" in two steps:
+
+1. Past the rectangle. The rectangle is `game.setActiveCombatArea x z w h` when set (flag `Game+0x119`, rect
+   `+0x11C..+0x128`; `setActiveCombatArea` also sets the flag), otherwise `(0, 0)`-`(worldSizeX, worldSizeZ)` from
+   the terrain. Offset is measured from the south-west corner; `Operation_Game_Warden` keeps its whole US base
+   inside only under that reading.
+2. **Then, even inside the rectangle**: `PatchTerrain::getMaterialAt(x, z) == 7` (terrain vtable slot 21, impl
+   `0x00721C50`; cell = `floor(x * cells / worldSize)`, a 4-bit bitmap at `PatchTerrain+0x3A0` loaded straight from
+   `MaterialMap.raw` - **no palette is consulted**). The engine's own material table is `default, water, dryGrass,
+   juicyGrass, dryDirt, wetDirt, mud, deathMaterial, gravel, muddyWater, drySand, wetSand, rock, sandRoad,
+   dirtRoad, pavelRoad`: **index 7 is `deathMaterial`.**
+
+Everything downstream hangs off that one predicate: `ObjectTemplate.damageForBeingOutSideWorld × dt` is applied
+when it returns 1 (`0x0069729F`), and the HUD elements are literally `Outside`, `OutsideText`, `OutsideTime`.
+
+Retail uses material 7 on purpose. Of the 84 stock BFV levels, 47 paint it across 60-90 % of the map - it is the
+void around the playable island (retail Saigon68: 79.9 %) - and every stock spawn sits on something else. A custom
+map that lays content across that void **without repainting the material map** inherits a kill zone that no
+Init.con setting can remove: a vehicle "spawns in the right place and blows up", a flag shows OUT OF COMBAT AREA to
+whoever walks up to it, and the transport pad 58 m away is fine because it happens to sit on index 14.
+
+RefractorForge: `Formats/Terrain/DeathMaterial.cs` (engine-exact lookup, count inside an area, `Repaint` - water
+below the water line, nearest painted land material elsewhere, boundary left alone, undoable); the map check flags
+every control point, vehicle spawner and soldier spawn on 7; the Combat Area panel shows the count and offers
+*Repaint deathMaterial inside area*; the painter labels index 7.
