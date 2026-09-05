@@ -442,6 +442,7 @@ uniform vec3 uLightDir; uniform vec3 uColor; uniform vec3 uTint;
 // uAlphaRef is the alpha-test threshold and is INDEPENDENT of that - mode 2 carries one whenever its .rs does.
 uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform sampler2D uTex;
 uniform float uAlphaRef;   // 0 = this material never discards
+uniform float uMinOpacity; // blended glass: what it keeps face-on, from the .rs `opacity` (0.30 when unstated)
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
 uniform vec3 uLmAmbient;                                  // renderer.LMambientColor: added to every lightmapped surface, as the engine does
 uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
@@ -540,7 +541,16 @@ void main(){
     // instead of letting sky through at the soft edges - vegetation needs those partly-transparent texels.
     float outA = 1.0;
     if (uAlphaEnable==1) {
-        if (uAlphaTest==2)      outA = max(a, 0.30);
+        if (uAlphaTest==2) {
+            // Refractor glass is mostly REFLECTION - the assault Huey's canopy is `reflectivity .6` over an
+            // `opacity .2` base - and none of that cubemap is drawn here, so honouring the opacity alone left a
+            // canopy looking like a hole in the aircraft. A fresnel term stands in for the reflection: glass turns
+            // mirror-solid at grazing angles and stays clear face-on, which is what the eye reads as a pane.
+            vec3 v = normalize(uCamPos - vWorld);
+            float fres = pow(1.0 - abs(dot(normalize(vN), v)), 3.0);
+            outA = clamp(max(a, uMinOpacity) + 0.55*fres, 0.0, 1.0);
+            c += vec3(0.10, 0.11, 0.13) * fres;        // a cool sheen, the sky the cubemap would have given it
+        }
         else if (uAlphaTest==1) outA = a;
     }
     frag = vec4(c, outA);
@@ -8248,6 +8258,7 @@ void Inspector()
         }
         else
         {
+            FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
             ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref gpInsRot, 1f);
             if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
                 hist.Do(new GameplayRotateCommand(gameplayEdit, gpKind, gpIndex, new Vec3(gpInsRot.X, gpInsRot.Y, gpInsRot.Z), null));
@@ -9214,12 +9225,14 @@ void EnvironmentPanel()
                 { cfg.WaterBelowLevel = SafeBelowWaterLevel(); cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; lightingDirty = true; }
             }
             var wasBelow = belowColor;
+            FitLabel(Loc.TL("Tunnel water colour"));
             bool bcol = ImGui.ColorEdit3(Loc.TL("Tunnel water colour"), ref belowColor);
             if (bcol && Vector3.DistanceSquared(belowShallowColor, wasBelow) < 1e-4f) belowShallowColor = belowColor;
             ImGui.SetNextItemWidth(150f);
             // shallowColor is what the game shows in shallow water - most of a flooded tunnel. It is a separate
             // setting from the colour above, and it was invisible here, so a level whose two disagreed looked right
             // in the viewport and wrong in the game with no way to tell why.
+            FitLabel(Loc.TL("Tunnel shallow colour"));
             bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
             if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
@@ -9715,8 +9728,23 @@ void OpenMod()
 // Drop-in replacements for ImGui.SliderFloat / ImGui.SliderInt that let you RIGHT-CLICK the slider to type an exact
 // value (it swaps to a focused input box until you press Enter or click away). Every slider in the editor goes through
 // these. They honour any SetNextItemWidth the caller set (the input/slider is the single next item).
+// ImGui puts a widget's label to its RIGHT, so a widget sized without regard to its label pushes that label off the
+// panel and it is silently clipped - "Offset X, Z / Size X, Z" read as "Offset X, Z /". Shrink the pending item just
+// enough that its label fits, and only when it would not: a width that already fits is left exactly as the call site
+// asked for, so nothing that reads correctly today changes.
+void FitLabel(string label)
+{
+    float want = ImGui.CalcItemWidth();                       // honours any SetNextItemWidth already queued
+    float avail = ImGui.GetContentRegionAvail().X;
+    float labelW = ImGui.CalcTextSize(label, true).X;         // true = ignore the ###id part, which is not drawn
+    if (labelW <= 0f) return;                                 // "##hidden" labels need no room
+    float room = avail - labelW - ImGui.GetStyle().ItemInnerSpacing.X - 4f;
+    if (want > room && room >= 48f) ImGui.SetNextItemWidth(room);
+}
+
 bool SldF(string label, ref float v, float min, float max, string fmt = "%.3f")
 {
+    FitLabel(label);
     uint id = ImGui.GetID(label);
     if (sliderEditId == id)
     {
@@ -9731,6 +9759,7 @@ bool SldF(string label, ref float v, float min, float max, string fmt = "%.3f")
 }
 bool SldI(string label, ref int v, int min, int max, string fmt = "%d")
 {
+    FitLabel(label);
     uint id = ImGui.GetID(label);
     if (sliderEditId == id)
     {
@@ -10715,6 +10744,7 @@ void CollabModal()
     if (!ImGui.BeginPopupModal(Loc.TL("Collaborate"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
     ImGui.InputText(Loc.TL("Your name"), ref collabName, 32);
+    FitLabel(Loc.TL("Password (optional)"));
     ImGui.InputText(Loc.TL("Password (optional)"), ref collabPass, 64, ImGuiInputTextFlags.Password);
     ImGui.Spacing();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Host a session"));
@@ -13200,6 +13230,7 @@ void CombatAreaPanel()
     var ca = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
     var v = new Vector4(ca.X, ca.Z, ca.Width, ca.Height);
     ImGui.SetNextItemWidth(260f * uiScale);
+    FitLabel(Loc.TL("Offset X, Z / Size X, Z"));
     if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Size X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
     {
         env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(v.X, v.Y, MathF.Max(v.Z, 16f), MathF.Max(v.W, 16f));
@@ -13700,9 +13731,8 @@ void LightsPanel()
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
     if (ImGui.Button(Loc.TL("Bake Lightmaps (sun + placed lights)"))) BakeAllLighting();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Terrain sun-shadow, every object's lightmap (with these lights) and the ground pools, in one go.\nShown at once; Save writes them. Also under Tools > Lighting."));
-    ImGui.SetNextItemWidth(150f);
+    ImGui.SetNextItemWidth(150f * uiScale);
     SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
-    ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
 
@@ -14058,8 +14088,10 @@ void EditCpModal()
     if (ecpIndex < 0 || ecpIndex >= gameplayEdit.ControlPoints.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
 
     ImGui.InputText(Loc.TL("Name"), ref ecpName, 64u);
+    FitLabel(Loc.TL("Control point name"));
     ImGui.InputText(Loc.TL("Control point name"), ref ecpCpName, 64u);
     ImGui.DragFloat3(Loc.TL("Position"), ref ecpPos, 0.25f);
+    FitLabel(Loc.TL("Capture radius (m)"));
     ImGui.DragFloat(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
     string[] teams = TeamLabels();
     int teamIdx = Math.Clamp(ecpTeam, 0, 2);
@@ -14070,7 +14102,9 @@ void EditCpModal()
     if (gameIsBf1942)
     {
         ImGui.Separator(); ImGui.TextDisabled(Loc.T("Capture timing / behaviour (BF1942)"));
+        FitLabel(Loc.TL("Time to get control"));
         ImGui.InputInt(Loc.TL("Time to get control"), ref ecpTimeGet);
+        FitLabel(Loc.TL("Time to lose control"));
         ImGui.InputInt(Loc.TL("Time to lose control"), ref ecpTimeLose);
         bool b;
         b = ecpDisEnemy != 0; if (ImGui.Checkbox(Loc.TL("Disable if enemy inside radius"), ref b)) ecpDisEnemy = b ? 1 : 0;
@@ -14079,6 +14113,7 @@ void EditCpModal()
         b = ecpLoseNot != 0; if (ImGui.Checkbox(Loc.TL("Lose control when not close"), ref b)) ecpLoseNot = b ? 1 : 0;
         b = ecpUnable != 0; if (ImGui.Checkbox(Loc.TL("Unable to change team"), ref b)) ecpUnable = b ? 1 : 0;
         b = ecpCollision != 0; if (ImGui.Checkbox(Loc.TL("Has collision physics"), ref b)) ecpCollision = b ? 1 : 0;
+        FitLabel(Loc.TL("Only takable by team"));
         ImGui.InputInt(Loc.TL("Only takable by team"), ref ecpOnlyTeam);
     }
     else
@@ -14123,6 +14158,7 @@ void EditVehModal()
     if (evIndex < 0 || evIndex >= gameplayEdit.VehicleSpawns.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
     ImGui.InputText(Loc.TL("Name"), ref evName, 64u);
     ImGui.DragFloat3(Loc.TL("Position"), ref evPos, 0.25f);
+    FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
     ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
     ImGui.InputInt(Loc.TL("OS id"), ref evOsId);
     string[] vteams = TeamLabels();
@@ -14137,14 +14173,18 @@ void EditVehModal()
     ImGui.TextDisabled(Loc.T("TEMPLATE (shared by every spawn using it)"));
     ImGui.InputText(Loc.TL("Team 1 object"), ref evVeh1, 64u);
     ImGui.InputText(Loc.TL("Team 2 object"), ref evVeh2, 64u);
+    FitLabel(Loc.TL("Min spawn delay (s)"));
     ImGui.InputInt(Loc.TL("Min spawn delay (s)"), ref evMinDelay);
+    FitLabel(Loc.TL("Max spawn delay (s)"));
     ImGui.InputInt(Loc.TL("Max spawn delay (s)"), ref evMaxDelay);
+    FitLabel(Loc.TL("Spawn delay at start (s)"));
     ImGui.InputInt(Loc.TL("Spawn delay at start (s)"), ref evDelayStart);
     ImGui.InputInt(Loc.TL("Time to live (s)"), ref evTtl);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How long an abandoned vehicle survives before it starts taking damage."));
     ImGui.InputInt(Loc.TL("Distance (m)"), ref evDist);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far from its spawn the vehicle must be before Time to live counts down."));
     ImGui.InputInt(Loc.TL("Damage when lost"), ref evDmgLost);
+    FitLabel(Loc.TL("Max spawned at once"));
     ImGui.InputInt(Loc.TL("Max spawned at once"), ref evMaxSpawned);
     ImGui.TextDisabled(Loc.T("Only fields the level already declares are written back."));
     ImGui.Separator();
@@ -14188,6 +14228,7 @@ void EditSolModal()
     ImGui.InputInt(Loc.TL("Spawn id"), ref esSpawnId);
     ImGui.Checkbox(Loc.TL("Spawn as paratrooper"), ref esPara);
     ImGui.DragFloat3(Loc.TL("Position"), ref esPos, 0.25f);
+    FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
     ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref esRot, 1f);
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("Spawn group ties this to its control point."));

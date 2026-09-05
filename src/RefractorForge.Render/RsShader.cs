@@ -18,8 +18,18 @@ public sealed class RsShaderSet
     /// ropes, painted markings. Across the stock BF1942 shaders that split is 178 blends vs 59 cutouts, and getting
     /// it wrong is what made the Willys' engine grill see-through: its sheet is 71% low-alpha, so blending it left
     /// almost nothing on screen where the engine punches a clean grille out of it.</summary>
+    /// <param name="GlossInAlpha">The material declares <c>glossMapInAlphaDiffuse</c>: its texture's alpha channel
+    /// is a SPECULAR GLOSS MASK, not transparency. 398 of BFVietnam's 1994 shaders say this (BF1942's older ones
+    /// never do, which is why that game needs the statistical guess). Reading such a channel as transparency is what
+    /// made the assault Huey's cockpit interior vanish - its <c>ve_hueycockpit</c> alpha is mostly dark gloss.</param>
+    /// <param name="Opacity">The material's own <c>opacity</c>, which the shaders comment as "minimum opacity" -
+    /// what a blended pane keeps when its texture alpha is zero. BFVietnam glass uses 0.2 alongside a
+    /// <c>reflectivity</c> the viewport cannot show, so the pane reads far emptier here than in game.</param>
+    /// <param name="DepthWrite">False when the material declares <c>depthWrite false</c> - blended glass must not
+    /// stamp the depth buffer, or whatever is drawn after it never appears through the pane.</param>
     public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade,
-                                        bool Transparent = false, float? AlphaTestRef = null);
+                                        bool Transparent = false, float? AlphaTestRef = null,
+                                        bool GlossInAlpha = false, float? Opacity = null, bool DepthWrite = true);
 
     private readonly Dictionary<string, MaterialShader> _byName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -30,7 +40,7 @@ public sealed class RsShaderSet
         var set = new RsShaderSet();
         string? curName = null, curTex = null;
         Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
-        float? alphaRef = null;
+        float? alphaRef = null; bool gloss = false; float? opacity = null; bool depthWrite = true;
 
         foreach (var rawLine in text.Split('\n'))
         {
@@ -41,12 +51,14 @@ public sealed class RsShaderSet
                 var q = SplitQuoted(line);
                 curName = q.Count > 0 ? q[0] : null;
                 curTex = null; diffuse = Vector3.One; fade = false; transp = false; alphaRef = null;
+                gloss = false; opacity = null; depthWrite = true;
             }
             else if (line.StartsWith("{")) inBlock = true;
             else if (line.StartsWith("}"))
             {
                 if (curName is not null)
-                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp, alphaRef);
+                    set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp, alphaRef,
+                                                             gloss, opacity, depthWrite);
                 inBlock = false; curName = null;
             }
             else if (inBlock && curName is not null)
@@ -69,6 +81,17 @@ public sealed class RsShaderSet
                     fade = line.Contains("true", StringComparison.OrdinalIgnoreCase);
                 else if (line.StartsWith("transparent", StringComparison.OrdinalIgnoreCase))
                     transp = line.Contains("true", StringComparison.OrdinalIgnoreCase);   // BF1942 glass/canopy: alpha-blended material
+                else if (line.StartsWith("glossMapInAlphaDiffuse", StringComparison.OrdinalIgnoreCase))
+                    gloss = line.Contains("true", StringComparison.OrdinalIgnoreCase);
+                else if (line.StartsWith("depthWrite", StringComparison.OrdinalIgnoreCase))
+                    depthWrite = !line.Contains("false", StringComparison.OrdinalIgnoreCase);
+                else if (line.StartsWith("opacity", StringComparison.OrdinalIgnoreCase))
+                {
+                    // "Opacity .2;//minimun opacity" - a trailing comment is normal here, so cut at the ';' or '//'.
+                    var v = line[7..].Split("//")[0].Trim().TrimEnd(';').Trim();
+                    if (float.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var op))
+                        opacity = Math.Clamp(op, 0f, 1f);
+                }
                 else if (line.StartsWith("alphaTestRef", StringComparison.OrdinalIgnoreCase))
                 {
                     // "alphaTestRef 0.7" - texels below this alpha are DISCARDED outright. Its presence is what

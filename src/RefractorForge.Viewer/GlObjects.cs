@@ -13,7 +13,7 @@ namespace RefractorForge.Viewer;
 /// </summary>
 sealed class GlObjects
 {
-    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; }
+    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; public float? Opacity; public bool DepthWrite; }
 
     /// <summary>The shader's uAlphaTest mode for a part, plus its alpha-test threshold. Mode picks OUTPUT and
     /// LIGHTING; the threshold is independent and applies in every mode, because a blended material can carry an
@@ -25,20 +25,33 @@ sealed class GlObjects
         : p.AlphaTest ? (p.Foliage ? 1 : 3, p.AlphaRef ?? 0.33f)
         : (0, 0f);
 
-    // uAlphaRef is resolved here rather than threaded through every Draw* signature (there are a dozen call sites).
-    private uint _refProg; private int _refLoc = -1;
-    private int AlphaRefLoc(GL gl, uint prog)
+    // uAlphaRef and uMinOpacity are resolved here rather than threaded through every Draw* signature (there are a
+    // dozen call sites).
+    private uint _refProg; private int _refLoc = -1, _minOpacityLoc = -1;
+    private void ResolveLocs(GL gl, uint prog)
     {
-        if (prog != _refProg) { _refProg = prog; _refLoc = gl.GetUniformLocation(prog, "uAlphaRef"); }
-        return _refLoc;
+        if (prog == _refProg) return;
+        _refProg = prog;
+        _refLoc = gl.GetUniformLocation(prog, "uAlphaRef");
+        _minOpacityLoc = gl.GetUniformLocation(prog, "uMinOpacity");
     }
+
+    /// <summary>How solid a blended pane stays when its texture alpha is nothing. The .rs calls this "minimum
+    /// opacity" and BFVietnam glass authors 0.2 - but it pairs that with a <c>reflectivity</c> cubemap the viewport
+    /// cannot draw, and the reflection is most of what makes a canopy read as glass rather than a hole. The
+    /// shader makes up the difference with a fresnel sheen, so the authored floor can be honoured as written.</summary>
+    private const float DefaultMinOpacity = 0.30f;      // what BF1942 material with no opacity line has always used
 
     private void SetAlpha(GL gl, uint prog, int uAlphaTest, Part part)
     {
         var (mode, aref) = AlphaModeOf(part);
         gl.Uniform1(uAlphaTest, mode);
-        int loc = AlphaRefLoc(gl, prog);
-        if (loc >= 0) gl.Uniform1(loc, aref);
+        ResolveLocs(gl, prog);
+        if (_refLoc >= 0) gl.Uniform1(_refLoc, aref);
+        if (_minOpacityLoc >= 0) gl.Uniform1(_minOpacityLoc, part.Opacity ?? DefaultMinOpacity);
+        // `depthWrite false` on 97 of BFVietnam's shaders, all of them blended glass. Objects are drawn unsorted
+        // here, so a pane that stamped depth erased whatever was drawn after it - the aircraft behind its own canopy.
+        gl.DepthMask(part.DepthWrite);
     }
     private sealed class Template { public uint Vao; public Part[] Parts = Array.Empty<Part>(); public Vector3 BbMin; public Vector3 BbMax; }
 
@@ -301,12 +314,13 @@ sealed class GlObjects
                 else
                 {
                     gl.Uniform1(uUseTex, 0);
-                    gl.Uniform1(uAlphaTest, 0);
+                    gl.Uniform1(uAlphaTest, 0); gl.DepthMask(true);
                     gl.Uniform3(uColor, part.Color.X, part.Color.Y, part.Color.Z);
                 }
                 gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
             }
         }
+            gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
     }
 
     /// <summary>Replace the overgrowth-foliage overlay with these (template, world) instances, uploading any
@@ -366,13 +380,14 @@ sealed class GlObjects
                     else
                     {
                         gl.Uniform1(uUseTex, 0);
-                        gl.Uniform1(uAlphaTest, 0);
+                        gl.Uniform1(uAlphaTest, 0); gl.DepthMask(true);
                         gl.Uniform3(uColor, part.Color.X, part.Color.Y, part.Color.Z);
                     }
                     gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
                 }
             }
         }
+            gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
     }
 
     /// <summary>Upload a mesh under a cache key (once), returning its template. Used for gameplay-spawn
@@ -412,7 +427,7 @@ sealed class GlObjects
             int off = allIdx.Count;
             foreach (var ix in part.Indices) allIdx.Add((uint)ix);
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
-            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage });
+            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage, Opacity = part.Opacity, DepthWrite = part.DepthWrite });
         }
         Bounds(pos, out var bbMin, out var bbMax);
         var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = parts.ToArray(), BbMin = bbMin, BbMax = bbMax };
@@ -439,7 +454,7 @@ sealed class GlObjects
             if (solidColor is Vector3 sc)   // flat untextured colour for every part (e.g. a neutral white flag cloth)
             {
                 gl.Uniform1(uUseTex, 0);
-                gl.Uniform1(uAlphaTest, 0);
+                gl.Uniform1(uAlphaTest, 0); gl.DepthMask(true);
                 gl.Uniform3(uColor, sc.X, sc.Y, sc.Z);
             }
             else if (part.Tex != 0)
@@ -451,11 +466,12 @@ sealed class GlObjects
             else
             {
                 gl.Uniform1(uUseTex, 0);
-                gl.Uniform1(uAlphaTest, 0);
+                gl.Uniform1(uAlphaTest, 0); gl.DepthMask(true);
                 gl.Uniform3(uColor, part.Color.X, part.Color.Y, part.Color.Z);
             }
             gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
         }
+            gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
     }
 
     /// <summary>Largest object texture uploaded, or 0 to use the map's own resolution (the default). Object

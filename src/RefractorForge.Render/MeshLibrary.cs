@@ -49,7 +49,7 @@ public sealed class MeshLibrary
     /// diffuse shading turns a canopy near-black). It is tracked separately from <paramref name="AlphaRef"/> because
     /// foliage now carries a threshold of its own, worked out from the texture; before that, "has a ref" was used as
     /// a stand-in for "is a hard surface", and reusing it here would have made every tree dark.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false);
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false, float? Opacity = null, bool DepthWrite = true);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -1454,12 +1454,24 @@ public sealed class MeshLibrary
             float? aref = sh?.AlphaTestRef is { } r && AlphaReaches(tex, r) ? r : null;
             // No shader to consult -> read the alpha channel itself, exactly as the .tm tree path does.
             var auto = sh is null ? ProfileAlpha(tex) : default;
-            bool cutout = !blend && (aref is not null || sh?.TextureFade == true || IsCutout(sh?.Texture) || auto.Cutout);
+            // `glossMapInAlphaDiffuse` settles the question outright: the alpha channel is a SPECULAR mask and means
+            // nothing about transparency, so the material is solid whatever its name or its histogram suggest. This
+            // is the assault Huey: its cockpit interior is `ve_hueycockpit`, whose name trips the "cockpit" rule in
+            // IsCutout below, and reading that gloss mask as coverage rendered the inside of the aircraft - and so
+            // the aircraft - nearly invisible. The transport has no cockpit mesh, which is why only one was wrong.
+            bool glossAlpha = sh?.GlossInAlpha == true;
+            bool cutout = !blend && !glossAlpha
+                          && (aref is not null || sh?.TextureFade == true || IsCutout(sh?.Texture) || auto.Cutout);
             // Vegetation is lit flat; a material the .rs explicitly alpha-tested is a hard surface and is shaded solid.
             bool foliage = cutout && aref is null;
             parts.Add(new MaterialPart(idx.ToArray(), RsShaderSet.ColorFor(sh), tex, AlphaTest: cutout, Blend: blend,
                                        TextureName: sh?.Texture, AlphaRef: aref ?? (auto.Cutout ? auto.Ref : null),
-                                       Foliage: foliage));
+                                       Foliage: foliage,
+                                       // A blended pane keeps its authored minimum rather than a guessed one, and
+                                       // glass that says depthWrite false must not stamp depth: the viewport draws
+                                       // objects unsorted, so a pane that wrote depth erased whatever came after it.
+                                       Opacity: blend ? sh?.Opacity : null,
+                                       DepthWrite: sh?.DepthWrite != false));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())
