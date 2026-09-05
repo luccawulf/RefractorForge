@@ -24,6 +24,8 @@ public static class LevelValidator
         public Heightmap? Heightmap { get; init; }
         public TerrainConfig? Config { get; init; }
         public CombatArea? CombatArea { get; init; }
+        /// <summary>The material map. Index 7 is deathMaterial - the engine treats it as outside the world.</summary>
+        public MaterialMap? Material { get; init; }
 
         /// <summary>Local-space bounds of a template, or null if unknown. Used for float/bury checks.</summary>
         public Func<string, (Vec3 Min, Vec3 Max)?>? Bounds { get; init; }
@@ -41,6 +43,7 @@ public static class LevelValidator
         var r = new LevelReport("Map check");
         if (inp.Objects is not null) CheckObjects(inp, r);
         if (inp.Gameplay is not null) CheckGameplay(inp, r);
+        CheckDeathMaterial(inp, r);
         return r;
     }
 
@@ -171,6 +174,40 @@ public static class LevelValidator
         foreach (int team in new[] { 1, 2 })
             if (gp.ControlPoints.Count > 0 && !gp.ControlPoints.Any(c => c.Team == team))
                 r.Add(IssueSeverity.Warning, "Gameplay", $"Team {team} owns no control point at the start");
+    }
+
+    // Material 7 is deathMaterial. Game::isOutsideWorld(x, z) returns "outside" for any position whose material
+    // cell is 7, exactly as it does for a position past the combat-area rectangle - so a spawner on it is
+    // destroyed the moment it appears and a player walking onto it gets OUT OF COMBAT AREA and the countdown,
+    // whatever the combat area says. Retail paints the void around every island with it; a map built across that
+    // void without repainting inherits a kill zone it cannot see. Saigon68 had 68 spawns on it.
+    private static void CheckDeathMaterial(Inputs inp, LevelReport r)
+    {
+        if (inp.Material is null || inp.Config is null) return;
+        var map = inp.Material; var cfg = inp.Config;
+        const string cat = "On deathMaterial";
+        string why = "material 7 (deathMaterial) - the engine treats it as OUTSIDE THE WORLD";
+
+        if (inp.Gameplay is { } gp)
+        {
+            foreach (var cp in gp.ControlPoints)
+                if (DeathMaterial.IsDeath(map, cfg, cp.Position.X, cp.Position.Z))
+                    r.Add(IssueSeverity.Error, cat, $"'{cp.Name}' stands on {why}: anyone at the flag gets OUT OF COMBAT AREA", cp.Position);
+            foreach (var v in gp.VehicleSpawns)
+                if (DeathMaterial.IsDeath(map, cfg, v.Position.X, v.Position.Z))
+                    r.Add(IssueSeverity.Error, cat, $"'{v.Name}' stands on {why}: the vehicle is destroyed as it spawns", v.Position);
+            foreach (var sp in gp.SoldierSpawns)
+                if (DeathMaterial.IsDeath(map, cfg, sp.Position.X, sp.Position.Z))
+                    r.Add(IssueSeverity.Error, cat, $"'{sp.Name}' stands on {why}: spawning there starts the countdown", sp.Position);
+        }
+
+        // And the area as a whole: deathMaterial inside the combat area is ground the mapper thinks is playable.
+        var area = inp.CombatArea ?? CombatArea.Whole(cfg.WorldSize);
+        var (death, total) = DeathMaterial.CountInside(map, cfg, area);
+        if (death > 0 && total > 0)
+            r.Add(IssueSeverity.Warning, cat,
+                $"{death} of the {total} material cells inside the combat area are deathMaterial ({100f * death / total:0}%) - " +
+                "players there are out of bounds. Combat Area panel > Repaint deathMaterial inside area fixes it.");
     }
 
     private static void CheckAboveGround(Inputs inp, LevelReport r, string cat, string name, Vec3 pos)

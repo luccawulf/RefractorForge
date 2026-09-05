@@ -3787,6 +3787,7 @@ void DrawGridLabels()
                 // (index.dat order) -- NOT the old matNames guess, which was a different, wrong order (it showed
                 // jungle grass as "Wet Sand"). Name only (no leading index number).
                 string name = mi < surfNames.Length ? surfNames[mi] : mi.ToString();
+                if (mi == RefractorForge.Formats.Terrain.DeathMaterial.Index) name += " DEATH";   // out of the world, in the engine's eyes
                 var at = s - ImGui.CalcTextSize(name) * 0.5f;   // centre the name in the cell
                 dl.AddText(at + new Vector2(1f, 1f), 0xCC000000, name);
                 dl.AddText(at, col, name);
@@ -5103,6 +5104,10 @@ IEnumerable<(string What, Vec3 Pos)> PlacedSpawns()
     foreach (var v in gameplayEdit.VehicleSpawns) yield return (string.IsNullOrEmpty(v.Vehicle) ? v.Name : v.Vehicle, v.Position);
     foreach (var d in gameplayEdit.SoldierSpawns) yield return (d.Name, d.Position);
 }
+
+// Re-upload the material texture whichever paint layer is active, for edits that come from a panel button
+// rather than the brush.
+void RefreshMaterialTexture() => UploadPaintTexture(materialMap);
 
 // The rectangle the level's in-game map image was drawn for, remembered the moment before it stops being true.
 void NoteCombatAreaBaseline()
@@ -8246,6 +8251,8 @@ void Inspector()
                 // and the on-map labels - the old matNames order was wrong (it mislabelled jungle grass as Wet Sand).
                 int hSlot = activeMaterial < matToSurf.Length ? (matToSurf[activeMaterial] & 15) : (activeMaterial & 15);
                 ImGui.Text($"Material #{activeMaterial}  {(hSlot < surfNames.Length ? surfNames[hSlot] : "")}");
+                if (activeMaterial == RefractorForge.Formats.Terrain.DeathMaterial.Index)
+                    ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f), Loc.T("deathMaterial: the game treats this as OUTSIDE THE WORLD - anything on it is out of bounds."));
                 // 16-swatch material palette (8 per row); click selects the active material index.
                 for (int i = 0; i < 16; i++)
                 {
@@ -8255,7 +8262,9 @@ void Inspector()
                     if (ImGui.ColorButton($"mat{i}", texSwatch[slot], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)))
                         activeMaterial = (byte)i;
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}"
+                            + (i == RefractorForge.Formats.Terrain.DeathMaterial.Index ? "\n" + Loc.T("deathMaterial - OUT OF BOUNDS. The engine kills on this, whatever the combat area says.") : ""));
                     if (i % 8 != 7 && i != 15) ImGui.SameLine();
                 }
                 SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
@@ -13870,6 +13879,35 @@ void CombatAreaPanel()
                 ImGui.SetTooltip(Loc.T("Grow the area to a square holding every control point, vehicle spawner and\nsoldier spawn, with 48 m to spare."));
         }
     }
+    // Material 7 is deathMaterial. Game::isOutsideWorld returns "outside" for a position on it exactly as it does
+    // for one past the rectangle, so a spawn on it is destroyed as it appears and a player walking onto it gets the
+    // countdown - whatever the combat area says. Retail paints the void around every island with it, and a map
+    // built across that void without repainting inherits a kill zone it cannot see. Saigon68 had 68 spawns on it.
+    if (materialMap is not null)
+    {
+        var dArea = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
+        var (dCount, dTotal) = RefractorForge.Formats.Terrain.DeathMaterial.CountInside(materialMap, cfg, dArea);
+        var onDeath = PlacedSpawns().Where(s => RefractorForge.Formats.Terrain.DeathMaterial.IsDeath(materialMap, cfg, s.Pos.X, s.Pos.Z)).ToList();
+        if (dCount > 0 || onDeath.Count > 0)
+        {
+            ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f),
+                string.Format(Loc.T("{0} spawn(s) stand on deathMaterial (7); {1}% of this area is painted with it."),
+                              onDeath.Count, dTotal > 0 ? 100 * dCount / dTotal : 0));
+            ImGui.TextDisabled(Loc.T("The game treats material 7 as OUTSIDE THE WORLD, whatever the combat area says."));
+            if (ImGui.Button(Loc.TL("Repaint deathMaterial inside area")))
+            {
+                var dEdit = RefractorForge.Formats.Terrain.DeathMaterial.Repaint(materialMap, heightmap, cfg, dArea);
+                if (dEdit is not null)
+                {
+                    if (hist is not null) hist.Do(new MaterialStrokeCommand(dEdit, materialMap, RefreshMaterialTexture));
+                    else RefreshMaterialTexture();
+                    Toast(string.Format(Loc.T("Repainted {0} deathMaterial cells inside the combat area. Outside it is left as the boundary."), dCount));
+                }
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(Loc.T("Below the water line a cell becomes water; above it, the nearest painted land material.\nCells outside the area stay deathMaterial - that is your boundary. Undo with Ctrl+Z."));
+        }
+    }
     if (combatAreaDirty)
     {
         ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
@@ -13909,6 +13947,7 @@ void RunMapValidation()
     {
         Objects = so, Gameplay = gameplayEdit, Heightmap = heightmap, Config = cfg,
         CombatArea = env?.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize),
+        Material = materialMap,
         Bounds = TemplateBoundsOf,
         // An ammo spawner, an effect or a sound has no mesh but the game creates it; only a name nothing declares is missing.
         TemplateExists = meshLib is null ? null : (t => TemplateExistsAnywhere(t) || meshLib.KnowsTemplate(t)),
