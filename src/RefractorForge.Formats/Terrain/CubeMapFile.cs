@@ -25,8 +25,17 @@ public static class CubeMapFile
 
     /// <summary>Where a level-local cube map for <paramref name="skyBaseName"/> lives, as the engine refers to it
     /// (forward slashes, no extension games). Shipping the file at <c>Texture/&lt;leaf&gt;</c> inside the level makes
-    /// the level's copy win, the same way a map overrides a hi-res skybox face.</summary>
-    public static string RefFor(string skyBaseName) => "texture/" + Leaf(skyBaseName);
+    /// the level's copy win, the same way a map overrides a hi-res skybox face.
+    /// <para>
+    /// The SAME whole-path rule as <see cref="FaceFolder"/> applies to the .rcm itself, not just to the faces
+    /// inside it: a shader referring to a level-local cube map as <c>texture/x.rcm</c> looks in the base archive,
+    /// finds nothing, and the water simply never gets a cube map. Shaders write forward slashes (the .rcm's own
+    /// face lines use backslashes - both are the game's own convention, copied as found).
+    /// </para></summary>
+    public static string RefFor(string skyBaseName, string? modRoot = null, string? levelName = null) =>
+        string.IsNullOrWhiteSpace(modRoot) || string.IsNullOrWhiteSpace(levelName)
+            ? "texture/" + Leaf(skyBaseName)
+            : $"{modRoot}/levels/{levelName}/Texture/{Leaf(skyBaseName)}";
 
     /// <summary>The level-relative path to write it at, matching <see cref="RefFor"/>.</summary>
     public static string RelPathFor(string skyBaseName) => "Texture/" + Leaf(skyBaseName);

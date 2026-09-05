@@ -154,6 +154,25 @@ public class WaterCubeMapTests
     }
 
     [Fact]
+    public void The_rcm_itself_is_named_by_its_whole_path_too()
+    {
+        // The same rule as the faces, one level up: a shader naming a level-local cube map as "texture/x.rcm"
+        // reads the BASE archive, finds nothing, and the water never gets a cube map at all.
+        var levelRef = CubeMapFile.RefFor("Sky_HCMT2", "BfVietnam", "Saigon68");
+        Assert.Equal("BfVietnam/levels/Saigon68/Texture/Sky_HCMT2_env.rcm", levelRef);
+
+        var text = WaterShader.Patch(null, WaterShaderSettings.RetailDefault with { Cubemap = levelRef }, null);
+        Assert.Contains("cubemap \"BfVietnam/levels/Saigon68/Texture/Sky_HCMT2_env.rcm\"", text);
+    }
+
+    [Fact]
+    public void Without_a_level_it_still_names_the_stock_place()
+    {
+        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("Sky_OI"));
+        Assert.Equal("texture/Sky_OI_env.rcm", CubeMapFile.RefFor("Sky_OI", null, "Saigon68"));
+    }
+
+    [Fact]
     public void With_no_folder_it_still_names_the_stock_one()
     {
         Assert.Contains(@"PositiveX = texture\env_default_02.dds", CubeMapFile.Text("env_default"));

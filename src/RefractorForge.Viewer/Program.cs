@@ -12476,9 +12476,16 @@ void QueueWaterShader()
 {
     // Mirror the level's OWN sky when it has one. Both shipped .rcm files name the same generic sky, so without
     // this a map with a custom skybox reflected clouds that are nowhere in it.
-    var cube = !waterMirrorsLevelSky || RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName)
-        ? waterShaderBase.Cubemap
-        : RefractorForge.Formats.Terrain.CubeMapFile.RefFor(skyCubeBaseName!);
+    string cube;
+    if (!waterMirrorsLevelSky || RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName))
+        cube = waterShaderBase.Cubemap;
+    else
+    {
+        // The .rcm ships INSIDE the level, so the shader has to name its whole path - exactly as the faces inside
+        // it do. "texture/x.rcm" reads the base archive, finds nothing, and the water gets no cube map at all.
+        var (modRoot, lvlName) = LevelIdentity();
+        cube = RefractorForge.Formats.Terrain.CubeMapFile.RefFor(skyCubeBaseName!, modRoot, lvlName);
+    }
     var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity, Cubemap = cube };
     var below = cfg.DrawWaterBelowTerrain
         ? RefractorForge.Formats.Terrain.WaterShaderSettings.BelowTerrainDefault with { Reflectivity = waterBelowReflect, Opacity = waterBelowOpacity }
