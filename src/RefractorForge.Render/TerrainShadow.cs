@@ -117,6 +117,17 @@ public static class TerrainShadow
         return LightmapShadowBits.FromVisibility(full, fullSide, gridDim, tilePx);
     }
 
+    /// <summary>A shadow map with NOTHING in shadow, for undoing a bake. The engine stores the OPPOSITE sense of
+    /// <see cref="Bake"/>'s "lit" (see <see cref="BakeToLsb"/>), so all-zero visibility is a fully sunlit terrain -
+    /// which is what a level looks like before anyone bakes it. Writing this beats deleting the file: the level
+    /// keeps the entry it shipped, and every save path already knows how to write one.</summary>
+    public static LightmapShadowBits UnshadowedLsb(int gridDim, int tilePx = 1024)
+    {
+        if (gridDim < 1) throw new ArgumentOutOfRangeException(nameof(gridDim));
+        int fullSide = gridDim * tilePx;
+        return LightmapShadowBits.FromVisibility(new byte[fullSide * fullSide], fullSide, gridDim, tilePx);
+    }
+
     /// <summary>The terrain height span in metres (min, max) — precompute once and pass to <see cref="PointLit"/>.</summary>
     public static (float Min, float Max) HeightSpan(Heightmap hm, TerrainConfig cfg)
     {

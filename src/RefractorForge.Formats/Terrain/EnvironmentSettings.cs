@@ -438,11 +438,18 @@ public sealed class EnvironmentSettings
     {
         var outLines = new List<string>();
         bool dropGeoFile = false;
-        bool wroteSun = false;
+        bool wroteSun = false, wroteRot = false;
         foreach (var raw in existing)
         {
             var t = raw.Trim();
             if (IsCloudLine(t, ref dropGeoFile)) continue;
+            if (WriteSkyRotation && t.StartsWith("sky.setRotAngle", StringComparison.OrdinalIgnoreCase))
+            {
+                if (wroteRot) continue;
+                wroteRot = true;
+                outLines.Add(raw[..(raw.Length - raw.TrimStart().Length)] + $"sky.setRotAngle {F(SkyRotationAngle)}");
+                continue;
+            }
             // The sun's direction is rewritten in place, keeping the file's own indentation and everything else in it
             // (skybox mesh, rotation, fog...) exactly where the author left it.
             if (WriteSun && t.StartsWith("sky.sunLightDirectionVec", StringComparison.OrdinalIgnoreCase))
@@ -457,6 +464,7 @@ public sealed class EnvironmentSettings
         while (outLines.Count > 0 && outLines[^1].Trim().Length == 0) outLines.RemoveAt(outLines.Count - 1);   // trim trailing blanks
         // A level that never declared one still needs the line once the editor has aimed the sun.
         if (WriteSun && !wroteSun) outLines.Add($"sky.sunLightDirectionVec {V(SunDirection)}");
+        if (WriteSkyRotation && !wroteRot) outLines.Add($"sky.setRotAngle {F(SkyRotationAngle)}");
         outLines.AddRange(CloudConLines());
         return outLines;
     }
@@ -513,6 +521,10 @@ public sealed class EnvironmentSettings
     /// this the manual sun was a viewport-only setting: the bakes used it, the game did not, and baked shadows then
     /// disagreed with the game's own lighting.</summary>
     public bool WriteSun { get; set; }
+
+    /// <summary>The skybox was turned in the editor, so <c>sky.setRotAngle</c> goes into SkyAndSun.con. All 83 retail
+    /// levels that ship a sky set it, and without this the editor's rotation was a viewport-only preview.</summary>
+    public bool WriteSkyRotation { get; set; }
 
     /// <summary>Where the camera sits before you pick a spawn - the first thing anyone sees of a map. Init.con holds
     /// one per team as <c>game.setBeforeSpawnCameraPosition &lt;team&gt; x/y/z</c> (+ a matching Rotation), and 83 of

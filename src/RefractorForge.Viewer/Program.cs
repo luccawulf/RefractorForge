@@ -1476,6 +1476,10 @@ Vector3 cloudColor = new(0.96f, 0.97f, 1.0f);
 string? cloudMeshImportPath = null;    // imported cloud .sm/.obj to ship into the level on save (for in-game)
 bool skyUseCubemap = true;              // use the level's real cubemap when loaded (else the procedural sun-sky)
 float skyRotDeg = 0f;                   // user yaw offset added to the level's Sky.setRotAngle
+bool skyRotEdited = false;              // the offset was folded into the level -> SkyAndSun.con is rewritten on save
+bool clearFoliageRequest = false;       // menu -> confirm popup next frame (clearing a whole map's growth is not small)
+byte[]? foliageUnderBackup = null, foliageOverBackup = null;   // what "Clear" replaced, so it can be put straight back
+bool unbakeLighting = false;            // write a FULLY LIT terrain shadow on save instead of a baked one
 double appClock = 0;                    // seconds since launch, drives the water ripple animation
 bool showWater = true, showSky = true;  // Layers-panel toggles
 uint shadowTexId = 0;                   // (legacy) baked sun-shadow buffer for the TerrainShadow.dds export only
@@ -4648,6 +4652,11 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? BakeShadowLsb()
         var existing = RefractorForge.Formats.Terrain.LightmapShadowBits.TryLoadFolder(levelDir);
         if (existing is { GridDim: > 0 }) gridDim = existing.GridDim;
     }
+    if (unbakeLighting)
+    {
+        Console.WriteLine($"Writing a fully lit LightmapShadowBits.lsb ({gridDim}x{gridDim} grid) - lighting unbaked.");
+        return TerrainShadow.UnshadowedLsb(gridDim);
+    }
     Console.WriteLine($"Baking LightmapShadowBits.lsb ({gridDim}x{gridDim} grid{(shadowLsbFlipX ? ", flipX" : "")}{(shadowLsbFlipY ? ", flipY" : "")})...");
     return TerrainShadow.BakeToLsb(heightmap, cfg, sun, gridDim, flipX: shadowLsbFlipX, flipY: shadowLsbFlipY);
 }
@@ -5472,6 +5481,7 @@ void DoBakeShadows(bool announce = true)
     // layer on without marking it dirty left the screen looking identical and the bake looking like it did nothing.
     showShadows = true; shadowMapDirty = true;
     writeShadowLsb = true; bakedLsb = true;      // what actually gets LightmapShadowBits.lsb written on save
+    unbakeLighting = false;                      // baking again undoes an unbake
 
     // The .dds is a convenience export for folder levels; the .lsb the game reads rides the save either way, so a
     // level opened straight from a .rfa is not a failure - say which happened rather than swallowing it.
@@ -8864,7 +8874,7 @@ void ApplyWeatherToLevel()
 // old cloud block first). Game-compatible Cloud system; needs a 'cloud' StandardMesh in-game to actually render.
 void SaveCloudsFolder()
 {
-    if ((!cloudsDirty && !sunEdited) || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
+    if ((!cloudsDirty && !sunEdited && !skyRotEdited) || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveCloudsToEnv();
     var skyPath = System.IO.Directory.EnumerateFiles(levelDir, "SkyAndSun.con", System.IO.SearchOption.AllDirectories).FirstOrDefault();
     try
@@ -8937,7 +8947,7 @@ void ImportCloudMesh()
 // the sun has been aimed by hand, its direction.
 (string Name, byte[] Bytes)? CloudRfaExtra(string baseRfa)
 {
-    if ((!cloudsDirty && !sunEdited) || env is null) return null;
+    if ((!cloudsDirty && !sunEdited && !skyRotEdited) || env is null) return null;
     SaveCloudsToEnv();
     try
     {
@@ -9084,6 +9094,97 @@ void SetLevelStartCamera()
     lightingDirty = true;                                  // the flag that gets Init.con rewritten on save
     Toast(string.Format(Loc.T("Level start camera set to {0:0}/{1:0}/{2:0}, facing {3:0} deg. Save writes it to Init.con."),
                         cam.Position.X, cam.Position.Y, cam.Position.Z, yaw));
+}
+
+// Everything the growth maps describe, gone: both index maps set to slot 0 ("default"), which every retail palette
+// leaves empty. The .wst palette is untouched, so the species are still there to paint back with - and the previous
+// maps are kept in memory so the whole thing can be put back without reloading the level.
+void ClearAllFoliage()
+{
+    if (growth is null) { Toast(Loc.T("This level has no growth maps.")); return; }
+    foliageUnderBackup = growth.Under?.Samples.ToArray();
+    foliageOverBackup = growth.Over?.Samples.ToArray();
+    int cleared = 0;
+    foreach (var map in new[] { growth.Under, growth.Over })
+    {
+        if (map is null) continue;
+        for (int i = 0; i < map.Samples.Length; i++) { if (map.Samples[i] != 0) cleared++; map.Samples[i] = 0; }
+    }
+    AfterFoliageMapsChanged();
+    Toast(cleared > 0
+        ? string.Format(Loc.T("Foliage cleared: {0} cell(s) emptied. Save writes it; Tools can put it back."), cleared)
+        : Loc.T("This map already had no foliage."));
+}
+
+void RestoreFoliage()
+{
+    if (growth is null || (foliageUnderBackup is null && foliageOverBackup is null)) return;
+    if (growth.Under is not null && foliageUnderBackup is { } u && u.Length == growth.Under.Samples.Length)
+        u.CopyTo(growth.Under.Samples, 0);
+    if (growth.Over is not null && foliageOverBackup is { } o && o.Length == growth.Over.Samples.Length)
+        o.CopyTo(growth.Over.Samples, 0);
+    foliageUnderBackup = foliageOverBackup = null;
+    AfterFoliageMapsChanged();
+    Toast(Loc.T("Foliage put back."));
+}
+
+// Both the painted view and the 3D scatter read straight from the maps, so anything that rewrites them wholesale
+// has to say so - and peers need the new maps, which is the same wire op painting already uses.
+void AfterFoliageMapsChanged()
+{
+    UploadActivePaintTexture();
+    foliageDirty = true;
+    BuildOvergrowthFoliage();
+    BroadcastOvergrowth();
+}
+
+// Fully lit terrain shadow, fully lit object lightmaps: what the level looked like before anyone baked it. Writing
+// "no shadow" beats deleting the files - the level keeps the entries it shipped, and every save path already knows
+// how to write them.
+void UnbakeLighting()
+{
+    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    unbakeLighting = true;
+    writeShadowLsb = true;                      // the unshadowed map still has to be WRITTEN to replace the baked one
+    bakedLsb = false; bakedObjects = false; bakedGround = false;
+
+    // An all-white lightmap is "lit everywhere". Only the maps this level would bake are written, which is exactly
+    // the set a bake would have replaced.
+    int maps = 0;
+    bakedObjectLightmaps.Clear();
+    if (so is not null && meshLib is not null)
+    {
+        var white = new Texture2D(64, 64, System.Linq.Enumerable.Repeat((byte)255, 64 * 64 * 4).ToArray());
+        var encoded = TgaTexture.EncodeGrayColormapped(white);
+        foreach (var o in so.Objects)
+            foreach (var meshName in meshLib.LodGeometryNames(o.Template))
+            {
+                if (!meshLib.TryGet(meshName, out var lm) || lm.LightmapUvs is null) continue;
+                bakedObjectLightmaps[$"{meshName}_{(int)o.Position.X}-{(int)o.Position.Y}-{(int)o.Position.Z}.tga"] = encoded;
+                maps++;
+            }
+    }
+
+    objectLightmaps = null; objectLightmapsLoaded = true;      // stop showing the baked maps in the viewport
+    glObjects?.SetObjectLightmaps(gl, null, so, meshLib);
+    showObjectLightmaps = false;
+    showShadows = false; shadowMapDirty = true;
+    BroadcastLightBake();
+    Toast(string.Format(Loc.T("Lighting unbaked: a fully lit terrain shadow and {0} lightmap(s). Save writes it. The ground-texture bake is separate - undo that with Z."), maps));
+}
+
+// The slider is a viewport OFFSET on top of whatever the level declared; saving folds the two into one angle and
+// resets the offset, so what you see is what the level now says.
+void SaveSkyRotation()
+{
+    if (env is null) { Toast(Loc.T("No level loaded.")); return; }
+    float total = env.SkyRotationAngle + skyRotDeg;
+    total -= 360f * MathF.Floor((total + 180f) / 360f);       // into -180..180, the range retail writes
+    env.SkyRotationAngle = total;
+    env.WriteSkyRotation = true;
+    skyRotDeg = 0f;
+    skyRotEdited = true;
+    Toast(string.Format(Loc.T("Sky rotation set to {0:0} deg. Save writes sky.setRotAngle to SkyAndSun.con."), total));
 }
 
 void SaveLightingFolder()
@@ -9422,6 +9523,9 @@ void EnvironmentPanel()
     else ImGui.TextDisabled(Loc.T("no cubemap faces found - procedural sun-sky"));
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Sky rotation (deg)"), ref skyRotDeg, -180f, 180f, "%.0f");
+    if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
+    if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
     if (ImGui.Button(Loc.TL("Import skybox..."))) ImportSkybox();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
 
@@ -9847,6 +9951,32 @@ void DoScatter()
     foreach (var id in ids) { int idx = so.Objects.FindIndex(o => o.Id == id); if (idx >= 0) { multi.Add(idx); selected = idx; } }
     Console.WriteLine($"Scattered {placements.Count} objects from {candidates.Count} candidate template(s).");
     scatterSeed++;                       // so a second Scatter gives a fresh layout
+}
+
+void ClearFoliageModal()
+{
+    if (clearFoliageRequest) { ImGui.OpenPopup(Loc.TL("Clear All Foliage")); clearFoliageRequest = false; }
+    var fbs = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbs.X * 0.5f, fbs.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    bool open = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Clear All Foliage"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
+        return;
+
+    int under = 0, over = 0;
+    if (growth?.Under is not null) foreach (var b in growth.Under.Samples) if (b != 0) under++;
+    if (growth?.Over is not null) foreach (var b in growth.Over.Samples) if (b != 0) over++;
+
+    ImGui.TextWrapped(Loc.T("Empty both growth maps, so the map grows nothing at all."));
+    ImGui.Spacing();
+    ImGui.Text(string.Format(Loc.T("Undergrowth: {0} painted cell(s)"), under));
+    ImGui.Text(string.Format(Loc.T("Overgrowth (trees): {0} painted cell(s)"), over));
+    ImGui.Spacing();
+    ImGui.TextDisabled(Loc.T("The .wst palette is kept, so every species is still there to paint back.\nNothing reaches the level until you save; Tools has \"Put Foliage Back\" as well."));
+    ImGui.Separator();
+    if (ImGui.Button(Loc.TL("Clear it"), new Vector2(120, 0))) { ClearAllFoliage(); ImGui.CloseCurrentPopup(); }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Cancel"), new Vector2(120, 0))) ImGui.CloseCurrentPopup();
+    ImGui.EndPopup();
 }
 
 void ScatterModal()
@@ -11228,6 +11358,10 @@ void BuildUi()
                 if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
                 if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
                 if (ImGui.MenuItem(Loc.TL("Show the level's baked terrain shadow (.lsb)"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showShadows = true; }
+                ImGui.Separator();
+                if (ImGui.MenuItem(Loc.TL("Unbake Lighting (back to unlit)"), null, unbakeLighting, heightmap is not null)) UnbakeLighting();
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(Loc.T("Put the map back to how it looked before anything was baked: a fully lit terrain\nshadow and fully lit object lightmaps, written on Save. Baking again undoes it.\nThe ground-texture bake is separate - undo that with Z."));
                 ImGui.EndMenu();
             }
             if (ImGui.BeginMenu(Loc.TL("AI")))
@@ -11271,6 +11405,11 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Save Overgrowth Settings"), null, false, levelDir is not null)) SaveOvergrowthSettings();
             if (ImGui.MenuItem(Loc.TL("Export Overgrowth (map + .wst)..."), null, false, haveOver)) DoExportOvergrowthFiles();
             if (ImGui.MenuItem(Loc.TL("Bake Overgrowth -> StaticObjects.con..."), null, false, haveOver && meshLib is not null)) DoBakeOvergrowthToCon();
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Clear All Foliage..."), null, false, growth is not null)) clearFoliageRequest = true;
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(Loc.T("Empty both growth maps, so the map grows nothing. The .wst palette is kept, so the\nspecies are still there to paint back. Save writes it."));
+            if (ImGui.MenuItem(Loc.TL("Put Foliage Back"), null, false, foliageUnderBackup is not null || foliageOverBackup is not null)) RestoreFoliage();
             ImGui.EndMenu();
         }
         if (ImGui.BeginMenu(Loc.TL("Terrain")))
@@ -11542,6 +11681,7 @@ void BuildUi()
     SavePrefabModal();
     CollabModal();
     ScatterModal();
+    ClearFoliageModal();
     EditCpModal();
     EditVehModal();
     EditSolModal();
