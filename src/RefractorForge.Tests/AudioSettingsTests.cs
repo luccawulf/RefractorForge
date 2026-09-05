@@ -67,4 +67,17 @@ public class AudioSettingsTests
         Assert.DoesNotContain("stereo", Script(mono));
         Assert.Contains("stereo", Script(stereo));
     }
+
+    [Fact]
+    public void A_screen_whose_sound_comes_from_an_emitter_gets_a_silent_bik()
+    {
+        // The engine plays a .bik's own track as part of the picture. Leaving it in while a separate AreaObject
+        // emitter also plays is how a video ended up audible twice.
+        var silent = BinkEncoder.FfmpegArgs("in.mp4", "out.avi", 512, 22050, 1, withAudio: false);
+        Assert.Contains("-an", silent);
+        Assert.DoesNotContain("-c:a", silent);
+        Assert.DoesNotContain("-ar", silent);
+        // and the synced mode keeps it
+        Assert.Contains("-c:a pcm_s16le -ar 44100 -ac 2", BinkEncoder.FfmpegArgs("in.mp4", "out.avi", 512, 44100, 2, withAudio: true));
+    }
 }

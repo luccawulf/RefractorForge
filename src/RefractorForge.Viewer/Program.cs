@@ -12230,7 +12230,11 @@ void DecalDialog()
             if (ImGui.Combo(Loc.TL("Sample rate"), ref rateIdx, "22 kHz\044 kHz\0")) decalAudioRate = rateIdx == 1 ? 44100 : 22050;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The game has two sound-quality tiers, Sound/22khz and Sound/44kHz, and plays the one its settings\nchoose. 44 kHz writes a real 44.1 kHz file for the high tier and a 22 kHz one for the low tier;\n22 kHz writes the same 22 kHz file to both. The .bik's own track uses the rate chosen too."));
         }
+        // Which audio the .bik carries follows "When it plays", because the engine plays a .bik's own track as part
+        // of the picture. "Only while you look at it" keeps it (perfectly in sync, drawn-gated); "Always" strips it,
+        // since the separate emitter carries the sound - keeping both is how a screen ended up playing twice.
         int aRate = decalAudioRate, aCh = decalSoundStereo ? 2 : 1;
+        bool aWithAudio = !(decalSound && decalSoundMode == 0);
         if (ImGui.Button(Loc.TL("Convert a video to .bik...")))
         {
             var src = Picker.File("Pick a video to convert", "Videos|*.mp4;*.avi;*.mov;*.mkv;*.webm;*.wmv;*.m4v|All files|*.*", levelDir);
@@ -12242,7 +12246,7 @@ void DecalDialog()
                 Toast(Loc.T("Converting to Bink - the editor stays usable; this can take a few minutes."));
                 bikTask = System.Threading.Tasks.Task.Run(() =>
                 {
-                    var made = ConvertVideoToBik(src, dst, out var e, bw, aRate, aCh);
+                    var made = ConvertVideoToBik(src, dst, out var e, bw, aRate, aCh, aWithAudio);
                     return (made, e);
                 });
             }
@@ -12309,7 +12313,10 @@ void DecalDialog()
                 ImGui.SetNextItemWidth(240f * uiScale);
                 ImGui.Combo(Loc.TL("When it plays"), ref decalSoundMode,
                             new[] { Loc.T("Always - fades with distance"), Loc.T("Only while you look at it") }, 2);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Always: the engine's ambient (autoPlaySound), like the game's own speakers and generators -\nit starts with the level and rises as you approach.\nOnly while looking: no autoPlaySound, so the sound follows the object being DRAWN - it snaps\non at full volume when the screen is in view and stops when it leaves."));
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nOnly while you look at it: the sound stays inside the .bik, perfectly in sync with the picture,\nand plays only while the screen is on your screen."));
+                ImGui.TextDisabled(decalSoundMode == 0
+                    ? Loc.T("The .bik will be made silent; the emitter carries the sound (not frame-synced).")
+                    : Loc.T("The sound stays in the .bik: in sync with the picture, heard only while it is drawn."));
                 ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref decalSoundVol, 0.05f, 1f, "%.2f");
                 if (decalSoundMode == 0)
                 {
@@ -12423,7 +12430,7 @@ byte[]? ExtractWav(string path, bool stereo = false, int rate = 22050)
 // Convert any video into the Bink .bik the game plays. The work - and the awkward business of waiting for RAD's
 // compressor, which never exits on its own - lives in Render/BinkEncoder so it can be run and checked outside the
 // editor. Safe off the UI thread: it touches no ImGui or GL state.
-string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1)
+string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1, bool withAudio = true)
 {
     error = "";
     var rad = FindRadVideo();
@@ -12431,7 +12438,7 @@ string? ConvertVideoToBik(string src, string dstBik, out string error, int maxWi
     var ff = FindFfmpeg();
     if (ff is null) { error = Loc.T("FFmpeg is needed to prepare the video for Bink."); return null; }
     var sw = System.Diagnostics.Stopwatch.StartNew();
-    var r = RefractorForge.Render.BinkEncoder.Convert(ff, rad, src, dstBik, b => bikProgressBytes = b, out var err, 30, maxWidth, audioRate, audioChannels);
+    var r = RefractorForge.Render.BinkEncoder.Convert(ff, rad, src, dstBik, b => bikProgressBytes = b, out var err, 30, maxWidth, audioRate, audioChannels, withAudio);
     if (r != RefractorForge.Render.BinkEncoder.Result.Ok)
     {
         error = err;
@@ -12509,6 +12516,8 @@ bool CreateDecalObject()
         string? soundScript = null;
         var soundFiles = new List<(string RelPath, byte[] Bytes)>();
         string? companionSound = null;
+        if (video && decalSound && decalSoundMode == 0 && MediaHasAudio(decalImagePath))
+            Toast(Loc.T("This .bik still has its own audio track, which the game plays whenever the screen is drawn - you would hear it AND the emitter. Convert the video again with 'Always' selected to make a silent .bik."));
         if (video && decalSound && decalSoundMode == 0 && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } awavs)
         {
             // Heard by DISTANCE, whether or not the screen is in view: its own AreaObject emitter, exactly the shape

@@ -41,18 +41,25 @@ public static class BinkEncoder
     /// a map. 512 keeps a screen sharp at the distance anyone reads one from.</param>
     /// <summary>The FFmpeg command that makes RAD's intermediate: MJPEG video, PCM audio at the rate and channel
     /// count asked for. Its own function so the choice can be checked without running anything.</summary>
-    public static string FfmpegArgs(string src, string avi, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1)
+    /// <param name="withAudio">Keep the video's own audio track inside the .bik. The engine plays that track as part
+    /// of the video, so it is perfectly in sync with the picture - and, like the picture, only while the object is
+    /// drawn. A screen whose sound comes from a separate emitter must be made SILENT here, or both play at once.</param>
+    public static string FfmpegArgs(string src, string avi, int maxWidth = 512, int audioRate = 22050, int audioChannels = 1,
+                                    bool withAudio = true)
     {
         // -2 on the height keeps the aspect and lands on an even number, which the yuv420p intermediate needs.
         string scale = maxWidth > 0 ? $"-vf \"scale='min(iw,{maxWidth})':-2\" " : "";
-        return $"-hide_banner -y -i \"{src}\" {scale}-c:v mjpeg -q:v 3 -pix_fmt yuvj420p -c:a pcm_s16le -ar {audioRate} -ac {Math.Clamp(audioChannels, 1, 2)} \"{avi}\"";
+        string audio = withAudio
+            ? $"-c:a pcm_s16le -ar {audioRate} -ac {Math.Clamp(audioChannels, 1, 2)}"
+            : "-an";
+        return $"-hide_banner -y -i \"{src}\" {scale}-c:v mjpeg -q:v 3 -pix_fmt yuvj420p {audio} \"{avi}\"";
     }
 
     /// <param name="audioRate">Sample rate of the .bik's audio track: 22050 (the game's 22khz tier) or 44100.</param>
     /// <param name="audioChannels">1 for mono, 2 for stereo.</param>
     public static Result Convert(string ffmpegExe, string radExe, string src, string dstBik,
                                  Action<long>? progress, out string error, int maxMinutes = 30, int maxWidth = 512,
-                                 int audioRate = 22050, int audioChannels = 1)
+                                 int audioRate = 22050, int audioChannels = 1, bool withAudio = true)
     {
         error = "";
         if (!File.Exists(ffmpegExe) || !File.Exists(radExe)) { error = "FFmpeg or RAD Video Tools is missing."; return Result.NoTools; }
@@ -64,7 +71,7 @@ public static class BinkEncoder
         {
             // MJPEG + PCM in an AVI: RAD reads it, it is faithful enough as an intermediate, and the audio survives
             // into the .bik at the rate and channel count chosen.
-            RunQuiet(ffmpegExe, FfmpegArgs(src, avi, maxWidth, audioRate, audioChannels), 30 * 60 * 1000);
+            RunQuiet(ffmpegExe, FfmpegArgs(src, avi, maxWidth, audioRate, audioChannels, withAudio), 30 * 60 * 1000);
             if (!File.Exists(avi) || new FileInfo(avi).Length < 1024) { error = "FFmpeg could not read that video."; return Result.SourceUnreadable; }
 
             Del(dstBik); Del(tmp);
