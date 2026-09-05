@@ -636,6 +636,9 @@ bool decalLimitDraw = false;                // stop drawing the screen past a di
 float decalLookRange = 120f;                // ...this one. In look-at mode it is also how far the sound carries.
 bool decalSoundStereo = false;              // mono places the sound at the screen; stereo is fuller but not positional
 int decalAudioRate = 22050;                  // 22050 or 44100: the .bik's track and the sound object's wav alike
+// A decal whose sound is an AMBIENT carries its audio on a separate AreaObject emitter, because a sound hung on the
+// visible object is only heard while that object is DRAWN. Placing the decal places the emitter with it.
+Dictionary<string, string> decalSoundCompanion = new(StringComparer.OrdinalIgnoreCase);
 // Bink conversion runs on a worker: a real video takes minutes, and doing it on the UI thread froze the editor.
 System.Threading.Tasks.Task<(string? Path, string Error)>? bikTask = null;
 int bikWidthIdx = 1;                                   // how big the converted video should be
@@ -2415,7 +2418,14 @@ void OnLoad()
             {
                 var id = Guid.NewGuid().ToString("N");
                 var ppos = SnapXZ(new Vec3(hitPos.X, hitPos.Y, hitPos.Z));
-                hist.Do(new AddObject(id, browserTemplate, ppos, Vec3.Zero));
+                // A video screen whose sound is an ambient brings its emitter with it, at the same spot.
+                if (decalSoundCompanion.TryGetValue(browserTemplate, out var compTpl))
+                    hist.Do(new CompositeCommand(new List<IEditCommand>
+                    {
+                        new AddObject(id, browserTemplate, ppos, Vec3.Zero),
+                        new AddObject(Guid.NewGuid().ToString("N"), compTpl, ppos, Vec3.Zero),
+                    }));
+                else hist.Do(new AddObject(id, browserTemplate, ppos, Vec3.Zero));
                 SyncMarkers(); RebuildObjects(); UploadMarkers();
                 selected = so.Objects.FindIndex(o => o.Id == id);
                 multi.Clear(); if (selected >= 0) multi.Add(selected);
@@ -12498,7 +12508,23 @@ bool CreateDecalObject()
         // position, which is the middle of the screen.
         string? soundScript = null;
         var soundFiles = new List<(string RelPath, byte[] Bytes)>();
-        if (video && decalSound && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } wavs)
+        string? companionSound = null;
+        if (video && decalSound && decalSoundMode == 0 && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } awavs)
+        {
+            // Heard by DISTANCE, whether or not the screen is in view: its own AreaObject emitter, exactly the shape
+            // the retail levels use for a river or a generator. Hanging it on the decal instead ties it to the
+            // screen being drawn - which is the "only when I look at it" the editor used to produce.
+            var area = RefractorForge.Formats.Sound.SoundObject.BuildArea(name + "_snd", awavs.Wav22, decalSoundVol,
+                        decalSoundNear, decalSoundFar, loop: true, stereo: decalSoundStereo, wav44kBytes: awavs.Wav44);
+            foreach (var f in area.Files) pendingLevelFiles.Add(f);
+            BroadcastLevelFiles(area.Template, area.Files);
+            string? envCon0 = PendingText("Sounds/Environment.con") ?? ReadLevelText("Sounds/Environment.con");
+            pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Sounds/Environment.con", StringComparison.OrdinalIgnoreCase));
+            pendingLevelFiles.Add(("Sounds/Environment.con", System.Text.Encoding.Latin1.GetBytes(
+                RefractorForge.Formats.Sound.SoundObject.PatchEnvironmentCon(envCon0, area.RunLine))));
+            companionSound = area.Template;
+        }
+        else if (video && decalSound && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } wavs)
         {
             var snd = RefractorForge.Formats.Sound.SoundObject.Build(name, wavs.Wav22, decalSoundVol, decalSoundNear, decalSoundFar,
                                                                      loop: true, triggerRadius: decalSoundFar, stereo: decalSoundStereo, wav44kBytes: wavs.Wav44);
@@ -12541,6 +12567,7 @@ bool CreateDecalObject()
         importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)> { (name + "_Material0", video ? Path.GetFileNameWithoutExtension(decalImagePath) : texName, Vector3.One) };
         BroadcastObjMesh(built.Template);
         RebuildCatalog();
+        if (companionSound is not null) decalSoundCompanion[built.Template] = companionSound;
         browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
         Toast(string.Format(Loc.T("Decal '{0}' ready - click to place it. {1} file(s) will be written on save."), built.Template, built.Files.Count + 2));
         return true;

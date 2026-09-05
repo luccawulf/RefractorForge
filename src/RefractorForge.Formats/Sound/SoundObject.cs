@@ -45,6 +45,49 @@ public static class SoundObject
     /// own long loops. The largest clip any retail script loads is 0.8 MB.</summary>
     public const int StreamAbove = 1024 * 1024;
 
+    /// <summary>
+    /// A sound at a PLACE, the way every retail level does it: an <c>AreaObject</c> with a triggerRadius and an
+    /// <c>addLinePoint</c> polygon, run from <c>Sounds/Environment.con</c> and placed in StaticObjects.con like any
+    /// other object (Hue places river1 / river3 / island1 exactly so).
+    ///
+    /// This exists because the other shape - the sound hung on a visible SimpleObject with <c>autoPlaySound</c> -
+    /// ties the sound to the object being DRAWN: it is heard only while the thing is on screen and stops at the
+    /// draw distance, whatever the script's distances say. An AreaObject has no geometry, so nothing can cull it and
+    /// the player's POSITION is all that matters.
+    /// </summary>
+    /// <param name="areaRadius">Half-width of the square area, in metres. Inside it the sound is at full volume.</param>
+    public static Built BuildArea(string name, byte[] wavBytes, float volume = 0.6f, float minDistance = 20f,
+                                  float maxDistance = 120f, bool loop = true, bool stereo = false,
+                                  byte[]? wav44kBytes = null, float? areaRadius = null)
+    {
+        if (wavBytes is null || wavBytes.Length == 0) throw new ArgumentException("no wav data", nameof(wavBytes));
+        string tpl = Sanitize(name);
+        float minD = MathF.Max(1f, minDistance);
+        float maxD = MathF.Max(minD + 1f, maxDistance);
+        float rad = MathF.Max(1f, areaRadius ?? minD);
+        // MDT: triggerRadius is the activation distance, 10..275, most commonly 50.
+        float trig = Math.Clamp(maxD, 10f, 275f);
+
+        var con = new StringBuilder();
+        con.Append($"rem *** {tpl} ***\r\n");
+        con.Append($"ObjectTemplate.create AreaObject {tpl}\r\n");
+        con.Append("ObjectTemplate.saveInSeparateFile 1\r\n");
+        con.Append($"ObjectTemplate.triggerRadius {F(trig)}\r\n");
+        con.Append($"ObjectTemplate.loadSoundScript {tpl}.ssc\r\n");
+        // A closed square around the object's own origin, traced out and back as the retail areas are.
+        var pts = new (float X, float Z)[] { (rad, rad), (rad, -rad), (-rad, -rad), (-rad, rad), (rad, rad) };
+        foreach (var p in pts) con.Append($"ObjectTemplate.addLinePoint {F(p.X)}/{F(p.Z)}\r\n");
+
+        var files = new List<(string, byte[])>
+        {
+            ($"Sound/22khz/{tpl}.wav", wavBytes),
+            ($"Sound/44kHz/{tpl}.wav", wav44kBytes ?? wavBytes),
+            ($"Sounds/{tpl}.ssc", Encoding.Latin1.GetBytes(ScriptText(tpl, wavBytes, volume, minD, maxD, loop, stereo))),
+            ($"Sounds/{tpl}.con", Encoding.Latin1.GetBytes(con.ToString())),
+        };
+        return new Built(tpl, files, $"run {tpl}.con");
+    }
+
     public static Built Build(string name, byte[] wavBytes, float volume = 0.6f, float minDistance = 20f,
                               float maxDistance = 120f, bool loop = true, float? triggerRadius = null,
                               bool stereo = false, byte[]? wav44kBytes = null)
@@ -67,19 +110,7 @@ public static class SoundObject
         //    (26 retail scripts combine them).
         //  - priority 11 for a looping ambient, as the radios and speakers have; a one-shot keeps a low one.
         bool stream = wavBytes.Length > StreamAbove;
-        var ssc = new StringBuilder();
-        ssc.Append("newPatch\r\n");
-        ssc.Append($"*** {tpl} (RefractorForge) ***\r\n");
-        ssc.Append($"{(stream ? "stream" : "load")} @ROOT/Sound/@RTD/{tpl}.wav\r\n");
-        if (loop) ssc.Append("loop\r\n");
-        if (stereo) ssc.Append("stereo\r\n");
-        ssc.Append($"minDistance {F(minD)}\r\n");
-        ssc.Append($"volume {F(volume)}\r\n");
-        ssc.Append(loop ? "priority 11\r\n" : "priority -7\r\n");
-        // The distance falloff, exactly the shape the retail scripts use: full at minDistance, gone at maxDistance.
-        ssc.Append("*** Distance Volume ***\r\nbeginEffect\r\n\tcontrolDestination Volume\r\n\tcontrolSource Distance\r\n");
-        ssc.Append($"\tenvelope Ramp\r\n\tparam {F(minD)}\r\n\tparam {F(maxD)}\r\n\tparam 1\r\n\tparam -1\r\nendEffect\r\n");
-
+        var ssc = new StringBuilder(ScriptText(tpl, wavBytes, volume, minD, maxD, loop, stereo));
         var con = new StringBuilder();
         con.Append($"rem *** {tpl} ***\r\n");
         con.Append($"ObjectTemplate.create SimpleObject {tpl}\r\n");
@@ -101,6 +132,33 @@ public static class SoundObject
             ($"Sounds/{tpl}.con", Encoding.Latin1.GetBytes(con.ToString())),
         };
         return new Built(tpl, files, $"run {tpl}.con");
+    }
+
+
+    /// <summary>The .ssc both shapes share, in the form the game's own ambients use.</summary>
+    private static string ScriptText(string tpl, byte[] wavBytes, float volume, float minD, float maxD, bool loop, bool stereo)
+    {
+        // Shaped like the game's own ambient scripts (the US/NVA radios, the Hue speakers, o_gen_sound):
+        //  - no "#templateLevel HIGH": that OPENS a per-quality block, and 359 of the 361 retail scripts using it
+        //    carry HIGH, MEDIUM and LOW. A script with only a HIGH block gives a player on any other sound setting
+        //    nothing of ours to apply. The object ambients carry no such line at all, so they apply everywhere.
+        //  - no "rem": not one of the 1226 retail scripts uses it; the label form is "*** text ***".
+        //  - "stream" for a long clip: retail never loads anything over 0.8 MB and streams its 8-10 MB radio loops.
+        //    Streams take the distance ramp too (26 retail scripts combine them).
+        //  - priority 11 for a looping ambient, as the radios and speakers have.
+        bool stream = wavBytes.Length > StreamAbove;
+        var ssc = new StringBuilder();
+        ssc.Append("newPatch\r\n");
+        ssc.Append($"*** {tpl} (RefractorForge) ***\r\n");
+        ssc.Append($"{(stream ? "stream" : "load")} @ROOT/Sound/@RTD/{tpl}.wav\r\n");
+        if (loop) ssc.Append("loop\r\n");
+        if (stereo) ssc.Append("stereo\r\n");
+        ssc.Append($"minDistance {F(minD)}\r\n");
+        ssc.Append($"volume {F(volume)}\r\n");
+        ssc.Append(loop ? "priority 11\r\n" : "priority -7\r\n");
+        ssc.Append("*** Distance Volume ***\r\nbeginEffect\r\n\tcontrolDestination Volume\r\n\tcontrolSource Distance\r\n");
+        ssc.Append($"\tenvelope Ramp\r\n\tparam {F(minD)}\r\n\tparam {F(maxD)}\r\n\tparam 1\r\n\tparam -1\r\nendEffect\r\n");
+        return ssc.ToString();
     }
 
     /// <summary>Add the emitter's <c>run</c> line to the level's <c>Sounds/Environment.con</c> (creating the file's
