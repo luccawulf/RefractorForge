@@ -37,7 +37,7 @@ public class SoundObjectTests
     public void The_script_carries_the_near_and_far_volume_the_way_the_retail_ones_do()
     {
         var ssc = TextOf(SoundObject.Build("river", Wav, volume: 0.4f, minDistance: 50f, maxDistance: 150f), ".ssc");
-        Assert.Contains("#templateLevel HIGH", ssc);
+        Assert.DoesNotContain("#templateLevel", ssc);   // a per-quality block would leave other settings with nothing
         Assert.Contains("newPatch", ssc);
         Assert.Contains("load @ROOT/Sound/@RTD/river.wav", ssc);
         Assert.Contains("loop", ssc);

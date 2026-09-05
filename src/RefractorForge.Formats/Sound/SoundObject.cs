@@ -41,6 +41,10 @@ public static class SoundObject
     /// <param name="stereo">Declare the sample as stereo. The format supports it and 276 of the game's own scripts
     /// use it alongside distance settings, but a stereo sample is the wrong choice for something you should be able to
     /// walk around - mono is what places a sound in the world.</param>
+    /// <summary>Clips bigger than this are streamed from disk rather than loaded whole, as the game does with its
+    /// own long loops. The largest clip any retail script loads is 0.8 MB.</summary>
+    public const int StreamAbove = 1024 * 1024;
+
     public static Built Build(string name, byte[] wavBytes, float volume = 0.6f, float minDistance = 20f,
                               float maxDistance = 120f, bool loop = true, float? triggerRadius = null,
                               bool stereo = false, byte[]? wav44kBytes = null)
@@ -51,15 +55,27 @@ public static class SoundObject
         float maxD = MathF.Max(minD + 1f, maxDistance);
         float trig = triggerRadius is { } tr && tr > 0f ? tr : maxD;
 
+        // Shaped like the game's own ambient scripts (the US/NVA radios, the Hue speakers, o_gen_sound), because the
+        // first shape did not work in game - its settings were ignored:
+        //  - no "#templateLevel HIGH": in the 361 retail scripts that use it, that line OPENS a per-quality block,
+        //    and all but two carry a block for each of HIGH / MEDIUM / LOW. A script with only a HIGH block gives a
+        //    player on any other sound-quality setting nothing of ours to apply. The ambients carry no such line at
+        //    all, so they apply at every setting - as this one now does.
+        //  - no "rem": not one of the 1226 retail scripts uses it. A label in the "*** ***" form they do use.
+        //  - "stream", not "load", for a long clip: retail never loads anything over 0.8 MB and streams its radio
+        //    and propaganda loops (8-10 MB); a video's audio is minutes long. Streams take the distance ramp too
+        //    (26 retail scripts combine them).
+        //  - priority 11 for a looping ambient, as the radios and speakers have; a one-shot keeps a low one.
+        bool stream = wavBytes.Length > StreamAbove;
         var ssc = new StringBuilder();
-        ssc.Append("#templateLevel HIGH\r\n\r\nnewPatch\r\n\r\n");
-        ssc.Append($"rem *** {tpl} (RefractorForge) ***\r\n");
-        ssc.Append($"load @ROOT/Sound/@RTD/{tpl}.wav\r\n");
+        ssc.Append("newPatch\r\n");
+        ssc.Append($"*** {tpl} (RefractorForge) ***\r\n");
+        ssc.Append($"{(stream ? "stream" : "load")} @ROOT/Sound/@RTD/{tpl}.wav\r\n");
         if (loop) ssc.Append("loop\r\n");
         if (stereo) ssc.Append("stereo\r\n");
         ssc.Append($"minDistance {F(minD)}\r\n");
         ssc.Append($"volume {F(volume)}\r\n");
-        ssc.Append("priority -10\r\n");
+        ssc.Append(loop ? "priority 11\r\n" : "priority -7\r\n");
         // The distance falloff, exactly the shape the retail scripts use: full at minDistance, gone at maxDistance.
         ssc.Append("*** Distance Volume ***\r\nbeginEffect\r\n\tcontrolDestination Volume\r\n\tcontrolSource Distance\r\n");
         ssc.Append($"\tenvelope Ramp\r\n\tparam {F(minD)}\r\n\tparam {F(maxD)}\r\n\tparam 1\r\n\tparam -1\r\nendEffect\r\n");
