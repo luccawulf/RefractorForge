@@ -438,11 +438,21 @@ public sealed class EnvironmentSettings
     {
         var outLines = new List<string>();
         bool dropGeoFile = false;
-        bool wroteSun = false, wroteRot = false;
+        bool wroteSun = false, wroteRot = false, inSkyBox = false, wroteMesh = false;
         foreach (var raw in existing)
         {
             var t = raw.Trim();
             if (IsCloudLine(t, ref dropGeoFile)) continue;
+            if (t.StartsWith("GeometryTemplate.create", StringComparison.OrdinalIgnoreCase))
+                inSkyBox = t.IndexOf("SkyBox", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (WriteSkyBoxMesh && inSkyBox && !wroteMesh
+                && t.StartsWith("GeometryTemplate.file", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(SkyBoxMesh))
+            {
+                wroteMesh = true;
+                outLines.Add(raw[..(raw.Length - raw.TrimStart().Length)] + $"GeometryTemplate.file {SkyBoxMesh}");
+                continue;
+            }
             if (WriteSkyRotation && t.StartsWith("sky.setRotAngle", StringComparison.OrdinalIgnoreCase))
             {
                 if (wroteRot) continue;
@@ -525,6 +535,10 @@ public sealed class EnvironmentSettings
     /// <summary>The skybox was turned in the editor, so <c>sky.setRotAngle</c> goes into SkyAndSun.con. All 83 retail
     /// levels that ship a sky set it, and without this the editor's rotation was a viewport-only preview.</summary>
     public bool WriteSkyRotation { get; set; }
+
+    /// <summary>A different skybox was chosen in the editor, so the <c>GeometryTemplate.file</c> under the SkyBox
+    /// declaration in SkyAndSun.con is rewritten to <see cref="SkyBoxMesh"/>.</summary>
+    public bool WriteSkyBoxMesh { get; set; }
 
     /// <summary>Where the camera sits before you pick a spawn - the first thing anyone sees of a map. Init.con holds
     /// one per team as <c>game.setBeforeSpawnCameraPosition &lt;team&gt; x/y/z</c> (+ a matching Rotation), and 83 of

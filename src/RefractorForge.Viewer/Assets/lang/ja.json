@@ -1233,5 +1233,11 @@
  "The .wst palette is kept, so every species is still there to paint back.\nNothing reaches the level until you save; Tools has \"Put Foliage Back\" as well.": ".wst パレットは保持されるので、すべての樹種はあとから塗り直せます。\n保存するまでレベルには反映されません。ツールメニューの「植生を元に戻す」も使えます。",
  "This level has no growth maps.": "このレベルには成長マップがありません。",
  "This map already had no foliage.": "このマップにはもともと植生がありません。",
- "Unbake Lighting (back to unlit)": "ライティングのベイクを解除（未ベイク状態に戻す）"
+ "Unbake Lighting (back to unlit)": "ライティングのベイクを解除（未ベイク状態に戻す）",
+ "Every skybox the mounted archives offer. Picking one shows it straight away -\nmesh, cube map and the level's own fog - and Save writes it to Init/SkyAndSun.con.": "マウント済みアーカイブにあるすべてのスカイボックスです。選ぶとすぐに反映されます\n（メッシュ、キューブマップ、レベル自身のフォグ）。保存すると Init/SkyAndSun.con に書き込まれます。",
+ "Off: the water reflects the stock cube map, as every retail level does.\nOn: the level ships a cube map of its OWN sky (128px DXT1 faces, the form the\ngame's own is in) and the water mirrors that. Check it in game before keeping it -\na cube map the engine cannot read crashes the map on its first drawn frame.": "オフ: 製品版のレベルと同じく、標準のキューブマップを反射します。\nオン: レベル自身の空のキューブマップ（128px DXT1、ゲーム標準と同じ形式）を同梱し、\n水面がそれを映します。採用する前に必ずゲームで確認してください。エンジンが読めない\nキューブマップは、最初のフレーム描画時にマップをクラッシュさせます。",
+ "Put back##sky": "元に戻す",
+ "Sky set to {0}. Save writes it to SkyAndSun.con.": "空を {0} に設定しました。保存すると SkyAndSun.con に書き込まれます。",
+ "Water mirrors this level's sky (experimental)": "水面がこのレベルの空を映す（実験的）",
+ "changed from {0}": "{0} から変更されています"
 }

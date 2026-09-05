@@ -146,3 +146,53 @@ public class WaterCubeMapTests
         Assert.DoesNotContain("env_default.rcm", text);
     }
 }
+
+/// <summary>Switching a map's skybox writes the mesh name into the SkyBox declaration's own
+/// <c>GeometryTemplate.file</c> - and only that one, since a SkyAndSun.con can declare a cloud mesh too.</summary>
+public class SkyBoxSwitchTests
+{
+    private static string[] Sky(params string[] extra) => new[]
+    {
+        "TextureManager.mipmaps 0",
+        "GeometryTemplate.create StandardMesh SkyBox",
+        "GeometryTemplate.file Sky_HCMT2_m1",
+        "Sky.initSky",
+    }.Concat(extra).ToArray();
+
+    [Fact]
+    public void Nothing_changes_until_a_sky_is_chosen()
+    {
+        var e = EnvironmentSettings.Parse(Sky(), null, null);
+        e.SkyBoxMesh = "Sky_Stalingrad_M1";                      // set, but not marked for writing
+        Assert.Contains(e.PatchSkyAndSunConLines(Sky()), l => l.Trim() == "GeometryTemplate.file Sky_HCMT2_m1");
+    }
+
+    [Fact]
+    public void Choosing_one_rewrites_the_skybox_mesh()
+    {
+        var e = EnvironmentSettings.Parse(Sky(), null, null);
+        Assert.Equal("Sky_HCMT2_m1", e.SkyBoxMesh);
+        e.SkyBoxMesh = "Sky_Stalingrad_M1";
+        e.WriteSkyBoxMesh = true;
+
+        var outLines = e.PatchSkyAndSunConLines(Sky()).ToList();
+        Assert.Contains(outLines, l => l.Trim() == "GeometryTemplate.file Sky_Stalingrad_M1");
+        Assert.DoesNotContain(outLines, l => l.Trim() == "GeometryTemplate.file Sky_HCMT2_m1");
+        Assert.Contains(outLines, l => l.Trim() == "Sky.initSky");
+        Assert.Equal("Sky_Stalingrad_M1", EnvironmentSettings.Parse(outLines.ToArray(), null, null).SkyBoxMesh);
+    }
+
+    [Fact]
+    public void A_second_mesh_in_the_same_file_is_left_alone()
+    {
+        // The cloud system declares its own GeometryTemplate; only the SkyBox one is the skybox.
+        var withCloud = Sky("GeometryTemplate.create StandardMesh CloudLayer", "GeometryTemplate.file cloud");
+        var e = EnvironmentSettings.Parse(withCloud, null, null);
+        e.SkyBoxMesh = "Sky_Stalingrad_M1";
+        e.WriteSkyBoxMesh = true;
+
+        var outLines = e.PatchSkyAndSunConLines(withCloud).ToList();
+        Assert.Contains(outLines, l => l.Trim() == "GeometryTemplate.file Sky_Stalingrad_M1");
+        Assert.Single(outLines.Where(l => l.TrimStart().StartsWith("GeometryTemplate.file Sky_", StringComparison.OrdinalIgnoreCase)));
+    }
+}

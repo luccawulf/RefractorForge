@@ -1478,6 +1478,13 @@ bool skyUseCubemap = true;              // use the level's real cubemap when loa
 float skyRotDeg = 0f;                   // user yaw offset added to the level's Sky.setRotAngle
 bool skyRotEdited = false;              // the offset was folded into the level -> SkyAndSun.con is rewritten on save
 string? skyCubeBaseName = null;         // the level's own skybox face base (Sky_OI), so the water can mirror IT
+// OFF by default, and it stays that way until somebody has seen it work in game. Shipping a level cube map the
+// engine could not read crashed BFVietnam on the FIRST FRAME of a real map - the level loaded through, then died
+// drawing the water. A save must never be able to do that on its own.
+bool waterMirrorsLevelSky = false;
+string[] skyBoxChoices = System.Array.Empty<string>();   // every skybox mesh the mounted archives offer
+int skyBoxChoice = -1;                                   // index into skyBoxChoices, -1 = the level's own
+string? skyBoxOriginal = null;                           // what the level shipped, so it can be put back
 bool clearFoliageRequest = false;       // menu -> confirm popup next frame (clearing a whole map's growth is not small)
 byte[]? foliageUnderBackup = null, foliageOverBackup = null;   // what "Clear" replaced, so it can be put straight back
 bool unbakeLighting = false;            // write a FULLY LIT terrain shadow on save instead of a baked one
@@ -3140,6 +3147,7 @@ void OnLoad()
     }
     gl.BindVertexArray(0);
     LoadSkyCubemap();
+    BuildSkyBoxCatalogue();
     LoadSkyboxMesh();   // the level's real skybox mesh (e.g. Sky_Bocage_m1 = Immersed's underwater surface)
     LoadCloudMesh();    // the level's real cloud-layer meshes (the scrolling bubbles/clouds)
 
@@ -9020,6 +9028,35 @@ string[]? LayeredConLines(string suffix)
     catch { return null; }
 }
 
+// Every skybox the mounted archives can offer, which is what makes swapping one in worth doing: BFVietnam keeps
+// them as StandardMesh meshes named Sky_<map>_m1, alongside <base>_01..06 face textures.
+void BuildSkyBoxCatalogue()
+{
+    skyBoxOriginal = env?.SkyBoxMesh;
+    if (meshLib is null) { skyBoxChoices = System.Array.Empty<string>(); skyBoxChoice = -1; return; }
+    skyBoxChoices = meshLib.MeshBaseNames
+        .Where(n => n.StartsWith("sky", StringComparison.OrdinalIgnoreCase) && n.Contains('_'))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    skyBoxChoice = System.Array.FindIndex(skyBoxChoices, n => string.Equals(n, env?.SkyBoxMesh, StringComparison.OrdinalIgnoreCase));
+    Console.WriteLine($"Skyboxes available: {skyBoxChoices.Length}" + (env?.SkyBoxMesh is { } m ? $"; this level uses {m}" : ""));
+}
+
+// Show a different sky at once - mesh AND the cube map its faces make - and mark it to be written to
+// Init/SkyAndSun.con on save. This is the Battlecraft trick: try a sky on the map before committing to it.
+void ApplySkyBox(string meshName)
+{
+    if (env is null) return;
+    env.SkyBoxMesh = meshName;
+    env.WriteSkyBoxMesh = true;
+    skyRotEdited = true;                 // SkyAndSun.con has to be rewritten for this to reach the game
+    LoadSkyboxMesh();                    // the mesh, drawn as the box
+    LoadSkyCubemap();                    // and its faces as the cube map the sky shader samples
+    ReapplySkyFacePreviews();
+    Toast(string.Format(Loc.T("Sky set to {0}. Save writes it to SkyAndSun.con."), meshName));
+}
+
 // The level's own skybox as a cube map the WATER can mirror. Both .rcm files the game ships name the same generic
 // sky, so a map with its own skybox reflected somebody else's clouds; this ships one naming the level's own faces.
 //
@@ -9030,7 +9067,7 @@ string[]? LayeredConLines(string suffix)
 List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
 {
     var outp = new List<(string, byte[])>();
-    var cm = typeof(RefractorForge.Formats.Terrain.CubeMapFile);
+    if (!waterMirrorsLevelSky) return outp;
     if (RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName) || meshLib?.Textures is null) return outp;
     string b = skyCubeBaseName!;
 
@@ -9044,38 +9081,31 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
         return outp;
     }
 
-    // Same size everywhere? Then the engine can read the level's own faces directly and nothing needs copying.
-    int w = faces[0]!.Width, h = faces[0]!.Height;
-    bool uniform = faces.All(f => f!.Width == w && f.Height == h && f.Width == f.Height);
-    string faceBase = b;
-    if (!uniform)
+    // ALWAYS re-emit the faces, in the form the game's own cube map is in: 128px square, DXT1, FULL mip chain
+    // (env_default_0N.dds is 11,064 bytes, which is exactly that). The first attempt referenced the skybox faces
+    // where they lay, or copied them uncompressed and un-mipped, and the map died on its first drawn frame - the
+    // same shape as the terrain tiles that came out black until they were re-emitted as 256px DXT1 with mips.
+    const int Side = 128;
+    string faceBase = b + "_env";
+    for (int i = 0; i < 6; i++)
     {
-        // Square, one size, and small: this is a reflection, not the sky itself. The stock cube map's faces are
-        // tiny for exactly that reason.
-        const int Side = 128;
-        faceBase = b + "_env";
-        for (int i = 0; i < 6; i++)
-        {
-            var src = faces[i]!;
-            var rgba = new byte[Side * Side * 4];
-            for (int y = 0; y < Side; y++)
-                for (int x = 0; x < Side; x++)
-                {
-                    var c = src.SampleRGBA((x + 0.5f) / Side, (y + 0.5f) / Side);
-                    int o = (y * Side + x) * 4;
-                    rgba[o] = (byte)(c.X * 255f); rgba[o + 1] = (byte)(c.Y * 255f);
-                    rgba[o + 2] = (byte)(c.Z * 255f); rgba[o + 3] = 255;
-                }
-            outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.FaceRelPath(faceBase, i + 1),
-                      DdsTexture.EncodeUncompressed(new Texture2D(Side, Side, rgba))));
-        }
-        Console.WriteLine($"Water reflection: skybox '{b}' faces differ in size - shipping {Side}px square copies as '{faceBase}_0N.dds'.");
+        var src = faces[i]!;
+        var rgba = new byte[Side * Side * 4];
+        for (int y = 0; y < Side; y++)
+            for (int x = 0; x < Side; x++)
+            {
+                var c = src.SampleRGBA((x + 0.5f) / Side, (y + 0.5f) / Side);
+                int o = (y * Side + x) * 4;
+                rgba[o] = (byte)(c.X * 255f); rgba[o + 1] = (byte)(c.Y * 255f);
+                rgba[o + 2] = (byte)(c.Z * 255f); rgba[o + 3] = 255;
+            }
+        outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.FaceRelPath(faceBase, i + 1),
+                  DxtEncoder.EncodeDxt1Mipped(new Texture2D(Side, Side, rgba))));
     }
-    else Console.WriteLine($"Water reflection: pointing the water at the level's own sky '{b}' ({w}px faces).");
+    Console.WriteLine($"Water reflection: '{b}' re-emitted as {Side}px DXT1 cube faces '{faceBase}_0N.dds'.");
 
     outp.Add((RefractorForge.Formats.Terrain.CubeMapFile.RelPathFor(b),
               System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Terrain.CubeMapFile.Text(faceBase))));
-    _ = cm;
     return outp;
 }
 
@@ -9655,11 +9685,36 @@ void EnvironmentPanel()
     else if (skyMeshOk)
         ImGui.TextDisabled($"Skybox: {env?.SkyBoxMesh} (level mesh)");
     else ImGui.TextDisabled(Loc.T("no cubemap faces found - procedural sun-sky"));
+    // Try any sky on the map and see it at once - mesh, cube map and the level's own fog together.
+    if (skyBoxChoices.Length > 0)
+    {
+        int pick = skyBoxChoice;
+        ImGui.SetNextItemWidth(-1f);
+        if (ImGui.Combo("##skyboxpick", ref pick, string.Join('\0', skyBoxChoices) + "\0") && pick != skyBoxChoice
+            && pick >= 0 && pick < skyBoxChoices.Length)
+        { skyBoxChoice = pick; ApplySkyBox(skyBoxChoices[pick]); }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(Loc.T("Every skybox the mounted archives offer. Picking one shows it straight away -\nmesh, cube map and the level's own fog - and Save writes it to Init/SkyAndSun.con."));
+        if (skyBoxOriginal is not null && !string.Equals(skyBoxOriginal, env?.SkyBoxMesh, StringComparison.OrdinalIgnoreCase))
+        {
+            ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), string.Format(Loc.T("changed from {0}"), skyBoxOriginal));
+            ImGui.SameLine();
+            if (ImGui.SmallButton(Loc.TL("Put back##sky")))
+            {
+                ApplySkyBox(skyBoxOriginal);
+                skyBoxChoice = System.Array.FindIndex(skyBoxChoices, n => string.Equals(n, skyBoxOriginal, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+    }
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Sky rotation (deg)"), ref skyRotDeg, -180f, 180f, "%.0f");
     if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
     if (ImGui.IsItemHovered())
         ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
+    if (ImGui.Checkbox(Loc.TL("Water mirrors this level's sky (experimental)"), ref waterMirrorsLevelSky))
+    { EnsureWaterShaderLoaded(); QueueWaterShader(); }
+    if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(Loc.T("Off: the water reflects the stock cube map, as every retail level does.\nOn: the level ships a cube map of its OWN sky (128px DXT1 faces, the form the\ngame's own is in) and the water mirrors that. Check it in game before keeping it -\na cube map the engine cannot read crashes the map on its first drawn frame."));
     if (ImGui.Button(Loc.TL("Import skybox..."))) ImportSkybox();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
 
@@ -12407,7 +12462,7 @@ void QueueWaterShader()
 {
     // Mirror the level's OWN sky when it has one. Both shipped .rcm files name the same generic sky, so without
     // this a map with a custom skybox reflected clouds that are nowhere in it.
-    var cube = RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName)
+    var cube = !waterMirrorsLevelSky || RefractorForge.Formats.Terrain.CubeMapFile.IsStockSky(skyCubeBaseName)
         ? waterShaderBase.Cubemap
         : RefractorForge.Formats.Terrain.CubeMapFile.RefFor(skyCubeBaseName!);
     var settings = waterShaderBase with { Reflectivity = waterReflect, Opacity = waterOpacity, Cubemap = cube };
