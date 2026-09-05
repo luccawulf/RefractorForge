@@ -5569,7 +5569,7 @@ unsafe void UploadHeightTexture()
 }
 
 // Everything the water shader needs to colour itself by depth, for whichever body is being drawn.
-void SetWaterDepthUniforms(Vector3 shallow, Vector3 deep, float colorDepth, float surfaceY)
+void SetWaterDepthUniforms(Vector3 shallow, Vector3 deep, float colorDepth, float surfaceY, bool useDepth = true)
 {
     int l;
     if ((l = gl.GetUniformLocation(waterProg, "uShallowColor")) >= 0) gl.Uniform3(l, shallow.X, shallow.Y, shallow.Z);
@@ -5578,12 +5578,15 @@ void SetWaterDepthUniforms(Vector3 shallow, Vector3 deep, float colorDepth, floa
     if ((l = gl.GetUniformLocation(waterProg, "uWorldSizeM")) >= 0) gl.Uniform1(l, (float)cfg.WorldSize);
     if ((l = gl.GetUniformLocation(waterProg, "uYScaleM")) >= 0) gl.Uniform1(l, cfg.YScale);
     if ((l = gl.GetUniformLocation(waterProg, "uWaterLevelM")) >= 0) gl.Uniform1(l, surfaceY);
-    if ((l = gl.GetUniformLocation(waterProg, "uHasHeight")) >= 0) gl.Uniform1(l, heightTexId != 0 ? 1 : 0);
+    if ((l = gl.GetUniformLocation(waterProg, "uHasHeight")) >= 0) gl.Uniform1(l, useDepth && heightTexId != 0 ? 1 : 0);
+    // Unit SIX. The water draw already uses 0/1/2 for its texture layers and normal map, 3 for the sky cube and
+    // 4/5 for the two animated ripple frames - putting the heightmap on 4 meant the shader read the ripple normal
+    // map as terrain height, so the depth blend came out as noise across the whole surface.
     if (heightTexId != 0 && (l = gl.GetUniformLocation(waterProg, "uHeightTex")) >= 0)
     {
-        gl.ActiveTexture(TextureUnit.Texture4);
+        gl.ActiveTexture(TextureUnit.Texture6);
         gl.BindTexture(TextureTarget.Texture2D, heightTexId);
-        gl.Uniform1(l, 4);
+        gl.Uniform1(l, 6);
         gl.ActiveTexture(TextureUnit.Texture0);
     }
 }
@@ -7222,7 +7225,10 @@ void OnRender(double dt)
         {
             gl.Uniform1(uWaterYW, wbl);
             gl.Uniform3(uWaterColorW, belowColor.X, belowColor.Y, belowColor.Z);
-            SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater());
+            // No depth ramp for this body: it sits BELOW the terrain, so the surface heightmap says "zero deep"
+            // everywhere and the whole sheet would read as shallowColor. The editor has no tunnel floor to
+            // measure against, so it shows waterBelowTerrain.color as-is.
+            SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater(), useDepth: false);
             gl.Uniform1(uWaterAlphaW, belowAlpha);
             { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
             gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
@@ -9587,6 +9593,7 @@ void EnvironmentPanel()
             FitLabel(Loc.TL("Tunnel shallow colour"));
             bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
             bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
+            ImGui.TextDisabled(Loc.T("Three colours reach the game: shallow, this one and deep, over the depth below.\nThe viewport can only show the middle one - the tunnel water is under the terrain, so\nthe heightmap cannot say how deep it is. Check the ramp in game."));
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
             if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
             {
