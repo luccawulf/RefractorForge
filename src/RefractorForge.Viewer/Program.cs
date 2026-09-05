@@ -5458,27 +5458,45 @@ void InitTerrainShadowOnLoad()
 // Bake the terrain sun cast-shadow from the heightmap + sun direction, upload it for the terrain
 // shader to sample, and export an inspectable TerrainShadow.dds. (This is the editor preview/export;
 // the engine's packed LightmapShadowBits.lsb is a separate format and isn't written here.)
-void DoBakeShadows()
+// Bake the terrain's sun cast-shadow and ARM IT FOR SAVING. Arming used to live only in the caller, so the
+// standalone "Bake Sun Shadows (terrain)" lit the viewport and the save then wrote nothing - while the combined
+// "Bake Lightmaps" worked, because that one set the flags itself. Every caller wants them, so they belong here.
+void DoBakeShadows(bool announce = true)
 {
-    if (heightmap is null) return;
+    if (heightmap is null) { if (announce) Toast(Loc.T("Load a level with terrain first.")); return; }
     var sun = env?.SunDirection ?? new Vec3(-0.5f, 0.8f, -0.35f);
     var shadow = TerrainShadow.Bake(1024, heightmap, cfg, sun);
     if (shadowTexId != 0) { gl.DeleteTexture(shadowTexId); shadowTexId = 0; }
     shadowTexId = UploadTexture(shadow);
-    showShadows = true;
+    // shadowTexId feeds the .dds export only - the viewport's shadowing comes from the real-time map, so turning the
+    // layer on without marking it dirty left the screen looking identical and the bake looking like it did nothing.
+    showShadows = true; shadowMapDirty = true;
+    writeShadowLsb = true; bakedLsb = true;      // what actually gets LightmapShadowBits.lsb written on save
+
+    // The .dds is a convenience export for folder levels; the .lsb the game reads rides the save either way, so a
+    // level opened straight from a .rfa is not a failure - say which happened rather than swallowing it.
+    string? wrote = null, failed = null;
     try
     {
         string? dir = (levelDir is not null && System.IO.Directory.Exists(levelDir))
             ? (System.IO.Directory.EnumerateDirectories(levelDir, "Textures", System.IO.SearchOption.AllDirectories).FirstOrDefault() ?? levelDir)
-            : (levelDir is not null ? System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(levelDir)) : null);
+            : null;
         if (dir is not null)
         {
-            var p = System.IO.Path.Combine(dir, "TerrainShadow.dds");
-            DdsTexture.Save(shadow, p);
-            Console.WriteLine($"Baked sun shadows -> {p}");
+            wrote = System.IO.Path.Combine(dir, "TerrainShadow.dds");
+            DdsTexture.Save(shadow, wrote);
+            Console.WriteLine($"Baked sun shadows -> {wrote}");
         }
     }
-    catch { }
+    catch (Exception ex) { failed = ex.Message; wrote = null; }
+
+    if (!announce) return;
+    BroadcastLightBake();
+    Toast(failed is not null
+            ? Loc.T("Sun shadows baked. Save writes LightmapShadowBits.lsb. (TerrainShadow.dds export failed: ") + failed + ")"
+        : wrote is not null
+            ? Loc.T("Sun shadows baked, and TerrainShadow.dds written. Save writes LightmapShadowBits.lsb.")
+            : Loc.T("Sun shadows baked. Save writes LightmapShadowBits.lsb into the level."));
 }
 // Re-sync GPU buffers after a transform change (no geometry change).
 void SyncTransformEdit() { SyncMarkers(); glObjects?.Sync(so!); UploadMarkers(); }
@@ -6703,8 +6721,7 @@ bool LevelHasLightmapPalette()
 void BakeAllLighting()
 {
     if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
-    DoBakeShadows();
-    writeShadowLsb = true; bakedLsb = true;
+    DoBakeShadows(announce: false);
     if (so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
     if (lightRig.Lights.Count > 0 && atlasCpu is not null) { BakeLightsToGround(); bakedGround = true; }
     showShadows = true; showObjectLightmaps = true;
@@ -10402,7 +10419,7 @@ void RunRemoteBake((bool Lsb, bool Objects, bool Ground) rb)
     applyingRemote = true;   // nothing a bake touches may be broadcast back
     try
     {
-        if (rb.Lsb) { DoBakeShadows(); writeShadowLsb = true; bakedLsb = true; }
+        if (rb.Lsb) DoBakeShadows(announce: false);
         if (rb.Objects && so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
         if (rb.Ground && lightRig.Lights.Count > 0 && atlasCpu is not null) { BakeLightsToGround(); bakedGround = true; }
         showShadows = true; showObjectLightmaps = true;
@@ -11201,6 +11218,7 @@ void BuildUi()
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Everything the game reads for light, in one go: the terrain sun-shadow (.lsb), every\nobject's lightmap (sun + your placed lights) and the placed lights' colour in the ground\ntexture. Shown at once; Save writes it all. Set the sun and lights first."));
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain)"), null, false, heightmap is not null)) DoBakeShadows();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads."));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Each object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor."));
                 if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();

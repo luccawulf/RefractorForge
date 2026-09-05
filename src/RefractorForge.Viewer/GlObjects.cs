@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Numerics;
 using RefractorForge.Formats.Con;
 using RefractorForge.Render;
@@ -429,8 +430,13 @@ sealed class GlObjects
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
             parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage, Opacity = part.Opacity, DepthWrite = part.DepthWrite });
         }
+        // Blended parts go LAST, whatever order the mesh listed them in. The assault Huey puts its canopy FIRST,
+        // so the glass was composited against the sky and the opaque fuselage then drew straight over it - and,
+        // before depthWrite was honoured, the fuselage was culled by the glass's own depth and never drew at all.
+        // OrderBy is a stable sort, so everything else keeps its authored order.
+        var ordered = parts.OrderBy(p => p.Blend ? 1 : 0).ToArray();
         Bounds(pos, out var bbMin, out var bbMax);
-        var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = parts.ToArray(), BbMin = bbMin, BbMax = bbMax };
+        var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = ordered, BbMin = bbMin, BbMax = bbMax };
         _templates[key] = tpl;
         return tpl;
     }

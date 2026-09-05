@@ -773,7 +773,10 @@ public sealed class MeshLibrary
             {
                 var idx = new int[mp.Indices.Length];
                 for (int k = 0; k < idx.Length; k++) idx[k] = mp.Indices[k] + baseV;
-                mats.Add(new MaterialPart(idx, mp.Color, mp.Texture, mp.AlphaTest, mp.Blend, mp.TextureName, mp.AlphaRef, mp.Foliage));
+                // `with`, not a field-by-field rebuild: listing the fields here silently DROPPED every render
+                // state added later, so a vehicle's glass lost its opacity and its depthWrite while the same
+                // material on a static object kept them. Only the indices are rebased.
+                mats.Add(mp with { Indices = idx });
             }
         }
         return mats.Count > 0
