@@ -243,6 +243,10 @@ uniform vec2 uScroll1; uniform vec2 uScroll2; uniform vec2 uScrollN;   // direct
 uniform float uTile1; uniform float uTile2; uniform float uTileN;     // water.tileLayer*
 uniform vec3 uSpecColor;
 uniform float uReflect; uniform int uHasSkyCube; uniform samplerCube uSkyCube;   // levelWater.rs 'reflectivity', mirrored off the level's own sky
+// The sky is DRAWN turned by this; its reflection has to be turned by the same amount or the water mirrors a sky
+// that is not the one overhead. Same convention as the sky shader: rotating the LOOKUP is the inverse of rotating
+// the box, so the signs here are the mirror of a CreateRotationY.
+uniform float uSkyRot;
 // BfVietnam: the levelWater.rs `sequence` - 32 animated NORMAL maps, cross-faded, tiled every waterScale metres.
 uniform int uWaterSeq; uniform sampler2D uSeqA; uniform sampler2D uSeqB; uniform float uSeqMix;
 uniform float uWaterScaleM; uniform vec3 uMatDiffuse;
@@ -307,7 +311,10 @@ void main(){
         alpha = mix(uWaterAlpha, 1.0, fres*0.4);                          // transparent looking down, opaque at grazing
     }
     // Sky reflection: the levelWater.rs reflectivity knob, off the real cubemap when the level has one, else the haze.
-    vec3 refl = (uHasSkyCube==1) ? texture(uSkyCube, reflect(-viewDir, n)).rgb : uFogColor;
+    vec3 rd = reflect(-viewDir, n);
+    float scr = cos(uSkyRot), ssr = sin(uSkyRot);
+    rd = vec3(scr*rd.x - ssr*rd.z, rd.y, ssr*rd.x + scr*rd.z);
+    vec3 refl = (uHasSkyCube==1) ? texture(uSkyCube, rd).rgb : uFogColor;
     float fr = pow(1.0 - max(dot(n, viewDir), 0.0), 2.0);
     col = mix(col, refl, clamp(uReflect * (0.5 + 0.5*fr), 0.0, 1.0));
     if (uFogEnable==1) {                              // fade into the fog like the land, at the SAME distance
@@ -1501,6 +1508,13 @@ string? cloudMeshImportPath = null;    // imported cloud .sm/.obj to ship into t
 bool skyUseCubemap = true;              // use the level's real cubemap when loaded (else the procedural sun-sky)
 float skyRotDeg = 0f;                   // user yaw offset added to the level's Sky.setRotAngle
 bool skyRotEdited = false;              // the offset was folded into the level -> SkyAndSun.con is rewritten on save
+// The engine hangs a skybox half a turn round from where CreateRotationY(angle) puts it, so a level whose
+// sky.setRotAngle looked right in the editor came out backwards in game and needed 180 adding by hand. The offset
+// belongs in the PREVIEW, not in the saved number: correcting the file instead would fight the user every time
+// they touched the slider. Same family as the cube-map faces, which are numbered half a turn round too.
+const float SkyPreviewYawOffsetDeg = 180f;
+// Where the editor should DRAW the sky, for the level's angle plus whatever the slider is holding.
+float SkyPreviewYawRad() => ((env?.SkyRotationAngle ?? 0f) + skyRotDeg + SkyPreviewYawOffsetDeg) * MathF.PI / 180f;
 string? skyCubeBaseName = null;         // the level's own skybox face base (Sky_OI), so the water can mirror IT
 // OFF by default, and it stays that way until somebody has seen it work in game. Shipping a level cube map the
 // engine could not read crashed BFVietnam on the FIRST FRAME of a real map - the level loaded through, then died
@@ -6907,7 +6921,7 @@ void OnRender(double dt)
         var sky_sun = EffectiveSun();   // honour the manual sun control (sky glow follows the sun too)
         gl.Uniform3(uSunDirS, sky_sun.X, sky_sun.Y, sky_sun.Z);
         gl.Uniform3(uFogColorS, fogColor.X, fogColor.Y, fogColor.Z);
-        gl.Uniform1(uRotS, ((env?.SkyRotationAngle ?? 0f) + skyRotDeg) * MathF.PI / 180f);
+        gl.Uniform1(uRotS, SkyPreviewYawRad());
         bool useCube = skyUseCubemap && skyCubeTex != 0;
         gl.Uniform1(uHasCubeS, useCube ? 1 : 0);
         if (useCube) { gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.TextureCubeMap, skyCubeTex); gl.Uniform1(uCubeS, 0); }
@@ -7179,6 +7193,7 @@ void OnRender(double dt)
         SetWaterDepthUniforms(shallowColor, deepColor, env?.ColorDepth ?? 20f, cfg.WaterLevel);
         { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
         { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
+        { int usr = gl.GetUniformLocation(waterProg, "uSkyRot"); if (usr >= 0) gl.Uniform1(usr, SkyPreviewYawRad()); }
         if (skyCubeTex != 0)
         {
             gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.TextureCubeMap, skyCubeTex);
@@ -14966,7 +14981,7 @@ unsafe void DrawSkyMesh(uint vao, (int Off, int Count, uint Tex)[] parts, Vector
     gl.Disable(EnableCap.CullFace);
     if (opaque) gl.Disable(EnableCap.Blend);
     else { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
-    float rot = ((env?.SkyRotationAngle ?? 0f) + skyRotDeg) * MathF.PI / 180f;
+    float rot = SkyPreviewYawRad();
     var model = Matrix4x4.CreateRotationY(rot) * Matrix4x4.CreateTranslation(cam.Position);
     var mvpM = model * cam.ViewProjection;
     gl.UniformMatrix4(uSMmvp, 1, false, (float*)&mvpM);
