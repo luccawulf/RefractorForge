@@ -9725,10 +9725,10 @@ void EnvironmentPanel()
     if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
     if (ImGui.IsItemHovered())
         ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
-    if (ImGui.Checkbox(Loc.TL("Water mirrors this level's sky (experimental)"), ref waterMirrorsLevelSky))
+    if (ImGui.Checkbox(Loc.TL("Water mirrors this level's sky (KNOWN TO CRASH)"), ref waterMirrorsLevelSky))
     { EnsureWaterShaderLoaded(); QueueWaterShader(); }
     if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("Off: the water reflects the stock cube map, as every retail level does.\nOn: the level ships a cube map of its OWN sky (128px DXT1 faces, the form the\ngame's own is in) and the water mirrors that. Check it in game before keeping it -\na cube map the engine cannot read crashes the map on its first drawn frame."));
+        ImGui.SetTooltip(Loc.T("LEAVE THIS OFF unless you are testing it. Turning it on has crashed a real map on its\nfirst drawn frame every time - even with faces byte-identical to the game's own and the\npaths written the way the level's own shaders write theirs.\n\nZERO of the 97 retail levels ship a cube map of their own; every one points its water at\ntexture/env_default.rcm in the base archive, so the engine may simply not read a .rcm from\ninside a level. To change what water reflects across a whole MOD, replace that file in the\nmod's own texture archive instead - that is the route the game itself uses."));
     if (ImGui.Button(Loc.TL("Import skybox..."))) ImportSkybox();
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
 
