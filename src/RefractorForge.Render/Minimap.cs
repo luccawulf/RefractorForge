@@ -93,5 +93,49 @@ public static class Minimap
         return new Texture2D(size, size, rgba);
     }
 
+    /// <summary>
+    /// Re-cut an existing in-game map image from the world rectangle it covers to a different one.
+    /// <para>
+    /// The engine stretches <c>ingamemap.dds</c> over the level's combat area, so moving that area moves every
+    /// icon relative to the art underneath. Re-rendering from the terrain would fix the alignment and throw away
+    /// the map, which on most levels is hand-drawn - grid letters, unit icons, a painted out-of-bounds boundary.
+    /// This keeps the drawing and moves it instead. Bilinear, because the crop is not a whole number of pixels;
+    /// clamped at the edges, so an area reaching past the source just repeats its border rather than wrapping.
+    /// </para>
+    /// Always re-cut from the level's ORIGINAL art rather than from the last result - resampling a resample
+    /// softens the image a little more every save.
+    /// </summary>
+    public static Texture2D Refit(Texture2D src,
+                                  RefractorForge.Formats.Validation.CombatArea srcArea,
+                                  RefractorForge.Formats.Validation.CombatArea dstArea,
+                                  int size)
+    {
+        if (size < 1) size = 1;
+        if (srcArea.Width <= 0f || srcArea.Height <= 0f) return src;
+        var rgba = new byte[size * size * 4];
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                // Destination pixel -> world, north-up (image top is max Z) -> the source image's own UV.
+                float wx = dstArea.X + (x + 0.5f) / size * dstArea.Width;
+                float wz = dstArea.Z + (1f - (y + 0.5f) / size) * dstArea.Height;
+                float su = (wx - srcArea.X) / srcArea.Width * src.Width - 0.5f;
+                float sv = (1f - (wz - srcArea.Z) / srcArea.Height) * src.Height - 0.5f;
+                int x0 = (int)MathF.Floor(su), y0 = (int)MathF.Floor(sv);
+                float fx = su - x0, fy = sv - y0;
+                int i = (y * size + x) * 4;
+                for (int c = 0; c < 4; c++)
+                    rgba[i + c] = (byte)Math.Clamp(
+                        Lerp(Lerp(At(src, x0, y0, c), At(src, x0 + 1, y0, c), fx),
+                             Lerp(At(src, x0, y0 + 1, c), At(src, x0 + 1, y0 + 1, c), fx), fy) + 0.5f, 0f, 255f);
+            }
+        return new Texture2D(size, size, rgba);
+    }
+
+    private static float Lerp(float a, float b, float t) => a + (b - a) * t;
+
+    private static float At(Texture2D t, int x, int y, int c)
+        => t.Rgba[(Math.Clamp(y, 0, t.Height - 1) * t.Width + Math.Clamp(x, 0, t.Width - 1)) * 4 + c];
+
     private static byte Byte(float c) => (byte)(Math.Clamp(c, 0f, 1f) * 255f + 0.5f);
 }

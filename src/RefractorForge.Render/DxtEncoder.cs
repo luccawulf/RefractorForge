@@ -38,6 +38,31 @@ public static class DxtEncoder
         return buf;
     }
 
+    /// <summary>
+    /// DXT1 with NO mip chain - the format the menu art ships in. Of the 84 BFV levels that carry an
+    /// <c>ingamemap.dds</c>, 81 are 512x512 DXT1 with no mips and the other three DXT5; not one is uncompressed,
+    /// though the editor had been writing uncompressed BGRA. BF1942 agrees (184 of 240). Thumbnails are the same
+    /// story at 128x128. Menu art is drawn at one size, so a chain would only be weight.
+    /// </summary>
+    public static byte[] EncodeDxt1Flat(Texture2D top)
+    {
+        var buf = new byte[128 + Dxt1Size(top.Width, top.Height)];
+        buf[0] = (byte)'D'; buf[1] = (byte)'D'; buf[2] = (byte)'S'; buf[3] = (byte)' ';
+        void U32(int off, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off), v);
+        U32(4, 124);
+        U32(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000);             // CAPS|HEIGHT|WIDTH|PIXELFORMAT|LINEARSIZE - no MIPMAPCOUNT
+        U32(12, (uint)top.Height);
+        U32(16, (uint)top.Width);
+        U32(20, (uint)Dxt1Size(top.Width, top.Height));
+        U32(28, 0);                                             // no mip levels
+        U32(76, 32);
+        U32(80, 0x4);                                           // DDPF_FOURCC
+        buf[84] = (byte)'D'; buf[85] = (byte)'X'; buf[86] = (byte)'T'; buf[87] = (byte)'1';
+        U32(108, 0x1000);                                       // TEXTURE only - not COMPLEX, not MIPMAP
+        EncodeLevel(top, buf, 128);
+        return buf;
+    }
+
     public static int Dxt1Size(int w, int h) => Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * 8;
 
     private static int EncodeLevel(Texture2D t, byte[] dst, int at)

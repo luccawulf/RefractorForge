@@ -636,6 +636,15 @@ int selGroup = -1;
 bool showCombatArea = true;
 int combatDragCorner = -1;                  // 0 = min corner, 1 = max corner, 2 = whole box
 Vector2 combatDragStart = default;   // read by the drag threshold, so it must be provably assigned
+// The engine stretches the in-game map image over the combat area, so moving that area moves every icon relative
+// to the art. These remember which rectangle the level's shipped image was drawn for, so a save can re-cut it to
+// match. The baseline is taken at the FIRST edit of a session, which is the last moment it still describes the
+// image on disk; the art itself is cached so repeated edits re-cut from the original rather than from a resample.
+RefractorForge.Formats.Validation.CombatArea? mapArtBaseline = null;
+bool mapArtBaselineSet = false;
+RefractorForge.Formats.Validation.CombatArea? mapArtWritten = null;
+Dictionary<string, Texture2D> mapArtCache = new(StringComparer.OrdinalIgnoreCase);
+bool mapArtCacheLoaded = false;
 RefractorForge.Formats.Validation.CombatArea combatDragOrig = default;   // assigned before use, but straight-line code cannot prove it
 bool combatAreaDirty = false;
 bool showMapReport = false;
@@ -2069,6 +2078,7 @@ void OnLoad()
                 // a corner, so selecting an object near one used to re-write the area with whatever the ground was
                 // under the cursor - Saigon68's drifted a third of a metre per session, silently, every save.
                 if (Vector2.Distance(pos, combatDragStart) < 4f * uiScale) return;
+                NoteCombatAreaBaseline();
                 var cray = Picking.ScreenToRay(cam, pos.X, pos.Y, window.FramebufferSize.X, window.FramebufferSize.Y);
                 if (terrainPick.Raycast(cray, out var cg))
                 {
@@ -4958,6 +4968,7 @@ void DoSaveCore()
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }
         foreach (var (name, bytes) in bakedObjectLightmaps) wxFiles.Add(($"ObjectLightMaps/{name}", bytes));   // upsert
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
+        foreach (var mi in MapImagePieces(baseRfa)) wxFiles.Add(mi);   // in-game map re-cut to the combat area
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
 
         var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles);
@@ -5054,6 +5065,7 @@ void DoSavePatch(bool serverSideOnly = false)
         if (TerrainConNewEntry(baseRfa) is { } tn) wxFiles.Add(tn);   // water levels, for a level that ships no Terrain.con
         if (LightingRfaExtra(baseRfa) is { } lx) { extras.Add(lx); lightingDirty = false; }   // lighting -> patched Init.con
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
+        foreach (var mi in MapImagePieces(baseRfa)) wxFiles.Add(mi);   // in-game map re-cut to the combat area
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
         var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
         if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
@@ -5080,6 +5092,63 @@ void DoSavePatch(bool serverSideOnly = false)
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
     }
     catch (Exception ex) { Toast(Loc.T("Patch save failed: ") + ex.Message); }
+}
+
+// The rectangle the level's in-game map image was drawn for, remembered the moment before it stops being true.
+void NoteCombatAreaBaseline()
+{
+    if (mapArtBaselineSet || env is null) return;
+    mapArtBaseline = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
+    mapArtBaselineSet = true;
+}
+
+static bool SameArea(RefractorForge.Formats.Validation.CombatArea a, RefractorForge.Formats.Validation.CombatArea b)
+    => MathF.Abs(a.X - b.X) < 0.05f && MathF.Abs(a.Z - b.Z) < 0.05f
+    && MathF.Abs(a.Width - b.Width) < 0.05f && MathF.Abs(a.Height - b.Height) < 0.05f;
+
+// Re-cut the level's in-game map, thumbnail and briefing art to the combat area, and put them back INTO the
+// archive. Two separate holes met here: the images were only ever written loose beside a packed .rfa, where the
+// game never reads them, and nothing tied them to the combat area at all - so declaring an area silently left
+// every icon sitting somewhere else on the map. Each image is re-cut at its own shipped size and under its own
+// shipped name, so a level that ships a 128px thumbnail keeps one.
+List<(string Name, byte[] Bytes)> MapImagePieces(string baseRfa)
+{
+    var outp = new List<(string, byte[])>();
+    if (!mapArtBaselineSet || env is null || heightmap is null) return outp;
+    var world = RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
+    var want = env.CombatArea ?? world;
+    var have = mapArtWritten ?? mapArtBaseline ?? world;
+    if (SameArea(have, want)) return outp;                     // a zero-edit save must write nothing
+    try
+    {
+        if (!mapArtCacheLoaded)
+        {
+            mapArtCacheLoaded = true;
+            var arch = new RefractorForge.Formats.Rfa.RefractorFlatArchive(baseRfa);
+            foreach (var e in arch.Entries)
+            {
+                var n = e.Name.Replace('\\', '/');
+                bool isMap = n.Contains("ingamemap", StringComparison.OrdinalIgnoreCase)
+                          || n.Contains("thumbnail", StringComparison.OrdinalIgnoreCase)
+                          || n.Contains("briefing", StringComparison.OrdinalIgnoreCase);
+                if (!isMap || !n.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) continue;
+                try { mapArtCache[e.Name] = DdsTexture.Decode(arch.Read(e)); } catch { }
+            }
+        }
+        var src = mapArtBaseline ?? world;
+        foreach (var (name, art) in mapArtCache)
+        {
+            // The level prefix is stripped: these ride the same upsert path as the navmaps and lightmaps, which
+            // name their entries relative to the level.
+            int lv = name.Replace('\\', '/').IndexOf("/levels/", StringComparison.OrdinalIgnoreCase);
+            var rel = name.Replace('\\', '/');
+            if (lv >= 0) { int slash = rel.IndexOf('/', lv + 8); if (slash >= 0) rel = rel[(slash + 1)..]; }
+            outp.Add((rel, DxtEncoder.EncodeDxt1Flat(Minimap.Refit(art, src, want, art.Width))));
+        }
+        if (outp.Count > 0) mapArtWritten = want;
+    }
+    catch { }
+    return outp;
 }
 
 // Generate the level's minimap (ingame HUD map) + menu thumbnail from the current heightmap/terrain.
@@ -5117,11 +5186,11 @@ void DoGenerateMinimap()
     }
     if (a is not null && b is not null)
     {
-        DdsTexture.Save(ingame, a);
-        DdsTexture.Save(thumb, b);
+        System.IO.File.WriteAllBytes(a, DxtEncoder.EncodeDxt1Flat(ingame));
+        System.IO.File.WriteAllBytes(b, DxtEncoder.EncodeDxt1Flat(thumb));
         Console.WriteLine($"Minimap -> {a}");
         Console.WriteLine($"        -> {b}");
-        if (c is not null) { DdsTexture.Save(thumb, c); Console.WriteLine($"        -> {c}"); }
+        if (c is not null) { System.IO.File.WriteAllBytes(c, DxtEncoder.EncodeDxt1Flat(thumb)); Console.WriteLine($"        -> {c}"); }
     }
 }
 
@@ -13697,6 +13766,7 @@ void CombatAreaPanel()
     FitLabel(Loc.TL("Offset X, Z / Scale X, Z"));
     if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Scale X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
     {
+        NoteCombatAreaBaseline();
         env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(v.X, v.Y, MathF.Max(v.Z, 16f), MathF.Max(v.W, 16f));
         combatAreaDirty = true; lightingDirty = true;
     }
@@ -13711,6 +13781,7 @@ void CombatAreaPanel()
         ImGui.TextDisabled(Loc.T("Not declared - the whole world is playable."));
         if (ImGui.Button(Loc.TL("Declare one")))
         {
+            NoteCombatAreaBaseline();
             env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(cfg.WorldSize * 0.25f, cfg.WorldSize * 0.25f, cfg.WorldSize * 0.5f, cfg.WorldSize * 0.5f);
             env.RemoveCombatArea = false;
             combatAreaDirty = true; lightingDirty = true;
@@ -13720,6 +13791,7 @@ void CombatAreaPanel()
     {
         if (ImGui.Button(Loc.TL("Square it")))
         {
+            NoteCombatAreaBaseline();
             // Grow the short side rather than crop the long one: whatever was inside the rectangle stays inside it.
             float sz = MathF.Max(ca.Width, ca.Height);
             env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(ca.X, ca.Z, sz, sz);
@@ -13731,6 +13803,7 @@ void CombatAreaPanel()
         // out of bounds over their own map.
         if (ImGui.Button(Loc.TL("Remove")))
         {
+            NoteCombatAreaBaseline();
             env.CombatArea = null;
             env.RemoveCombatArea = true;
             combatAreaDirty = true; lightingDirty = true;
