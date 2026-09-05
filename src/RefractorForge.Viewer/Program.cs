@@ -102,7 +102,7 @@ void main(){ gl_Position = uMVP * vec4(aPos,1.0); vN = aNormal; vH = aPos.y; vUv
 
 const string TerrainFrag = @"#version 330 core
 in vec3 vN; in float vH; in vec2 vUv; in vec3 vWorld;
-uniform vec3 uLightDir; uniform float uWater; uniform float uMaxH; uniform vec3 uDeepColor;
+uniform vec3 uLightDir; uniform float uWater; uniform float uMaxH;
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
 uniform int uHasTex; uniform sampler2D uTer;
 // Terrain-atlas UV correction. The painted ground was landing in the wrong place (features magnified outward
@@ -185,10 +185,6 @@ void main(){
     // A texel cannot hold more than white, so a pool can never be brighter than the scene light itself. Showing
     // the same ceiling live is what makes a bake look like the preview instead of a surprise.
     vec3 c = min(baseCol * (d + placedLights(vWorld, n)), d);
-    if (vH < uWater) {                              // shallow shows the riverbed, deep reads as water
-        float depth = clamp((uWater - vH)/8.0, 0.0, 1.0);
-        c = mix(c, uDeepColor, 0.45 + 0.45*depth);
-    }
     if (uShowMat==1) {                              // material-paint mode: tint by material index
         int idx = int(texture(uMat, vUv).r * 255.0 + 0.5);
         c = mix(c, matColor(idx), 0.55);
@@ -1432,7 +1428,6 @@ string[] brushShapeNames = brushShapes.Select(b => b.Name).ToArray();
     }
 }
 int uMvp = -1, uLight = -1, uWater = -1, uMaxH = -1, uHasTexT = -1, uShowMat = -1, uMvpM = -1, uColor = -1, uSize = -1;
-int uDeepColor = -1;   // terrain submerged-tint colour (water.deepcolor)
 int uHasDetail = -1, uDetailScale = -1;
 // water surface (translucent plane at the water level) + gradient sky background
 uint waterProg = 0, waterVao = 0, waterVbo = 0;
@@ -2838,7 +2833,6 @@ void OnLoad()
     uDifLightT = gl.GetUniformLocation(terrainProg, "uDifLight");
     uWater = gl.GetUniformLocation(terrainProg, "uWater");
     uMaxH = gl.GetUniformLocation(terrainProg, "uMaxH");
-    uDeepColor = gl.GetUniformLocation(terrainProg, "uDeepColor");
     uHasTexT = gl.GetUniformLocation(terrainProg, "uHasTex");
     uShowMat = gl.GetUniformLocation(terrainProg, "uShowMat");
     uHasDetail = gl.GetUniformLocation(terrainProg, "uHasDetail");
@@ -6860,7 +6854,6 @@ void OnRender(double dt)
         SetLightUniforms(uAmbLightT, uDifLightT, terrainProg);
         gl.Uniform1(uWater, cfg.WaterLevel);
         gl.Uniform1(uMaxH, maxH);
-        gl.Uniform3(uDeepColor, deepColor.X, deepColor.Y, deepColor.Z);
         SetFogUniforms(terrainProg);
         if (terrainTexId != 0) { gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.Texture2D, terrainTexId); }
         if (detailTexId != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, detailTexId); gl.ActiveTexture(TextureUnit.Texture0); }
@@ -9046,6 +9039,25 @@ void SaveLightingToEnv()
 
 // Patch the lighting into the level's Init.con on a FOLDER save. Init.con is real gameplay, so only the four
 // renderer lines are rewritten and everything else is passed through untouched.
+// The vantage the game opens a map on, before the player picks a spawn: Init.con's
+// game.setBeforeSpawnCameraPosition / ...Rotation, one line per team. Every team is aimed at the same place, which
+// is what 81 of the 83 retail levels that define one do.
+void SetLevelStartCamera()
+{
+    if (env is null) { Toast(Loc.T("No level loaded.")); return; }
+
+    float yaw = cam.Yaw * 180f / MathF.PI;
+    yaw -= 360f * MathF.Floor((yaw + 180f) / 360f);        // into -180..180, the range retail writes
+    // The engine's pitch runs opposite to the editor's, where + looks up. BloodBowl_one parks its pre-spawn camera
+    // 67 m above the water line and writes 70, which can only mean looking down; Crossroads (28 m up) writes 10.
+    float pitch = -cam.Pitch * 180f / MathF.PI;
+
+    env.SetStartCamera(new Vec3(cam.Position.X, cam.Position.Y, cam.Position.Z), new Vec3(yaw, pitch, 0f));
+    lightingDirty = true;                                  // the flag that gets Init.con rewritten on save
+    Toast(string.Format(Loc.T("Level start camera set to {0:0}/{1:0}/{2:0}, facing {3:0} deg. Save writes it to Init.con."),
+                        cam.Position.X, cam.Position.Y, cam.Position.Z, yaw));
+}
+
 void SaveLightingFolder()
 {
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
@@ -9143,7 +9155,6 @@ void EnvironmentPanel()
         ImGui.SameLine();
         if (ImGui.SmallButton(Loc.TL("Match##wshallow"))) { shallowColor = waterColor; wcol = true; }
     }
-    wcol |= ImGui.ColorEdit3(Loc.TL("Deep colour"), ref deepColor);
     ImGui.SetNextItemWidth(150f);
     wcol |= SldF(Loc.TL("Water transparency"), ref waterAlpha, 0.08f, 1f, "%.2f");
     if (wcol) MarkWaterColorsEdited();
@@ -9205,7 +9216,6 @@ void EnvironmentPanel()
             var wasBelow = belowColor;
             bool bcol = ImGui.ColorEdit3(Loc.TL("Tunnel water colour"), ref belowColor);
             if (bcol && Vector3.DistanceSquared(belowShallowColor, wasBelow) < 1e-4f) belowShallowColor = belowColor;
-            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
             ImGui.SetNextItemWidth(150f);
             // shallowColor is what the game shows in shallow water - most of a flooded tunnel. It is a separate
             // setting from the colour above, and it was invisible here, so a level whose two disagreed looked right
@@ -9226,7 +9236,7 @@ void EnvironmentPanel()
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep the tunnel water has to be before it stops being see-through.\nSmaller hides the bottom sooner. Saigon68, the only retail tunnel map, uses 0.4 m."));
             ImGui.SetNextItemWidth(150f);
             bcol |= SldF(Loc.TL("Tunnel full colour at depth"), ref belowColorDepth, 0.5f, 20f, "%.2f m");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep before the water reaches its deep colour rather than its own colour.\nSaigon68 uses 7.5 m."));
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep before the water stops taking its colour from the shallow setting.\nSaigon68 uses 7.5 m."));
             if (bcol)
             {
                 env.BelowColor = new Vec3(belowColor.X, belowColor.Y, belowColor.Z);
@@ -11144,6 +11154,10 @@ void BuildUi()
         {
             if (ImGui.MenuItem(Loc.TL("Road tool"), null, roadMode)) { roadMode = !roadMode; if (roadMode) measureMode = false; roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; }
             if (ImGui.MenuItem(Loc.TL("Measure"), null, measureMode)) { measureMode = !measureMode; if (measureMode) roadMode = false; measurePts.Clear(); }
+            ImGui.Separator();
+            if (ImGui.MenuItem(Loc.TL("Set Level Start Camera Here"), null, false, env is not null)) SetLevelStartCamera();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(Loc.T("Where the game opens the map, before you pick a spawn - fly to the view you want\nand click. Both teams are aimed here, which is what nearly every retail level does.\nWritten to Init.con on save as game.setBeforeSpawnCameraPosition."));
             ImGui.Separator();
             if (ImGui.BeginMenu(Loc.TL("Arrange Selection")))
             {

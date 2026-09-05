@@ -937,21 +937,18 @@ public sealed class MeshLibrary
     /// <summary>What sound a placed template carries, if any: the <c>.ssc</c> it loads and whether it is an AMBIENT
     /// (<c>autoPlaySound</c> - started with the level and heard by distance, like the game's generators and speakers)
     /// or tied to the object being DRAWN, which is what an object with a sound script but no autoPlaySound does.
-    /// Looks through a Bundle/LodObject's children too, since that is where retail keeps the sounding part.</summary>
+    /// <para>
+    /// Only the template ITSELF counts. This used to walk children eight deep to find "the sounding part", which
+    /// turned out to classify a large share of ordinary scenery as sound emitters: 301 of BFVietnam's object .con
+    /// files load a sound script and nearly all of them are EFFECTS, so any building with a fire, a smoke plume or a
+    /// generator effect somewhere in its tree got sound rings and a volume label in the editor.
+    /// </para></summary>
     public (string Script, bool AutoPlay)? SoundOf(string template)
     {
         EnsureAllTemplates();
-        if (_allTemplates is null) return null;
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        (string, bool)? Walk(string name, int depth)
-        {
-            if (depth > 8 || !seen.Add(name) || !_allTemplates!.TryGetValue(name, out var t)) return null;
-            if (t.SoundScript is { Length: > 0 } s) return (s, t.AutoPlaySound);
-            foreach (var (child, _, _) in t.Children)
-                if (Walk(child, depth + 1) is { } hit) return hit;
-            return null;
-        }
-        return Walk(template, 0);
+        if (_allTemplates is null || template is null) return null;
+        if (!_allTemplates.TryGetValue(template, out var t)) return null;
+        return t.SoundScript is { Length: > 0 } s ? (s, t.AutoPlaySound) : null;
     }
 
     /// <summary>The first ObjectTemplate.create name in a single .con entry (the main Objects.con's root), or null.</summary>

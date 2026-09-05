@@ -43,8 +43,7 @@ public static class OvergrowthFoliage
         var pal = over ? growth.OverPalette : growth.UnderPalette;
         int side = over ? growth.OverSide : growth.UnderSide;
         if (map is null || pal is null || side <= 0 || cfg.WorldSize <= 0) return list;
-        var slots = pal.Materials;
-        if (slots.Count == 0) return list;
+        if (pal.Materials.Count == 0) return list;
 
         float ws = cfg.WorldSize;
         int grid = Math.Max(1, (int)MathF.Round(ws / MathF.Max(patchMeters, 1f)));   // patches per axis (game ~163 @ 12.5 m on 2048)
@@ -57,8 +56,8 @@ public static class OvergrowthFoliage
                 // Cheap occupancy reject: if the patch centre's material grows nothing, skip the whole patch.
                 int mcx0 = Math.Clamp((int)((cx + 0.5f) * ps / ws * side), 0, side - 1);
                 int mcy0 = Math.Clamp((int)((cy + 0.5f) * ps / ws * side), 0, side - 1);
-                int cidx = map[mcx0, mcy0];
-                if (cidx < 0 || cidx >= slots.Count || slots[cidx].Types.Count == 0) continue;
+                var patchSlot = pal.SlotForIndex(map[mcx0, mcy0]);
+                if (patchSlot is null || patchSlot.Types.Count == 0) continue;
 
                 uint state = (uint)((cy * 4711 + cx * 13 + 23) & 0x7fffffff);          // engine per-patch seed
                 int count = Math.Max(0, (int)MathF.Round(CountForPatch(ref state) * densityScale));
@@ -70,10 +69,9 @@ public static class OvergrowthFoliage
                     // Per-tree material check (like the engine -> ~99.7% land on a tree-bearing material).
                     int mcx = Math.Clamp((int)(wx / ws * side), 0, side - 1);
                     int mcy = Math.Clamp((int)(wz / ws * side), 0, side - 1);
-                    int idx = map[mcx, mcy];
-                    if (idx < 0 || idx >= slots.Count) continue;
-                    var types = slots[idx].Types;
-                    if (types.Count == 0) continue;
+                    var slot = pal.SlotForIndex(map[mcx, mcy]);
+                    if (slot is null || slot.Types.Count == 0) continue;
+                    var types = slot.Types;
 
                     var ft = Roulette(types, ref state);
                     if (string.IsNullOrWhiteSpace(ft.GeometryName)) continue;

@@ -1169,7 +1169,7 @@
  "Tunnel opaque at depth": "トンネル水が不透明になる深さ",
  "How deep the tunnel water has to be before it stops being see-through.\nSmaller hides the bottom sooner. Saigon68, the only retail tunnel map, uses 0.4 m.": "トンネルの水がどれだけ深くなると透けなくなるかを決めます。\n値が小さいほど底が早く隠れます。製品版で唯一のトンネルマップ Saigon68 では 0.4 m です。",
  "Tunnel full colour at depth": "トンネル水が深色になる深さ",
- "How deep before the water reaches its deep colour rather than its own colour.\nSaigon68 uses 7.5 m.": "水が自身の色ではなく深い部分の色になるまでの深さです。\nSaigon68 では 7.5 m です。",
+ "How deep before the water stops taking its colour from the shallow setting.\nSaigon68 uses 7.5 m.": "水が浅い部分の色を使わなくなるまでの深さです。\nSaigon68 では 7.5 m です。",
  "Shallow colour": "浅瀬の色",
  "Tunnel shallow colour": "トンネル浅瀬の色",
  "Match##wshallow": "色に合わせる",
@@ -1207,5 +1207,8 @@
  "In the video, in sync": "動画の中（同期）",
  "The .bik is made silent and a separate emitter carries the sound (not frame-synced).": ".bik は無音になり、別のエミッターが音を担当します（映像とは非同期）。",
  "The .bik's own track is the sound - nothing else is added, so it cannot play twice.": ".bik 自身の音声トラックが音になります。ほかには何も追加されないため、二重再生は起きません。",
- "The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit.": "エンジンは画面が描画されている間しか動画を進めず、.bik 自身の音声トラックもその再生の一部です。\nそのため標準では「同期」と「常に聞こえる」を同時には満たせません。\n\n常に: .bik を無音にし、別の AreaObject エミッターが音を担当します。どこを向いていても距離に応じて\n聞こえますが、映像とは同期しません。\n\n動画の中（同期）: .bik が自身のトラックを保持し、ほかには何も追加されません。完全に同期しますが、\n標準では画面が見えている間だけ再生されます。bink DLL パッチはこの制限を取り除きます。"
+ "The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit.": "エンジンは画面が描画されている間しか動画を進めず、.bik 自身の音声トラックもその再生の一部です。\nそのため標準では「同期」と「常に聞こえる」を同時には満たせません。\n\n常に: .bik を無音にし、別の AreaObject エミッターが音を担当します。どこを向いていても距離に応じて\n聞こえますが、映像とは同期しません。\n\n動画の中（同期）: .bik が自身のトラックを保持し、ほかには何も追加されません。完全に同期しますが、\n標準では画面が見えている間だけ再生されます。bink DLL パッチはこの制限を取り除きます。",
+ "Set Level Start Camera Here": "レベル開始時のカメラをここに設定",
+ "Where the game opens the map, before you pick a spawn - fly to the view you want\nand click. Both teams are aimed here, which is what nearly every retail level does.\nWritten to Init.con on save as game.setBeforeSpawnCameraPosition.": "スポーン地点を選ぶ前にゲームがマップを映す視点です。見せたい視点まで移動して\nクリックしてください。両チームともここを向きます（製品版のほぼ全レベルと同じ方式です）。\n保存時に game.setBeforeSpawnCameraPosition として Init.con に書き込まれます。",
+ "Level start camera set to {0:0}/{1:0}/{2:0}, facing {3:0} deg. Save writes it to Init.con.": "レベル開始カメラを {0:0}/{1:0}/{2:0}、方位 {3:0} 度に設定しました。保存すると Init.con に書き込まれます。"
 }

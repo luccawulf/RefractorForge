@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Xml.Linq;
 
 namespace RefractorForge.Formats.Terrain;
 
@@ -59,34 +58,56 @@ public sealed class FoliagePalette
 
     public int TypeCount => Materials.Sum(m => m.Types.Count);
 
+    /// <summary>The engine's terrain materials, in the order a growth map's cell values index them. Verified against
+    /// every retail BFVietnam level: 79 of 82 list exactly these 16 names in exactly this order.</summary>
+    public static readonly string[] MaterialNames =
+    {
+        "default", "water", "dryGrass", "juicyGrass", "dryDirt", "wetDirt", "mud", "deathMaterial",
+        "gravel", "muddyWater", "drySand", "wetSand", "rock", "sandRoad", "dirtRoad", "pavelRoad",
+    };
+
+    /// <summary>Which slot a growth-map cell value selects. Matched by NAME rather than by position, because
+    /// Khe_Sahn and Lang_Vei duplicate their <c>dryDirt</c> block - a 17th slot that shifts every material after it,
+    /// so counting down the list would grow the wrong species from index 6 on. Falls back to position for a palette
+    /// whose names are not the engine's (Operation_Flaming_Dart renames slot 0).</summary>
+    public FoliageMaterialSlot? SlotForIndex(int index)
+    {
+        if (index < 0) return null;
+        if (index < MaterialNames.Length)
+            foreach (var m in Materials)
+                if (string.Equals(m.Name, MaterialNames[index], StringComparison.OrdinalIgnoreCase)) return m;
+        return index < Materials.Count ? Materials[index] : null;
+    }
+
     public static FoliagePalette Parse(string xml)
     {
-        // Some shipped .wst files have a stray leading space/BOM before the XML declaration.
-        string trimmed = xml.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
-        var doc = XDocument.Parse(trimmed);
-        var root = doc.Root ?? throw new InvalidDataException("empty .wst");
+        // Read with the forgiving scanner rather than an XML parser: four retail levels ship .wst files that are not
+        // well-formed, the game loads them, and a palette that failed to load means a map with no trees. See WstNode.
+        var doc = WstNode.Parse(xml);
+        var root = doc.Children.FirstOrDefault()
+                   ?? throw new InvalidDataException("empty .wst");
         // root = <WRAPPER_TREE>; its single child is <underGrowth> or <overGrowth>.
-        var growth = root.Elements().FirstOrDefault()
+        var growth = root.Children.FirstOrDefault()
                      ?? throw new InvalidDataException(".wst has no growth element");
-        bool isOver = growth.Name.LocalName.IndexOf("over", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool isOver = growth.Name.IndexOf("over", StringComparison.OrdinalIgnoreCase) >= 0;
 
         var slots = new List<FoliageMaterialSlot>();
-        var materials = FirstLocal(growth, "materials");
+        var materials = growth.Child("materials");
         if (materials is not null)
         {
-            foreach (var mat in materials.Elements())
+            foreach (var mat in materials.Children)
             {
-                var slot = new FoliageMaterialSlot { Name = mat.Name.LocalName };
-                var types = FirstLocal(mat, "types");
+                var slot = new FoliageMaterialSlot { Name = mat.Name };
+                var types = mat.Child("types");
                 if (types is not null)
-                    foreach (var t in types.Elements())
+                    foreach (var t in types.Children)
                         slot.Types.Add(new FoliageType(
-                            AttrStr(t, "geometryName") ?? t.Name.LocalName,
+                            NonEmpty(t.Attr("geometryName")) ?? t.Name,
                             AttrFloat(t, "probability", 0f),
                             AttrFloat(t, "normalScale", 1f),
                             AttrFloat(t, "minRadiusDistToEquals", 0f),
                             AttrFloat(t, "minRadiusDistToOthers", 0f),
-                            AttrStr(t, "scale") ?? ""));
+                            t.Attr("scale") ?? ""));
                 slots.Add(slot);
             }
         }
@@ -95,22 +116,18 @@ public sealed class FoliagePalette
         {
             IsOver = isOver,
             MaterialMapSideSize = AttrInt(growth, "materialMapSideSize", 0),
-            ViewDistance = AttrFloat(growth, "viewdistance", AttrFloat(growth, "viewDistance", 0f)),
-            ImportSceneObjects = string.Equals(AttrStr(growth, "importSceneObjects"), "true", StringComparison.OrdinalIgnoreCase),
+            ViewDistance = AttrFloat(growth, "viewDistance", 0f),
+            ImportSceneObjects = string.Equals(growth.Attr("importSceneObjects"), "true", StringComparison.OrdinalIgnoreCase),
             Materials = slots,
             RawXml = xml,
         };
     }
 
-    private static XElement? FirstLocal(XElement parent, string local) =>
-        parent.Elements().FirstOrDefault(e => string.Equals(e.Name.LocalName, local, StringComparison.OrdinalIgnoreCase));
+    private static string? NonEmpty(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 
-    private static string? AttrStr(XElement e, string name) =>
-        e.Attributes().FirstOrDefault(a => string.Equals(a.Name.LocalName, name, StringComparison.OrdinalIgnoreCase))?.Value?.Trim();
+    private static int AttrInt(WstNode e, string name, int def) =>
+        int.TryParse(e.Attr(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : def;
 
-    private static int AttrInt(XElement e, string name, int def) =>
-        int.TryParse(AttrStr(e, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : def;
-
-    private static float AttrFloat(XElement e, string name, float def) =>
-        float.TryParse(AttrStr(e, name), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : def;
+    private static float AttrFloat(WstNode e, string name, float def) =>
+        float.TryParse(e.Attr(name), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : def;
 }

@@ -321,6 +321,18 @@ public sealed class EnvironmentSettings
                     case "mapmanager.addobjectmap": if (ObjectMap.Parse(val) is { } om) e.ObjectMaps.Add(om); break;
                     case "water.color": if (TryVec(val, out var wcl)) e.WaterColor = wcl; break;
                     case "water.deepcolor": if (TryVec(val, out var wdc)) e.DeepColor = wdc; break;
+                    // "<team> x/y/z" - the team is part of the setting, so it cannot be keyed like the rest.
+                    case "game.setbeforespawncameraposition":
+                    case "game.setbeforespawncamerarotation":
+                    {
+                        var bits = val.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (bits.Length >= 2 && int.TryParse(bits[0], out var team) && TryVec(bits[1], out var cv))
+                        {
+                            if (key.EndsWith("position", StringComparison.Ordinal)) e.StartCameraPosition[team] = cv;
+                            else e.StartCameraRotation[team] = cv;
+                        }
+                        break;
+                    }
                     case "water.shallowcolor": if (TryVec(val, out var wsh)) { e.ShallowColor = wsh; e.HasShallowColor = true; } break;
                     case "water.watershallowalpha": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var wal)) e.WaterAlpha = Math.Clamp(wal, 0.08f, 1f); break;
                     // BF1942 textured-water layers + scroll/tile/specular.
@@ -502,6 +514,28 @@ public sealed class EnvironmentSettings
     /// disagreed with the game's own lighting.</summary>
     public bool WriteSun { get; set; }
 
+    /// <summary>Where the camera sits before you pick a spawn - the first thing anyone sees of a map. Init.con holds
+    /// one per team as <c>game.setBeforeSpawnCameraPosition &lt;team&gt; x/y/z</c> (+ a matching Rotation), and 83 of
+    /// the 97 retail levels set both. Keyed by team because a handful of maps aim the two sides differently.</summary>
+    public Dictionary<int, Vec3> StartCameraPosition { get; } = new();
+    public Dictionary<int, Vec3> StartCameraRotation { get; } = new();
+
+    /// <summary>The start camera was set in the editor, so both lines go back into Init.con.</summary>
+    public bool WriteStartCamera { get; set; }
+
+    /// <summary>Aim every team's pre-spawn camera at one spot. Teams 1 and 2 always exist; any others the level
+    /// already declared are moved too, so a map does not end up with half its sides looking somewhere else.</summary>
+    public void SetStartCamera(Vec3 position, Vec3 rotation)
+    {
+        var teams = new SortedSet<int>(StartCameraPosition.Keys) { 1, 2 };
+        foreach (var team in teams)
+        {
+            StartCameraPosition[team] = position;
+            StartCameraRotation[team] = rotation;
+        }
+        WriteStartCamera = true;
+    }
+
     public List<string> PatchInitConLines(IEnumerable<string> existing)
     {
         var wanted = new (string Key, string Line, bool Want)[]
@@ -544,6 +578,7 @@ public sealed class EnvironmentSettings
         }
         var missing = wanted.Where(x => x.Want && !seen.Contains(x.Key)).Select(x => x.Line).ToList();
         if (missing.Count > 0) outLines.InsertRange(lastRenderer >= 0 ? lastRenderer + 1 : 0, missing);
+        if (WriteStartCamera) PatchStartCamera(outLines);
         if (WriteTunnel && IsTunnelMap && ObjectMaps.Count > 0)
         {
             // Directly after the isTunnelMap line, wherever that ended up, so the block reads as one setting.
@@ -576,6 +611,46 @@ public sealed class EnvironmentSettings
             }
         }
         return outLines;
+    }
+
+    // Rewrite the pre-spawn camera lines in place, one per team, and append any team that had none. Existing rem'd
+    // copies are left alone: retail keeps the previous position commented out just above the live one, and a mapper
+    // reads those as history.
+    private void PatchStartCamera(List<string> lines)
+    {
+        var wrotePos = new HashSet<int>();
+        var wroteRot = new HashSet<int>();
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            var t = lines[i].Trim();
+            int sp = t.IndexOf(' ');
+            if (sp < 0) continue;
+            var key = t[..sp].ToLowerInvariant();
+            bool isPos = key == "game.setbeforespawncameraposition";
+            bool isRot = key == "game.setbeforespawncamerarotation";
+            if (!isPos && !isRot) continue;
+
+            var bits = t[(sp + 1)..].Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (bits.Length < 1 || !int.TryParse(bits[0], out var team)) continue;
+            if (isPos && StartCameraPosition.TryGetValue(team, out var p))
+            { lines[i] = $"game.setBeforeSpawnCameraPosition {team} {V(p)}"; wrotePos.Add(team); }
+            else if (isRot && StartCameraRotation.TryGetValue(team, out var r))
+            { lines[i] = $"game.setBeforeSpawnCameraRotation {team} {V(r)}"; wroteRot.Add(team); }
+        }
+
+        var add = new List<string>();
+        foreach (var team in StartCameraPosition.Keys.OrderBy(k => k))
+        {
+            if (!wrotePos.Contains(team)) add.Add($"game.setBeforeSpawnCameraPosition {team} {V(StartCameraPosition[team])}");
+            if (!wroteRot.Contains(team) && StartCameraRotation.TryGetValue(team, out var r))
+                add.Add($"game.setBeforeSpawnCameraRotation {team} {V(r)}");
+        }
+        if (add.Count == 0) return;
+
+        // Next to the lines it belongs with when they exist, otherwise at the end - never inside the run chain.
+        int at = lines.FindLastIndex(l => l.TrimStart().StartsWith("game.setBeforeSpawnCamera", StringComparison.OrdinalIgnoreCase));
+        lines.InsertRange(at >= 0 ? at + 1 : lines.Count, add);
     }
 
     /// <summary>Parse an "x/y/z" triple (the .con vector form).</summary>
