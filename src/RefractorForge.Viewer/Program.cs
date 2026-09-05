@@ -12234,7 +12234,11 @@ void DecalDialog()
         // of the picture. "Only while you look at it" keeps it (perfectly in sync, drawn-gated); "Always" strips it,
         // since the separate emitter carries the sound - keeping both is how a screen ended up playing twice.
         int aRate = decalAudioRate, aCh = decalSoundStereo ? 2 : 1;
-        bool aWithAudio = !(decalSound && decalSoundMode == 0);
+        // A .bik's own audio track is played by the engine as part of the picture, so it IS the screen's sound in
+        // the mode that keeps it - and a second copy in any other form is what made a screen play twice over. Only
+        // "Only while you look at it" keeps the track; the ambient mode strips it and lets the emitter carry the
+        // sound; no sound at all strips it too.
+        bool aWithAudio = decalSound && decalSoundMode == 1;
         if (ImGui.Button(Loc.TL("Convert a video to .bik...")))
         {
             var src = Picker.File("Pick a video to convert", "Videos|*.mp4;*.avi;*.mov;*.mkv;*.webm;*.wmv;*.m4v|All files|*.*", levelDir);
@@ -12312,11 +12316,11 @@ void DecalDialog()
             {
                 ImGui.SetNextItemWidth(240f * uiScale);
                 ImGui.Combo(Loc.TL("When it plays"), ref decalSoundMode,
-                            new[] { Loc.T("Always - fades with distance"), Loc.T("Only while you look at it") }, 2);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nOnly while you look at it: the sound stays inside the .bik, perfectly in sync with the picture,\nand plays only while the screen is on your screen."));
+                            new[] { Loc.T("Always - fades with distance"), Loc.T("In the video, in sync") }, 2);
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit."));
                 ImGui.TextDisabled(decalSoundMode == 0
-                    ? Loc.T("The .bik will be made silent; the emitter carries the sound (not frame-synced).")
-                    : Loc.T("The sound stays in the .bik: in sync with the picture, heard only while it is drawn."));
+                    ? Loc.T("The .bik is made silent and a separate emitter carries the sound (not frame-synced).")
+                    : Loc.T("The .bik's own track is the sound - nothing else is added, so it cannot play twice."));
                 ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref decalSoundVol, 0.05f, 1f, "%.2f");
                 if (decalSoundMode == 0)
                 {
@@ -12533,24 +12537,9 @@ bool CreateDecalObject()
                 RefractorForge.Formats.Sound.SoundObject.PatchEnvironmentCon(envCon0, area.RunLine))));
             companionSound = area.Template;
         }
-        else if (video && decalSound && ExtractWavPair(decalImagePath, decalSoundStereo, decalAudioRate) is { } wavs)
-        {
-            var snd = RefractorForge.Formats.Sound.SoundObject.Build(name, wavs.Wav22, decalSoundVol, decalSoundNear, decalSoundFar,
-                                                                     loop: true, triggerRadius: decalSoundFar, stereo: decalSoundStereo, wav44kBytes: wavs.Wav44);
-            soundScript = snd.Template + ".ssc";
-            // Only the script + the wavs: the decal's own template carries the loadSoundScript line, so it needs
-            // neither its own Sounds/*.con nor a run line. The script goes in the OBJECT'S folder, because that is
-            // where the engine looks for it - one written to Sounds/ came back as
-            // "File not found: .../objects/<name>/<name>.ssc" and the decal played silently.
-            foreach (var f in snd.Files)
-            {
-                if (f.RelPath.EndsWith(".con", StringComparison.OrdinalIgnoreCase)) continue;
-                var rel = f.RelPath.EndsWith(".ssc", StringComparison.OrdinalIgnoreCase)
-                    ? RefractorForge.Formats.Sound.SoundObject.ScriptPathFor(name, snd.Template)
-                    : f.RelPath;
-                soundFiles.Add((rel, f.Bytes));
-            }
-        }
+        // "Only while you look at it" adds NOTHING: the .bik's own track is the sound, and it is already in
+        // sync with the picture because the engine plays both from the same frame advance. A sound script here
+        // would simply be a second copy of it.
         var built = RefractorForge.Formats.Con.DecalObject.Build(levelName, name, decalW, decalH, texName, dds, decalFlat, true, baseSub, movieRef,
                                                                  soundScript, decalSoundFar, soundAutoPlay: decalSoundMode == 0, uMax: uMax, vMax: vMax,
                                                                  maxDrawDistance: decalLimitDraw ? decalLookRange : 0f);
