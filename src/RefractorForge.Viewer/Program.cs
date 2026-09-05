@@ -5398,11 +5398,13 @@ void PathmapPreviewWindow()
     ImGui.SetNextWindowSize(new Vector2(560, 640), ImGuiCond.FirstUseEver);
     if (ImGui.Begin(Loc.TL("AI Pathmap Preview"), ref pathmapPreviewOpen, ImGuiWindowFlags.NoScrollbar))
     {
+        ImGui.PushTextWrapPos(0f);
         ImGui.TextColored(new Vector4(0.86f, 0.55f, 0.55f, 1f), pathmapPreviewLabel);
         ImGui.Text($"{pathmapPreviewSide} x {pathmapPreviewSide} cells   black = passable, white = blocked");
         if (pathmapPreviewT > 0f) { ImGui.SameLine(); ImGui.TextDisabled($"(auto-close {pathmapPreviewT:0.#}s)"); }
         float sz = MathF.Min(ImGui.GetContentRegionAvail().X, 512f);
         // North (+Z = high world-grid row) at the TOP, matching the minimap + the in-game map (V-flip the texture).
+        ImGui.PopTextWrapPos();
         ImGui.Image((IntPtr)pathmapTex, new Vector2(sz, sz), new Vector2(0f, 1f), new Vector2(1f, 0f));
     }
     ImGui.End();
@@ -6350,7 +6352,7 @@ bool LibTile(string id, uint tex, Vector2 size, bool selected)
 // The texture-library browser: category + search row, then a thumbnail grid. height 0 = fill the rest of the window.
 void DrawTextureBrowser(float height)
 {
-    ImGui.SetNextItemWidth(140f); ImGui.Combo(Loc.TL("Category"), ref texLibCatIdx, texLibCats, texLibCats.Length);
+    ImGui.SetNextItemWidth(140f); Cbo(Loc.TL("Category"), ref texLibCatIdx, texLibCats, texLibCats.Length);
     ImGui.SameLine(); ImGui.SetNextItemWidth(130f); ImGui.InputTextWithHint("##texsearch", Loc.T("search"), ref texLibSearch, 64);
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Refresh"))) RefreshTextureLibrary();
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Import..."))) ImportToLibrary();
@@ -6403,6 +6405,7 @@ void LayerToolWindow()
     ImGui.SetNextWindowSize(new Vector2(380, 580), ImGuiCond.FirstUseEver);
     if (ImGui.Begin(Loc.TL("Layer Tool"), ref showLayerTool))
     {
+        ImGui.PushTextWrapPos(0f);
         ImGui.TextWrapped(Loc.T("Blend two tileable textures across the terrain by height or slope, with noise breaking up the seam (Editor42-style)."));
         ImGui.Separator();
         // Layer A
@@ -6423,7 +6426,7 @@ void LayerToolWindow()
         ImGui.EndGroup();
         ImGui.Separator();
         string[] selNames = { "Height", "Slope" };
-        if (ImGui.Combo(Loc.TL("Selector"), ref layerSelectorIdx, selNames, selNames.Length)) layerProofDirty = true;
+        if (Cbo(Loc.TL("Selector"), ref layerSelectorIdx, selNames, selNames.Length)) layerProofDirty = true;
         if (layerSelectorIdx == 1)
         {
             if (SldF(Loc.TL("Slope low (deg)"), ref layerThrLow, 0f, 90f, "%.0f")) layerProofDirty = true;
@@ -6451,10 +6454,11 @@ void LayerToolWindow()
         if (ImGui.Button(Loc.TL("Apply to terrain"))) ApplyLayerToTerrain();
         ImGui.SameLine(); if (ImGui.Button(Loc.TL("Library..."))) { layerPickTarget = 0; showTexLibrary = true; }
         ImGui.Spacing();
-        ImGui.SetNextItemWidth(150f); ImGui.InputText("##presetname", ref layerPresetName, 48);
+        ImGui.SetNextItemWidth(150f); InT("##presetname", ref layerPresetName, 48);
         ImGui.SameLine(); if (ImGui.Button(Loc.TL("Save preset"))) SaveLayerPreset();
         ImGui.SameLine(); if (ImGui.Button(Loc.TL("Load preset"))) LoadLayerPreset();
         ImGui.TextDisabled(Loc.T("Apply bakes into the terrain texture; Ctrl+S writes the .dds tiles."));
+        ImGui.PopTextWrapPos();
     }
     ImGui.End();
 }
@@ -7921,7 +7925,7 @@ void MapperSubToolbar()
             gtLabels[0] = Loc.T("Show All");
             for (int i = 0; i < gameplayModes.Modes.Count; i++) gtLabels[i + 1] = gameplayModes.Modes[i];
             ImGui.SetNextItemWidth(130f);
-            ImGui.Combo(Loc.TL("Game type"), ref gameTypeFilter, gtLabels, gtLabels.Length);
+            Cbo(Loc.TL("Game type"), ref gameTypeFilter, gtLabels, gtLabels.Length);
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing still applies to the mode the level was loaded from."));
             ImGui.SameLine();
@@ -8012,7 +8016,7 @@ void MapperSubToolbar()
     {
         if (ImGui.RadioButton(Loc.TL("Passable"), !aiPathBlock)) aiPathBlock = false; ImGui.SameLine();
         if (ImGui.RadioButton(Loc.TL("Blocked"), aiPathBlock)) aiPathBlock = true; ImGui.SameLine();
-        ImGui.SetNextItemWidth(130f); ImGui.Combo(Loc.TL("Vehicle##sub"), ref aiPathVeh, aiPathVehNames, aiPathVehNames.Length);
+        ImGui.SetNextItemWidth(130f); Cbo(Loc.TL("Vehicle##sub"), ref aiPathVeh, aiPathVehNames, aiPathVehNames.Length);
         ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Radius##ai"), ref brushRadius, 1f, 200f, "%.0f");
         ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Square brush##ai"), ref squareBrush);   // square footprint + cursor (like terrain)
     }
@@ -8043,7 +8047,7 @@ void ToolButtons()
     if (snapOn)   // grid step: object move/place snaps X/Z to this many metres
     {
         ImGui.SameLine(); ImGui.SetNextItemWidth(56f);
-        if (ImGui.DragFloat("##snapStep", ref snapStep, 0.25f, 0.25f, 64f, "%.2fm")) snapStep = Math.Clamp(snapStep, 0.25f, 64f);
+        if (DrgF("##snapStep", ref snapStep, 0.25f, 0.25f, 64f, "%.2fm")) snapStep = Math.Clamp(snapStep, 0.25f, 64f);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Snap grid step (m): placed/moved objects round to this."));
     }
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Map"), ref showMinimap);
@@ -8109,7 +8113,7 @@ void Inspector()
         }
         if (ImGui.Button(Loc.TL("Pick road texture..."))) { layerPickTarget = 3; showTexLibrary = true; RefreshTextureLibrary(); }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick a road strip from the Texture Library (Road category). Oriented mode runs it lengthwise down the road."));
-        int rs = roadSurface; if (ImGui.Combo(Loc.TL("Surface/material"), ref rs, surfNames, surfNames.Length)) roadSurface = (byte)Math.Clamp(rs, 0, 15);
+        int rs = roadSurface; if (Cbo(Loc.TL("Surface/material"), ref rs, surfNames, surfNames.Length)) roadSurface = (byte)Math.Clamp(rs, 0, 15);
         ImGui.Separator();
         ImGui.Checkbox(Loc.TL("Flatten terrain"), ref roadFlatten);
         if (roadFlatten) SldF(Loc.TL("Shoulder (m)"), ref roadShoulder, 0f, 16f, "%.1f");
@@ -8206,7 +8210,7 @@ void Inspector()
                 if (captureMode)
                 {
                     SldF(Loc.TL("Capture size (m)"), ref captureMeters, 8f, 1024f, "%.0f");
-                    ImGui.Combo(Loc.TL("Capture res"), ref captureResIdx, captureSizeNames, captureSizeNames.Length);
+                    Cbo(Loc.TL("Capture res"), ref captureResIdx, captureSizeNames, captureSizeNames.Length);
                     ImGui.Checkbox(Loc.TL("Save as .dds file"), ref captureSaveFile);
                     if (captureSaveFile) ImGui.Checkbox(Loc.TL("Also import into this slot"), ref captureImport);
                 }
@@ -8269,7 +8273,7 @@ void Inspector()
                 }
                 SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
                 SldF(Loc.TL("Hardness"), ref matHardness, 0.05f, 1f, "%.2f");
-                if (brushShapeNames.Length > 1) ImGui.Combo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
+                if (brushShapeNames.Length > 1) Cbo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
                 if (brushShapeIdx == 0) ImGui.Checkbox(Loc.TL("Square brush"), ref squareBrush);
                 ImGui.Spacing();
                 ImGui.BulletText(Loc.T("Drag on terrain to paint the material."));
@@ -8295,7 +8299,7 @@ void Inspector()
             }
             SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
             SldF(Loc.TL("Hardness"), ref matHardness, 0.05f, 1f, "%.2f");
-            if (brushShapeNames.Length > 1) ImGui.Combo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
+            if (brushShapeNames.Length > 1) Cbo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
             if (brushShapeIdx == 0) ImGui.Checkbox(Loc.TL("Square brush"), ref squareBrush);
             ImGui.Spacing();
             if (pal is not null && pal.DistinctGeometries.Count > 0)
@@ -8310,11 +8314,11 @@ void Inspector()
             return;
         }
         if (terrainEd is null) { ImGui.TextDisabled(Loc.T("No terrain loaded.")); return; }
-        if (tn == "Sculpt") ImGui.Combo(Loc.TL("Mode"), ref sculptModeIdx, sculptModeLabels, sculptModeLabels.Length);
+        if (tn == "Sculpt") Cbo(Loc.TL("Mode"), ref sculptModeIdx, sculptModeLabels, sculptModeLabels.Length);
         if (tn == "Sculpt") { ImGui.Checkbox(Loc.TL("L/R mouse = raise / lower"), ref lrSculpt); if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Left-drag raises, right-drag lowers the terrain (overrides the Mode above).\nWhile sculpting, right-drag won't orbit the camera.")); }
-        if (brushShapeNames.Length > 1) ImGui.Combo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
+        if (brushShapeNames.Length > 1) Cbo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
         // Falloff + the procedural square only apply to the radial brush; bitmap shapes carry their own edge.
-        if (brushShapeIdx == 0) ImGui.Combo(Loc.TL("Falloff"), ref falloffIdx, falloffLabels, falloffLabels.Length);
+        if (brushShapeIdx == 0) Cbo(Loc.TL("Falloff"), ref falloffIdx, falloffLabels, falloffLabels.Length);
         if (brushShapeIdx == 0) ImGui.Checkbox(Loc.TL("Square brush"), ref squareBrush);
         SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
 
@@ -8350,7 +8354,7 @@ void Inspector()
         ImGui.TextWrapped(Loc.T("Paint where AI bots can and cannot go. Black = passable, white = blocked (matches the engine navmap)."));
         if (ImGui.RadioButton(Loc.TL("Passable (black)"), !aiPathBlock)) aiPathBlock = false;
         ImGui.SameLine(); if (ImGui.RadioButton(Loc.TL("Blocked (white)"), aiPathBlock)) aiPathBlock = true;
-        ImGui.Combo(Loc.TL("Vehicle"), ref aiPathVeh, aiPathVehNames, aiPathVehNames.Length);
+        Cbo(Loc.TL("Vehicle"), ref aiPathVeh, aiPathVehNames, aiPathVehNames.Length);
         SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
         ImGui.Checkbox(Loc.TL("Square brush"), ref squareBrush);
         // Re-seed ONLY this vehicle's buffer (others keep their edits): from the level's shipped navmap, or
@@ -8422,7 +8426,7 @@ void Inspector()
             if (gpKind == GpKind.Vehicle) gpVehBuf = gameplayEdit.GetDetail(gpKind, gpIndex);
             if (gpKind != GpKind.ControlPoint) { var r = gameplayEdit.GetRotation(gpKind, gpIndex); gpInsRot = new Vector3(r.X, r.Y, r.Z); }
         }
-        ImGui.InputText(Loc.TL("Name"), ref gpNameBuf, 64u);
+        InT(Loc.TL("Name"), ref gpNameBuf, 64u);
         if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
         {
             object cur = gameplayEdit.GetItem(gpKind, gpIndex);
@@ -8442,20 +8446,20 @@ void Inspector()
             var choices = cat.Contains(gpVehBuf) || string.IsNullOrEmpty(gpVehBuf)
                 ? cat : cat.Append(gpVehBuf).ToArray();
             int sel = Array.IndexOf(choices, gpVehBuf);
-            if (ImGui.Combo(Loc.TL("Vehicle"), ref sel, choices, choices.Length) && sel >= 0 && hist is not null)
+            if (Cbo(Loc.TL("Vehicle"), ref sel, choices, choices.Length) && sel >= 0 && hist is not null)
             {
                 gpVehBuf = choices[sel];
                 var v = (VehicleSpawnDef)gameplayEdit.GetItem(GpKind.Vehicle, gpIndex);
                 hist.Do(new GameplaySetItemCommand(gameplayEdit, GpKind.Vehicle, gpIndex, v with { Vehicle = gpVehBuf }, null));
             }
-            ImGui.InputText(Loc.TL("Custom##veh"), ref gpVehBuf, 64u);
+            InT(Loc.TL("Custom##veh"), ref gpVehBuf, 64u);
             if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
             {
                 var v = (VehicleSpawnDef)gameplayEdit.GetItem(GpKind.Vehicle, gpIndex);
                 hist.Do(new GameplaySetItemCommand(gameplayEdit, GpKind.Vehicle, gpIndex, v with { Vehicle = gpVehBuf }, null));
             }
         }
-        ImGui.DragFloat3(Loc.TL("Position"), ref gpInsPos, 0.25f);
+        DrgF3(Loc.TL("Position"), ref gpInsPos, 0.25f);
         if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
             hist.Do(new GameplayMoveCommand(gameplayEdit, gpKind, gpIndex, new Vec3(gpInsPos.X, gpInsPos.Y, gpInsPos.Z), null));
         if (gpKind == GpKind.ControlPoint)
@@ -8479,7 +8483,7 @@ void Inspector()
         else
         {
             FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
-            ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref gpInsRot, 1f);
+            DrgF3(Loc.TL("Rotation yaw/pitch/roll"), ref gpInsRot, 1f);
             if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
                 hist.Do(new GameplayRotateCommand(gameplayEdit, gpKind, gpIndex, new Vec3(gpInsRot.X, gpInsRot.Y, gpInsRot.Z), null));
             // Full Battlecraft-style spawn editors (team / OS id for vehicles; group / spawn id / paratrooper for soldiers).
@@ -8547,19 +8551,19 @@ void Inspector()
     }
     ImGui.PushItemWidth(-80f);   // fields fill the row but leave room for the Position/Rotation/Scale labels (not -1, which clips them)
 
-    if (ImGui.DragFloat3(Loc.TL("Position"), ref insPos, 0.25f, 0f, 0f))
+    if (DrgF3(Loc.TL("Position"), ref insPos, 0.25f, 0f, 0f))
     { o.Position = new Vec3(insPos.X, insPos.Y, insPos.Z); SyncTransformEdit(); }
     if (ImGui.IsItemActivated()) dragFromV3 = o.Position;
     if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
     { var to = new Vec3(insPos.X, insPos.Y, insPos.Z); o.Position = dragFromV3; hist.Do(new MoveObject(o.Id, to)); SyncTransformEdit(); }
 
-    if (ImGui.DragFloat3(Loc.TL("Rotation"), ref insRot, 0.5f, 0f, 0f))
+    if (DrgF3(Loc.TL("Rotation"), ref insRot, 0.5f, 0f, 0f))
     { o.Rotation = new Vec3(insRot.X, insRot.Y, insRot.Z); SyncTransformEdit(); }
     if (ImGui.IsItemActivated()) dragFromV3 = o.Rotation;
     if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
     { var to = new Vec3(insRot.X, insRot.Y, insRot.Z); o.Rotation = dragFromV3; hist.Do(new RotateObject(o.Id, to)); SyncTransformEdit(); }
 
-    if (ImGui.DragFloat(Loc.TL("Scale##objscale"), ref insScale, 0.01f, 0.01f, 100f))
+    if (DrgF(Loc.TL("Scale##objscale"), ref insScale, 0.01f, 0.01f, 100f))
     { o.Scale = insScale; SyncTransformEdit(); }
     if (ImGui.IsItemActivated()) dragFromScale = o.Scale ?? 1f;
     if (ImGui.IsItemDeactivatedAfterEdit() && hist is not null)
@@ -8583,11 +8587,11 @@ void Inspector()
             if (!ImGui.IsAnyItemActive()) sndWavBuf = sc.Wav ?? "";
             ImGui.TextDisabled(sc.SourceMode + " wav:");
             ImGui.SetNextItemWidth(-1f);   // the wav path field has no label, so let it use the full row width
-            if (ImGui.InputText("##sndwav", ref sndWavBuf, 200)) { sc.SetWav(sndWavBuf.Trim()); em.Dirty = true; }
+            if (InT("##sndwav", ref sndWavBuf, 200)) { sc.SetWav(sndWavBuf.Trim()); em.Dirty = true; }
             float vol = sc.Volume;
-            if (ImGui.DragFloat(Loc.TL("Volume"), ref vol, 0.01f, 0f, 4f)) { sc.SetVolume(MathF.Max(0f, vol)); em.Dirty = true; }
+            if (DrgF(Loc.TL("Volume"), ref vol, 0.01f, 0f, 4f)) { sc.SetVolume(MathF.Max(0f, vol)); em.Dirty = true; }
             float md = sc.MinDistance;
-            if (ImGui.DragFloat(Loc.TL("Min distance (m)"), ref md, 0.25f, 0f, 2000f)) { sc.SetMinDistance(MathF.Max(0f, md)); em.Dirty = true; }
+            if (DrgF(Loc.TL("Min distance (m)"), ref md, 0.25f, 0f, 2000f)) { sc.SetMinDistance(MathF.Max(0f, md)); em.Dirty = true; }
             bool loop = sc.Loop;
             if (ImGui.Checkbox(Loc.TL("Loop"), ref loop)) { sc.SetLoop(loop); em.Dirty = true; }
             ImGui.SameLine();
@@ -8936,7 +8940,7 @@ void LayersPanel()
     if (showWeather)
     {
         ImGui.SetNextItemWidth(120f);
-        ImGui.Combo(Loc.TL("Type"), ref weatherTypeIdx, "Snow\0Rain\0Dust\0Dust Storm\0");
+        CboZ(Loc.TL("Type"), ref weatherTypeIdx, "Snow\0Rain\0Dust\0Dust Storm\0");
         ImGui.SetNextItemWidth(150f);
         SldI(Loc.TL("Intensity/s"), ref weatherIntensity, 20, 600);
         ImGui.SetNextItemWidth(150f);
@@ -9600,7 +9604,7 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("GAME"));
     int gameIdx = gameIsBf1942 ? 0 : 1;
     ImGui.SetNextItemWidth(180f);
-    if (ImGui.Combo(Loc.TL("Target game"), ref gameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) gameIsBf1942 = gameIdx == 0;
+    if (CboZ(Loc.TL("Target game"), ref gameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) gameIsBf1942 = gameIdx == 0;
     if (gameIsBf1942) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("BF1942: no overgrowth / tunnels."));
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Auto-detected from the level path; set it here if wrong. Drives team names (Axis/Allies vs NVA/US) and which features show."));
 
@@ -9614,20 +9618,20 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("SURFACE WATER"));
     float wl = cfg.WaterLevel;
     ImGui.SetNextItemWidth(150f);
-    if (ImGui.DragFloat(Loc.TL("Water level (m)"), ref wl, 0.25f, -5000f, 5000f, "%.1f")) { cfg.WaterLevel = wl; waterLevelEdited = true; BroadcastWater(); }
+    if (DrgF(Loc.TL("Water level (m)"), ref wl, 0.25f, -5000f, 5000f, "%.1f")) { cfg.WaterLevel = wl; waterLevelEdited = true; BroadcastWater(); }
     ImGui.SameLine();
     if (ImGui.SmallButton(Loc.TL("Reset##wl")) && env is not null) { cfg.WaterLevel = waterLevelLoaded; waterLevelEdited = false; BroadcastWater(); }
     // Colour + transparency, from (and back to) the level's water.color / water.deepColor / waterShallowAlpha.
     // These used to be viewport-only: an edit never reached Init.con, which is one reason the game's water looked
     // nothing like the editor's.
     var wasWater = waterColor;
-    bool wcol = ImGui.ColorEdit3(Loc.TL("Water colour"), ref waterColor);
+    bool wcol = Col3(Loc.TL("Water colour"), ref waterColor);
     if (wcol && Vector3.DistanceSquared(shallowColor, wasWater) < 1e-4f) shallowColor = waterColor;   // linked while equal
     // The colour the game paints where the water is shallow, which on a river is most of its surface. A separate
     // setting from the one above, and one the editor did not show - so a level whose two disagreed looked one way
     // here and another in the game.
-    wcol |= ImGui.ColorEdit3(Loc.TL("Shallow colour"), ref shallowColor);
-    wcol |= ImGui.ColorEdit3(Loc.TL("Deep colour"), ref deepColor);
+    wcol |= Col3(Loc.TL("Shallow colour"), ref shallowColor);
+    wcol |= Col3(Loc.TL("Deep colour"), ref deepColor);
     if (ImGui.IsItemHovered())
         ImGui.SetTooltip(Loc.T("What the water turns into where it is DEEP - past 'full colour at depth' below.\nIt is easy to miss because the editor shows it only under deep water, and a stray\nvalue here is what makes a river read as orange in game."));
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep."));
@@ -9681,7 +9685,7 @@ void EnvironmentPanel()
         {
             float twl2 = cfg.WaterBelowLevel ?? SafeBelowWaterLevel();
             ImGui.SetNextItemWidth(150f);
-            if (ImGui.DragFloat(Loc.TL("Tunnel water level (m)##inspector"), ref twl2, 0.25f, -500f, 500f, "%.1f"))
+            if (DrgF(Loc.TL("Tunnel water level (m)##inspector"), ref twl2, 0.25f, -500f, 500f, "%.1f"))
             { cfg.WaterBelowLevel = twl2; cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true; }
             ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface {0:0.0} m"), cfg.WaterLevel));
             // The second surface is drawn wherever the ground is under it, per terrain patch - so a level above the
@@ -9697,15 +9701,15 @@ void EnvironmentPanel()
             }
             var wasBelow = belowColor;
             FitLabel(Loc.TL("Tunnel water colour"));
-            bool bcol = ImGui.ColorEdit3(Loc.TL("Tunnel water colour"), ref belowColor);
+            bool bcol = Col3(Loc.TL("Tunnel water colour"), ref belowColor);
             if (bcol && Vector3.DistanceSquared(belowShallowColor, wasBelow) < 1e-4f) belowShallowColor = belowColor;
             ImGui.SetNextItemWidth(150f);
             // shallowColor is what the game shows in shallow water - most of a flooded tunnel. It is a separate
             // setting from the colour above, and it was invisible here, so a level whose two disagreed looked right
             // in the viewport and wrong in the game with no way to tell why.
             FitLabel(Loc.TL("Tunnel shallow colour"));
-            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
-            bcol |= ImGui.ColorEdit3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
+            bcol |= Col3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
+            bcol |= Col3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
             ImGui.TextDisabled(Loc.T("Three colours reach the game: shallow, this one and deep, over the depth below.\nThe viewport can only show the middle one - the tunnel water is under the terrain, so\nthe heightmap cannot say how deep it is. Check the ramp in game."));
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
             if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
@@ -9782,13 +9786,13 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("LIGHTING"));
     ImGui.Checkbox(Loc.TL("Preview lighting"), ref lightPreview);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Shade the editor with the level's light colours.\nOff = neutral white light (the old look)."));
-    if (ImGui.ColorEdit3(Loc.TL("Global ambient"), ref lightGlobalAmb)) { lightingDirty = true; BroadcastLight(); }
+    if (Col3(Loc.TL("Global ambient"), ref lightGlobalAmb)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.globalAmbientColor - scene-wide fill added to everything."));
-    if (ImGui.ColorEdit3(Loc.TL("Ambient"), ref lightAmb)) { lightingDirty = true; BroadcastLight(); }
+    if (Col3(Loc.TL("Ambient"), ref lightAmb)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.ambientColor - the sun light's own ambient term."));
-    if (ImGui.ColorEdit3(Loc.TL("Sun diffuse"), ref lightDiffuse)) { lightingDirty = true; BroadcastLight(); }
+    if (Col3(Loc.TL("Sun diffuse"), ref lightDiffuse)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.diffuseColor - the key light colour. This is what\nmakes a level read warm or cold."));
-    if (ImGui.ColorEdit3(Loc.TL("Specular"), ref lightSpecular)) { lightingDirty = true; BroadcastLight(); }
+    if (Col3(Loc.TL("Specular"), ref lightSpecular)) { lightingDirty = true; BroadcastLight(); }
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.specularColor - highlight colour on shiny surfaces.\nWritten to Init.con; not previewed in the editor."));
     if (ImGui.Button(Loc.TL("Reset lighting to level")) && env is not null)
     {
@@ -9814,7 +9818,7 @@ void EnvironmentPanel()
     ImGui.TextDisabled(Loc.T("PERFORMANCE"));
     int texIdx = AppPrefs.ObjectTextureCap switch { 512 => 3, 1024 => 2, 2048 => 1, _ => 0 };
     ImGui.SetNextItemWidth(150f);
-    if (ImGui.Combo(Loc.TL("Object texture detail"), ref texIdx, "Full (map's own)\0" + "2048\0" + "1024\0" + "512\0"))
+    if (CboZ(Loc.TL("Object texture detail"), ref texIdx, "Full (map's own)\0" + "2048\0" + "1024\0" + "512\0"))
     {
         AppPrefs.ObjectTextureCap = texIdx switch { 3 => 512, 2 => 1024, 1 => 2048, _ => 0 };
         AppPrefs.Save();
@@ -9853,7 +9857,7 @@ void EnvironmentPanel()
     ImGui.Checkbox(Loc.TL("Fog"), ref fogEnabled);
     if (fogEnabled)
     {
-        ImGui.ColorEdit3(Loc.TL("Fog colour"), ref fogColor);
+        Col3(Loc.TL("Fog colour"), ref fogColor);
         SldF(Loc.TL("Fog start (m)"), ref fogStart, 0f, Math.Max(2000f, fogEnd), "%.0f");
         SldF(Loc.TL("Fog end (m)"), ref fogEnd, fogStart + 1f, Math.Max(4000f, cfg.WorldSize * 2f), "%.0f");
         if (fogStart > fogEnd - 1f) fogStart = fogEnd - 1f;
@@ -9881,7 +9885,7 @@ void EnvironmentPanel()
     {
         int pick = skyBoxChoice;
         ImGui.SetNextItemWidth(-1f);
-        if (ImGui.Combo("##skyboxpick", ref pick, string.Join('\0', skyBoxChoices) + "\0") && pick != skyBoxChoice
+        if (CboZ("##skyboxpick", ref pick, string.Join('\0', skyBoxChoices) + "\0") && pick != skyBoxChoice
             && pick >= 0 && pick < skyBoxChoices.Length)
         { skyBoxChoice = pick; ApplySkyBox(skyBoxChoices[pick]); }
         if (ImGui.IsItemHovered())
@@ -9982,7 +9986,7 @@ void EnvironmentPanel()
         if (SldF(Loc.TL("Drift X"), ref cloudSpeedX, -0.2f, 0.2f, "%.3f")) cloudsDirty = true;
         ImGui.SetNextItemWidth(150f);
         if (SldF(Loc.TL("Drift Y"), ref cloudSpeedY, -0.2f, 0.2f, "%.3f")) cloudsDirty = true;
-        if (ImGui.ColorEdit3(Loc.TL("Cloud color"), ref cloudColor)) cloudsDirty = true;
+        if (Col3(Loc.TL("Cloud color"), ref cloudColor)) cloudsDirty = true;
         if (ImGui.Button(Loc.TL("Import cloud texture..."))) ImportCloudTexture();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Use a custom cloud image (.dds/.tga/.png) for the scrolling layer - shown here and shipped."));
         ImGui.SameLine();
@@ -10248,8 +10252,36 @@ void FitLabel(string label)
     float labelW = ImGui.CalcTextSize(label, true).X;         // true = ignore the ###id part, which is not drawn
     if (labelW <= 0f) return;                                 // "##hidden" labels need no room
     float room = avail - labelW - ImGui.GetStyle().ItemInnerSpacing.X - 4f;
-    if (want > room && room >= 48f) ImGui.SetNextItemWidth(room);
+    // A label too long to share the row at all still gets whatever is left: a floor keeps a multi-component
+    // drag usable, and clipping the tail of one word beats clipping half the label.
+    if (want > room) ImGui.SetNextItemWidth(MathF.Max(room, 60f));
 }
+
+// The same courtesy for every other widget whose label ImGui draws to its RIGHT. A Combo / Input / Drag /
+// ColorEdit sized without regard to its label pushes that label off the panel, where it is silently clipped:
+// in the 384 px Inspector "Rotation yaw/pitch/roll" read as "Rotation yaw/pit". These forward to ImGui
+// unchanged apart from asking FitLabel for the room first, so a call that already fits is untouched.
+// (Local functions cannot be overloaded, hence Cbo/CboZ rather than two Cbo.)
+bool Cbo(string label, ref int v, string[] items, int count)
+    { FitLabel(label); return ImGui.Combo(label, ref v, items, count); }
+bool CboZ(string label, ref int v, string itemsZeroSeparated)
+    { FitLabel(label); return ImGui.Combo(label, ref v, itemsZeroSeparated); }
+bool InT(string label, ref string v, uint maxLen, ImGuiInputTextFlags flags = ImGuiInputTextFlags.None)
+    { FitLabel(label); return ImGui.InputText(label, ref v, maxLen, flags); }
+bool InI(string label, ref int v)
+    { FitLabel(label); return ImGui.InputInt(label, ref v); }
+bool InF(string label, ref float v, float step, float stepFast, string fmt)
+    { FitLabel(label); return ImGui.InputFloat(label, ref v, step, stepFast, fmt); }
+bool Col3(string label, ref Vector3 v)
+    { FitLabel(label); return ImGui.ColorEdit3(label, ref v); }
+bool DrgF(string label, ref float v, float speed, float min, float max, string? fmt = null)
+    { FitLabel(label); return fmt is null ? ImGui.DragFloat(label, ref v, speed, min, max)
+                                          : ImGui.DragFloat(label, ref v, speed, min, max, fmt); }
+bool DrgF3(string label, ref Vector3 v, float speed, float min = 0f, float max = 0f)
+    { FitLabel(label); return ImGui.DragFloat3(label, ref v, speed, min, max); }
+bool DrgF4(string label, ref Vector4 v, float speed, float min, float max, string fmt)
+    { FitLabel(label); return ImGui.DragFloat4(label, ref v, speed, min, max, fmt); }
+
 
 bool SldF(string label, ref float v, float min, float max, string fmt = "%.3f")
 {
@@ -10291,7 +10323,7 @@ float SliderInput(string label, float v, float min, float max, string sliderFmt,
     ImGui.PopItemWidth();
     ImGui.SameLine();
     ImGui.PushItemWidth(96f);
-    ImGui.InputFloat(Loc.TL(label), ref v, 0f, 0f, inputFmt);
+    InF(Loc.TL(label), ref v, 0f, 0f, inputFmt);
     ImGui.PopItemWidth();
     return Math.Clamp(v, min, max);
 }
@@ -10382,7 +10414,7 @@ void ScatterModal()
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Structures"), ref scatterStruct);
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Props"), ref scatterProps);
     ImGui.Separator();
-    ImGui.InputInt(Loc.TL("Count"), ref scatterCount); scatterCount = Math.Clamp(scatterCount, 1, 20000);
+    InI(Loc.TL("Count"), ref scatterCount); scatterCount = Math.Clamp(scatterCount, 1, 20000);
     scatterMaxSlope = SliderInput("Max slope (deg)", scatterMaxSlope, 0f, 60f, "%.0f", "%.0f");
     ImGui.Checkbox(Loc.TL("Avoid water"), ref scatterAvoidWater);
     if (scatterAvoidWater) scatterClearance = SliderInput("Water clearance (m)", scatterClearance, 0f, 25f, "%.1f", "%.1f");
@@ -10391,7 +10423,7 @@ void ScatterModal()
     scatterScaleMin = SliderInput("Min scale", scatterScaleMin, 0.2f, 3f, "%.2f", "%.2f");
     scatterScaleMax = SliderInput("Max scale", scatterScaleMax, 0.2f, 3f, "%.2f", "%.2f");
     if (scatterScaleMax < scatterScaleMin) scatterScaleMax = scatterScaleMin;
-    ImGui.InputInt(Loc.TL("Seed"), ref scatterSeed);
+    InI(Loc.TL("Seed"), ref scatterSeed);
     if (!string.IsNullOrEmpty(scatterError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), scatterError);
 
     ImGui.Separator();
@@ -10418,9 +10450,9 @@ void NewMapModal()
     if (!ImGui.BeginPopupModal(Loc.TL("New Map"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
         return;
 
-    ImGui.InputText(Loc.TL("Name"), ref nmName, 64);
+    InT(Loc.TL("Name"), ref nmName, 64);
     ImGui.PushItemWidth(-140);   // reserve room for the "Folder" label (drawn to the right) AND the Browse button
-    ImGui.InputText(Loc.TL("Folder"), ref nmFolder, 512);
+    InT(Loc.TL("Folder"), ref nmFolder, 512);
     ImGui.PopItemWidth();
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Browse...")))
@@ -10430,22 +10462,22 @@ void NewMapModal()
     }
 
     ImGui.Separator();
-    ImGui.Combo(Loc.TL("Material size"), ref nmMatSizeIdx, nmMatSizeLabels, nmMatSizeLabels.Length);
-    ImGui.Combo(Loc.TL("World size (m)"), ref nmWorldSizeIdx, nmWorldSizeLabels, nmWorldSizeLabels.Length);
+    Cbo(Loc.TL("Material size"), ref nmMatSizeIdx, nmMatSizeLabels, nmMatSizeLabels.Length);
+    Cbo(Loc.TL("World size (m)"), ref nmWorldSizeIdx, nmWorldSizeLabels, nmWorldSizeLabels.Length);
     nmWorldSize = nmWorldSizes[Math.Clamp(nmWorldSizeIdx, 0, nmWorldSizes.Length - 1)];
     nmYScale     = SliderInput("Y scale", nmYScale, 0.05f, 10f, "%.3f", "%.3f");
     nmWaterLevel = SliderInput("Water level (m)", nmWaterLevel, -2000f, 500f, "%.1f", "%.1f");
 
     ImGui.Separator();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Terrain"));
-    ImGui.Combo(Loc.TL("Type"), ref nmTerrainType, Array.ConvertAll(nmTerrainTypeLabels, Loc.T), nmTerrainTypeLabels.Length);
+    Cbo(Loc.TL("Type"), ref nmTerrainType, Array.ConvertAll(nmTerrainTypeLabels, Loc.T), nmTerrainTypeLabels.Length);
     if (nmTerrainType == 0)
         nmFlatHeight = SliderInput("Ground height (m)", nmFlatHeight, -100f, 500f, "%.1f", "%.1f");
     else if (nmTerrainType == 4)
     {
         // Import a headerless 16-bit LE square .raw as the starting terrain (resampled to the grid if sizes differ).
         ImGui.PushItemWidth(-160);   // reserve room for the "Heightmap" label (drawn to the right) AND the Browse button
-        ImGui.InputText(Loc.TL("Heightmap"), ref nmHeightmapPath, 512);
+        InT(Loc.TL("Heightmap"), ref nmHeightmapPath, 512);
         ImGui.PopItemWidth();
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Browse...##hm")))
@@ -10470,7 +10502,7 @@ void NewMapModal()
     }
     else
     {
-        ImGui.InputInt(Loc.TL("Seed"), ref nmSeed);
+        InI(Loc.TL("Seed"), ref nmSeed);
         nmRoughness = SliderInput("Roughness", nmRoughness, 0.1f, 1f, "%.2f", "%.2f");
         nmMinH      = SliderInput("Min height (m)", nmMinH, -100f, 1500f, "%.1f", "%.1f");
         nmMaxH      = SliderInput("Max height (m)", nmMaxH, -100f, 1500f, "%.1f", "%.1f");
@@ -10482,7 +10514,7 @@ void NewMapModal()
     // Target game for the new map: gates BFV-only features (overgrowth, tunnels) and sets team names.
     int nmGameIdx = nmGameBf1942 ? 0 : 1;
     ImGui.SetNextItemWidth(200f);
-    if (ImGui.Combo(Loc.TL("Game"), ref nmGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) nmGameBf1942 = nmGameIdx == 0;
+    if (CboZ(Loc.TL("Game"), ref nmGameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) nmGameBf1942 = nmGameIdx == 0;
     ImGui.TextDisabled(nmGameBf1942 ? "BF1942: no overgrowth / tunnel features." : "BF Vietnam: full feature set.");
     ImGui.Checkbox(Loc.TL("Playable (Conquest: flags, spawns, kits)"), ref nmPlayable);
     // A NEW map has no Init.con to read teams from yet, so this one stays game-based on purpose.
@@ -10578,7 +10610,7 @@ void SavePrefabModal()
     bool open = true;
     if (!ImGui.BeginPopupModal(Loc.TL("Save Prefab"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize)) return;
     ImGui.Text($"{multi.Count} object(s) selected");
-    ImGui.InputText(Loc.TL("Name"), ref spName, 64);
+    InT(Loc.TL("Name"), ref spName, 64);
     if (!string.IsNullOrEmpty(spError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), spError);
     ImGui.Separator();
     if (ImGui.Button(Loc.TL("Save"), new Vector2(120, 0))) DoSavePrefab();
@@ -11278,17 +11310,17 @@ void CollabModal()
     bool open = true;
     if (!ImGui.BeginPopupModal(Loc.TL("Collaborate"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
-    ImGui.InputText(Loc.TL("Your name"), ref collabName, 32);
+    InT(Loc.TL("Your name"), ref collabName, 32);
     FitLabel(Loc.TL("Password (optional)"));
-    ImGui.InputText(Loc.TL("Password (optional)"), ref collabPass, 64, ImGuiInputTextFlags.Password);
+    InT(Loc.TL("Password (optional)"), ref collabPass, 64, ImGuiInputTextFlags.Password);
     ImGui.Spacing();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Host a session"));
-    ImGui.InputInt(Loc.TL("Port##host"), ref collabPort);
+    InI(Loc.TL("Port##host"), ref collabPort);
     if (ImGui.Button(Loc.TL("Host"), new Vector2(160, 0))) DoCollabHost();
     ImGui.Separator();
     ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Join a session"));
-    ImGui.InputText(Loc.TL("Host address"), ref collabHostAddr, 64);
-    ImGui.InputInt(Loc.TL("Port##join"), ref collabPort);
+    InT(Loc.TL("Host address"), ref collabHostAddr, 64);
+    InI(Loc.TL("Port##join"), ref collabPort);
     if (ImGui.Button(Loc.TL("Join"), new Vector2(160, 0))) DoCollabJoin();
 
     if (!string.IsNullOrEmpty(collabError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), collabError);
@@ -11507,7 +11539,7 @@ void BikWindow()
             ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Loop"), ref bikLoop);
             ImGui.SameLine(); ImGui.TextDisabled($"{bikFrameIdx + 1}/{bikFrames.Length}  {bikFps:0.#}fps");
             int fi = bikFrameIdx; ImGui.SetNextItemWidth(-1f);
-            if (ImGui.SliderInt("##bikseek", ref fi, 0, bikFrames.Length - 1)) { bikFrameIdx = Math.Clamp(fi, 0, bikFrames.Length - 1); bikPlaying = false; }
+            if (SldI("##bikseek", ref fi, 0, bikFrames.Length - 1)) { bikFrameIdx = Math.Clamp(fi, 0, bikFrames.Length - 1); bikPlaying = false; }
             if (bikTex != 0 && bikW > 0 && bikH > 0)
             {
                 var avail = ImGui.GetContentRegionAvail();
@@ -11913,6 +11945,7 @@ void BuildUi()
     ImGui.SetNextWindowSize(new Vector2(leftW, bodyH), ImGuiCond.Always);
     if (ImGui.Begin(Loc.TL("Object Library"), fixedFlags))
     {
+        ImGui.PushTextWrapPos(0f);   // fixed-width panel: wrap, do not clip
         ImGui.PushItemWidth(-1);
         ImGui.InputTextWithHint("##search", Loc.T("Search objects..."), ref searchText, 64);
         ImGui.PopItemWidth();
@@ -11960,12 +11993,20 @@ void BuildUi()
         }
         ImGui.EndChild();
         if (showLevelTree) { ImGui.Separator(); LevelTreePanel(); }
+        ImGui.PopTextWrapPos();
     }
     ImGui.End();
 
     ImGui.SetNextWindowPos(new Vector2(W - rightW, top), ImGuiCond.Always);
     ImGui.SetNextWindowSize(new Vector2(rightW, bodyH), ImGuiCond.Always);
-    if (ImGui.Begin(Loc.TL("Inspector"), fixedFlags)) { Inspector(); LayersPanel(); EnvironmentPanel(); }
+    if (ImGui.Begin(Loc.TL("Inspector"), fixedFlags))
+    {
+        // ImGui text does not wrap - anything wider than the panel is silently clipped at the right edge,
+        // which swallowed whole sentences in here. Wrap at the content edge instead.
+        ImGui.PushTextWrapPos(0f);
+        Inspector(); LayersPanel(); EnvironmentPanel();
+        ImGui.PopTextWrapPos();
+    }
     ImGui.End();
 
     MinimapPanel();
@@ -12550,7 +12591,7 @@ void TunnelsWindow()
         {
             float twl = cfg.WaterBelowLevel ?? (cfg.WaterLevel - 15f);
             ImGui.SetNextItemWidth(160f * uiScale);
-            if (ImGui.DragFloat(Loc.TL("Tunnel water level (m)"), ref twl, 0.25f, -500f, 500f, "%.1f"))
+            if (DrgF(Loc.TL("Tunnel water level (m)"), ref twl, 0.25f, -500f, 500f, "%.1f"))
             { cfg.WaterBelowLevel = twl; cfg.WriteWaterBelow = true; waterLevelEdited = true; env.WriteWaterBelow = true; env.WaterBelowEnabled = true; lightingDirty = true; }
             ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface water {0:0.0} m"), cfg.WaterLevel));
             ImGui.TextDisabled(Loc.T("Its colour and look: Inspector > Water."));
@@ -12806,9 +12847,9 @@ void DecalDialog()
         ImGui.TextWrapped(Loc.T("Refractor has no decal primitive: posters, signs and scorch marks in retail maps are ordinary objects with a flat mesh. This makes one from your image - or a Bink video - and registers it as a level-local object, so it ships inside the map and needs nothing from the mod."));
         ImGui.Spacing();
         ImGui.SetNextItemWidth(220f * uiScale);
-        ImGui.InputText(Loc.TL("Template name"), ref decalName, 40);
+        InT(Loc.TL("Template name"), ref decalName, 40);
         ImGui.SetNextItemWidth(300f * uiScale);
-        ImGui.InputText(Loc.TL("Image / video"), ref decalImagePath, 260);
+        InT(Loc.TL("Image / video"), ref decalImagePath, 260);
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Image...")))
         {
@@ -12827,11 +12868,11 @@ void DecalDialog()
         {
             int chIdx = decalSoundStereo ? 1 : 0, rateIdx = decalAudioRate >= 44100 ? 1 : 0;
             ImGui.SetNextItemWidth(110f * uiScale);
-            if (ImGui.Combo(Loc.TL("Audio"), ref chIdx, "Mono\0Stereo\0")) decalSoundStereo = chIdx == 1;
+            if (CboZ(Loc.TL("Audio"), ref chIdx, "Mono\0Stereo\0")) decalSoundStereo = chIdx == 1;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Mono is placed in the world at the screen and fades with distance. Stereo is fuller\nbut is not positioned the way a mono sample is - the game's own scripts use both."));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110f * uiScale);
-            if (ImGui.Combo(Loc.TL("Sample rate"), ref rateIdx, "22 kHz\044 kHz\0")) decalAudioRate = rateIdx == 1 ? 44100 : 22050;
+            if (CboZ(Loc.TL("Sample rate"), ref rateIdx, "22 kHz\044 kHz\0")) decalAudioRate = rateIdx == 1 ? 44100 : 22050;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The game has two sound-quality tiers, Sound/22khz and Sound/44kHz, and plays the one its settings\nchoose. 44 kHz writes a real 44.1 kHz file for the high tier and a 22 kHz one for the low tier;\n22 kHz writes the same 22 kHz file to both. The .bik's own track uses the rate chosen too."));
         }
         // Which audio the .bik carries follows "When it plays", because the engine plays a .bik's own track as part
@@ -12862,7 +12903,7 @@ void DecalDialog()
         ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.SetNextItemWidth(110f * uiScale);
-        ImGui.Combo(Loc.TL("Video size"), ref bikWidthIdx, bikWidthNames, bikWidthNames.Length);
+        Cbo(Loc.TL("Video size"), ref bikWidthIdx, bikWidthNames, bikWidthNames.Length);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bink is not a small format and the file ships inside your map: the game's own background.bik is 320x240 and 5 MB a minute, while an untouched 720p minute is nearly 80 MB. 512 px keeps a screen sharp at the distance anyone reads one from."));
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Turns an mp4 (or any video FFmpeg reads) into the Bink .bik the game plays,\nkeeping its sound. Needs the free RAD Video Tools installed."));
         if (converting)
@@ -12919,7 +12960,7 @@ void DecalDialog()
             if (decalSound)
             {
                 ImGui.SetNextItemWidth(240f * uiScale);
-                ImGui.Combo(Loc.TL("When it plays"), ref decalSoundMode,
+                Cbo(Loc.TL("When it plays"), ref decalSoundMode,
                             new[] { Loc.T("Always - fades with distance"), Loc.T("In the video, in sync") }, 2);
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit."));
                 ImGui.TextDisabled(decalSoundMode == 0
@@ -13193,7 +13234,7 @@ void SoundImportDialog()
         ImGui.TextWrapped(Loc.T("Adds an ambient sound to the map: the audio, a sound script with its distance falloff, and a placeable object that carries them. The game plays .wav, so an mp3 (or any other format FFmpeg reads) is converted for you."));
         ImGui.Spacing();
         ImGui.SetNextItemWidth(300f * uiScale);
-        ImGui.InputText(Loc.TL("Audio file"), ref sndImportPath, 260);
+        InT(Loc.TL("Audio file"), ref sndImportPath, 260);
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Browse...")))
         {
@@ -13205,7 +13246,7 @@ void SoundImportDialog()
             }
         }
         ImGui.SetNextItemWidth(220f * uiScale);
-        ImGui.InputText(Loc.TL("Name"), ref sndImportName, 40);
+        InT(Loc.TL("Name"), ref sndImportName, 40);
         ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref sndVol, 0.05f, 1f, "%.2f");
         ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref sndNear, 1f, 200f, "%.0f");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The script's minDistance: inside this radius the sound plays at full volume."));
@@ -13216,10 +13257,10 @@ void SoundImportDialog()
         {
             int chIdx = sndStereo ? 1 : 0, rateIdx = sndAudioRate >= 44100 ? 1 : 0;
             ImGui.SetNextItemWidth(110f * uiScale);
-            if (ImGui.Combo(Loc.TL("Audio##snd"), ref chIdx, "Mono\0Stereo\0")) sndStereo = chIdx == 1;
+            if (CboZ(Loc.TL("Audio##snd"), ref chIdx, "Mono\0Stereo\0")) sndStereo = chIdx == 1;
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110f * uiScale);
-            if (ImGui.Combo(Loc.TL("Sample rate##snd"), ref rateIdx, "22 kHz\044 kHz\0")) sndAudioRate = rateIdx == 1 ? 44100 : 22050;
+            if (CboZ(Loc.TL("Sample rate##snd"), ref rateIdx, "22 kHz\044 kHz\0")) sndAudioRate = rateIdx == 1 ? 44100 : 22050;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A .wav you supply is used as it is. Anything else is converted at this rate and channel count;\n44 kHz also writes a real 44.1 kHz file for the game's high-quality tier."));
         }
         if (FindFfmpeg() is null && !sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
@@ -13328,7 +13369,7 @@ void NotesPanel()
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Review notes pinned in the world, shared with everyone in the session.\nPlace one, then click the ground where it belongs."));
     ImGui.Checkbox(Loc.TL("Show notes"), ref showNotes);
     ImGui.SetNextItemWidth(220f * uiScale);
-    ImGui.InputText("##notedraft", ref noteDraft, 200);
+    InT("##notedraft", ref noteDraft, 200);
     ImGui.SameLine();
     if (!placingNote)
     {
@@ -13376,7 +13417,7 @@ void ErosionPanel()
     ImGui.TextDisabled(Loc.T("EROSION"));
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Weathering for hand-sculpted ground: thermal erosion knocks steep faces into scree,\nhydraulic droplets cut gullies where water would run. Applied around the camera."));
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Area radius (m)"), ref erodeRadius, 10f, 400f, "%.0f");
-    ImGui.SetNextItemWidth(150f * uiScale); ImGui.SliderInt(Loc.TL("Iterations"), ref erodeIterations, 5, 200);
+    ImGui.SetNextItemWidth(150f * uiScale); SldI(Loc.TL("Iterations"), ref erodeIterations, 5, 200);
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Talus (m per cell)"), ref erodeTalus, 0.2f, 5f, "%.1f");
     ImGui.Checkbox(Loc.TL("Hydraulic (gullies)"), ref erodeHydraulic);
     if (ImGui.Button(Loc.TL("Erode around camera"))) RunErosion();
@@ -13410,8 +13451,8 @@ void RiverPanel()
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Width (m)"), ref riverWidth, 4f, 120f, "%.0f");
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Depth (m)"), ref riverDepth, 0.5f, 30f, "%.1f");
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Bank width (m)"), ref riverBank, 0f, 40f, "%.0f");
-    ImGui.SetNextItemWidth(100f * uiScale); ImGui.SliderInt(Loc.TL("Bank material"), ref riverBankMat, 0, 15);
-    ImGui.SetNextItemWidth(100f * uiScale); ImGui.SliderInt(Loc.TL("Bed material"), ref riverBedMat, 0, 15);
+    ImGui.SetNextItemWidth(100f * uiScale); SldI(Loc.TL("Bank material"), ref riverBankMat, 0, 15);
+    ImGui.SetNextItemWidth(100f * uiScale); SldI(Loc.TL("Bed material"), ref riverBedMat, 0, 15);
     bool ready = roadPts.Count >= 2;
     if (!ready) ImGui.TextDisabled(Loc.T("Lay at least two road points first (Road tool)."));
     if (ImGui.Button(Loc.TL("Make river from road points")) && ready) RunRiver();
@@ -13468,8 +13509,8 @@ void PackageDialog()
     if (ImGui.Begin(Loc.TL("Package Level") + "###pkgdlg", ref showPackage, ImGuiWindowFlags.AlwaysAutoResize))
     {
         ImGui.TextWrapped(Loc.T("Everything a release needs in one zip: the map archive, a server-side copy with client content stripped, the minimap and thumbnail, and a readme that says where the files go."));
-        ImGui.SetNextItemWidth(240f * uiScale); ImGui.InputText(Loc.TL("Author"), ref pkgAuthor, 60);
-        ImGui.SetNextItemWidth(120f * uiScale); ImGui.InputText(Loc.TL("Version"), ref pkgVersion, 16);
+        ImGui.SetNextItemWidth(240f * uiScale); InT(Loc.TL("Author"), ref pkgAuthor, 60);
+        ImGui.SetNextItemWidth(120f * uiScale); InT(Loc.TL("Version"), ref pkgVersion, 16);
         ImGui.InputTextMultiline(Loc.TL("Description"), ref pkgDesc, 2000, new Vector2(420f * uiScale, 80f * uiScale));
         ImGui.Checkbox(Loc.TL("Include server-side archive"), ref pkgServer);
         ImGui.Checkbox(Loc.TL("Render minimap + thumbnail"), ref pkgMinimap);
@@ -13558,7 +13599,7 @@ void GroupsPanel()
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Name a set of objects, then hide, lock or colour it as one.\nMembership is by object id, so a group survives sorting, undo and collaboration."));
 
     ImGui.SetNextItemWidth(150f * uiScale);
-    ImGui.InputText("##newgroup", ref newGroupName, 48);
+    InT("##newgroup", ref newGroupName, 48);
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("New from selection")) && multi.Count > 0)
     {
@@ -13783,7 +13824,7 @@ void CombatAreaPanel()
     var v = new Vector4(ca.X, ca.Z, ca.Width, ca.Height);
     ImGui.SetNextItemWidth(260f * uiScale);
     FitLabel(Loc.TL("Offset X, Z / Scale X, Z"));
-    if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Scale X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
+    if (DrgF4(Loc.TL("Offset X, Z / Scale X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
     {
         NoteCombatAreaBaseline();
         env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(v.X, v.Y, MathF.Max(v.Z, 16f), MathF.Max(v.W, 16f));
@@ -14142,7 +14183,7 @@ void MapReportWindow()
 
         int minLvl = (int)mapReportMin;
         ImGui.SetNextItemWidth(160f * uiScale);
-        if (ImGui.Combo(Loc.TL("Show"), ref minLvl, "Everything\0Warnings and errors\0Errors only\0"))
+        if (CboZ(Loc.TL("Show"), ref minLvl, "Everything\0Warnings and errors\0Errors only\0"))
             mapReportMin = (RefractorForge.Formats.Validation.IssueSeverity)minLvl;
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Copy to clipboard")))
@@ -14492,7 +14533,7 @@ void LightsPanel()
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bake traces terrain occlusion for this light. Off is much faster and\nis right for a fill light that only lifts the ambient."));
 
         var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
-        if (ImGui.ColorEdit3(Loc.TL("Colour"), ref colv))
+        if (Col3(Loc.TL("Colour"), ref colv))
         { l.ColorR = colv.X; l.ColorG = colv.Y; l.ColorB = colv.Z; }
 
         float inten = l.Intensity, rad = l.Radius, fall = l.Falloff;
@@ -14506,7 +14547,7 @@ void LightsPanel()
 
         var pv = new Vector3(l.Position.X, l.Position.Y, l.Position.Z);
         ImGui.SetNextItemWidth(220f);
-        if (ImGui.DragFloat3(Loc.TL("Position"), ref pv, 0.25f))
+        if (DrgF3(Loc.TL("Position"), ref pv, 0.25f))
             l.Position = new Vec3(pv.X, pv.Y, pv.Z);
 
         float gnd = GroundUnder(l.Position.X, l.Position.Z);
@@ -14516,7 +14557,7 @@ void LightsPanel()
         // reaches anything, and it is the one a mapper actually thinks in ("a lamp is 4 m up").
         float aboveEdit = above;
         ImGui.SetNextItemWidth(150f);
-        if (ImGui.DragFloat(Loc.TL("Height above ground"), ref aboveEdit, 0.1f, -50f, 400f, "%.1f m"))
+        if (DrgF(Loc.TL("Height above ground"), ref aboveEdit, 0.1f, -50f, 400f, "%.1f m"))
             l.Position = new Vec3(l.Position.X, gnd + aboveEdit, l.Position.Z);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport."));
 
@@ -14604,11 +14645,11 @@ void PointToolOverlay()
         {
             ImGui.Text($"{Loc.T("Vertex")} {vertGx}, {vertGz}   ({vertGx * sp:0} / {vertGz * sp:0} m)");
             ImGui.SetNextItemWidth(120f * uiScale);
-            if (ImGui.InputFloat(Loc.TL("Height (m)"), ref vertHeightField, 0.1f, 1f, "%.2f")
+            if (InF(Loc.TL("Height (m)"), ref vertHeightField, 0.1f, 1f, "%.2f")
                 && terrainEd is not null && heightmap is not null)
                 ApplyVertexEdit(st => st.SetVertex(vertGx, vertGz, vertHeightField));
             ImGui.SetNextItemWidth(120f * uiScale);
-            ImGui.SliderInt(Loc.TL("Auto-smooth (cells)"), ref vertSmoothRadius, 0, 8);
+            SldI(Loc.TL("Auto-smooth (cells)"), ref vertSmoothRadius, 0, 8);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Blend the ring around a moved vertex toward it, so it leaves a\nslope instead of a spike. 0 moves the single point only."));
             ImGui.SetNextItemWidth(120f * uiScale);
             SldF(Loc.TL("Step (m)"), ref vertNudgeStep, 0.05f, 5f, "%.2f");
@@ -14750,25 +14791,25 @@ void EditCpModal()
         return;
     if (ecpIndex < 0 || ecpIndex >= gameplayEdit.ControlPoints.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
 
-    ImGui.InputText(Loc.TL("Name"), ref ecpName, 64u);
+    InT(Loc.TL("Name"), ref ecpName, 64u);
     FitLabel(Loc.TL("Control point name"));
-    ImGui.InputText(Loc.TL("Control point name"), ref ecpCpName, 64u);
-    ImGui.DragFloat3(Loc.TL("Position"), ref ecpPos, 0.25f);
+    InT(Loc.TL("Control point name"), ref ecpCpName, 64u);
+    DrgF3(Loc.TL("Position"), ref ecpPos, 0.25f);
     FitLabel(Loc.TL("Capture radius (m)"));
-    ImGui.DragFloat(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
+    DrgF(Loc.TL("Capture radius (m)"), ref ecpRadius, 0.5f, 1f, 300f, "%.1f");
     string[] teams = TeamLabels();
     int teamIdx = Math.Clamp(ecpTeam, 0, 2);
-    if (ImGui.Combo(Loc.TL("Team"), ref teamIdx, teams, teams.Length)) ecpTeam = teamIdx;
-    ImGui.InputInt(Loc.TL("Area value"), ref ecpArea);
-    ImGui.InputInt(Loc.TL("Spawn group id"), ref ecpGroup);
-    ImGui.InputInt(Loc.TL("Object spawner id"), ref ecpOsId);
+    if (Cbo(Loc.TL("Team"), ref teamIdx, teams, teams.Length)) ecpTeam = teamIdx;
+    InI(Loc.TL("Area value"), ref ecpArea);
+    InI(Loc.TL("Spawn group id"), ref ecpGroup);
+    InI(Loc.TL("Object spawner id"), ref ecpOsId);
     if (gameIsBf1942)
     {
         ImGui.Separator(); ImGui.TextDisabled(Loc.T("Capture timing / behaviour (BF1942)"));
         FitLabel(Loc.TL("Time to get control"));
-        ImGui.InputInt(Loc.TL("Time to get control"), ref ecpTimeGet);
+        InI(Loc.TL("Time to get control"), ref ecpTimeGet);
         FitLabel(Loc.TL("Time to lose control"));
-        ImGui.InputInt(Loc.TL("Time to lose control"), ref ecpTimeLose);
+        InI(Loc.TL("Time to lose control"), ref ecpTimeLose);
         bool b;
         b = ecpDisEnemy != 0; if (ImGui.Checkbox(Loc.TL("Disable if enemy inside radius"), ref b)) ecpDisEnemy = b ? 1 : 0;
         b = ecpDisLosing != 0; if (ImGui.Checkbox(Loc.TL("Disable when losing control"), ref b)) ecpDisLosing = b ? 1 : 0;
@@ -14777,11 +14818,11 @@ void EditCpModal()
         b = ecpUnable != 0; if (ImGui.Checkbox(Loc.TL("Unable to change team"), ref b)) ecpUnable = b ? 1 : 0;
         b = ecpCollision != 0; if (ImGui.Checkbox(Loc.TL("Has collision physics"), ref b)) ecpCollision = b ? 1 : 0;
         FitLabel(Loc.TL("Only takable by team"));
-        ImGui.InputInt(Loc.TL("Only takable by team"), ref ecpOnlyTeam);
+        InI(Loc.TL("Only takable by team"), ref ecpOnlyTeam);
     }
     else
     {
-        ImGui.InputInt(Loc.TL("Conversion time"), ref ecpConv);
+        InI(Loc.TL("Conversion time"), ref ecpConv);
     }
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("Flag geometry + team flags are preserved on save."));
@@ -14819,14 +14860,14 @@ void EditVehModal()
     if (!ImGui.BeginPopupModal(Loc.TL("Edit Object Spawn"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
         return;
     if (evIndex < 0 || evIndex >= gameplayEdit.VehicleSpawns.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
-    ImGui.InputText(Loc.TL("Name"), ref evName, 64u);
-    ImGui.DragFloat3(Loc.TL("Position"), ref evPos, 0.25f);
+    InT(Loc.TL("Name"), ref evName, 64u);
+    DrgF3(Loc.TL("Position"), ref evPos, 0.25f);
     FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
-    ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
-    ImGui.InputInt(Loc.TL("OS id"), ref evOsId);
+    DrgF3(Loc.TL("Rotation yaw/pitch/roll"), ref evRot, 1f);
+    InI(Loc.TL("OS id"), ref evOsId);
     string[] vteams = TeamLabels();
     int vteamIdx = Math.Clamp(evTeam, 0, 2);
-    if (ImGui.Combo(Loc.TL("Team"), ref vteamIdx, vteams, vteams.Length)) evTeam = vteamIdx;
+    if (Cbo(Loc.TL("Team"), ref vteamIdx, vteams, vteams.Length)) evTeam = vteamIdx;
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("OS id links the spawner to its control point."));
 
@@ -14834,21 +14875,21 @@ void EditVehModal()
     // spawn point using it changes together - say so rather than letting it look per-placement.
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("TEMPLATE (shared by every spawn using it)"));
-    ImGui.InputText(Loc.TL("Team 1 object"), ref evVeh1, 64u);
-    ImGui.InputText(Loc.TL("Team 2 object"), ref evVeh2, 64u);
+    InT(Loc.TL("Team 1 object"), ref evVeh1, 64u);
+    InT(Loc.TL("Team 2 object"), ref evVeh2, 64u);
     FitLabel(Loc.TL("Min spawn delay (s)"));
-    ImGui.InputInt(Loc.TL("Min spawn delay (s)"), ref evMinDelay);
+    InI(Loc.TL("Min spawn delay (s)"), ref evMinDelay);
     FitLabel(Loc.TL("Max spawn delay (s)"));
-    ImGui.InputInt(Loc.TL("Max spawn delay (s)"), ref evMaxDelay);
+    InI(Loc.TL("Max spawn delay (s)"), ref evMaxDelay);
     FitLabel(Loc.TL("Spawn delay at start (s)"));
-    ImGui.InputInt(Loc.TL("Spawn delay at start (s)"), ref evDelayStart);
-    ImGui.InputInt(Loc.TL("Time to live (s)"), ref evTtl);
+    InI(Loc.TL("Spawn delay at start (s)"), ref evDelayStart);
+    InI(Loc.TL("Time to live (s)"), ref evTtl);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How long an abandoned vehicle survives before it starts taking damage."));
-    ImGui.InputInt(Loc.TL("Distance (m)"), ref evDist);
+    InI(Loc.TL("Distance (m)"), ref evDist);
     if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far from its spawn the vehicle must be before Time to live counts down."));
-    ImGui.InputInt(Loc.TL("Damage when lost"), ref evDmgLost);
+    InI(Loc.TL("Damage when lost"), ref evDmgLost);
     FitLabel(Loc.TL("Max spawned at once"));
-    ImGui.InputInt(Loc.TL("Max spawned at once"), ref evMaxSpawned);
+    InI(Loc.TL("Max spawned at once"), ref evMaxSpawned);
     ImGui.TextDisabled(Loc.T("Only fields the level already declares are written back."));
     ImGui.Separator();
     if (ImGui.Button(Loc.TL("OK"), new Vector2(150, 0)))
@@ -14886,13 +14927,13 @@ void EditSolModal()
     if (!ImGui.BeginPopupModal(Loc.TL("Edit Soldier Spawn"), ref open, ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
         return;
     if (esIndex < 0 || esIndex >= gameplayEdit.SoldierSpawns.Count) { ImGui.CloseCurrentPopup(); ImGui.EndPopup(); return; }
-    ImGui.InputText(Loc.TL("Name"), ref esName, 64u);
-    ImGui.InputInt(Loc.TL("Spawn group"), ref esGroup);
-    ImGui.InputInt(Loc.TL("Spawn id"), ref esSpawnId);
+    InT(Loc.TL("Name"), ref esName, 64u);
+    InI(Loc.TL("Spawn group"), ref esGroup);
+    InI(Loc.TL("Spawn id"), ref esSpawnId);
     ImGui.Checkbox(Loc.TL("Spawn as paratrooper"), ref esPara);
-    ImGui.DragFloat3(Loc.TL("Position"), ref esPos, 0.25f);
+    DrgF3(Loc.TL("Position"), ref esPos, 0.25f);
     FitLabel(Loc.TL("Rotation yaw/pitch/roll"));
-    ImGui.DragFloat3(Loc.TL("Rotation yaw/pitch/roll"), ref esRot, 1f);
+    DrgF3(Loc.TL("Rotation yaw/pitch/roll"), ref esRot, 1f);
     ImGui.Spacing();
     ImGui.TextDisabled(Loc.T("Spawn group ties this to its control point."));
     ImGui.Separator();
