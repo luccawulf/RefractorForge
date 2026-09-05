@@ -4771,6 +4771,10 @@ void DoSave()
 }
 void DoSaveCore()
 {
+    // Where the video screens stand, for the bink patch. Beside the mod, not in the level: it is a client-side
+    // aid, and nothing in the game reads it.
+    WriteVideoScreensFile();
+
     // Tunnel water needs its subshader shipped with it, always - not only when the water panel was opened this
     // session. Without it the level asserts and crashes the moment the terrain object is created.
     if (!gameIsBf1942 && cfg.DrawWaterBelowTerrain) { EnsureWaterShaderLoaded(); QueueWaterShader(); }
@@ -4955,6 +4959,7 @@ int WarnAboutShadowingPatches(string baseRfa)
 void DoSavePatch(bool serverSideOnly = false)
 {
     if (so is null) return;
+    WriteVideoScreensFile();
     string? baseRfa = SaveBaseRfa()
                     ?? (levelDir is not null && LevelArchive.IsRfa(levelDir) ? levelDir : null);
     if (baseRfa is null) { Toast(Loc.T("Save as Patch needs an .rfa-loaded level (folder levels save in place with Ctrl+S).")); return; }
@@ -9046,7 +9051,6 @@ void SaveLightingFolder()
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveLightingToEnv();
     if (levelDir is not null) { lightRig.Save(levelDir); objGroups.Save(levelDir); notes.Save(levelDir); }   // sidecars, never packed
-    WriteVideoScreensFile();   // for the bink patch; beside the mod, not in the level
     try
     {
         var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
