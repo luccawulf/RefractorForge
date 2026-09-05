@@ -2,6 +2,7 @@ using System.Text;
 using RefractorForge.Formats;
 using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Terrain;
+using RefractorForge.Render;
 using Xunit;
 
 namespace RefractorForge.Tests;
@@ -224,5 +225,110 @@ public class SurfaceWaterDepthTests
         var e = EnvironmentSettings.Parse(null, null, Init("water.deepColor 0.498039/0.298039/0.007843"));
         Assert.Equal(0.498039f, e.DeepColor.X, 4);
         Assert.Equal(0.007843f, e.DeepColor.Z, 4);
+    }
+}
+
+/// <summary>
+/// game.setActiveCombatArea is two OFFSETS and one SIZE, not a free rectangle. The MDT is explicit: "the last two
+/// numbers are the X and Z scales (which are always the same, since all maps are square)" and it OVERRIDES
+/// GeometryTemplate.WorldSize - so a non-square pair scales the overhead map differently in X and Z and the minimap
+/// comes out wrong. All 71 retail levels that declare one keep it square; DC's Al Nas is "380 0 416 416".
+/// </summary>
+/// <summary>
+/// The combat area is not just a fence: <c>game.setActiveCombatArea</c>'s last two numbers REPLACE worldSize, and
+/// the engine stretches <c>ingamemap.dds</c> across that rectangle. Proven against DC's Al Nas, whose shipped map
+/// image lines up river-for-river with a render windowed to its 380 0 416 416 area and not at all with a
+/// whole-world render. So the generated map image has to be windowed the same way.
+/// </summary>
+public class CombatAreaMapScalingTests
+{
+    [Fact]
+    public void The_retail_shape_round_trips()
+    {
+        Assert.True(RefractorForge.Formats.Validation.CombatArea.TryParse("game.setActiveCombatArea 380 0 416 416", out var a));
+        Assert.Equal(380f, a.X, 3);
+        Assert.Equal(0f, a.Z, 3);
+        Assert.Equal(416f, a.Width, 3);
+        Assert.Equal(416f, a.Height, 3);
+        Assert.Equal("game.setActiveCombatArea 380 0 416 416", a.ToConLine());
+    }
+
+    [Fact]
+    public void A_non_square_area_survives_a_save_unchanged()
+    {
+        // The engine accepts an uneven pair - Fy_Pool_Day ships "98 856 60 68" - so the editor must not quietly
+        // square it. It warns instead; silently rewriting an author's numbers is worse than an odd-looking map.
+        var lines = new[] { "renderer.diffuseColor 1/1/1", "game.setActiveCombatArea 98 856 60 68" };
+        var e = EnvironmentSettings.Parse(null, null, lines);
+        var line = e.PatchInitConLines(lines).Single(l => l.StartsWith("game.setActiveCombatArea", StringComparison.OrdinalIgnoreCase));
+        var n = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal("60", n[3]);
+        Assert.Equal("68", n[4]);
+    }
+
+    // A landmark you can actually see in the output. Height alone is no good - the minimap hill-shades from the
+    // SLOPE, so a plateau renders identically to a plain - so the marker is the material index instead: the
+    // +X/+Z quadrant is palette 7 (red) and the rest palette 4 (blue).
+    private static (Heightmap Hm, TerrainConfig Cfg, MaterialMap Mat) Landmark()
+    {
+        var cfg = new TerrainConfig { WorldSize = 1024, MaterialSize = 64, YScale = 1f, WaterLevel = -1000f };
+        var hm = new Heightmap(64, 64);
+        var mat = new MaterialMap(64, 64);
+        for (int y = 0; y < 64; y++)
+            for (int x = 0; x < 64; x++)
+                mat[x, y] = (byte)(x >= 32 && y >= 32 ? 7 : 4);
+        return (hm, cfg, mat);
+    }
+
+    [Fact]
+    public void A_null_area_still_renders_the_whole_world()
+    {
+        var (hm, cfg, mat) = Landmark();
+        var whole = Minimap.Render(64, hm, cfg, null, mat, flipNorthUp: true, area: null);
+        var explicitWhole = Minimap.Render(64, hm, cfg, null, mat, flipNorthUp: true,
+                                area: RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize));
+        Assert.Equal(explicitWhole.Rgba, whole.Rgba);
+    }
+
+    [Fact]
+    public void Windowing_to_a_quadrant_fills_the_image_with_that_quadrant()
+    {
+        var (hm, cfg, mat) = Landmark();
+        // The red quadrant is world X 512..1024, Z 512..1024. Ask for exactly it and the image should be red all
+        // over; ask for the opposite quadrant and it should be blue all over. That is the whole claim: these four
+        // numbers pick which piece of the world the image covers.
+        var red = Minimap.Render(32, hm, cfg, null, mat, flipNorthUp: true,
+                      area: new RefractorForge.Formats.Validation.CombatArea(512f, 512f, 512f, 512f));
+        var blue = Minimap.Render(32, hm, cfg, null, mat, flipNorthUp: true,
+                       area: new RefractorForge.Formats.Validation.CombatArea(0f, 0f, 512f, 512f));
+        Assert.True(MeanR(red) > MeanB(red), $"the +X/+Z window should be red (R {MeanR(red):0}, B {MeanB(red):0})");
+        Assert.True(MeanB(blue) > MeanR(blue), $"the origin window should be blue (R {MeanR(blue):0}, B {MeanB(blue):0})");
+
+        // and a whole-world render is a mix of both, which is exactly the bug: it was being written as the
+        // in-game map on levels whose combat area is only part of the terrain.
+        var whole = Minimap.Render(32, hm, cfg, null, mat, flipNorthUp: true, area: null);
+        Assert.NotEqual(whole.Rgba, red.Rgba);
+        Assert.NotEqual(whole.Rgba, blue.Rgba);
+    }
+
+    [Fact]
+    public void An_area_reaching_outside_the_terrain_is_clamped_not_wrapped()
+    {
+        // Faid_Pass ships a negative offset (-65). SampleUv wraps on its own, which would fold the red quadrant at
+        // the far corner into a window that sits entirely in the blue one, so Minimap has to clamp before sampling.
+        var (hm, cfg, mat) = Landmark();
+        var t = Minimap.Render(32, hm, cfg, null, mat, flipNorthUp: true,
+                    area: new RefractorForge.Formats.Validation.CombatArea(-256f, -256f, 256f, 256f));
+        Assert.True(MeanB(t) > MeanR(t), $"a clamped window belongs in the blue quadrant (R {MeanR(t):0}, B {MeanB(t):0})");
+    }
+
+    private static float MeanR(Texture2D t) => Channel(t, 0);
+    private static float MeanB(Texture2D t) => Channel(t, 2);
+
+    private static float Channel(Texture2D t, int off)
+    {
+        double sum = 0;
+        for (int i = off; i < t.Rgba.Length; i += 4) sum += t.Rgba[i];
+        return (float)(sum / (t.Rgba.Length / 4));
     }
 }

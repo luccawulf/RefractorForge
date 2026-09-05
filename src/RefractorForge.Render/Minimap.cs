@@ -22,10 +22,25 @@ public static class Minimap
     };
 
     /// <param name="flipNorthUp">Put +Z (north) at the top of the image, matching the in-game map.</param>
+    /// <param name="area">
+    /// The world rectangle the image covers. The engine stretches ingamemap.dds across the level's
+    /// <c>game.setActiveCombatArea</c> rectangle, NOT across the whole terrain - so rendering the whole world into
+    /// it puts every icon in the wrong place on any level whose combat area is a sub-rectangle. Null means the
+    /// whole world, which is what 48 of the 71 BFV levels that set one ask for anyway (0 0 1024 1024).
+    /// </param>
     public static Texture2D Render(int size, Heightmap hm, TerrainConfig cfg,
-                                   TerrainTexture? tex, MaterialMap? material = null, bool flipNorthUp = true)
+                                   TerrainTexture? tex, MaterialMap? material = null, bool flipNorthUp = true,
+                                   RefractorForge.Formats.Validation.CombatArea? area = null)
     {
         if (size < 1) size = 1;
+        // World-space window -> the 0..1 terrain coordinates everything below samples with.
+        float wsz = cfg.WorldSize > 0f ? cfg.WorldSize : 1f;
+        float u0 = 0f, v0 = 0f, uScale = 1f, vScale = 1f;
+        if (area is { } ar && ar.Width > 0f && ar.Height > 0f)
+        {
+            u0 = ar.X / wsz; uScale = ar.Width / wsz;
+            v0 = ar.Z / wsz; vScale = ar.Height / wsz;
+        }
         var rgba = new byte[size * size * 4];
         var light = Vector3.Normalize(new Vector3(-0.6f, 1.0f, -0.5f));
         var water = new Vector3(0.20f, 0.40f, 0.60f);
@@ -38,6 +53,10 @@ public static class Minimap
                 float u = (px + 0.5f) / size;
                 float v = (py + 0.5f) / size;
                 if (flipNorthUp) v = 1f - v;   // image top -> max world Z
+                // Clamped, not wrapped: a combat area may start negative (Faid_Pass uses -65) or run past the
+                // terrain, and SampleUv wraps, which would fold the far edge of the map into the near one.
+                u = Math.Clamp(u0 + u * uScale, 0f, 1f);
+                v = Math.Clamp(v0 + v * vScale, 0f, 1f);
 
                 // Base colour: real terrain atlas if available, else material palette, else flat.
                 Vector3 col;

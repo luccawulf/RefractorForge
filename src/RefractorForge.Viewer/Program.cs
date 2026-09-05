@@ -5085,8 +5085,8 @@ void DoSavePatch(bool serverSideOnly = false)
 void DoGenerateMinimap()
 {
     if (heightmap is null) return;
-    var ingame = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap);
-    var thumb = Minimap.Render(256, heightmap, cfg, terrainTex, materialMap);
+    var ingame = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
+    var thumb = Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
     string? a = null, b = null, c = null;
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
@@ -13414,9 +13414,9 @@ bool BuildPackage()
         byte[]? mini = null, thumb = null;
         if (pkgMinimap)
         {
-            var m = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap);
+            var m = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
             mini = PngWriter.Encode(m);
-            thumb = PngWriter.Encode(Minimap.Render(256, heightmap, cfg, terrainTex, materialMap));
+            thumb = PngWriter.Encode(Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea));
         }
 
         var inputs = new RefractorForge.Formats.Packaging.LevelPackager.Inputs
@@ -13678,17 +13678,24 @@ void CombatAreaPanel()
     if (env is null || heightmap is null) return;
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("COMBAT AREA"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("game.setActiveCombatArea: the square players may fight in and the overhead map covers.\nOffset then size, per the MDT. Drag the two corner handles in the viewport, or type it here."));
+    if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(Loc.T("game.setActiveCombatArea: two OFFSETS then the X and Z SCALES, which REPLACE worldSize.\nThe game stretches ingamemap.dds over THIS rectangle, not over the whole terrain - so these\nfour numbers decide how the in-game map is scaled. Uneven scales work (Fy_Pool_Day ships\n98 856 60 68) but stretch the square image; 380 of the 382 levels across BFV, BF1942 and DC\nthat set one keep them equal. DC's Al Nas: 380 0 416 416 on a 1024 world."));
     ImGui.Checkbox(Loc.TL("Show combat area"), ref showCombatArea);
     var ca = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
     var v = new Vector4(ca.X, ca.Z, ca.Width, ca.Height);
     ImGui.SetNextItemWidth(260f * uiScale);
-    FitLabel(Loc.TL("Offset X, Z / Size X, Z"));
-    if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Size X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
+    FitLabel(Loc.TL("Offset X, Z / Scale X, Z"));
+    if (ImGui.DragFloat4(Loc.TL("Offset X, Z / Scale X, Z"), ref v, 1f, 0f, cfg.WorldSize, "%.0f"))
     {
         env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(v.X, v.Y, MathF.Max(v.Z, 16f), MathF.Max(v.W, 16f));
         combatAreaDirty = true; lightingDirty = true;
     }
+    // Non-square is ACCEPTED by the engine - Fy_Pool_Day ships 98 856 60 68 - so this reports rather than refuses.
+    // The image is square though, and these two numbers are the X and Z scales it is stretched over, so an uneven
+    // pair squashes it. 380 of the 382 levels across BFV, BF1942 and DC that set an area keep the two equal.
+    if (MathF.Abs(ca.Width - ca.Height) > 0.5f)
+        ImGui.TextColored(new Vector4(1f, 0.55f, 0.4f, 1f),
+            string.Format(Loc.T("{0:0} x {1:0} is uneven, so the square map image gets squashed to fit. Legal - 2 of 382 levels do it - but rare."), ca.Width, ca.Height));
     if (env.CombatArea is null)
     {
         ImGui.TextDisabled(Loc.T("Not declared - the whole world is playable."));
@@ -13700,13 +13707,19 @@ void CombatAreaPanel()
     }
     else if (ImGui.Button(Loc.TL("Square it")))
     {
-        // The engine treats the two sizes as one - all maps are square - so an author who dragged the corners
-        // into a rectangle gets what the game will actually use.
+        // Grow the short side rather than crop the long one: whatever was inside the rectangle stays inside it.
         float sz = MathF.Max(ca.Width, ca.Height);
         env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(ca.X, ca.Z, sz, sz);
         combatAreaDirty = true; lightingDirty = true;
     }
-    if (combatAreaDirty) ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+    if (combatAreaDirty)
+    {
+        ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Edited - written to Init.con on save."));
+        // The map image is stretched over this rectangle, so moving it invalidates the one already generated.
+        ImGui.TextDisabled(Loc.T("The in-game map covers this rectangle - regenerate it (Tools) after changing it."));
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Regenerate map image"))) DoGenerateMinimap();
+    }
 }
 
 // ---- Map checks --------------------------------------------------------------------------------------------
