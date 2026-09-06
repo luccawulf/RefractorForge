@@ -1600,6 +1600,9 @@ int uMvpO = -1, uModelO = -1, uColorO = -1, uLightO = -1, uUseTexO = -1, uAlphaT
 int uNightS = -1, uNightSkyS = -1;   // sky night dim
 int uAmbLightT = -1, uDifLightT = -1, uAmbLightO = -1, uDifLightO = -1;   // level lighting -> terrain + object shaders
 GlObjects? glObjects = null;
+// Selection reads the rendered picture (see GlPick): objects are re-drawn on a click, each painted its own index,
+// and the pixel under the cursor is read back. Kept for the editor's lifetime - it owns one framebuffer.
+GlPick glPick = new();
 // Editable lighting (Init.con renderer.globalAmbientColor / ambientColor / diffuseColor / specularColor), seeded
 // from the level and written back on save. lightPreview shades the viewport with them.
 Vector3 lightGlobalAmb = new(0.16f, 0.15f, 0.17f), lightAmb = new(0.12f, 0.10f, 0.08f);
@@ -2621,7 +2624,7 @@ void OnLoad()
                     }
                 }
                 // A spawn or control-point handle drawn over an object still wins: those are handled further down.
-                int bodyHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                int bodyHit = OverGameplayHandle() ? -1 : PickObject(ray);
                 if (bodyHit >= 0)
                 {
                     GrabObject(bodyHit);
@@ -2662,7 +2665,7 @@ void OnLoad()
             }
             if (toolNames[tool] == "Nudge" && so is not null && terrainPick is not null)
             {
-                int nHit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+                int nHit = PickObject(ray);
                 if (nHit >= 0 && terrainPick.Raycast(ray, out var ng))
                 {
                     if (!multi.Contains(nHit)) { multi.Clear(); multi.Add(nHit); selected = nHit; SyncTransformEdit(); }
@@ -2678,7 +2681,7 @@ void OnLoad()
             // move the mouse up or down (guide 8.G.3). No ring to hit, and it works on the whole selection.
             if (toolNames[tool] == "Rotate" && axisLock >= 0 && so is not null)
             {
-                int rHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                int rHit = OverGameplayHandle() ? -1 : PickObject(ray);
                 if (rHit >= 0)
                 {
                     GrabObject(rHit);
@@ -2709,7 +2712,7 @@ void OnLoad()
             // Snap toggle rounds to 15 degrees). Ctrl pitches it and Alt rolls it, with an up/down drag.
             if (toolNames[tool] == "Rotate" && so is not null)
             {
-                int bHit = OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                int bHit = OverGameplayHandle() ? -1 : PickObject(ray);
                 if (bHit >= 0)
                 {
                     GrabObject(bHit);
@@ -2732,7 +2735,7 @@ void OnLoad()
                     var sp0 = Gizmo.Project(SelPos(), cam.ViewProjection, fb.X, fb.Y);
                     onHandle = !float.IsNaN(sp0.X) && Vector2.Distance(sp0, lastMouse) <= 22f;
                 }
-                int sHit = onHandle || OverGameplayHandle() ? -1 : (glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1);
+                int sHit = onHandle || OverGameplayHandle() ? -1 : PickObject(ray);
                 if (onHandle || sHit >= 0)
                 {
                     if (sHit >= 0) GrabObject(sHit);
@@ -2782,7 +2785,7 @@ void OnLoad()
             // Geometry first. The fallbacks are for objects whose mesh did not resolve (they draw as markers), so
             // they stay DELIBERATELY tight - a 3-cell world radius reached ~12 m on a 2 km map, which is why objects
             // selected themselves from far away and neighbours were hard to tell apart.
-            int hit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+            int hit = PickObject(ray);
             if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, PickPx(10f));
             if (hit < 0) hit = Picking.PickNearest(ray, markers, MathF.Min(cfg.HorizontalSpacing, 3f));
             bool shift = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
@@ -3402,6 +3405,27 @@ void OnKeyDown(IKeyboard k, Key key, int _)
 }
 
 bool UiWantsMouse() => imgui is not null && ImGui.GetIO().WantCaptureMouse;
+
+// The object under the cursor. Asks the PICTURE first - the objects are re-drawn painted with their own indices
+// and the pixel under the cursor is read back - so what gets selected is what you can see, down to the pixel, and
+// a lamp post or a railing is clickable on its own few pixels instead of on the large empty box around it. The
+// ray-versus-box test stays as the fallback for a driver with no framebuffer support, and for the moment before
+// the first frame has been drawn.
+int PickObject(Ray ray)
+{
+    if (glObjects is not null)
+    {
+        try
+        {
+            var fbp = window.FramebufferSize;
+            int id = glPick.Pick(gl, glObjects, cam.ViewProjection, lastMouse, fbp.X, fbp.Y, PickPx(6f));
+            if (id >= 0 && (so is null || id < so.Objects.Count)) return id;
+            if (glPick.Ready) return -1;   // the buffer worked and nothing was there: an honest miss
+        }
+        catch (Exception ex) { Console.WriteLine("Object pick fell back to the box test: " + ex.Message); }
+    }
+    return glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+}
 
 // How forgiving a click is, in framebuffer pixels. Every hit-test radius in the editor was written as a raw pixel
 // count on a 1080p screen, so on a 4K panel the target was literally half the size and selecting anything small

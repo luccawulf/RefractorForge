@@ -299,6 +299,43 @@ public sealed class GlObjects
         }
     }
 
+    /// <summary>
+    /// Draw every clickable placement painted a flat colour that encodes its object index — the pass behind
+    /// <see cref="GlPick"/>. Whatever ends up in a pixel is, by construction, the object you can see there, so
+    /// selection cannot disagree with the picture the way a separate ray test can.
+    ///
+    /// Alpha-tested parts discard the same texels they discard when drawn normally, so a fence, a railing or a
+    /// palm frond is clickable on its bars and leaves and see-through everywhere else, exactly as it looks.
+    /// Blended parts are left solid here: a canopy you can see is a canopy you should be able to click.
+    /// </summary>
+    public unsafe void DrawIds(GL gl, uint prog, int uMVP, int uId, int uUseTex, int uAlphaRef, Matrix4x4 viewProj)
+    {
+        gl.UseProgram(prog);
+        gl.ActiveTexture(TextureUnit.Texture0);
+        foreach (var (tmpl, world, objIndex) in Placements)
+        {
+            if (!_templates.TryGetValue(tmpl, out var t)) continue;
+            if (HiddenIndices is not null && HiddenIndices.Contains(objIndex)) continue;   // hidden = not clickable
+            Matrix4x4 mvpM = world * viewProj;
+            gl.UniformMatrix4(uMVP, 1, false, (float*)&mvpM);
+            // objIndex + 1, so a cleared (zero) pixel reads as "nothing here" rather than as object 0.
+            int code = objIndex + 1;
+            gl.Uniform4(uId, (code & 0xFF) / 255f, ((code >> 8) & 0xFF) / 255f, ((code >> 16) & 0xFF) / 255f, 1f);
+            gl.BindVertexArray(t.Vao);
+            foreach (var part in t.Parts)
+            {
+                bool cutout = part.AlphaTest && part.Tex != 0;
+                gl.Uniform1(uUseTex, cutout ? 1 : 0);
+                if (cutout)
+                {
+                    gl.Uniform1(uAlphaRef, part.AlphaRef ?? (part.Foliage ? 0.33f : 0.5f));
+                    gl.BindTexture(TextureTarget.Texture2D, part.Tex);
+                }
+                gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
+            }
+        }
+    }
+
     public unsafe void Draw(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
                             Matrix4x4 viewProj, IReadOnlySet<int> selectedSet, int primaryIndex, Vector3 highlightTint,
                             IReadOnlySet<int>? lockedSet = null)
