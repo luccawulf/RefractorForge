@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
@@ -18,5 +19,8 @@
     <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
     <ProjectReference Include="..\RefractorForge.Collab\RefractorForge.Collab.csproj" />
     <ProjectReference Include="..\RefractorForge.Mcp\RefractorForge.Mcp.csproj" />
+    <!-- The editor's Theme is driven through a headless Dear ImGui context (no window, no GPU) so a push/pop
+         imbalance in a helper is caught here rather than as a corrupted panel on someone's screen. -->
+    <ProjectReference Include="..\RefractorForge.Viewer\RefractorForge.Viewer.csproj" />
   </ItemGroup>
 </Project>

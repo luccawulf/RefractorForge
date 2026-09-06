@@ -1304,5 +1304,16 @@
  "{0:0.##} x {1:0.##} x {2:0.##} m": "{0:0.##} x {1:0.##} x {2:0.##} m",
  "{0} texture file(s) named by the .mtl could not be found next to the model.": ".mtl が指す {0} 個のテクスチャファイルがモデルの隣に見つかりませんでした。",
  "{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). Decimate it in Blender first.": "三角形 {0} 個は、これらのゲームの水準を大きく超えています（主要メッシュで 1,100-2,200、車両全体で 2,000-6,000）。先に Blender で削減してください。",
- "{0} triangles, {1} vertices, {2} material(s). Authored size {3:0.##} x {4:0.##} x {5:0.##}.": "三角形 {0} 個、頂点 {1} 個、マテリアル {2} 個。作成時のサイズ {3:0.##} x {4:0.##} x {5:0.##}。"
+ "{0} triangles, {1} vertices, {2} material(s). Authored size {3:0.##} x {4:0.##} x {5:0.##}.": "三角形 {0} 個、頂点 {1} 個、マテリアル {2} 個。作成時のサイズ {3:0.##} x {4:0.##} x {5:0.##}。",
+ "Click an object to select it. Arrow keys nudge it, F focuses the camera on it, Delete removes it.": "オブジェクトをクリックして選択します。矢印キーで微調整、F でカメラを合わせ、Delete で削除します。",
+ "Click the terrain to drop a copy of the template chosen in the Object Library.": "地形をクリックすると、オブジェクトライブラリで選んだテンプレートのコピーを置きます。",
+ "Click to add a point; drag a point to move it.": "クリックで点を追加、ドラッグで点を移動します。",
+ "Drag any object across the terrain; the X / Y / Z buttons constrain the drag to one axis. G drops it to the ground.": "オブジェクトを地形上でドラッグします。X / Y / Z ボタンで 1 軸に制限、G で地面に落とします。",
+ "Drag any object along the ground, keeping its own height. Hold Ctrl for finer movement.": "高さを保ったままオブジェクトを地面に沿ってドラッグします。Ctrl を押すと細かく動きます。",
+ "Drag away from the object's centre to grow it, toward it to shrink.": "オブジェクトの中心から離す方向にドラッグで拡大、近づける方向で縮小します。",
+ "Drag sideways to spin the object (Snap = 15 degree steps). Hold Ctrl to pitch or Alt to roll.": "横にドラッグでオブジェクトを回転（スナップ時は 15 度刻み）。Ctrl でピッチ、Alt でロール。",
+ "Left-drag paints under the brush. The mouse wheel changes the brush size; right-click a slider to type a value.": "左ドラッグでブラシの下を塗ります。マウスホイールでブラシサイズ変更、スライダーを右クリックで数値入力。",
+ "Left-drag shapes the ground under the brush. The mouse wheel changes the brush size.": "左ドラッグでブラシの下の地形を変形します。マウスホイールでブラシサイズを変更します。",
+ "Left-drag softens the ground under the brush. The mouse wheel changes the brush size.": "左ドラッグでブラシの下の地形をなだらかにします。マウスホイールでブラシサイズを変更します。",
+ "Paint the pathfinding grid: where bots may go and where they may not, per vehicle type.": "経路探索グリッドを塗ります: 車両タイプごとに、ボットが通れる場所と通れない場所。"
 }

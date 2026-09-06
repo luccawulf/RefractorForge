@@ -1339,7 +1339,6 @@ System.Collections.Generic.Dictionary<string, ObjMesh> importedObjs = new(String
 System.Collections.Generic.HashSet<string> remoteMeshNames = new(StringComparer.OrdinalIgnoreCase);            // .obj meshes received from collab peers (render + catalog only; no source for .sm export)
 MeshLibrary.Mesh? soldierBoxMesh = null;                      // lazily-built soldier-sized box used as the soldier-spawn marker
 System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<(string Mat, string? TexName, Vector3 Diffuse)>> importMaterials = new(StringComparer.OrdinalIgnoreCase);  // -> for .rs export
-string toastText = ""; float toastT = 0f;                    // transient status-bar confirmation message (decays in OnRender)
 
 // texture-material painting
 MaterialStroke? matStroke = null;
@@ -1693,7 +1692,7 @@ bool squareBrush = true;      // square (box) footprint for the terrain + materi
 // UI layout metrics, hoisted so the 3D overlay (DrawGameplay labels) can clip world-space labels to the
 // central viewport instead of painting them over the side/menu/status panels. uiMenuH is refreshed by BuildUi.
 float uiMenuH = 0f;
-float uiStatusH = 30f, uiLeftW = 300f, uiRightW = 384f;   // Inspector wide enough for its labels
+float uiStatusH = 28f, uiLeftW = 310f, uiRightW = 400f;   // Inspector wide enough for its labels
 // UI scale. A 4K panel makes 16 px text and a 300 px panel unreadably small, so the whole interface doubles
 // there and is left alone at ordinary resolutions. Everything is scaled together - font, ImGui metrics and the
 // panel widths - because scaling only the font would overflow the panels it sits in.
@@ -2811,30 +2810,14 @@ void OnLoad()
         Console.WriteLine($"UI scale: {uiScale:0.#}x for a {fb0.X}x{fb0.Y} framebuffer.");
     }
 
+    // Every face the interface uses is loaded in the controller's IO hook - the one moment before the atlas is
+    // built: Segoe UI at three sizes for English, or the CJK face a non-English UI needs (Theme.LoadFonts).
     var uiFont = Loc.FindUiFont();
-    if (uiFont is not null)
-    {
-        try
-        {
-            imgui = new ImGuiController(gl, window, input,
-                new ImGuiFontConfig(uiFont, (int)(16 * uiScale), io => io.Fonts.GetGlyphRangesJapanese()));
-            Console.WriteLine($"UI font: {Path.GetFileName(uiFont)} (Japanese glyph ranges) for language '{Loc.Current}'.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"UI font '{Path.GetFileName(uiFont)}' failed ({ex.Message}); falling back to the built-in font.");
-            imgui = new ImGuiController(gl, window, input);
-        }
-    }
-    else imgui = new ImGuiController(gl, window, input);
-    if (uiScale > 1f)
-    {
-        // Padding, spacing, scrollbars, rounding: all in pixels, so they scale with everything else.
-        ImGui.GetStyle().ScaleAllSizes(uiScale);
-        // The built-in font cannot be re-baked at a larger size here, so it is magnified instead. A font file was
-        // loaded above whenever one was available, which is the crisp path.
-        if (uiFont is null) ImGui.GetIO().FontGlobalScale = uiScale;
-    }
+    imgui = new ImGuiController(gl, window, input, null, () => Theme.LoadFonts(ImGui.GetIO(), uiScale, uiFont));
+    Console.WriteLine($"UI font: {Theme.FontReport} for language '{Loc.Current}'.");
+    // The built-in font cannot be re-baked at a larger size, so on a 4K panel it is magnified instead; a real face
+    // was baked at the right size already. Style metrics are scaled inside Theme.Apply.
+    if (uiScale > 1f && !Theme.HasFonts) ImGui.GetIO().FontGlobalScale = uiScale;
     ImGui.GetIO().ConfigWindowsMoveFromTitleBarOnly = true;   // body-drags (model-viewer orbit, minimap click) don't move the window; the title bar still does
     try { ClipboardBridge.Install(); } catch { }   // Ctrl+C/V in text boxes -> OS clipboard (e.g. paste a collab IP)
     ApplyTheme();
@@ -5786,7 +5769,14 @@ void RebuildTerrain()
 }
 
 // Transient confirmation shown in the status bar (and echoed to the console). Fades out over a few seconds.
-void Toast(string msg) { toastText = msg; toastT = 4.5f; Console.WriteLine(msg); }
+void Toast(string msg)
+{
+    // A message that reads as a failure gets the red card. The wording is what every call site already uses.
+    bool bad = msg.Contains("fail", StringComparison.OrdinalIgnoreCase) || msg.Contains("could not", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("cannot", StringComparison.OrdinalIgnoreCase) || msg.Contains("error", StringComparison.OrdinalIgnoreCase);
+    Theme.Toast(msg, bad);
+    Console.WriteLine(msg);
+}
 
 // Import a Heightmap.raw (headerless 16-bit LE square grid) over the current terrain. Bilinearly resampled to the
 // level's materialSize if it differs, then copied IN PLACE so the existing TerrainPick / TerrainEditor keep working.
@@ -6353,9 +6343,9 @@ void LoadLayerPreset()
 // One clickable thumbnail tile (button for hover/click + the thumbnail drawn over it).
 bool LibTile(string id, uint tex, Vector2 size, bool selected)
 {
-    if (selected) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+    if (selected) Theme.PushOn();
     bool clicked = ImGui.Button(id, size);
-    if (selected) ImGui.PopStyleColor();
+    if (selected) Theme.PopOn();
     var mn = ImGui.GetItemRectMin(); var mx = ImGui.GetItemRectMax();
     if (tex != 0) ImGui.GetWindowDrawList().AddImage((IntPtr)tex, new Vector2(mn.X + 2, mn.Y + 2), new Vector2(mx.X - 2, mx.Y - 2));
     return clicked;
@@ -6389,7 +6379,7 @@ void DrawTextureBrowser(float height)
                 || (layerPickTarget == 1 && string.Equals(layerTexAPath, e.Path, StringComparison.OrdinalIgnoreCase))
                 || (layerPickTarget == 2 && string.Equals(layerTexBPath, e.Path, StringComparison.OrdinalIgnoreCase));
         if (LibTile($"##lib_{e.Path}", LibThumb(e.Path, false), new Vector2(64, 64), sel)) PickLibraryTexture(e.Path);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{e.Name}\n[{e.Category}]");
+        Theme.Tip($"{e.Name}\n[{e.Category}]");
         col++;
         if (col % cols != 0) ImGui.SameLine();
     }
@@ -6990,7 +6980,6 @@ void OnRender(double dt)
         appliedFbSize = fbSize;
     }
     lastFps = dt > 0 ? 1.0 / dt : lastFps;
-    if (toastT > 0f) toastT -= (float)dt;   // fade out the transient status-bar confirmation
     if (pathmapPreviewT > 0f) { pathmapPreviewT -= (float)dt; if (pathmapPreviewT <= 0f) pathmapPreviewOpen = false; }   // auto-close the post-save pathmap preview
     appClock += dt;              // advance the water-ripple animation
     if (meshViewerOpen && meshViewerAutoRotate) meshViewerYaw += (float)dt * 0.6f;   // spin the model viewer
@@ -7593,41 +7582,7 @@ void OnRender(double dt)
 // Editor UI (Dear ImGui). Panels are pinned to the window edges each frame; the
 // 3D viewport shows through the central gap. Matches the approved mockup layout.
 // ===========================================================================
-void ApplyTheme()
-{
-    ImGui.StyleColorsDark();
-    var s = ImGui.GetStyle();
-    s.WindowRounding = 0f; s.FrameRounding = 4f; s.GrabRounding = 4f; s.TabRounding = 4f;
-    s.WindowBorderSize = 1f; s.FrameBorderSize = 0f;
-    s.WindowPadding = new Vector2(10, 8);
-    s.FramePadding = new Vector2(8, 4);
-    s.ItemSpacing = new Vector2(8, 6);
-    s.ScrollbarSize = 12f;
-    static Vector4 C(int r, int g, int b, float a = 1f) => new(r / 255f, g / 255f, b / 255f, a);
-    var c = s.Colors;
-    c[(int)ImGuiCol.WindowBg]       = C(32, 37, 44);
-    c[(int)ImGuiCol.ChildBg]        = C(28, 33, 40);
-    c[(int)ImGuiCol.PopupBg]        = C(28, 33, 40);
-    c[(int)ImGuiCol.Border]         = C(17, 20, 26);
-    c[(int)ImGuiCol.TitleBg]        = C(31, 36, 43);
-    c[(int)ImGuiCol.TitleBgActive]  = C(39, 45, 53);
-    c[(int)ImGuiCol.MenuBarBg]      = C(28, 33, 40);
-    c[(int)ImGuiCol.FrameBg]        = C(23, 27, 33);
-    c[(int)ImGuiCol.FrameBgHovered] = C(33, 39, 47);
-    c[(int)ImGuiCol.FrameBgActive]  = C(40, 48, 58);
-    c[(int)ImGuiCol.Button]         = C(42, 49, 58);
-    c[(int)ImGuiCol.ButtonHovered]  = C(58, 109, 176);
-    c[(int)ImGuiCol.ButtonActive]   = C(49, 95, 156);
-    c[(int)ImGuiCol.Header]         = C(58, 109, 176);
-    c[(int)ImGuiCol.HeaderHovered]  = C(67, 120, 190);
-    c[(int)ImGuiCol.HeaderActive]   = C(49, 95, 156);
-    c[(int)ImGuiCol.CheckMark]      = C(120, 180, 230);
-    c[(int)ImGuiCol.Text]           = C(201, 208, 217);
-    c[(int)ImGuiCol.TextDisabled]   = C(110, 119, 130);
-    c[(int)ImGuiCol.Separator]      = C(44, 51, 61);
-    c[(int)ImGuiCol.ScrollbarBg]    = C(23, 27, 33);
-    c[(int)ImGuiCol.ScrollbarGrab]  = C(58, 66, 77);
-}
+void ApplyTheme() => Theme.Apply(uiScale);
 
 List<(string label, string[] items)> LoadCatalog()
 {
@@ -7748,7 +7703,24 @@ string ShortName(string n)
     return s.Length == 0 ? n : s;
 }
 
-void Sep() { ImGui.TextDisabled("|"); ImGui.SameLine(); }
+void Sep() => Theme.VSep();
+
+// One line on how the current tool is used, for the status bar. The wording is the user guide's own.
+string ToolHint() => toolNames[tool] switch
+{
+    "Select" => Loc.T("Click an object to select it. Arrow keys nudge it, F focuses the camera on it, Delete removes it."),
+    "Move" => Loc.T("Drag any object across the terrain; the X / Y / Z buttons constrain the drag to one axis. G drops it to the ground."),
+    "Rotate" => Loc.T("Drag sideways to spin the object (Snap = 15 degree steps). Hold Ctrl to pitch or Alt to roll."),
+    "Scale" => Loc.T("Drag away from the object's centre to grow it, toward it to shrink."),
+    "Place" => Loc.T("Click the terrain to drop a copy of the template chosen in the Object Library."),
+    "Paint" => Loc.T("Left-drag paints under the brush. The mouse wheel changes the brush size; right-click a slider to type a value."),
+    "Sculpt" => Loc.T("Left-drag shapes the ground under the brush. The mouse wheel changes the brush size."),
+    "Smooth" => Loc.T("Left-drag softens the ground under the brush. The mouse wheel changes the brush size."),
+    "AIPath" => Loc.T("Paint the pathfinding grid: where bots may go and where they may not, per vehicle type."),
+    "Nudge" => Loc.T("Drag any object along the ground, keeping its own height. Hold Ctrl for finer movement."),
+    "Point" => Loc.T("Click to add a point; drag a point to move it."),
+    _ => "",
+};
 
 // ---- Icon toolbar glyphs: each draws into a box of half-extent r around centre c, in the button's
 // text colour, using the window draw list. Vector-drawn so no icon font is needed (ASCII-font rule). ----
@@ -7835,17 +7807,17 @@ void GiUnlock(ImDrawListPtr dl, Vector2 c, float r, uint col) => Padlock(dl, c, 
 /// active state. Used for the Battlecraft view / camera / lock buttons.</summary>
 bool IconBtn(string id, System.Action<ImDrawListPtr, Vector2, float, uint> glyph, bool active, string tip, bool enabled = true)
 {
-    const float sz = 30f;
-    if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+    float sz = Theme.S(30f);
+    if (active) Theme.PushOn();
     if (!enabled) ImGui.BeginDisabled();
     bool clicked = ImGui.Button("##" + id, new Vector2(sz, sz));
     if (!enabled) ImGui.EndDisabled();
-    if (active) ImGui.PopStyleColor();
+    if (active) Theme.PopOn();
     var mn = ImGui.GetItemRectMin(); var mx = ImGui.GetItemRectMax();
     var ctr = new Vector2((mn.X + mx.X) * 0.5f, (mn.Y + mx.Y) * 0.5f);
-    uint col = ImGui.GetColorU32(enabled ? ImGuiCol.Text : ImGuiCol.TextDisabled);
-    glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - 8f, col);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
+    uint col = !enabled ? ImGui.GetColorU32(ImGuiCol.TextDisabled) : active ? Theme.U(Theme.Accent) : ImGui.GetColorU32(ImGuiCol.Text);
+    glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - Theme.S(8f), col);
+    Theme.Tip(Loc.T(tip));
     return clicked && enabled;
 }
 
@@ -7860,15 +7832,15 @@ void GiNudge(ImDrawListPtr dl, Vector2 c, float r, uint col)
 // One square icon tool button: draws the frame, overlays the glyph, shows a tooltip, selects on click.
 bool IconTool(int idx, System.Action<ImDrawListPtr, Vector2, float, uint> glyph, string tip)
 {
-    const float sz = 30f;
+    float sz = Theme.S(30f);
     bool active = tool == idx;
-    if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+    if (active) Theme.PushOn();
     bool clicked = ImGui.Button($"##tool{idx}", new Vector2(sz, sz));
-    if (active) ImGui.PopStyleColor();
+    if (active) Theme.PopOn();
     var mn = ImGui.GetItemRectMin(); var mx = ImGui.GetItemRectMax();
     var ctr = new Vector2((mn.X + mx.X) * 0.5f, (mn.Y + mx.Y) * 0.5f);
-    glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - 8f, ImGui.GetColorU32(ImGuiCol.Text));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
+    glyph(ImGui.GetWindowDrawList(), ctr, sz * 0.5f - Theme.S(8f), active ? Theme.U(Theme.Accent) : ImGui.GetColorU32(ImGuiCol.Text));
+    Theme.Tip(Loc.T(tip));
     if (clicked) tool = idx;
     return clicked;
 }
@@ -7895,10 +7867,8 @@ void SetMapper(int m)
 void MapperButton(int m, string tip)
 {
     bool active = mapper == m;
-    if (active) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
-    bool clicked = ImGui.Button($"{Loc.T(mapperNames[m])}###mapper{m}");
-    if (active) ImGui.PopStyleColor();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tip));
+    bool clicked = Theme.Segment($"{Loc.T(mapperNames[m])}###mapper{m}", active, new Vector2(0f, Theme.S(30f)));
+    Theme.Tip(Loc.T(tip));
     if (clicked) SetMapper(m);
 }
 
@@ -7911,15 +7881,15 @@ void MapperSubToolbar()
         for (int i = 0; i < sculptModeLabels.Length; i++)
         {
             bool on = tool == Array.IndexOf(toolNames, "Sculpt") && sculptModeIdx == i;
-            if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+            if (on) Theme.PushOn();
             if (ImGui.Button(sculptModeLabels[i])) { tool = Array.IndexOf(toolNames, "Sculpt"); sculptModeIdx = i; }
-            if (on) ImGui.PopStyleColor();
+            if (on) Theme.PopOn();
             ImGui.SameLine();
         }
         bool sm = tool == Array.IndexOf(toolNames, "Smooth");
-        if (sm) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+        if (sm) Theme.PushOn();
         if (ImGui.Button(Loc.TL("Smooth"))) tool = Array.IndexOf(toolNames, "Smooth");
-        if (sm) ImGui.PopStyleColor();
+        if (sm) Theme.PopOn();
     }
     else if (mapper == 2)
     {
@@ -7938,8 +7908,7 @@ void MapperSubToolbar()
             for (int i = 0; i < gameplayModes.Modes.Count; i++) gtLabels[i + 1] = gameplayModes.Modes[i];
             ImGui.SetNextItemWidth(130f);
             Cbo(Loc.TL("Game type"), ref gameTypeFilter, gtLabels, gtLabels.Length);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing still applies to the mode the level was loaded from."));
+            Theme.Tip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing still applies to the mode the level was loaded from."));
             ImGui.SameLine();
         }
 
@@ -7958,10 +7927,10 @@ void MapperSubToolbar()
         for (int v = 0; v < ovLabels.Length; v++)
         {
             bool on = objectView == v;
-            if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+            if (on) Theme.PushOn();
             if (ImGui.Button($"{Loc.T(ovLabels[v])}###objview{v}")) objectView = v;
-            if (on) ImGui.PopStyleColor();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(ovTips[v]));
+            if (on) Theme.PopOn();
+            Theme.Tip(Loc.T(ovTips[v]));
             ImGui.SameLine();
         }
         ImGui.NewLine();
@@ -7976,11 +7945,10 @@ void MapperSubToolbar()
             for (int a = -1; a <= 2; a++)
             {
                 bool on = axisLock == a;
-                if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+                if (on) Theme.PushOn();
                 if (ImGui.Button($"{Loc.T(axisLabels[a + 1])}###axis{a}")) axisLock = a;
-                if (on) ImGui.PopStyleColor();
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(Loc.T(a < 0 ? "Free: use the gizmo handles (this editor's own way)."
+                if (on) Theme.PopOn();
+                Theme.Tip(Loc.T(a < 0 ? "Free: use the gizmo handles (this editor's own way)."
                                                  : rot ? "Grab the object and drag up/down to spin it about this axis."
                                                        : "Grab the object and drag to slide it along this axis only."));
                 ImGui.SameLine();
@@ -7992,7 +7960,7 @@ void MapperSubToolbar()
     {
         // Battlecraft's Fill With Material button (guide figure 14).
         if (ImGui.Button(Loc.TL("Fill map"))) FillActiveMap();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Fill the WHOLE map with the selected material. Undoable with Z."));
+        Theme.Tip(Loc.T("Fill the WHOLE map with the selected material. Undoable with Z."));
         ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Radius##mat"), ref brushRadius, 1f, 200f, "%.0f");
         ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Square brush##mat"), ref squareBrush);
         ImGui.SameLine(); ImGui.TextDisabled(Loc.T("palette in the inspector ->"));
@@ -8013,14 +7981,14 @@ void MapperSubToolbar()
         for (int i = 0; i < ops.Length; i++)
         {
             bool on = surfaceOp == i;
-            if (on) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.23f, 0.43f, 0.69f, 1f));
+            if (on) Theme.PushOn();
             if (ImGui.Button($"{Loc.T(ops[i])}###surfop{i}")) surfaceOp = i;
-            if (on) ImGui.PopStyleColor();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T(tips[i]));
+            if (on) Theme.PopOn();
+            Theme.Tip(Loc.T(tips[i]));
             ImGui.SameLine();
         }
         ImGui.ColorEdit3("##surfcol", ref surfacePaintColor, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoLabel);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Colour used by the Colour brush."));
+        Theme.Tip(Loc.T("Colour used by the Colour brush."));
         ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Radius##surf"), ref brushRadius, 1f, 200f, "%.0f");
         ImGui.SameLine(); ImGui.SetNextItemWidth(110f); SldF(Loc.TL("Intensity##surf"), ref texIntensity, 0.02f, 1f, "%.2f");
     }
@@ -8042,25 +8010,27 @@ void ToolButtons()
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Open"))) OpenLevel();
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Save"))) DoSave();
     ImGui.SameLine(); Sep();
+    // The six mappers read as one control: segments touching, the active one filled.
+    ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(Theme.S(2f), ImGui.GetStyle().ItemSpacing.Y));
     MapperButton(0, "Sculpt & smooth the heightmap (F1)");      ImGui.SameLine();
     MapperButton(1, "Paint the ground material type (F2)");     ImGui.SameLine();
     MapperButton(2, "Place & edit objects / spawns (F3)");      ImGui.SameLine();
     MapperButton(3, "Paint the visual surface textures (F4)");  ImGui.SameLine();
     MapperButton(4, "Paint under/overgrowth foliage (F5)");     ImGui.SameLine();
-    MapperButton(5, "Paint AI pathfinding pass/block (F6)");    ImGui.SameLine(); Sep();
+    MapperButton(5, "Paint AI pathfinding pass/block (F6)");    ImGui.PopStyleVar(); ImGui.SameLine(); Sep();
     if (ImGui.Button(Loc.TL("Undo"))) DoUndo();
     ImGui.SameLine(); if (ImGui.Button(Loc.TL("Redo"))) DoRedo();
     ImGui.SameLine(); Sep();
     ImGui.Checkbox(Loc.TL("Grid"), ref gridOn);
     ImGui.SameLine(); ImGui.ColorEdit3("##gridcol", ref gridColor, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoLabel);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Grid line colour"));
+    Theme.Tip(Loc.T("Grid line colour"));
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Labels"), ref gridLabels);
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Snap"), ref snapOn);
     if (snapOn)   // grid step: object move/place snaps X/Z to this many metres
     {
         ImGui.SameLine(); ImGui.SetNextItemWidth(56f);
         if (DrgF("##snapStep", ref snapStep, 0.25f, 0.25f, 64f, "%.2fm")) snapStep = Math.Clamp(snapStep, 0.25f, 64f);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Snap grid step (m): placed/moved objects round to this."));
+        Theme.Tip(Loc.T("Snap grid step (m): placed/moved objects round to this."));
     }
     ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Map"), ref showMinimap);
     ImGui.SameLine(); Sep();
@@ -8090,7 +8060,7 @@ void Inspector()
 {
     if (roadMode)
     {
-        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Road Tool (spline)"));
+        Theme.Heading(Loc.T("Road Tool (spline)"));
         ImGui.Separator();
         ImGui.TextDisabled($"{roadPts.Count} point(s) -- click to add, drag a point to move it.");
         SldF(Loc.TL("Width (m)"), ref roadWidth, 2f, 60f, "%.0f");
@@ -8099,7 +8069,7 @@ void Inspector()
             float pw = roadPtW[roadSelIdx];
             if (SldF($"Point {roadSelIdx + 1} width (m)", ref pw, 0f, 60f, pw <= 0f ? "default" : "%.0f"))
                 roadPtW[roadSelIdx] = pw < 2f ? 0f : pw;   // below 2 m snaps back to "use the road width"
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Per-point override; widths blend smoothly along the curve. Drag to 0 for the default."));
+            Theme.Tip(Loc.T("Per-point override; widths blend smoothly along the curve. Drag to 0 for the default."));
         }
         SldF(Loc.TL("Edge softness (m)"), ref roadEdge, 0f, 16f, "%.1f");
         SldF(Loc.TL("Intensity"), ref roadIntensity, 0.05f, 1f, "%.2f");
@@ -8112,7 +8082,7 @@ void Inspector()
         {
             SldF(Loc.TL("Tile length (m)"), ref roadTileAlong, 2f, 64f, "%.0f");
             ImGui.Checkbox(Loc.TL("Texture runs horizontally"), ref roadTexRotate);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("On = road strip drawn left-right in the image (BF/ED42 default). Off if your strip is drawn top-to-bottom."));
+            Theme.Tip(Loc.T("On = road strip drawn left-right in the image (BF/ED42 default). Off if your strip is drawn top-to-bottom."));
         }
         if (roadUseLib && roadLibTexPath is not null)
         {
@@ -8124,14 +8094,14 @@ void Inspector()
             ImGui.EndGroup();
         }
         if (ImGui.Button(Loc.TL("Pick road texture..."))) { layerPickTarget = 3; showTexLibrary = true; RefreshTextureLibrary(); }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick a road strip from the Texture Library (Road category). Oriented mode runs it lengthwise down the road."));
+        Theme.Tip(Loc.T("Pick a road strip from the Texture Library (Road category). Oriented mode runs it lengthwise down the road."));
         int rs = roadSurface; if (Cbo(Loc.TL("Surface/material"), ref rs, surfNames, surfNames.Length)) roadSurface = (byte)Math.Clamp(rs, 0, 15);
         ImGui.Separator();
         ImGui.Checkbox(Loc.TL("Flatten terrain"), ref roadFlatten);
         if (roadFlatten) SldF(Loc.TL("Shoulder (m)"), ref roadShoulder, 0f, 16f, "%.1f");
         if (roadFlatten && ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Extra flattened ground outside each road edge (the embankment)."));
         ImGui.Spacing();
-        if (ImGui.Button(Loc.TL("Stamp Road"), new Vector2(150, 0))) StampRoad();
+        if (Theme.AccentButton(Loc.TL("Stamp Road"), new Vector2(150, 0))) StampRoad();
         ImGui.SameLine(); if (ImGui.Button(Loc.TL("Undo point")) && roadPts.Count > 0)
         { roadPts.RemoveAt(roadPts.Count - 1); if (roadPtW.Count > roadPts.Count) roadPtW.RemoveAt(roadPtW.Count - 1); if (roadSelIdx >= roadPts.Count) roadSelIdx = roadPts.Count - 1; }
         ImGui.SameLine(); if (ImGui.Button(Loc.TL("Clear"))) { roadPts.Clear(); roadPtW.Clear(); roadSelIdx = -1; roadDragIdx = -1; }
@@ -8145,7 +8115,7 @@ void Inspector()
     string tn = toolNames[tool];
     if (tn is "Sculpt" or "Smooth" or "Paint")
     {
-        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), string.Format(Loc.T("{0} Mapper"), Loc.T(mapperNames[mapper])));
+        Theme.Heading(string.Format(Loc.T("{0} Mapper"), Loc.T(mapperNames[mapper])));
         ImGui.Separator();
         if (tn == "Paint")
         {
@@ -8160,7 +8130,7 @@ void Inspector()
             if (paintLayer == 3)
             {
                 if (atlasCpu is null) { ImGui.TextWrapped(Loc.T("No terrain texture in this level.")); return; }
-                if (paintFromLib && libTexPath is not null) ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), $"Library: {Path.GetFileName(libTexPath)}");
+                if (paintFromLib && libTexPath is not null) ImGui.TextColored(Theme.Accent, $"Library: {Path.GetFileName(libTexPath)}");
                 else ImGui.Text($"{(activeTexture < surfNames.Length ? surfNames[activeTexture] : "?")}  #{activeTexture}");
                 ImGui.TextDisabled(Loc.T("Painted live; baked to .dds on Ctrl+S."));
                 // 16 surface swatches showing each texture's average colour; click selects the surface.
@@ -8172,7 +8142,7 @@ void Inspector()
                     if (ImGui.ColorButton($"tex{i}", texSwatch[i], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)) && has)
                         { activeTexture = (byte)i; paintFromLib = false; }   // picking a palette slot leaves library-paint mode
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{(i < surfNames.Length ? Loc.T(surfNames[i]) : "?")}  #{i}{(has ? "" : Loc.T("  (missing)"))}{(texSource[i] is not null ? Loc.T("  (custom)") : "")}");
+                    Theme.Tip($"{(i < surfNames.Length ? Loc.T(surfNames[i]) : "?")}  #{i}{(has ? "" : Loc.T("  (missing)"))}{(texSource[i] is not null ? Loc.T("  (custom)") : "")}");
                     if (i % 8 != 7 && i != texSwatch.Length - 1) ImGui.SameLine();
                 }
                 SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
@@ -8187,7 +8157,7 @@ void Inspector()
                 ImGui.SameLine(); if (ImGui.Button(Loc.TL("Load set..."))) LoadSurfaceSet();
                 // ---- Texture Library (Editor42-style: your own tileable textures from the TerrainTextures folder) ----
                 ImGui.Separator();
-                ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Texture Library"));
+                Theme.Heading(Loc.T("Texture Library"));
                 if (paintFromLib && libTexPath is not null)
                 {
                     LibTile("##activelib", LibThumb(libTexPath, true), new Vector2(28, 28), true);
@@ -8203,7 +8173,7 @@ void Inspector()
                 ImGui.SameLine(); if (ImGui.Button(Loc.TL("Layer Tool..."))) { showLayerTool = true; RefreshTextureLibrary(); }
                 if (ImGui.Button(Loc.TL("Fill terrain with this texture")) && SurfPaintTex() is Texture2D ftx) FillTerrainWith(ftx, SurfPaintTile());
                 ImGui.Checkbox(Loc.TL("Respect texture alpha (decal/splat)"), ref surfUseAlpha);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Paint only where the source texture is opaque - for cut-out decals/splats."));
+                Theme.Tip(Loc.T("Paint only where the source texture is opaque - for cut-out decals/splats."));
                 // ---- Detail texture (close-up tiling overlay, BF detailTexName) ----
                 ImGui.Separator();
                 if (ImGui.Button(Loc.TL("Import detail texture..."))) ImportDetailTexture();
@@ -8216,9 +8186,9 @@ void Inspector()
                 else ImGui.TextDisabled(Loc.T("No detail texture (adds crisp close-up tiling)."));
                 ImGui.Spacing();
                 ImGui.Separator();
-                ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Copy / paste ground (stamp)"));
+                Theme.Heading(Loc.T("Copy / paste ground (stamp)"));
                 if (ImGui.Checkbox(Loc.TL("Capture mode"), ref captureMode) && captureMode) stampMode = false;
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Click the terrain to copy a square of the painted ground. It becomes the stamp\nbelow, kept at its real size, so it pastes back 1:1 - here or on another map."));
+                Theme.Tip(Loc.T("Click the terrain to copy a square of the painted ground. It becomes the stamp\nbelow, kept at its real size, so it pastes back 1:1 - here or on another map."));
                 if (captureMode)
                 {
                     SldF(Loc.TL("Capture size (m)"), ref captureMeters, 8f, 1024f, "%.0f");
@@ -8236,7 +8206,7 @@ void Inspector()
                     if (ImGui.Checkbox(Loc.TL("Paste mode (click to stamp)"), ref stampMode) && stampMode) captureMode = false;
                     ImGui.SetNextItemWidth(150f);
                     SldF(Loc.TL("Stamp size (m)"), ref stampMeters, 4f, 2048f, "%.0f");
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The ground size the picture stands for. A capture sets it; an imported picture\ntakes it from its .stamp.json, or from a _NNm suffix in its name."));
+                    Theme.Tip(Loc.T("The ground size the picture stands for. A capture sets it; an imported picture\ntakes it from its .stamp.json, or from a _NNm suffix in its name."));
                     ImGui.SetNextItemWidth(150f);
                     SldF(Loc.TL("Scale x"), ref stampScale, 0.25f, 4f, "%.2f");
                     ImGui.SetNextItemWidth(150f);
@@ -8278,8 +8248,7 @@ void Inspector()
                     if (ImGui.ColorButton($"mat{i}", texSwatch[slot], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)))
                         activeMaterial = (byte)i;
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    if (ImGui.IsItemHovered())
-                        ImGui.SetTooltip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}"
+                    Theme.Tip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}"
                             + (i == RefractorForge.Formats.Terrain.DeathMaterial.Index ? "\n" + Loc.T("deathMaterial - OUT OF BOUNDS. The engine kills on this, whatever the combat area says.") : ""));
                     if (i % 8 != 7 && i != 15) ImGui.SameLine();
                 }
@@ -8327,7 +8296,7 @@ void Inspector()
         }
         if (terrainEd is null) { ImGui.TextDisabled(Loc.T("No terrain loaded.")); return; }
         if (tn == "Sculpt") Cbo(Loc.TL("Mode"), ref sculptModeIdx, sculptModeLabels, sculptModeLabels.Length);
-        if (tn == "Sculpt") { ImGui.Checkbox(Loc.TL("L/R mouse = raise / lower"), ref lrSculpt); if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Left-drag raises, right-drag lowers the terrain (overrides the Mode above).\nWhile sculpting, right-drag won't orbit the camera.")); }
+        if (tn == "Sculpt") { ImGui.Checkbox(Loc.TL("L/R mouse = raise / lower"), ref lrSculpt); Theme.Tip(Loc.T("Left-drag raises, right-drag lowers the terrain (overrides the Mode above).\nWhile sculpting, right-drag won't orbit the camera.")); }
         if (brushShapeNames.Length > 1) Cbo(Loc.TL("Shape"), ref brushShapeIdx, brushShapeNames, brushShapeNames.Length);
         // Falloff + the procedural square only apply to the radial brush; bitmap shapes carry their own edge.
         if (brushShapeIdx == 0) Cbo(Loc.TL("Falloff"), ref falloffIdx, falloffLabels, falloffLabels.Length);
@@ -8373,7 +8342,7 @@ void Inspector()
         // regenerated from terrain (the old always-generate behaviour, now an explicit choice).
         if (ImGui.Button(Loc.TL("Reload level navmap")))
         { int rv = Math.Clamp(aiPathVeh, 0, aiNavBufs.Length - 1); aiNavBufs[rv] = null; aiNavBufDirty[rv] = false; aiNav = null; aiNavVehLoaded = -1; EnsureAiNav(); }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Discard edits for this vehicle and reload the navmap the level ships (or generate if it has none)."));
+        Theme.Tip(Loc.T("Discard edits for this vehicle and reload the navmap the level ships (or generate if it has none)."));
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Generate from terrain")))
         {
@@ -8384,7 +8353,7 @@ void Inspector()
             aiNavBufDirty[rv] = aiNavBufs[rv] is not null;   // generated over an existing map = an edit worth saving
             aiNav = null; aiNavVehLoaded = -1; EnsureAiNav();
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Replace this vehicle's navmap with a fresh terrain-derived one (slopes + water + object footprints)."));
+        Theme.Tip(Loc.T("Replace this vehicle's navmap with a fresh terrain-derived one (slopes + water + object footprints)."));
         if (aiNavDirty) { ImGui.SameLine(); ImGui.TextColored(new Vector4(1f, 0.8f, 0.3f, 1f), Loc.T("unsaved")); }
         ImGui.Spacing();
         ImGui.BulletText(Loc.T("Drag to paint (terrain-seeded)."));
@@ -8397,7 +8366,7 @@ void Inspector()
     // Place tool: choose what to drop, then click the terrain. Always shown while Place is active.
     if (toolNames[tool] == "Place")
     {
-        var accent = new Vector4(0.49f, 0.70f, 0.92f, 1f);
+        var accent = Theme.Accent;
         ImGui.TextColored(accent, Loc.T("Place mode"));
         ImGui.TextDisabled(Loc.T("What to place:"));
         if (ImGui.RadioButton(Loc.TL("Static object"), gpPlaceKind is null)) gpPlaceKind = null;
@@ -8542,7 +8511,7 @@ void Inspector()
     if (meshLib is not null && !meshLib.TryGet(o.Template, out _) && !meshLib.TryGetAssembledMesh(o.Template, out _))
         ImGui.TextColored(new Vector4(1f, 0.55f, 0.3f, 1f),
             meshLib.HasMeshEntry(o.Template) ? "mesh not shown: .sm present but failed to parse" : "mesh not found in loaded archives");
-    if (multi.Count > 1) ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), string.Format(Loc.T("{0} selected - editing primary (gizmo moves all)"), multi.Count));
+    if (multi.Count > 1) ImGui.TextColored(Theme.Accent, string.Format(Loc.T("{0} selected - editing primary (gizmo moves all)"), multi.Count));
     ImGui.Separator();
 
     if (!ImGui.IsAnyItemActive())   // don't clobber a field that's mid-drag
@@ -8552,7 +8521,7 @@ void Inspector()
         insScale = o.Scale ?? 1f;
     }
 
-    ImGui.TextDisabled(Loc.T("TRANSFORM"));
+    Theme.Section(Loc.T("TRANSFORM"));
     // A locked object is locked against typing coordinates too, not just dragging - otherwise the lock would only
     // cover half the ways this editor can move something.
     bool selLocked = IsObjectLocked(selected);
@@ -8588,8 +8557,7 @@ void Inspector()
     if (sounds.IsSound(o.Template))
     {
         var em = sounds.Get(o.Template);
-        ImGui.Separator();
-        ImGui.TextDisabled(Loc.T("SOUND  -  ") + o.Template + ".ssc");
+        Theme.Section(Loc.T("SOUND  -  ") + o.Template + ".ssc");
         if (em?.Script is null)
             ImGui.TextWrapped(Loc.T(".ssc not found (sound editing is for folder levels)."));
         else
@@ -8619,12 +8587,11 @@ void Inspector()
     // Imported .obj: show counts + a one-click standard-mesh export (so it can be packed + used in-game).
     if (importedObjs.TryGetValue(o.Template, out var imp))
     {
-        ImGui.Separator();
-        ImGui.TextDisabled(Loc.T("IMPORTED MESH  -  ") + o.Template);
+        Theme.Section(Loc.T("IMPORTED MESH  -  ") + o.Template);
         int withTex = importMaterials.TryGetValue(o.Template, out var ml) ? ml.Count(m => !string.IsNullOrEmpty(m.TexName)) : 0;
         ImGui.TextDisabled($"{imp.TotalVertices} verts, {imp.TotalFaces} tris, {imp.SubMeshes.Count} material(s), {withTex} textured");
         ImGui.Checkbox(Loc.TL("include collision (experimental)"), ref expCollision);
-        if (expCollision) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("empty-BSP col - TEST IN-GAME (may not collide yet)"));
+        if (expCollision) ImGui.TextColored(Theme.Warn, Loc.T("empty-BSP col - TEST IN-GAME (may not collide yet)"));
         if (ImGui.Button(Loc.TL("Export as .sm (+ .rs)..."))) DoExportObjSm(o.Template);
     }
 }
@@ -8854,12 +8821,11 @@ void DoBakeOvergrowthToCon()
 void LayersPanel()
 {
     GroupsPanel();
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("LAYERS"));
+    Theme.Section(Loc.T("LAYERS"));
     ImGui.Checkbox(Loc.TL("Terrain"), ref showTerrain);
     ImGui.Checkbox(Loc.TL("Static Objects"), ref showObjects);
     ImGui.Checkbox(Loc.TL("Texture transparency"), ref alphaTransparency);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
+    Theme.Tip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
     if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
     ImGui.Checkbox(string.Format(Loc.T("Vehicles ({0})"), gameplayEdit.VehicleSpawns.Count) + "###vehLayer", ref showVehicles);
     ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
@@ -8868,14 +8834,14 @@ void LayersPanel()
     if (sounds.Count > 0)
     {
         ImGui.Checkbox(string.Format(Loc.T("Sounds ({0})"), sounds.Count) + "###soundLayer", ref showSounds);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Where each sound comes from and how far it carries: the inner ring is full volume, the\nouter one is silence, and the label shows what you would hear standing at the camera.\nCovers the level's own emitters and sounds carried by an object (a video screen).\nThe rings brighten while you are within earshot."));
+        Theme.Tip(Loc.T("Where each sound comes from and how far it carries: the inner ring is full volume, the\nouter one is silence, and the label shows what you would hear standing at the camera.\nCovers the level's own emitters and sounds carried by an object (a video screen).\nThe rings brighten while you are within earshot."));
         ImGui.SameLine();
         if (ImGui.Checkbox(Loc.TL("Play##sounds"), ref playSounds))
         {
             try { soundPlayback ??= new SoundPlayback(ResolveSoundWav); soundPlayback.SetEnabled(playSounds); }   // lazy: spin up audio on first enable
             catch (System.Exception ex) { playSounds = false; Console.WriteLine($"Sound playback unavailable: {ex.GetType().Name} {ex.Message}"); }
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Play placed LOOPING ambient sounds (frogs, crickets, water...) while the\ncamera is inside their ring, fading with distance. Needs the level's .wav\n(in the level .rfa's Sound/ or a shared sound*.rfa)."));
+        Theme.Tip(Loc.T("Play placed LOOPING ambient sounds (frogs, crickets, water...) while the\ncamera is inside their ring, fading with distance. Needs the level's .wav\n(in the level .rfa's Sound/ or a shared sound*.rfa)."));
     }
     // Overgrowth-trees overlay: instance the .wst foliage geometry on the map (a view of the in-game foliage).
     // BFV-only feature (BF1942 has no overgrowth system), so hide it for a BF1942 target.
@@ -8891,7 +8857,7 @@ void LayersPanel()
             // Density tops out at 1.5x: x1.0 is already the game-matched density, so the useful range is a small over/under.
             if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
             if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = 12.5f; foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Back to what the game generates for this map: 12.5 m patches at x1.0."));
+            Theme.Tip(Loc.T("Back to what the game generates for this map: 12.5 m patches at x1.0."));
             GrowthDefinitionTree(growth.OverPalette, "overdef");
         }
     }
@@ -8905,7 +8871,7 @@ void LayersPanel()
             ImGui.SetNextItemWidth(150f);
             if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
             if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = 17.5f; underDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Back to what the game generates for this map: 17.5 m patches at x1.0."));
+            Theme.Tip(Loc.T("Back to what the game generates for this map: 17.5 m patches at x1.0."));
             GrowthDefinitionTree(growth.UnderPalette, "underdef");
         }
     }
@@ -8913,11 +8879,11 @@ void LayersPanel()
     if (showWater && haveWaterTex)
     {
         ImGui.SameLine(); ImGui.Checkbox(Loc.TL("Textured##water"), ref useWaterTextures);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The level's scrolling water textures (water.texLayer1/2 + normalMap)\nare loaded. Uncheck for the plain procedural water."));
+        Theme.Tip(Loc.T("The level's scrolling water textures (water.texLayer1/2 + normalMap)\nare loaded. Uncheck for the plain procedural water."));
     }
     ImGui.Checkbox(Loc.TL("Sky"), ref showSky);
     if (ImGui.Checkbox(Loc.TL("Sun Shadows (real-time)"), ref showShadows) && showShadows) shadowMapDirty = true;
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Real-time sun cast-shadows on terrain + objects, from the current sun position.\nOFF by default. Move the sun in the Environment panel to recast them live."));
+    Theme.Tip(Loc.T("Real-time sun cast-shadows on terrain + objects, from the current sun position.\nOFF by default. Move the sun in the Environment panel to recast them live."));
     if (ImGui.Checkbox(Loc.TL("Object Lightmaps"), ref showObjectLightmaps) && showObjectLightmaps)
     {
         // Enabling it: decode now so we can tell the user when a level simply HAS no baked object lightmaps (e.g. the
@@ -8927,7 +8893,7 @@ void LayersPanel()
         if ((objectLightmaps?.Count ?? 0) == 0)
             Toast(Loc.T("This level has no baked object lightmaps. Use Tools > \"Bake Object Lightmaps (from sun)\" to generate them."));
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Show the level's BAKED per-object lighting (ObjectLightMaps/*.tga or *.dds). Loaded on first\nenable (kept off the load path). If the level ships none (some custom/FHSW maps don't), bake them\nwith Tools > Bake Object Lightmaps. Ignored while you control the sun manually (objects then light\ndynamically: real-time N-L + sun shadows, following the sun)."));
+    Theme.Tip(Loc.T("Show the level's BAKED per-object lighting (ObjectLightMaps/*.tga or *.dds). Loaded on first\nenable (kept off the load path). If the level ships none (some custom/FHSW maps don't), bake them\nwith Tools > Bake Object Lightmaps. Ignored while you control the sun manually (objects then light\ndynamically: real-time N-L + sun shadows, following the sun)."));
 
     // Weather (rain/snow/dust): a preview overlay + PLACEABLE emitters generated into the level on save.
     if (ImGui.Checkbox(Loc.TL("Effects"), ref showEffects) && showEffects)
@@ -8935,9 +8901,9 @@ void LayersPanel()
         EnsureEffects();   // lazy-parse the level's FX particle effects on first enable
         if (fxInstances.Count == 0) Toast(Loc.T("This level has no placed particle effects (or their textures aren't loaded)."));
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Animate the level's placed particle EFFECTS (FX/*.con: waterfalls, lava,\nfire, smoke, steam...) as billboards. Loaded on first enable. A preview\napproximation of the in-game particle systems."));
+    Theme.Tip(Loc.T("Animate the level's placed particle EFFECTS (FX/*.con: waterfalls, lava,\nfire, smoke, steam...) as billboards. Loaded on first enable. A preview\napproximation of the in-game particle systems."));
     ImGui.Checkbox(Loc.TL("Animate objects"), ref showAnimations);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Spin continuously-rotating object parts (BF1942 RotationalBundle: windmill\nblades, watermill wheel, and any mod object using setContinousRotationSpeed),\nlike in-game. View-only."));
+    Theme.Tip(Loc.T("Spin continuously-rotating object parts (BF1942 RotationalBundle: windmill\nblades, watermill wheel, and any mod object using setContinousRotationSpeed),\nlike in-game. View-only."));
     ImGui.Checkbox(Loc.TL("Weather (preview)"), ref showWeather);
     // Weather the LEVEL itself defines (FH winter maps etc.): announce it + one click arms the matching preview.
     if (!levelWeatherScanned) ScanLevelWeather();
@@ -8959,13 +8925,13 @@ void LayersPanel()
         SldF(Loc.TL("Wind"), ref weatherWind, -10f, 10f, "%.1f");
         // Place a weather emitter on the map (the normal Refractor way) - arms the Place tool with the bundle.
         if (ImGui.Button(Loc.TL("Place emitter"))) ArmWeatherPlace();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Arms the Place tool with this weather emitter - click the map to drop it (shows as a marker; saves into StaticObjects.con)."));
+        Theme.Tip(Loc.T("Arms the Place tool with this weather emitter - click the map to drop it (shows as a marker; saves into StaticObjects.con)."));
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Import texture..."))) ImportWeatherTexture();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Use a custom particle image (.dds/.tga/.png) for this weather type - shown in the preview and shipped to the level."));
+        Theme.Tip(Loc.T("Use a custom particle image (.dds/.tga/.png) for this weather type - shown in the preview and shipped to the level."));
         int placed = so?.Objects.Count(o => RefractorForge.Formats.Con.WeatherEffect.TypeOfBundle(o.Template) is not null) ?? 0;
         ImGui.Checkbox(Loc.TL("Also auto-place one at map centre"), ref weatherApply);
-        ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), $"{placed} placed - saves Effects/RF_Weather.con + texture (TEST IN-GAME).");
+        ImGui.TextColored(Theme.Warn, $"{placed} placed - saves Effects/RF_Weather.con + texture (TEST IN-GAME).");
     }
 }
 
@@ -9612,22 +9578,20 @@ void SaveLightingFolder()
 // terrain + object shaders; seeded from the level's Init.con (renderer.vertexFog* / fog start-end).
 void EnvironmentPanel()
 {
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("GAME"));
+    Theme.Section(Loc.T("GAME"));
     int gameIdx = gameIsBf1942 ? 0 : 1;
     ImGui.SetNextItemWidth(180f);
     if (CboZ(Loc.TL("Target game"), ref gameIdx, "Battlefield 1942\0Battlefield Vietnam\0")) gameIsBf1942 = gameIdx == 0;
-    if (gameIsBf1942) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("BF1942: no overgrowth / tunnels."));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Auto-detected from the level path; set it here if wrong. Drives team names (Axis/Allies vs NVA/US) and which features show."));
+    if (gameIsBf1942) ImGui.TextColored(Theme.Warn, Loc.T("BF1942: no overgrowth / tunnels."));
+    Theme.Tip(Loc.T("Auto-detected from the level path; set it here if wrong. Drives team names (Axis/Allies vs NVA/US) and which features show."));
 
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("TERRAIN"));
+    Theme.Section(Loc.T("TERRAIN"));
     // Water level edits cfg.WaterLevel live: the water plane (uWaterY), terrain water tint (uWater) and ground
     // picking all read it each frame. Saved into Init/Terrain.con on F5. DragFloat = drag or ctrl-click to type.
     // A map can have TWO water bodies and they are edited apart: the surface the level has always had, and (on a
     // BfVietnam tunnel map) the second one under the terrain. Each owns its level, its colours and - through
     // levelWater.rs - how much sky it mirrors and how opaque it is.
-    ImGui.TextDisabled(Loc.T("SURFACE WATER"));
+    Theme.Section(Loc.T("SURFACE WATER"));
     float wl = cfg.WaterLevel;
     ImGui.SetNextItemWidth(150f);
     if (DrgF(Loc.TL("Water level (m)"), ref wl, 0.25f, -5000f, 5000f, "%.1f")) { cfg.WaterLevel = wl; waterLevelEdited = true; BroadcastWater(); }
@@ -9644,9 +9608,8 @@ void EnvironmentPanel()
     // here and another in the game.
     wcol |= Col3(Loc.TL("Shallow colour"), ref shallowColor);
     wcol |= Col3(Loc.TL("Deep colour"), ref deepColor);
-    if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("What the water turns into where it is DEEP - past 'full colour at depth' below.\nIt is easy to miss because the editor shows it only under deep water, and a stray\nvalue here is what makes a river read as orange in game."));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep."));
+    Theme.Tip(Loc.T("What the water turns into where it is DEEP - past 'full colour at depth' below.\nIt is easy to miss because the editor shows it only under deep water, and a stray\nvalue here is what makes a river read as orange in game."));
+    Theme.Tip(Loc.T("What the water looks like where it is shallow - on a river, most of it.\nThe game uses this, not the colour above, until the water gets deep."));
     if (Vector3.DistanceSquared(shallowColor, waterColor) > 1e-4f)
     {
         ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Shallow water will read as this colour, not the one above."));
@@ -9671,12 +9634,12 @@ void EnvironmentPanel()
         EnsureWaterShaderLoaded();
         ImGui.SetNextItemWidth(150f);
         bool wchg = SldF(Loc.TL("Reflectivity"), ref waterReflect, 0f, 1f, "%.2f");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
+        Theme.Tip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
         if (wchg) QueueWaterShader();
         ImGui.TextDisabled(waterSeqTex.Length > 1
             ? string.Format(Loc.T("Animation: {0} frames (the game's own water ripple)"), waterSeqTex.Length)
             : Loc.T("Animation: the level's water sequence is not in the loaded archives"));
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("BfVietnam animates its water with a sequence of normal maps (texture/Waterseq/test0000...),\nnamed by levelWater.rs. The viewport plays the same ones, so the ripple and the sky\nreflection here are the game's."));
+        Theme.Tip(Loc.T("BfVietnam animates its water with a sequence of normal maps (texture/Waterseq/test0000...),\nnamed by levelWater.rs. The viewport plays the same ones, so the ripple and the sky\nreflection here are the game's."));
     }
     // ---- The second body, on a BfVietnam tunnel map ----
     if (!gameIsBf1942 && env is not null)
@@ -9692,7 +9655,7 @@ void EnvironmentPanel()
             env.WriteWaterBelow = true; env.WaterBelowEnabled = twOn2; lightingDirty = true;
             EnsureWaterShaderLoaded(); QueueWaterShader();   // the subshader ships with the flag or the level crashes
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A tunnel map has its own water under the ground: the river above cannot flood the corridors.\nWrites drawWaterBelowTerrain + waterBelowLevel, the waterBelowTerrain.* colours, and the\nWaterSettingBelowTerrain subshader the engine needs (without it the level crashes on load)."));
+        Theme.Tip(Loc.T("A tunnel map has its own water under the ground: the river above cannot flood the corridors.\nWrites drawWaterBelowTerrain + waterBelowLevel, the waterBelowTerrain.* colours, and the\nWaterSettingBelowTerrain subshader the engine needs (without it the level crashes on load)."));
         if (cfg.DrawWaterBelowTerrain)
         {
             float twl2 = cfg.WaterBelowLevel ?? SafeBelowWaterLevel();
@@ -9723,7 +9686,7 @@ void EnvironmentPanel()
             bcol |= Col3(Loc.TL("Tunnel shallow colour"), ref belowShallowColor);
             bcol |= Col3(Loc.TL("Tunnel deep colour"), ref belowDeepColor);
             ImGui.TextDisabled(Loc.T("Three colours reach the game: shallow, this one and deep, over the depth below.\nThe viewport can only show the middle one - the tunnel water is under the terrain, so\nthe heightmap cannot say how deep it is. Check the ramp in game."));
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
+            Theme.Tip(Loc.T("What the tunnel water looks like where it is shallow - in a flooded tunnel,\nmost of what you see. The game uses this, not the colour above, until the\nwater gets deep."));
             if (Vector3.DistanceSquared(belowShallowColor, belowColor) > 1e-4f)
             {
                 ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("Shallow water will read as this colour, not the one above."));
@@ -9735,10 +9698,10 @@ void EnvironmentPanel()
             // see-through sewer come out opaque: a surface tuned to hide its bottom hides the tunnel's too.
             ImGui.SetNextItemWidth(150f);
             bcol |= SldF(Loc.TL("Tunnel opaque at depth"), ref belowAlphaDepth, 0.1f, 8f, "%.2f m");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep the tunnel water has to be before it stops being see-through.\nSmaller hides the bottom sooner. Saigon68, the only retail tunnel map, uses 0.4 m."));
+            Theme.Tip(Loc.T("How deep the tunnel water has to be before it stops being see-through.\nSmaller hides the bottom sooner. Saigon68, the only retail tunnel map, uses 0.4 m."));
             ImGui.SetNextItemWidth(150f);
             bcol |= SldF(Loc.TL("Tunnel full colour at depth"), ref belowColorDepth, 0.5f, 20f, "%.2f m");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How deep before the water stops taking its colour from the shallow setting.\nSaigon68 uses 7.5 m."));
+            Theme.Tip(Loc.T("How deep before the water stops taking its colour from the shallow setting.\nSaigon68 uses 7.5 m."));
             if (bcol)
             {
                 env.BelowColor = new Vec3(belowColor.X, belowColor.Y, belowColor.Z);
@@ -9752,7 +9715,7 @@ void EnvironmentPanel()
             }
             ImGui.SetNextItemWidth(150f);
             bool bchg = SldF(Loc.TL("Tunnel reflectivity"), ref waterBelowReflect, 0f, 1f, "%.2f");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer."));
+            Theme.Tip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer."));
             if (bchg) QueueWaterShader();
         }
     }
@@ -9766,13 +9729,12 @@ void EnvironmentPanel()
         else if (env is not null && env.HasWaterTextures) ImGui.TextDisabled($"Water textures: {env.WaterTexLayer1 ?? env.WaterBaseTex} not in archives");
         else ImGui.TextDisabled(Loc.T("Water textures: none (color only)"));
         if (ImGui.SmallButton(Loc.TL("Import water textures..."))) ImportWaterTextures();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick the scrolling water texture(s): diffuse layer 1, then optionally layer 2 + a normal map.\nUse this when the level references water textures that aren't in its archives (most stock BF1942 maps)."));
+        Theme.Tip(Loc.T("Pick the scrolling water texture(s): diffuse layer 1, then optionally layer 2 + a normal map.\nUse this when the level references water textures that aren't in its archives (most stock BF1942 maps)."));
     }
 
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("SUN"));
+    Theme.Section(Loc.T("SUN"));
     if (ImGui.Checkbox(Loc.TL("Control sun manually"), ref sunOverride)) { shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Aim the sun yourself instead of using the level's SkyAndSun.con direction.\nIt relights terrain + objects and recasts the shadow map live, the lighting bakes\nuse it, and on save it is written to the level - so the game agrees with the bake."));
+    Theme.Tip(Loc.T("Aim the sun yourself instead of using the level's SkyAndSun.con direction.\nIt relights terrain + objects and recasts the shadow map live, the lighting bakes\nuse it, and on save it is written to the level - so the game agrees with the bake."));
     if (sunOverride)
     {
         ImGui.SetNextItemWidth(150f);
@@ -9795,17 +9757,17 @@ void EnvironmentPanel()
     ImGui.Separator();
     // Battlecraft's light settings: the four renderer.* colours in Init.con. Editing them relights the editor
     // immediately, and the values are written back into Init.con on save.
-    ImGui.TextDisabled(Loc.T("LIGHTING"));
+    Theme.Section(Loc.T("LIGHTING"));
     ImGui.Checkbox(Loc.TL("Preview lighting"), ref lightPreview);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Shade the editor with the level's light colours.\nOff = neutral white light (the old look)."));
+    Theme.Tip(Loc.T("Shade the editor with the level's light colours.\nOff = neutral white light (the old look)."));
     if (Col3(Loc.TL("Global ambient"), ref lightGlobalAmb)) { lightingDirty = true; BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.globalAmbientColor - scene-wide fill added to everything."));
+    Theme.Tip(Loc.T("renderer.globalAmbientColor - scene-wide fill added to everything."));
     if (Col3(Loc.TL("Ambient"), ref lightAmb)) { lightingDirty = true; BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.ambientColor - the sun light's own ambient term."));
+    Theme.Tip(Loc.T("renderer.ambientColor - the sun light's own ambient term."));
     if (Col3(Loc.TL("Sun diffuse"), ref lightDiffuse)) { lightingDirty = true; BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.diffuseColor - the key light colour. This is what\nmakes a level read warm or cold."));
+    Theme.Tip(Loc.T("renderer.diffuseColor - the key light colour. This is what\nmakes a level read warm or cold."));
     if (Col3(Loc.TL("Specular"), ref lightSpecular)) { lightingDirty = true; BroadcastLight(); }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("renderer.specularColor - highlight colour on shiny surfaces.\nWritten to Init.con; not previewed in the editor."));
+    Theme.Tip(Loc.T("renderer.specularColor - highlight colour on shiny surfaces.\nWritten to Init.con; not previewed in the editor."));
     if (ImGui.Button(Loc.TL("Reset lighting to level")) && env is not null)
     {
         lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
@@ -9827,7 +9789,7 @@ void EnvironmentPanel()
     // Object textures are the largest thing the editor uploads, so this is the dial that decides whether a
     // texture-heavy map draws on a GPU that shares system memory. Full is the default - a remastered map's art is
     // usually the reason for opening it - and the load log always states what it cost.
-    ImGui.TextDisabled(Loc.T("PERFORMANCE"));
+    Theme.Section(Loc.T("PERFORMANCE"));
     int texIdx = AppPrefs.ObjectTextureCap switch { 512 => 3, 1024 => 2, 2048 => 1, _ => 0 };
     ImGui.SetNextItemWidth(150f);
     if (CboZ(Loc.TL("Object texture detail"), ref texIdx, "Full (map's own)\0" + "2048\0" + "1024\0" + "512\0"))
@@ -9836,15 +9798,14 @@ void EnvironmentPanel()
         AppPrefs.Save();
         Toast(Loc.T("Applies next time a level is loaded."));
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Largest object texture handed to the GPU. Full keeps the map's own art.\nLower it if a texture-heavy map fails to draw - a few hundred 2048-4096\ntextures run to several GB, and a GPU sharing system memory can run out.\nNothing on disk is changed. Applies on the next level load."));
+    Theme.Tip(Loc.T("Largest object texture handed to the GPU. Full keeps the map's own art.\nLower it if a texture-heavy map fails to draw - a few hundred 2048-4096\ntextures run to several GB, and a GPU sharing system memory can run out.\nNothing on disk is changed. Applies on the next level load."));
 
     ImGui.Separator();
     // Terrain paint alignment: move/zoom the ground texture until it sits on the terrain it belongs to.
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("TERRAIN PAINT ALIGNMENT"));
+    Theme.Section(Loc.T("TERRAIN PAINT ALIGNMENT"));
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Paint scale"), ref terUvScale, 0.25f, 4f, "%.4f")) ApplyTerrainUv();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Zoom of the ground texture about the map's origin corner.\nBelow 1 pulls the paint inward, above 1 pushes it outward."));
+    Theme.Tip(Loc.T("Zoom of the ground texture about the map's origin corner.\nBelow 1 pulls the paint inward, above 1 pushes it outward."));
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Paint offset X"), ref terUvOffX, -1f, 1f, "%.4f")) ApplyTerrainUv();
     ImGui.SetNextItemWidth(150f);
@@ -9855,17 +9816,15 @@ void EnvironmentPanel()
         Console.WriteLine($"Terrain paint alignment: scale={terUvScale:0.#####} offsetX={terUvOffX:0.#####} offsetZ={terUvOffY:0.#####}" +
                           $"  (worldSize {cfg.WorldSize}, offset in metres = {terUvOffX * cfg.WorldSize:0.#}, {terUvOffY * cfg.WorldSize:0.#})");
 
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("CAMERA"));
+    Theme.Section(Loc.T("CAMERA"));
     ImGui.SetNextItemWidth(150f);
     SldF(Loc.TL("Fly speed"), ref camSpeedMult, 0.1f, 8f, "%.2fx");
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Multiplier on WASD fly speed + scroll-zoom. Hold Shift for a 4x burst.\nRight-click a slider to type an exact value."));
+    Theme.Tip(Loc.T("Multiplier on WASD fly speed + scroll-zoom. Hold Shift for a 4x burst.\nRight-click a slider to type an exact value."));
     bool gcam = groundCam;
     if (ImGui.Checkbox(Loc.TL("Battlecraft camera (fly where you look)  [F7]"), ref gcam)) SetGroundCam(gcam);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("W/S travel toward whatever is in the middle of the screen, so aiming down descends and\naiming up climbs - the height follows your view instead of needing Q/E.\nA/D still strafe level and Q/E still move straight up/down.\nOff = the fly camera, which keeps your altitude until you press Q/E."));
+    Theme.Tip(Loc.T("W/S travel toward whatever is in the middle of the screen, so aiming down descends and\naiming up climbs - the height follows your view instead of needing Q/E.\nA/D still strafe level and Q/E still move straight up/down.\nOff = the fly camera, which keeps your altitude until you press Q/E."));
 
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("ENVIRONMENT"));
+    Theme.Section(Loc.T("ENVIRONMENT"));
     ImGui.Checkbox(Loc.TL("Fog"), ref fogEnabled);
     if (fogEnabled)
     {
@@ -9881,8 +9840,7 @@ void EnvironmentPanel()
         fogStart = env.FogStart; fogEnd = env.FogEnd;
     }
 
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("SKY"));
+    Theme.Section(Loc.T("SKY"));
     if (skyCubeTex != 0)
     {
         ImGui.Checkbox(Loc.TL("Use level cubemap"), ref skyUseCubemap);
@@ -9900,8 +9858,7 @@ void EnvironmentPanel()
         if (CboZ("##skyboxpick", ref pick, string.Join('\0', skyBoxChoices) + "\0") && pick != skyBoxChoice
             && pick >= 0 && pick < skyBoxChoices.Length)
         { skyBoxChoice = pick; ApplySkyBox(skyBoxChoices[pick]); }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(Loc.T("Every skybox the mounted archives offer. Picking one shows it straight away -\nmesh, cube map and the level's own fog - and Save writes it to Init/SkyAndSun.con."));
+        Theme.Tip(Loc.T("Every skybox the mounted archives offer. Picking one shows it straight away -\nmesh, cube map and the level's own fog - and Save writes it to Init/SkyAndSun.con."));
         if (skyBoxOriginal is not null && !string.Equals(skyBoxOriginal, env?.SkyBoxMesh, StringComparison.OrdinalIgnoreCase))
         {
             ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), string.Format(Loc.T("changed from {0}"), skyBoxOriginal));
@@ -9924,14 +9881,12 @@ void EnvironmentPanel()
         ImGui.TextDisabled(string.Format(Loc.T("level: {0:0} deg"), eff));
     }
     if (ImGui.Button(Loc.TL("Save sky rotation to level"), new Vector2(0, 0)) && env is not null) SaveSkyRotation();
-    if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
+    Theme.Tip(Loc.T("Fold the rotation above into the level's own sky.setRotAngle, so the game opens the\nmap with the sky turned the way you have it. Save writes it to Init/SkyAndSun.con."));
     if (ImGui.Checkbox(Loc.TL("Water mirrors this level's own sky"), ref waterMirrorsLevelSky))
     { EnsureWaterShaderLoaded(); QueueWaterShader(); }
-    if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("Ships this level's skybox as its own copy of the stock cube map's six faces\n(Texture/env_default_01..06.dds, 128px DXT1). The water shader keeps naming\ntexture/env_default.rcm - the engine reads that from the base archive - and the\nFACES resolve level-first, so only this map is affected.\n\nIt is the cube map for the whole level, so anything else that mirrors the sky\n- vehicle glass, canopies - mirrors this one too."));
+    Theme.Tip(Loc.T("Ships this level's skybox as its own copy of the stock cube map's six faces\n(Texture/env_default_01..06.dds, 128px DXT1). The water shader keeps naming\ntexture/env_default.rcm - the engine reads that from the base archive - and the\nFACES resolve level-first, so only this map is affected.\n\nIt is the cube map for the whole level, so anything else that mirrors the sky\n- vehicle glass, canopies - mirrors this one too."));
     if (ImGui.Button(Loc.TL("Import skybox..."))) ImportSkybox();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
+    Theme.Tip(Loc.T("Folder with 6 faces named *_01 .. *_06 (.dds/.tga/.bmp/.png), any power-of-2 size."));
 
     // Per-face skybox editor: each sky-mesh material can take a replacement image or a Bink movie.
     if (skyMeshOk && skyMeshTexNames.Length > 0 && ImGui.CollapsingHeader(Loc.TL("Skybox faces (sky mesh materials)")))
@@ -9985,7 +9940,7 @@ void EnvironmentPanel()
     if (cloudMeshOk)
     {
         ImGui.Checkbox(Loc.TL("Cloud layers (level mesh)"), ref showCloudMesh);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("This level ships its own scrolling cloud mesh (the bubbles/clouds); shown faithfully.\nThe procedural overlay below is off while the real mesh is used."));
+        Theme.Tip(Loc.T("This level ships its own scrolling cloud mesh (the bubbles/clouds); shown faithfully.\nThe procedural overlay below is off while the real mesh is used."));
     }
     if (ImGui.Checkbox(Loc.TL("Clouds"), ref cloudsOn)) cloudsDirty = true;
     if (cloudsOn)
@@ -10000,12 +9955,12 @@ void EnvironmentPanel()
         if (SldF(Loc.TL("Drift Y"), ref cloudSpeedY, -0.2f, 0.2f, "%.3f")) cloudsDirty = true;
         if (Col3(Loc.TL("Cloud color"), ref cloudColor)) cloudsDirty = true;
         if (ImGui.Button(Loc.TL("Import cloud texture..."))) ImportCloudTexture();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Use a custom cloud image (.dds/.tga/.png) for the scrolling layer - shown here and shipped."));
+        Theme.Tip(Loc.T("Use a custom cloud image (.dds/.tga/.png) for the scrolling layer - shown here and shipped."));
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Import cloud mesh..."))) ImportCloudMesh();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick a cloud StandardMesh (.sm) or .obj - referenced + shipped so clouds render in-game."));
+        Theme.Tip(Loc.T("Pick a cloud StandardMesh (.sm) or .obj - referenced + shipped so clouds render in-game."));
         if (cloudMeshImportPath is not null) ImGui.TextDisabled($"mesh: {System.IO.Path.GetFileName(cloudMeshImportPath)}");
-        ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("Saved to SkyAndSun.con - needs a 'cloud' mesh in-game."));
+        ImGui.TextColored(Theme.Warn, Loc.T("Saved to SkyAndSun.con - needs a 'cloud' mesh in-game."));
     }
 }
 
@@ -10481,7 +10436,7 @@ void NewMapModal()
     nmWaterLevel = SliderInput("Water level (m)", nmWaterLevel, -2000f, 500f, "%.1f", "%.1f");
 
     ImGui.Separator();
-    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Terrain"));
+    Theme.Heading(Loc.T("Terrain"));
     Cbo(Loc.TL("Type"), ref nmTerrainType, Array.ConvertAll(nmTerrainTypeLabels, Loc.T), nmTerrainTypeLabels.Length);
     if (nmTerrainType == 0)
         nmFlatHeight = SliderInput("Ground height (m)", nmFlatHeight, -100f, 500f, "%.1f", "%.1f");
@@ -10538,7 +10493,7 @@ void NewMapModal()
 
     ImGui.Separator();
     ImGui.TextDisabled(Loc.T("Create restarts the editor on the new map."));
-    if (ImGui.Button(Loc.TL("Create"), new Vector2(130, 0))) DoCreateNewMap();
+    if (Theme.AccentButton(Loc.TL("Create"), new Vector2(130, 0))) DoCreateNewMap();
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Cancel"), new Vector2(130, 0))) { nmError = ""; ImGui.CloseCurrentPopup(); }
 
@@ -11326,18 +11281,18 @@ void CollabModal()
     FitLabel(Loc.TL("Password (optional)"));
     InT(Loc.TL("Password (optional)"), ref collabPass, 64, ImGuiInputTextFlags.Password);
     ImGui.Spacing();
-    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Host a session"));
+    Theme.Heading(Loc.T("Host a session"));
     InI(Loc.TL("Port##host"), ref collabPort);
-    if (ImGui.Button(Loc.TL("Host"), new Vector2(160, 0))) DoCollabHost();
+    if (Theme.AccentButton(Loc.TL("Host"), new Vector2(160, 0))) DoCollabHost();
     ImGui.Separator();
-    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Join a session"));
+    Theme.Heading(Loc.T("Join a session"));
     InT(Loc.TL("Host address"), ref collabHostAddr, 64);
     InI(Loc.TL("Port##join"), ref collabPort);
-    if (ImGui.Button(Loc.TL("Join"), new Vector2(160, 0))) DoCollabJoin();
+    if (Theme.AccentButton(Loc.TL("Join"), new Vector2(160, 0))) DoCollabJoin();
 
     if (!string.IsNullOrEmpty(collabError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), collabError);
     ImGui.Separator();
-    ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T("Central server (no host clobbering)"));
+    Theme.Heading(Loc.T("Central server (no host clobbering)"));
     ImGui.TextDisabled(Loc.T("Run an always-on relay everyone Joins (nobody 'hosts'):"));
     ImGui.TextDisabled(Loc.T("   RefractorForge.exe --relay 7777 [levelFolder]"));
     ImGui.TextDisabled(Loc.T("   add  --save serverState  to persist EVERYTHING across restarts"));
@@ -11574,7 +11529,7 @@ void MeshViewerWindow()
         else
         {
             bool has = meshLib.TryGetAssembledMesh(meshViewerTemplate, out var m) || meshLib.TryGet(meshViewerTemplate, out m);
-            ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), ShortName(meshViewerTemplate));
+            Theme.Heading(ShortName(meshViewerTemplate));
             if (!has) ImGui.TextWrapped(Loc.T("No mesh for this template (it may be a sound/effect emitter or a proxy with no .sm)."));
             else
             {
@@ -11710,20 +11665,20 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Open Level / .rfa..."), "Ctrl+O")) OpenLevel();
             if (ImGui.MenuItem(Loc.TL("Open Mod..."))) OpenMod();
             if (ImGui.MenuItem(Loc.TL("Save"), "Ctrl+S", false, so is not null && (soPath is not null || levelDir is not null))) DoSave();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Save the level itself: a folder level is written back to its folder, a .rfa level\nback into that .rfa (through a temp file, verified, with an auto-backup first)."));
+            Theme.Tip(Loc.T("Save the level itself: a folder level is written back to its folder, a .rfa level\nback into that .rfa (through a temp file, verified, with an auto-backup first)."));
             if (ImGui.MenuItem(Loc.TL("Test This Level (in-game)"), "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads."));
+            Theme.Tip(Loc.T("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads."));
             if (ImGui.MenuItem(Loc.TL("Save as Patch .rfa..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Export ONLY the changed files as an overlay archive the engine mounts over this map.\nPlain Save writes the map itself; this is for shipping an update on top of one."));
+            Theme.Tip(Loc.T("Export ONLY the changed files as an overlay archive the engine mounts over this map.\nPlain Save writes the map itself; this is for shipping an update on top of one."));
             if (ImGui.MenuItem(Loc.TL("Save as SSM Patch (server-side only)..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch(serverSideOnly: true);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A server-side-mod patch: only gameplay .con files, no textures/sounds. Drop it in the server's levels folder - clients need nothing."));
+            Theme.Tip(Loc.T("A server-side-mod patch: only gameplay .con files, no textures/sounds. Drop it in the server's levels folder - clients need nothing."));
             if (ImGui.MenuItem(Loc.TL("Auto-backup on save"), null, autoBackup)) autoBackup = !autoBackup;
             if (ImGui.MenuItem(Loc.TL("Import .obj..."), null, false, meshLib is not null && so is not null)) DoImportObj();
             if (ImGui.MenuItem(Loc.TL("Import treeMesh.rfa..."), null, false, meshLib is not null && so is not null)) DoImportTreeMesh();
             if (ImGui.MenuItem(Loc.TL("Play .bik video..."))) DoPlayBik();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Play a Bink (.bik) movie from the mod's movies/ folder (or anywhere) inside the editor.\nDecoded with FFmpeg if present, else opened in the RAD Bink player."));
+            Theme.Tip(Loc.T("Play a Bink (.bik) movie from the mod's movies/ folder (or anywhere) inside the editor.\nDecoded with FFmpeg if present, else opened in the RAD Bink player."));
             if (ImGui.MenuItem(Loc.TL("Play map video (.bik in this map)..."), null, false, rfaList.Length > 0)) DoPlayMapBik();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Find + play any .bik video embedded in the loaded map's .rfa."));
+            Theme.Tip(Loc.T("Find + play any .bik video embedded in the loaded map's .rfa."));
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Exit"))) window.Close();
             ImGui.EndMenu();
@@ -11765,8 +11720,7 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Measure"), null, measureMode)) { measureMode = !measureMode; if (measureMode) roadMode = false; measurePts.Clear(); }
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Set Level Start Camera Here"), null, false, env is not null)) SetLevelStartCamera();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(Loc.T("Where the game opens the map, before you pick a spawn - fly to the view you want\nand click. Both teams are aimed here, which is what nearly every retail level does.\nWritten to Init.con on save as game.setBeforeSpawnCameraPosition."));
+            Theme.Tip(Loc.T("Where the game opens the map, before you pick a spawn - fly to the view you want\nand click. Both teams are aimed here, which is what nearly every retail level does.\nWritten to Init.con on save as game.setBeforeSpawnCameraPosition."));
             ImGui.Separator();
             if (ImGui.BeginMenu(Loc.TL("Arrange Selection")))
             {
@@ -11777,14 +11731,14 @@ void BuildUi()
             if (ImGui.BeginMenu(Loc.TL("Lighting")))
             {
                 if (ImGui.MenuItem(Loc.TL("Bake Lightmaps (sun + placed lights)"), null, false, heightmap is not null)) BakeAllLighting();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Everything the game reads for light, in one go: the terrain sun-shadow (.lsb), every\nobject's lightmap (sun + your placed lights) and the placed lights' colour in the ground\ntexture. Shown at once; Save writes it all. Set the sun and lights first."));
+                Theme.Tip(Loc.T("Everything the game reads for light, in one go: the terrain sun-shadow (.lsb), every\nobject's lightmap (sun + your placed lights) and the placed lights' colour in the ground\ntexture. Shown at once; Save writes it all. Set the sun and lights first."));
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain)"), null, false, heightmap is not null)) DoBakeShadows();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads."));
+                Theme.Tip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads."));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Each object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor."));
+                Theme.Tip(Loc.T("Each object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor."));
                 if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
+                Theme.Tip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
                 if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
@@ -11792,8 +11746,7 @@ void BuildUi()
                 if (ImGui.MenuItem(Loc.TL("Show the level's baked terrain shadow (.lsb)"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showShadows = true; }
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Unbake Lighting (back to unlit)"), null, unbakeLighting, heightmap is not null)) UnbakeLighting();
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(Loc.T("Put the map back to how it looked before anything was baked: a fully lit terrain\nshadow and fully lit object lightmaps, written on Save. Baking again undoes it.\nThe ground-texture bake is separate - undo that with Z."));
+                Theme.Tip(Loc.T("Put the map back to how it looked before anything was baked: a fully lit terrain\nshadow and fully lit object lightmaps, written on Save. Baking again undoes it.\nThe ground-texture bake is separate - undo that with Z."));
                 ImGui.EndMenu();
             }
             if (ImGui.BeginMenu(Loc.TL("AI")))
@@ -11806,31 +11759,31 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Scatter Objects..."), null, false, so is not null && meshLib is not null && terrainPick is not null)) { scatterError = ""; scatterRequest = true; }
             ImGui.Separator();
             if (!gameIsBf1942 && ImGui.MenuItem(Loc.TL("Tunnels (BFV 1.2)..."), null, false, heightmap is not null)) showTunnels = true;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Holes, entrances, below-ground objects and the underground map - the whole BFV 1.2 tunnel system,\nwith the Init.con switches Battlecraft never set."));
+            Theme.Tip(Loc.T("Holes, entrances, below-ground objects and the underground map - the whole BFV 1.2 tunnel system,\nwith the Init.con switches Battlecraft never set."));
             if (ImGui.BeginMenu(Loc.TL("Check Map")))
             {
                 if (ImGui.MenuItem(Loc.TL("Validate Map"), null, false, so is not null)) RunMapValidation();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Floating and buried objects, missing templates, flags with no spawns,\nspawns outside the combat area, vehicle spawners with nothing to spawn."));
+                Theme.Tip(Loc.T("Floating and buried objects, missing templates, flags with no spawns,\nspawns outside the combat area, vehicle spawners with nothing to spawn."));
                 if (ImGui.MenuItem(Loc.TL("Bot Reachability"), null, false, heightmap is not null)) RunReachability();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Flood-fills the navmap from every spawn and reports control points\nbots cannot walk to - without launching the game."));
+                Theme.Tip(Loc.T("Flood-fills the navmap from every spawn and reports control points\nbots cannot walk to - without launching the game."));
                 if (ImGui.MenuItem(Loc.TL("Performance Budget"), null, false, so is not null)) RunPerformanceBudget();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Triangles, objects and texture memory per 256 m cell,\nso the report points at the corner that needs thinning."));
+                Theme.Tip(Loc.T("Triangles, objects and texture memory per 256 m cell,\nso the report points at the corner that needs thinning."));
                 if (ImGui.MenuItem(Loc.TL("Dependencies"), null, false, so is not null)) RunDependencyCheck();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Templates, vehicles and textures the level uses that the LOADED mod chain\ndoes not provide - the invisible-building check."));
+                Theme.Tip(Loc.T("Templates, vehicles and textures the level uses that the LOADED mod chain\ndoes not provide - the invisible-building check."));
                 if (ImGui.MenuItem(Loc.TL("Server / Client Files"), null, false, levelDir is not null)) RunServerClientSplit();
                 if (ImGui.MenuItem(Loc.TL("Compare With Another Version..."), null, false, so is not null)) RunLevelDiff();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Pick an older StaticObjects.con or level .rfa and see what was added,\nremoved, moved or rotated since."));
+                Theme.Tip(Loc.T("Pick an older StaticObjects.con or level .rfa and see what was added,\nremoved, moved or rotated since."));
                 ImGui.EndMenu();
             }
             if (ImGui.MenuItem(Loc.TL("Map Report"), null, showMapReport, mapReport is not null)) showMapReport = !showMapReport;
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
             if (ImGui.MenuItem(Loc.TL("Import 3D Model..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showModelImport = true;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A model of your own as a placeable static object: the mesh, its textures\nand the .con files that register it, all written inside the map."));
+            Theme.Tip(Loc.T("A model of your own as a placeable static object: the mesh, its textures\nand the .con files that register it, all written inside the map."));
             if (ImGui.MenuItem(Loc.TL("Import Sound (MP3/WAV)..."), null, false, so is not null && levelDir is not null)) showSoundImport = true;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
+            Theme.Tip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
             if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
+            Theme.Tip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Convert TGA -> DDS..."))) DoConvertTgaToDds();
             if (ImGui.MenuItem(Loc.TL("Batch TGA -> DDS (folder)..."))) DoBatchTgaToDds();
@@ -11841,8 +11794,7 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Bake Overgrowth -> StaticObjects.con..."), null, false, haveOver && meshLib is not null)) DoBakeOvergrowthToCon();
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Clear All Foliage..."), null, false, growth is not null)) clearFoliageRequest = true;
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(Loc.T("Empty both growth maps, so the map grows nothing. The .wst palette is kept, so the\nspecies are still there to paint back. Save writes it."));
+            Theme.Tip(Loc.T("Empty both growth maps, so the map grows nothing. The .wst palette is kept, so the\nspecies are still there to paint back. Save writes it."));
             if (ImGui.MenuItem(Loc.TL("Put Foliage Back"), null, false, foliageUnderBackup is not null || foliageOverBackup is not null)) RestoreFoliage();
             ImGui.EndMenu();
         }
@@ -11863,7 +11815,7 @@ void BuildUi()
             {
                 if (ImGui.MenuItem(Loc.TL("Collaborate..."))) { collabError = ""; collabRequest = true; }
                 if (ImGui.MenuItem(Loc.TL("AI Bridge"))) DoAiBridge();
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Let an AI assistant edit this level with you, through the\nRefractorForge MCP server. Listens on 127.0.0.1 only - this\nmachine, not the network. Objects it places appear here live."));
+                Theme.Tip(Loc.T("Let an AI assistant edit this level with you, through the\nRefractorForge MCP server. Listens on 127.0.0.1 only - this\nmachine, not the network. Objects it places appear here live."));
             }
             else
             {
@@ -11907,10 +11859,10 @@ void BuildUi()
                 bool inh = AppPrefs.ResolveInheritedMods, layer = AppPrefs.LayerBaseMap;
                 if (ImGui.MenuItem(Loc.TL("Resolve inherited mod dependencies"), null, ref inh))
                 { AppPrefs.ResolveInheritedMods = inh; AppPrefs.Save(); Toast(Loc.T("Reopen the map to apply.")); }
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Follow each dependency's own init.con, so a mod that lists FHSW also gets FH."));
+                Theme.Tip(Loc.T("Follow each dependency's own init.con, so a mod that lists FHSW also gets FH."));
                 if (ImGui.MenuItem(Loc.TL("Layer base map under add-on maps"), null, ref layer))
                 { AppPrefs.LayerBaseMap = layer; AppPrefs.Save(); Toast(Loc.T("Reopen the map to apply.")); }
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("When the opened .rfa has no terrain, load the same-named base map underneath it."));
+                Theme.Tip(Loc.T("When the opened .rfa has no terrain, load the same-named base map underneath it."));
                 ImGui.EndMenu();
             }
             ImGui.Separator();
@@ -11948,8 +11900,10 @@ void BuildUi()
     ImGui.SetNextWindowPos(new Vector2(0, top), ImGuiCond.Always);
     ImGui.SetNextWindowSize(new Vector2(W, 0f), ImGuiCond.Always);   // 0 height = auto-fit both toolbar rows so the sub-toolbar is never clipped
     float toolH = uiToolH;
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, Theme.Bg0);
     if (ImGui.Begin("##toolbar", barFlags)) { ToolButtons(); toolH = ImGui.GetWindowHeight(); }
     ImGui.End();
+    ImGui.PopStyleColor();
     uiToolH = toolH;   // remember the measured height for the 3D-overlay viewport clip (uiMenuH + uiToolH)
     top += toolH;
 
@@ -11957,9 +11911,10 @@ void BuildUi()
 
     ImGui.SetNextWindowPos(new Vector2(0, top), ImGuiCond.Always);
     ImGui.SetNextWindowSize(new Vector2(leftW, bodyH), ImGuiCond.Always);
-    if (ImGui.Begin(Loc.TL("Object Library"), fixedFlags))
+    if (ImGui.Begin(Loc.TL("Object Library"), fixedFlags | ImGuiWindowFlags.NoTitleBar))
     {
         ImGui.PushTextWrapPos(0f);   // fixed-width panel: wrap, do not clip
+        Theme.PanelTitle(Loc.T("Object Library"));
         ImGui.PushItemWidth(-1);
         ImGui.InputTextWithHint("##search", Loc.T("Search objects..."), ref searchText, 64);
         ImGui.PopItemWidth();
@@ -12013,8 +11968,9 @@ void BuildUi()
 
     ImGui.SetNextWindowPos(new Vector2(W - rightW, top), ImGuiCond.Always);
     ImGui.SetNextWindowSize(new Vector2(rightW, bodyH), ImGuiCond.Always);
-    if (ImGui.Begin(Loc.TL("Inspector"), fixedFlags))
+    if (ImGui.Begin(Loc.TL("Inspector"), fixedFlags | ImGuiWindowFlags.NoTitleBar))
     {
+        Theme.PanelTitle(Loc.T("Inspector"));
         // ImGui text does not wrap - anything wider than the panel is silently clipped at the right edge,
         // which swallowed whole sentences in here. Wrap at the content edge instead.
         ImGui.PushTextWrapPos(0f);
@@ -12027,31 +11983,41 @@ void BuildUi()
 
     ImGui.SetNextWindowPos(new Vector2(0, H - statusH), ImGuiCond.Always);
     ImGui.SetNextWindowSize(new Vector2(W, statusH), ImGuiCond.Always);
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, Theme.Bg0);
     if (ImGui.Begin("##status", barFlags))
     {
+        ImGui.PushFont(Theme.FontSmall);
         var cp = cam.Position;
-        ImGui.Text($"Cam  {cp.X:0.0}, {cp.Y:0.0}, {cp.Z:0.0}"); ImGui.SameLine(); Sep();
+        Theme.Muted($"Cam  {cp.X:0.0}, {cp.Y:0.0}, {cp.Z:0.0}"); Sep();
         // World position of the terrain point under the cursor ("--" when over a panel or pointed at the sky).
+        string cursor = Loc.T("Cursor  --");
         if (terrainPick is not null && !UiWantsMouse())
         {
             var fbh = window.FramebufferSize;
             var hr = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbh.X, fbh.Y);
-            if (terrainPick.Raycast(hr, out var hp)) ImGui.Text($"Cursor  {hp.X:0.0}, {hp.Y:0.0}, {hp.Z:0.0}");
-            else ImGui.Text(Loc.T("Cursor  --"));
+            if (terrainPick.Raycast(hr, out var hp)) cursor = $"Cursor  {hp.X:0.0}, {hp.Y:0.0}, {hp.Z:0.0}";
         }
-        else ImGui.Text(Loc.T("Cursor  --"));
-        ImGui.SameLine(); Sep();
-        ImGui.Text(string.Format(Loc.T("{0} selected"), multi.Count)); ImGui.SameLine(); Sep();
-        ImGui.Text(Loc.T("Tool:")); ImGui.SameLine();
-        ImGui.TextColored(new Vector4(0.49f, 0.70f, 0.92f, 1f), Loc.T(toolNames[tool])); ImGui.SameLine(); Sep();
-        ImGui.Text(string.Format(Loc.T("Snap {0}"), snapOn ? Loc.T("On") : Loc.T("Off"))); ImGui.SameLine(); Sep();
-        ImGui.Text(string.Format(Loc.T("world {0} m"), cfg.WorldSize.ToString("0"))); ImGui.SameLine(); Sep();
-        ImGui.Text(string.Format(Loc.T("{0} objects"), so?.Objects.Count ?? markers.Length)); ImGui.SameLine(); Sep();
-        ImGui.Text($"{lastFps:0} fps");
-        if (toastT > 0f && toastText.Length > 0)
-        { ImGui.SameLine(); Sep(); ImGui.TextColored(new Vector4(0.55f, 0.95f, 0.6f, MathF.Min(1f, toastT)), toastText); }
+        Theme.Muted(cursor); Sep();
+        Theme.Muted(string.Format(Loc.T("{0} selected"), multi.Count)); Sep();
+        // The tool by name, then one line on how to use it - the guide's own words, where a newcomer looks first.
+        ImGui.TextColored(Theme.Accent, Loc.T(toolNames[tool])); ImGui.SameLine();
+        Theme.Muted(ToolHint());
+
+        // The level's facts, right-aligned so they stay put while the hint changes length.
+        string right = string.Join("   |   ", new[]
+        {
+            string.Format(Loc.T("Snap {0}"), snapOn ? Loc.T("On") : Loc.T("Off")),
+            string.Format(Loc.T("world {0} m"), cfg.WorldSize.ToString("0")),
+            string.Format(Loc.T("{0} objects"), so?.Objects.Count ?? markers.Length),
+            $"{lastFps:0} fps",
+        });
+        ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - ImGui.CalcTextSize(right).X);
+        Theme.Muted(right);
+        ImGui.PopFont();
     }
     ImGui.End();
+    ImGui.PopStyleColor();
+    Theme.DrawToasts(new Vector2(leftW, top), new Vector2(W - rightW, H - statusH));
 
     // Complete a drag-and-drop from the Object Library: when the dragged item is released over the 3D
     // viewport (not over a panel), place it on the terrain under the cursor - same as the Place tool.
@@ -12580,19 +12546,18 @@ void TunnelsWindow()
         ImGui.Spacing();
         bool tOn = env.IsTunnelMap;
         if (ImGui.Checkbox("Game.isTunnelMap", ref tOn)) { env.IsTunnelMap = tOn; if (tOn) env.UseBelowGroundCulling = true; MarkTunnelEdited(); }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The master switch. Off, holes are ordinary pits and nobody gets underground."));
+        Theme.Tip(Loc.T("The master switch. Off, holes are ordinary pits and nobody gets underground."));
         bool tCull = env.UseBelowGroundCulling;
         if (ImGui.Checkbox("Game.useBelowGroundCulling", ref tCull)) { env.UseBelowGroundCulling = tCull; MarkTunnelEdited(); }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Do not draw the surface world while the camera is underground. Every retail tunnel map sets it."));
+        Theme.Tip(Loc.T("Do not draw the surface world while the camera is underground. Every retail tunnel map sets it."));
         float tRad = env.EntryPointRadius;
         ImGui.SetNextItemWidth(160f * uiScale);
         if (SldF("Game.entryPointRadius", ref tRad, 1f, 10f, "%.1f m")) { env.EntryPointRadius = tRad; MarkTunnelEdited(); }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How close to an entrance a soldier must be to pass through the terrain. Cedar Falls 3.5, Saigon68 5."));
+        Theme.Tip(Loc.T("How close to an entrance a soldier must be to pass through the terrain. Cedar Falls 3.5, Saigon68 5."));
         // The second water. With drawWaterBelowTerrain on, every point under the terrain surface - and every hole
         // cell - uses waterBelowLevel instead of the river. Without it the river fills every hole and tunnel, which
         // is the swim on the way in. Saigon68 is the reference: river 7.5 m, sewers flooded to -7.1 m.
-        ImGui.Separator();
-        ImGui.TextDisabled(Loc.T("TUNNEL WATER"));
+        Theme.Section(Loc.T("TUNNEL WATER"));
         bool twOn = cfg.DrawWaterBelowTerrain;
         if (ImGui.Checkbox(Loc.TL("Separate water level below the terrain"), ref twOn))
         {
@@ -12601,7 +12566,7 @@ void TunnelsWindow()
             env.WriteWaterBelow = true; env.WaterBelowEnabled = twOn; lightingDirty = true;
             EnsureWaterShaderLoaded(); QueueWaterShader();   // the second body's subshader ships with the flag
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes GeometryTemplate.drawWaterBelowTerrain 1 + waterBelowLevel to Terrain.con and a\nwaterBelowTerrain.* colour block to Init.con (mirroring water.*), exactly as Saigon68 ships.\nKeep this level below the tunnel floor for dry tunnels, or in a sewer for wading."));
+        Theme.Tip(Loc.T("Writes GeometryTemplate.drawWaterBelowTerrain 1 + waterBelowLevel to Terrain.con and a\nwaterBelowTerrain.* colour block to Init.con (mirroring water.*), exactly as Saigon68 ships.\nKeep this level below the tunnel floor for dry tunnels, or in a sewer for wading."));
         if (twOn)
         {
             float twl = cfg.WaterBelowLevel ?? (cfg.WaterLevel - 15f);
@@ -12612,7 +12577,7 @@ void TunnelsWindow()
             ImGui.TextDisabled(Loc.T("Its colour and look: Inspector > Water."));
         }
         ImGui.Checkbox(Loc.TL("Show entry points in the viewport"), ref showTunnelEntries);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
+        Theme.Tip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
         ImGui.Separator();
 
         int tEntries = 0, tHoled = 0, tBelow = 0, tMapped = 0, tWet = 0, tShore = 0;
@@ -12675,10 +12640,10 @@ void TunnelsWindow()
         if (tEntries == 0 && tBelow == 0) ImGui.TextDisabled(Loc.T("Place a tunnel (o_tunnelsA) and entrances (o_Tunnel_Hut_m1, o_Tunnel_Hole_m1, o_tunnel_Bunker_M1)\nfrom the Object Library's Tunnels category first."));
         ImGui.Spacing();
         if (ImGui.Button(Loc.TL("Punch holes under entrances"))) PunchHolesUnderEntrances();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sets the terrain cell under every entrance object to a hole, the way Cedar Falls and\nSaigon68 are built. The Hole / Fill hole brushes in the Terrain mapper do it by hand."));
+        Theme.Tip(Loc.T("Sets the terrain cell under every entrance object to a hole, the way Cedar Falls and\nSaigon68 are built. The Hole / Fill hole brushes in the Terrain mapper do it by hand."));
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Generate underground map(s)"))) GenerateUndergroundMaps();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Renders each below-ground object top-down into Textures/<Template>Map.dds and writes the\nmapManager.addObjectMap line that binds it. Replaces the maps registered so far."));
+        Theme.Tip(Loc.T("Renders each below-ground object top-down into Textures/<Template>Map.dds and writes the\nmapManager.addObjectMap line that binds it. Replaces the maps registered so far."));
         if (env.ObjectMaps.Count > 0)
         {
             ImGui.Spacing();
@@ -12884,11 +12849,11 @@ void DecalDialog()
             int chIdx = decalSoundStereo ? 1 : 0, rateIdx = decalAudioRate >= 44100 ? 1 : 0;
             ImGui.SetNextItemWidth(110f * uiScale);
             if (CboZ(Loc.TL("Audio"), ref chIdx, "Mono\0Stereo\0")) decalSoundStereo = chIdx == 1;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Mono is placed in the world at the screen and fades with distance. Stereo is fuller\nbut is not positioned the way a mono sample is - the game's own scripts use both."));
+            Theme.Tip(Loc.T("Mono is placed in the world at the screen and fades with distance. Stereo is fuller\nbut is not positioned the way a mono sample is - the game's own scripts use both."));
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110f * uiScale);
             if (CboZ(Loc.TL("Sample rate"), ref rateIdx, "22 kHz\044 kHz\0")) decalAudioRate = rateIdx == 1 ? 44100 : 22050;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The game has two sound-quality tiers, Sound/22khz and Sound/44kHz, and plays the one its settings\nchoose. 44 kHz writes a real 44.1 kHz file for the high tier and a 22 kHz one for the low tier;\n22 kHz writes the same 22 kHz file to both. The .bik's own track uses the rate chosen too."));
+            Theme.Tip(Loc.T("The game has two sound-quality tiers, Sound/22khz and Sound/44kHz, and plays the one its settings\nchoose. 44 kHz writes a real 44.1 kHz file for the high tier and a 22 kHz one for the low tier;\n22 kHz writes the same 22 kHz file to both. The .bik's own track uses the rate chosen too."));
         }
         // Which audio the .bik carries follows "When it plays", because the engine plays a .bik's own track as part
         // of the picture. "Only while you look at it" keeps it (perfectly in sync, drawn-gated); "Always" strips it,
@@ -12919,8 +12884,8 @@ void DecalDialog()
         ImGui.SameLine();
         ImGui.SetNextItemWidth(110f * uiScale);
         Cbo(Loc.TL("Video size"), ref bikWidthIdx, bikWidthNames, bikWidthNames.Length);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bink is not a small format and the file ships inside your map: the game's own background.bik is 320x240 and 5 MB a minute, while an untouched 720p minute is nearly 80 MB. 512 px keeps a screen sharp at the distance anyone reads one from."));
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Turns an mp4 (or any video FFmpeg reads) into the Bink .bik the game plays,\nkeeping its sound. Needs the free RAD Video Tools installed."));
+        Theme.Tip(Loc.T("Bink is not a small format and the file ships inside your map: the game's own background.bik is 320x240 and 5 MB a minute, while an untouched 720p minute is nearly 80 MB. 512 px keeps a screen sharp at the distance anyone reads one from."));
+        Theme.Tip(Loc.T("Turns an mp4 (or any video FFmpeg reads) into the Bink .bik the game plays,\nkeeping its sound. Needs the free RAD Video Tools installed."));
         if (converting)
         {
             ImGui.SameLine();
@@ -12966,18 +12931,18 @@ void DecalDialog()
             ImGui.SameLine();
             ImGui.SetNextItemWidth(130f * uiScale); SldF(Loc.TL("m##drawdist"), ref decalLookRange, 20f, 600f, "%.0f");
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine draws the screen out to its far LOD distance - 1000 m unless capped. With the\n'only while you look at it' sound this is ALSO how far the sound carries, so cap it there."));
+        Theme.Tip(Loc.T("The engine draws the screen out to its far LOD distance - 1000 m unless capped. With the\n'only while you look at it' sound this is ALSO how far the sound carries, so cap it there."));
         if (decalVideo) ImGui.TextWrapped(Loc.T("A video decal: the .bik is copied to the mod's Movies folder and the shader points at it - the same Bink-texture trick the mod movie screens use. It plays in the game with its sound; the editor shows its first frame."));
         if (decalVideo)
         {
             ImGui.Checkbox(Loc.TL("Sound from the video, at the screen"), ref decalSound);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Writes the movie's audio track as a level sound script on the decal object itself,\nso it plays from the middle of the screen and fades with distance."));
+            Theme.Tip(Loc.T("Writes the movie's audio track as a level sound script on the decal object itself,\nso it plays from the middle of the screen and fades with distance."));
             if (decalSound)
             {
                 ImGui.SetNextItemWidth(240f * uiScale);
                 Cbo(Loc.TL("When it plays"), ref decalSoundMode,
                             new[] { Loc.T("Always - fades with distance"), Loc.T("In the video, in sync") }, 2);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit."));
+                Theme.Tip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit."));
                 ImGui.TextDisabled(decalSoundMode == 0
                     ? Loc.T("The .bik is made silent and a separate emitter carries the sound (not frame-synced).")
                     : Loc.T("The .bik's own track is the sound - nothing else is added, so it cannot play twice."));
@@ -12986,14 +12951,14 @@ void DecalDialog()
                 {
                     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref decalSoundNear, 1f, 100f, "%.0f");
                     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref decalSoundFar, 5f, 400f, "%.0f");
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The sound is gone past this - it can never carry across the map. Keep it modest (40-80 m)\nfor a screen you only hear when you are near it, or raise it to cover an area."));
+                    Theme.Tip(Loc.T("The sound is gone past this - it can never carry across the map. Keep it modest (40-80 m)\nfor a screen you only hear when you are near it, or raise it to cover an area."));
                     if (decalSoundFar < decalSoundNear + 1f) decalSoundFar = decalSoundNear + 1f;
                 }
                 ImGui.TextDisabled(string.Format(Loc.T("Audio: {0}, {1} - set beside the Convert button above."), decalSoundStereo ? Loc.T("stereo") : Loc.T("mono"), decalAudioRate >= 44100 ? "44 kHz" : "22 kHz"));
             }
         }
         ImGui.Spacing();
-        if (ImGui.Button(Loc.TL("Create and place")))
+        if (Theme.AccentButton(Loc.TL("Create and place")))
         {
             if (CreateDecalObject()) showDecalDialog = false;
         }
@@ -13290,7 +13255,7 @@ void ModelImportDialog()
         if (miInfo.Length > 0) ImGui.TextWrapped(miInfo);
         if (miWarn.Length > 0)
         {
-            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.7f, 0.3f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Text, Theme.Warn);
             ImGui.TextWrapped(miWarn);
             ImGui.PopStyleColor();
         }
@@ -13299,30 +13264,30 @@ void ModelImportDialog()
         ImGui.TextUnformatted(Loc.T("Orientation and size"));
         ImGui.SetNextItemWidth(190f * uiScale);
         CboZ(Loc.TL("Up axis"), ref miUpAxis, Loc.T("Y up (OBJ default)") + "\0" + Loc.T("Z up (Blender / FBX)") + "\0");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side."));
+        Theme.Tip(Loc.T("Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side."));
         ImGui.SetNextItemWidth(190f * uiScale);
         CboZ(Loc.TL("Size"), ref miFitMode, Loc.T("Keep the file's units") + "\0" + Loc.T("Fit the height") + "\0" + Loc.T("Fit the longest side") + "\0");
         if (miFitMode == 0) { ImGui.SetNextItemWidth(120f * uiScale); DrgF(Loc.TL("Scale"), ref miScale, 0.01f, 0.001f, 1000f, "%.3f"); }
         else { ImGui.SetNextItemWidth(120f * uiScale); DrgF(Loc.TL("Metres"), ref miTarget, 0.1f, 0.05f, 500f, "%.2f m"); }
         ImGui.SetNextItemWidth(190f * uiScale);
         CboZ(Loc.TL("Origin"), ref miOrigin, Loc.T("On the ground, centred") + "\0" + Loc.T("Centre of the model") + "\0" + Loc.T("As authored") + "\0");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The origin is the point you place and the point it rotates about.\nAnything that stands on the terrain wants it on the ground."));
+        Theme.Tip(Loc.T("The origin is the point you place and the point it rotates about.\nAnything that stands on the terrain wants it on the ground."));
 
         ImGui.Separator();
         ImGui.TextUnformatted(Loc.T("Textures and collision"));
         ImGui.SetNextItemWidth(120f * uiScale);
         CboZ(Loc.TL("Max texture"), ref miMaxTexIdx, "256\0512\01024\0");
         ImGui.SameLine(); ImGui.Checkbox(Loc.TL("DXT5"), ref miDxt);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("DXT5 is a quarter the size and what retail ships.\nUncompressed is larger but exact - use it if a texture shows blocking."));
+        Theme.Tip(Loc.T("DXT5 is a quarter the size and what retail ships.\nUncompressed is larger but exact - use it if a texture shows blocking."));
         ImGui.Checkbox(Loc.TL("Solid (bake collision)"), ref miCollision);
-        if (miCollision) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("EXPERIMENTAL - the collision BSP is written empty; test in game."));
+        if (miCollision) ImGui.TextColored(Theme.Warn, Loc.T("EXPERIMENTAL - the collision BSP is written empty; test in game."));
         ImGui.SetNextItemWidth(120f * uiScale);
         DrgF(Loc.TL("Draw distance"), ref miDrawDist, 5f, 0f, 4000f, miDrawDist > 0f ? "%.0f m" : "default");
 
         ImGui.Separator();
         bool ready = miMesh is not null && so is not null && meshLib is not null && levelDir is not null;
         if (!ready) ImGui.BeginDisabled();
-        if (ImGui.Button(Loc.TL("Add to level"), new Vector2(160f * uiScale, 0f)))
+        if (Theme.AccentButton(Loc.TL("Add to level"), new Vector2(160f * uiScale, 0f)))
             if (CreateModelObject()) showModelImport = false;
         if (!ready) ImGui.EndDisabled();
         ImGui.SameLine();
@@ -13472,9 +13437,9 @@ void SoundImportDialog()
         InT(Loc.TL("Name"), ref sndImportName, 40);
         ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref sndVol, 0.05f, 1f, "%.2f");
         ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref sndNear, 1f, 200f, "%.0f");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The script's minDistance: inside this radius the sound plays at full volume."));
+        Theme.Tip(Loc.T("The script's minDistance: inside this radius the sound plays at full volume."));
         ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref sndFar, 5f, 600f, "%.0f");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Where the Distance->Volume ramp reaches silence, and the object's triggerRadius."));
+        Theme.Tip(Loc.T("Where the Distance->Volume ramp reaches silence, and the object's triggerRadius."));
         if (sndFar < sndNear + 1f) sndFar = sndNear + 1f;
         ImGui.Checkbox(Loc.TL("Loop"), ref sndLoop);
         {
@@ -13484,12 +13449,12 @@ void SoundImportDialog()
             ImGui.SameLine();
             ImGui.SetNextItemWidth(110f * uiScale);
             if (CboZ(Loc.TL("Sample rate##snd"), ref rateIdx, "22 kHz\044 kHz\0")) sndAudioRate = rateIdx == 1 ? 44100 : 22050;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A .wav you supply is used as it is. Anything else is converted at this rate and channel count;\n44 kHz also writes a real 44.1 kHz file for the game's high-quality tier."));
+            Theme.Tip(Loc.T("A .wav you supply is used as it is. Anything else is converted at this rate and channel count;\n44 kHz also writes a real 44.1 kHz file for the game's high-quality tier."));
         }
         if (FindFfmpeg() is null && !sndImportPath.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
             ImGui.TextColored(new Vector4(1f, 0.75f, 0.35f, 1f), Loc.T("FFmpeg not found - only .wav can be imported without it."));
         ImGui.Spacing();
-        if (ImGui.Button(Loc.TL("Create and place")))
+        if (Theme.AccentButton(Loc.TL("Create and place")))
         {
             if (ImportSoundObject()) showSoundImport = false;
         }
@@ -13587,9 +13552,8 @@ int PickNote(Vector2 mouse)
 
 void NotesPanel()
 {
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("NOTES"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Review notes pinned in the world, shared with everyone in the session.\nPlace one, then click the ground where it belongs."));
+    Theme.Section(Loc.T("NOTES"));
+    Theme.Tip(Loc.T("Review notes pinned in the world, shared with everyone in the session.\nPlace one, then click the ground where it belongs."));
     ImGui.Checkbox(Loc.TL("Show notes"), ref showNotes);
     ImGui.SetNextItemWidth(220f * uiScale);
     InT("##notedraft", ref noteDraft, 200);
@@ -13636,9 +13600,8 @@ void NotesPanel()
 void ErosionPanel()
 {
     if (heightmap is null || terrainEd is null) return;
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("EROSION"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Weathering for hand-sculpted ground: thermal erosion knocks steep faces into scree,\nhydraulic droplets cut gullies where water would run. Applied around the camera."));
+    Theme.Section(Loc.T("EROSION"));
+    Theme.Tip(Loc.T("Weathering for hand-sculpted ground: thermal erosion knocks steep faces into scree,\nhydraulic droplets cut gullies where water would run. Applied around the camera."));
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Area radius (m)"), ref erodeRadius, 10f, 400f, "%.0f");
     ImGui.SetNextItemWidth(150f * uiScale); SldI(Loc.TL("Iterations"), ref erodeIterations, 5, 200);
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Talus (m per cell)"), ref erodeTalus, 0.2f, 5f, "%.1f");
@@ -13668,9 +13631,8 @@ void RunErosion()
 void RiverPanel()
 {
     if (heightmap is null || terrainEd is null) return;
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("RIVER"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Uses the road tool's points as the centreline: carves a bed that never runs\nuphill, paints bed and banks, and sets the water level to fill it."));
+    Theme.Section(Loc.T("RIVER"));
+    Theme.Tip(Loc.T("Uses the road tool's points as the centreline: carves a bed that never runs\nuphill, paints bed and banks, and sets the water level to fill it."));
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Width (m)"), ref riverWidth, 4f, 120f, "%.0f");
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Depth (m)"), ref riverDepth, 0.5f, 30f, "%.1f");
     ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Bank width (m)"), ref riverBank, 0f, 40f, "%.0f");
@@ -13817,9 +13779,8 @@ bool IsGroupLocked(int objIndex) =>
 void GroupsPanel()
 {
     if (so is null) return;
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("GROUPS"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Name a set of objects, then hide, lock or colour it as one.\nMembership is by object id, so a group survives sorting, undo and collaboration."));
+    Theme.Section(Loc.T("GROUPS"));
+    Theme.Tip(Loc.T("Name a set of objects, then hide, lock or colour it as one.\nMembership is by object id, so a group survives sorting, undo and collaboration."));
 
     ImGui.SetNextItemWidth(150f * uiScale);
     InT("##newgroup", ref newGroupName, 48);
@@ -13831,7 +13792,7 @@ void GroupsPanel()
         selGroup = objGroups.Groups.Count - 1;
         groupsDirty = true;
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Select some objects first, then press this."));
+    Theme.Tip(Loc.T("Select some objects first, then press this."));
 
     for (int gi = 0; gi < objGroups.Groups.Count; gi++)
     {
@@ -13839,10 +13800,10 @@ void GroupsPanel()
         ImGui.PushID(gi);
         bool hid = g.Hidden, lck = g.Locked;
         if (ImGui.Checkbox("##hid", ref hid)) { g.Hidden = hid; groupsDirty = true; }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Hidden"));
+        Theme.Tip(Loc.T("Hidden"));
         ImGui.SameLine();
         if (ImGui.Checkbox("##lck", ref lck)) g.Locked = lck;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Locked"));
+        Theme.Tip(Loc.T("Locked"));
         ImGui.SameLine();
         var col = new Vector3(g.ColorR, g.ColorG, g.ColorB);
         ImGui.SetNextItemWidth(24f * uiScale);
@@ -13940,16 +13901,16 @@ void SelectionToolsMenu()
     }
     if (ImGui.MenuItem(Loc.TL("Distribute Evenly"), null, false, have && multi.Count >= 3))
         ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.DistributeEvenly(SelectedObjectsInOrder()), Loc.T("Distributed"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Spaces the selection evenly between the first and last picked; the ends stay put."));
+    Theme.Tip(Loc.T("Spaces the selection evenly between the first and last picked; the ends stay put."));
     if (ImGui.MenuItem(Loc.TL("Mirror Across X"), null, false, have))
         ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.Mirror(SelectedObjectsInOrder(), RefractorForge.Formats.Editing.SelectionOps.MirrorAxis.X), Loc.T("Mirrored"));
     if (ImGui.MenuItem(Loc.TL("Mirror Across Z"), null, false, have))
         ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.Mirror(SelectedObjectsInOrder(), RefractorForge.Formats.Editing.SelectionOps.MirrorAxis.Z), Loc.T("Mirrored"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Reflects the arrangement through its centre and flips each object's facing.\nMeshes themselves cannot mirror - what mirrors is where things stand."));
+    Theme.Tip(Loc.T("Reflects the arrangement through its centre and flips each object's facing.\nMeshes themselves cannot mirror - what mirrors is where things stand."));
     if (ImGui.MenuItem(Loc.TL("Align to Ground Slope"), null, false, have && heightmap is not null))
         ApplyPlacements(RefractorForge.Formats.Editing.SelectionOps.AlignToGround(SelectedObjectsInOrder(), TerrainNormalAt, true,
             (x, z) => GroundUnder(x, z)), Loc.T("Aligned"));
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Tilts each object to lie on the ground under it and drops it there. Facing is kept."));
+    Theme.Tip(Loc.T("Tilts each object to lie on the ground under it and drops it there. Facing is kept."));
 }
 
 // ---- Time of day ---------------------------------------------------------------------------------------------
@@ -14038,10 +13999,8 @@ int PickCombatHandle(Vector2 mouse)
 void CombatAreaPanel()
 {
     if (env is null || heightmap is null) return;
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("COMBAT AREA"));
-    if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("game.setActiveCombatArea: two OFFSETS then the X and Z SCALES, which REPLACE worldSize.\nThe game stretches ingamemap.dds over THIS rectangle, not over the whole terrain - so these\nfour numbers decide how the in-game map is scaled. Uneven scales work (Fy_Pool_Day ships\n98 856 60 68) but stretch the square image; 380 of the 382 levels across BFV, BF1942 and DC\nthat set one keep them equal. DC's Al Nas: 380 0 416 416 on a 1024 world."));
+    Theme.Section(Loc.T("COMBAT AREA"));
+    Theme.Tip(Loc.T("game.setActiveCombatArea: two OFFSETS then the X and Z SCALES, which REPLACE worldSize.\nThe game stretches ingamemap.dds over THIS rectangle, not over the whole terrain - so these\nfour numbers decide how the in-game map is scaled. Uneven scales work (Fy_Pool_Day ships\n98 856 60 68) but stretch the square image; 380 of the 382 levels across BFV, BF1942 and DC\nthat set one keep them equal. DC's Al Nas: 380 0 416 416 on a 1024 world."));
     ImGui.Checkbox(Loc.TL("Show combat area"), ref showCombatArea);
     var ca = env.CombatArea ?? RefractorForge.Formats.Validation.CombatArea.Whole(cfg.WorldSize);
     var v = new Vector4(ca.X, ca.Z, ca.Width, ca.Height);
@@ -14091,8 +14050,7 @@ void CombatAreaPanel()
             env.RemoveCombatArea = true;
             combatAreaDirty = true; lightingDirty = true;
         }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(Loc.T("Delete the line, making the whole world playable - what most retail levels do.\nThe in-game map then covers the whole terrain again."));
+        Theme.Tip(Loc.T("Delete the line, making the whole world playable - what most retail levels do.\nThe in-game map then covers the whole terrain again."));
     }
     // Tunnel maps and sub-rectangles do not mix. Of the seven levels in a stock BFV install that set
     // Game.isTunnelMap 1, Operation_Cedar_Falls declares no combat area and my_lai_massacre plus world_i_i..iv all
@@ -14139,8 +14097,7 @@ void CombatAreaPanel()
                 env.CombatArea = new RefractorForge.Formats.Validation.CombatArea(nx, nz, side, side);
                 combatAreaDirty = true; lightingDirty = true;
             }
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(Loc.T("Grow the area to a square holding every control point, vehicle spawner and\nsoldier spawn, with 48 m to spare."));
+            Theme.Tip(Loc.T("Grow the area to a square holding every control point, vehicle spawner and\nsoldier spawn, with 48 m to spare."));
         }
     }
     // Material 7 is deathMaterial. Game::isOutsideWorld returns "outside" for a position on it exactly as it does
@@ -14168,8 +14125,7 @@ void CombatAreaPanel()
                     Toast(string.Format(Loc.T("Repainted {0} deathMaterial cells inside the combat area. Outside it is left as the boundary."), dCount));
                 }
             }
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(Loc.T("Below the water line a cell becomes water; above it, the nearest painted land material.\nCells outside the area stay deathMaterial - that is your boundary. Undo with Ctrl+Z."));
+            Theme.Tip(Loc.T("Below the water line a cell becomes water; above it, the nearest painted land material.\nCells outside the area stay deathMaterial - that is your boundary. Undo with Ctrl+Z."));
         }
     }
     if (combatAreaDirty)
@@ -14429,7 +14385,7 @@ void MapReportWindow()
                 if (ImGui.Button(string.Format(Loc.T("Select {0} buried"), nBuried))) SelectIssueObjects(r, "Buried");
                 ImGui.SameLine();
                 if (ImGui.Button(string.Format(Loc.T("Seat {0} buried on the ground"), nBuried))) { SeatOnGround(IssueObjectIndices(r, "Buried")); RunMapValidation(); }
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Moves each one up until its bottom rests on the terrain. Objects that belong underground\n(tunnels, sewers) are left alone. One undo step (Ctrl+Z)."));
+                Theme.Tip(Loc.T("Moves each one up until its bottom rests on the terrain. Objects that belong underground\n(tunnels, sewers) are left alone. One undo step (Ctrl+Z)."));
                 any = true;
             }
             if (nFloat > 0)
@@ -14444,7 +14400,7 @@ void MapReportWindow()
             {
                 if (any) ImGui.SameLine();
                 if (ImGui.Button(string.Format(Loc.T("Select {0} missing"), nMissing))) SelectIssueObjects(r, "Missing template");
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Objects whose template no loaded archive declares - invisible here and in game.\nSelect them to delete them, or bring the objects in: the lines above say which mod has each one."));
+                Theme.Tip(Loc.T("Objects whose template no loaded archive declares - invisible here and in game.\nSelect them to delete them, or bring the objects in: the lines above say which mod has each one."));
             }
         }
 
@@ -14646,27 +14602,25 @@ void LightGizmos()
 // that then gets baked.
 void LightsPanel()
 {
-    ImGui.Separator();
-    ImGui.TextDisabled(Loc.T("PLACED LIGHTS"));
+    Theme.Section(Loc.T("PLACED LIGHTS"));
 
-    if (ImGui.IsItemHovered())
-        ImGui.SetTooltip(Loc.T("Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads."));
+    Theme.Tip(Loc.T("Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads."));
 
     ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);
     ImGui.SameLine();
     ImGui.Checkbox(Loc.TL("Live on ground"), ref groundLightsLive);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
+    Theme.Tip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
     if (ImGui.Button(Loc.TL("Bake Lightmaps (sun + placed lights)"))) BakeAllLighting();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Terrain sun-shadow, every object's lightmap (with these lights) and the ground pools, in one go.\nShown at once; Save writes them. Also under Tools > Lighting."));
+    Theme.Tip(Loc.T("Terrain sun-shadow, every object's lightmap (with these lights) and the ground pools, in one go.\nShown at once; Save writes them. Also under Tools > Lighting."));
     ImGui.SetNextItemWidth(150f * uiScale);
     SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
     if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
+    Theme.Tip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
 
     float night = lightRig.NightAmount;
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Editor-side only: shows the level's REAL light level (its Init.con ambient and diffuse)\ninstead of the editor's always-readable lighting, so placed lights read as they will\nin the game. Apply a Night preset first - on a daylight level there is nothing to darken."));
+    Theme.Tip(Loc.T("Editor-side only: shows the level's REAL light level (its Init.con ambient and diffuse)\ninstead of the editor's always-readable lighting, so placed lights read as they will\nin the game. Apply a Night preset first - on a daylight level there is nothing to darken."));
 
     ImGui.TextDisabled(Loc.T("Time of day"));
     foreach (var tod in RefractorForge.Formats.Terrain.TimeOfDayPreset.All)
@@ -14675,7 +14629,7 @@ void LightsPanel()
         ImGui.SameLine();
     }
     ImGui.NewLine();
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sun, ambient, fog and sky moved together. Each is a set of the Init.con\nrenderer values a real level declares, so it is what the game will show once saved."));
+    Theme.Tip(Loc.T("Sun, ambient, fog and sky moved together. Each is a set of the Init.con\nrenderer values a real level declares, so it is what the game will show once saved."));
 
     if (ImGui.Button(Loc.TL("Apply night preset to level")))
     {
@@ -14701,7 +14655,7 @@ void LightsPanel()
         BroadcastLight();
         Toast(Loc.T("Night lighting applied - written to Init.con on save."));
     }
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Sets the level's renderer ambient/diffuse/fog to night values\n(the same recipe DC_Basrah_Nights uses). Written to Init.con on save."));
+    Theme.Tip(Loc.T("Sets the level's renderer ambient/diffuse/fog to night values\n(the same recipe DC_Basrah_Nights uses). Written to Init.con on save."));
 
     if (ImGui.Button(Loc.TL("Add light here")))
     {
@@ -14753,7 +14707,7 @@ void LightsPanel()
         ImGui.SameLine();
         bool sh = l.CastsShadows;
         if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) l.CastsShadows = sh;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Bake traces terrain occlusion for this light. Off is much faster and\nis right for a fill light that only lifts the ambient."));
+        Theme.Tip(Loc.T("Bake traces terrain occlusion for this light. Off is much faster and\nis right for a fill light that only lifts the ambient."));
 
         var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
         if (Col3(Loc.TL("Colour"), ref colv))
@@ -14766,7 +14720,7 @@ void LightsPanel()
         if (SldF(Loc.TL("Radius (m)"), ref rad, 1f, 400f, "%.0f")) l.Radius = rad;
         ImGui.SetNextItemWidth(150f);
         if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 6f, "%.2f")) l.Falloff = fall;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("2 is physically correct inverse-square. Lower is flatter and easier\nto light a scene with."));
+        Theme.Tip(Loc.T("2 is physically correct inverse-square. Lower is flatter and easier\nto light a scene with."));
 
         var pv = new Vector3(l.Position.X, l.Position.Y, l.Position.Z);
         ImGui.SetNextItemWidth(220f);
@@ -14782,7 +14736,7 @@ void LightsPanel()
         ImGui.SetNextItemWidth(150f);
         if (DrgF(Loc.TL("Height above ground"), ref aboveEdit, 0.1f, -50f, 400f, "%.1f m"))
             l.Position = new Vec3(l.Position.X, gnd + aboveEdit, l.Position.Z);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport."));
+        Theme.Tip(Loc.T("Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport."));
 
         // The failure that looks like a broken feature: a light further above the ground than its own reach
         // lights nothing at all, and from a floating marker there is no way to tell. Say so, and offer the fix.
@@ -14873,10 +14827,10 @@ void PointToolOverlay()
                 ApplyVertexEdit(st => st.SetVertex(vertGx, vertGz, vertHeightField));
             ImGui.SetNextItemWidth(120f * uiScale);
             SldI(Loc.TL("Auto-smooth (cells)"), ref vertSmoothRadius, 0, 8);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Blend the ring around a moved vertex toward it, so it leaves a\nslope instead of a spike. 0 moves the single point only."));
+            Theme.Tip(Loc.T("Blend the ring around a moved vertex toward it, so it leaves a\nslope instead of a spike. 0 moves the single point only."));
             ImGui.SetNextItemWidth(120f * uiScale);
             SldF(Loc.TL("Step (m)"), ref vertNudgeStep, 0.05f, 5f, "%.2f");
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far PageUp / PageDown move the selected vertex."));
+            Theme.Tip(Loc.T("How far PageUp / PageDown move the selected vertex."));
 
             if (ImGui.Button(Loc.TL("Level to neighbours")) && heightmap is not null)
             {
@@ -15107,9 +15061,9 @@ void EditVehModal()
     FitLabel(Loc.TL("Spawn delay at start (s)"));
     InI(Loc.TL("Spawn delay at start (s)"), ref evDelayStart);
     InI(Loc.TL("Time to live (s)"), ref evTtl);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How long an abandoned vehicle survives before it starts taking damage."));
+    Theme.Tip(Loc.T("How long an abandoned vehicle survives before it starts taking damage."));
     InI(Loc.TL("Distance (m)"), ref evDist);
-    if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("How far from its spawn the vehicle must be before Time to live counts down."));
+    Theme.Tip(Loc.T("How far from its spawn the vehicle must be before Time to live counts down."));
     InI(Loc.TL("Damage when lost"), ref evDmgLost);
     FitLabel(Loc.TL("Max spawned at once"));
     InI(Loc.TL("Max spawned at once"), ref evMaxSpawned);
