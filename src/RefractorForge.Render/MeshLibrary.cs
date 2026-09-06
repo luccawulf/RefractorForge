@@ -909,6 +909,7 @@ public sealed class MeshLibrary
         public bool HasMap;                                    // hasMap 1: an underground minimap is bound to it
         public string? SoundScript;                            // loadSoundScript <file>.ssc
         public bool AutoPlaySound;                             // autoPlaySound 1: an ambient, heard by distance
+        public bool LevelLocal;                                // declared under levels/<Map>/objects: the map's own
     }
 
     /// <summary>What a placed object means to the tunnel system, resolved through the whole template registry:
@@ -946,12 +947,36 @@ public sealed class MeshLibrary
     /// files load a sound script and nearly all of them are EFFECTS, so any building with a fire, a smoke plume or a
     /// generator effect somewhere in its tree got sound rings and a volume label in the editor.
     /// </para></summary>
-    public (string Script, bool AutoPlay)? SoundOf(string template)
+    public (string Script, bool AutoPlay, bool LevelLocal)? SoundOf(string template)
     {
         EnsureAllTemplates();
         if (_allTemplates is null || template is null) return null;
         if (!_allTemplates.TryGetValue(template, out var t)) return null;
-        return t.SoundScript is { Length: > 0 } s ? (s, t.AutoPlaySound) : null;
+        return t.SoundScript is { Length: > 0 } s ? (s, t.AutoPlaySound, t.LevelLocal) : null;
+    }
+
+    /// <summary>The sound a placed object should be shown EMITTING in the editor - which is a much smaller set than
+    /// the templates that merely carry a script.
+    /// <para>
+    /// A sound emitter in a map editor means an AMBIENT: it has an audible radius, it can be previewed by walking up
+    /// to it, and the mapper placed it to be heard. That is <c>autoPlaySound 1</c>. Without that flag the engine
+    /// plays the script while the object is DRAWN, which is how the games attach a sound to a gun firing, an engine
+    /// running, a shell exploding or a turret turning - nothing with a place on the map.
+    /// </para><para>
+    /// The shipped data is unambiguous. Of BFVietnam's 413 templates carrying a script, 36 are ambients and they are
+    /// exactly the right ones - <c>o_gen_sound_m1</c>, the Hue speakers, the NVA radio, the flags. The other 377 are
+    /// EffectBundles, FireArms, Engines, Projectiles and RotationalBundles. **BF1942 does not use the flag at all**:
+    /// all 428 of its sound-carrying templates are gameplay sounds, so every emitter the editor drew on a BF1942 map
+    /// was a false one - windmills, factories, guard towers, the harbour dock, flags and every placed turret.
+    /// </para><para>
+    /// The exception is a template the LEVEL itself declares, which is how the editor's own video and sound screens
+    /// are built: a look-at screen leaves <c>autoPlaySound</c> out on purpose, and the mapper who made it should
+    /// still see it.
+    /// </para></summary>
+    public (string Script, bool AutoPlay)? PlacedSoundOf(string template)
+    {
+        if (SoundOf(template) is not { } s) return null;
+        return s.AutoPlay || s.LevelLocal ? (s.Script, s.AutoPlay) : null;
     }
 
     /// <summary>The first ObjectTemplate.create name in a single .con entry (the main Objects.con's root), or null.</summary>
@@ -1291,8 +1316,13 @@ public sealed class MeshLibrary
             string text;
             try { text = System.Text.Encoding.Latin1.GetString(OwningArchive(e).Read(e)); } catch { continue; }
             if (text.IndexOf("ObjectTemplate.create", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            bool local = IsLevelLocalObjectPath(e.Name.Replace((char)92, '/'));   // declared by the level itself
             foreach (var t in ParseConTemplates(text))
-                if (t.Name.Length > 0) _allTemplates.TryAdd(t.Name, t);
+            {
+                if (t.Name.Length == 0) continue;
+                t.LevelLocal = local;
+                _allTemplates.TryAdd(t.Name, t);
+            }
         }
     }
 

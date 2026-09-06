@@ -4152,7 +4152,9 @@ void DrawSounds()
         result = (near, em.Script.MaxDistance ?? MathF.Max(near * 4f, near + 25f), true, em.Script.Volume);
     }
     // ...or a sound carried by the object template itself (our video screens; the game's generators and speakers).
-    else if (meshLib?.SoundOf(template) is { } os)
+    // PlacedSoundOf, not SoundOf: only an ambient - or one of the level's own objects - is something the mapper
+    // placed to be heard. Every other template with a script is a gun, an engine or an explosion.
+    else if (meshLib?.PlacedSoundOf(template) is { } os)
     {
         var text = FindSoundScriptText(template, os.Script);
         if (text is not null)
