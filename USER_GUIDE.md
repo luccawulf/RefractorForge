@@ -374,6 +374,10 @@ tick **Playable** to seed Conquest flags, spawns and kits. **Create** restarts t
   - One thing to watch: a `<Level>_NNN.rfa` sitting beside your map is mounted *over* it by the engine, so its
     copy of a file wins over what you just saved. Save names any it finds in the log — delete or rename them and
     your edits appear.
+- **Closing with unsaved work** — closing the window, Alt+F4, File ▸ Exit, switching language or going back to
+  the startup screen all ask first when anything has changed since the last save: **Save and exit**, **Exit
+  without saving**, or **Cancel**. Everything the undo history knows about counts (objects, gameplay, terrain,
+  material and foliage strokes), as do queued level files and the environment edits that Ctrl+S writes back.
 - **File ▸ Save as Patch .rfa…** — export only the changed files as an overlay `.rfa` that the engine mounts over
   the map. For shipping an update on top of a map without touching it. A patch is not a separate map: in game you
   still launch the base level.

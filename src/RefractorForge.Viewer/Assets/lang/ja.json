@@ -1336,5 +1336,11 @@
  "Texture(s) not found next to the model: {0}. Put them beside the model file (any subfolder will do) and import again.": "モデルの隣にテクスチャが見つかりません: {0}。モデルファイルの隣（サブフォルダーでも可）に置いて、もう一度読み込んでください。",
  "No material names a texture, so the model will be flat-coloured in game. Check the material's image in your modelling tool.": "どのマテリアルもテクスチャを指していないため、ゲーム内では単色になります。モデリングツールでマテリアルの画像を確認してください。",
  "Converted with Blender: {0} mesh object(s), {1} texture(s).": "Blender で変換しました: メッシュオブジェクト {0} 個、テクスチャ {1} 個。",
- "Blender could not find {0} texture(s): {1}. Put the file next to the model (any subfolder will do) and choose the model again.": "Blender が {0} 個のテクスチャを見つけられませんでした: {1}。ファイルをモデルの隣（サブフォルダーでも可）に置いて、モデルを選び直してください。"
+ "Blender could not find {0} texture(s): {1}. Put the file next to the model (any subfolder will do) and choose the model again.": "Blender が {0} 個のテクスチャを見つけられませんでした: {1}。ファイルをモデルの隣（サブフォルダーでも可）に置いて、モデルを選び直してください。",
+ "Unsaved changes": "未保存の変更",
+ "Are you sure you want to exit?": "本当に終了しますか？",
+ "This level has unsaved changes. Leaving now throws them away.": "このレベルには未保存の変更があります。今終了すると失われます。",
+ "Save and exit": "保存して終了",
+ "Exit without saving": "保存せずに終了",
+ "The save did not go through, so the editor stays open. The Log window says why.": "保存が完了しなかったため、エディターは開いたままです。理由はログウィンドウに表示されています。"
 }

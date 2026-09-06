@@ -615,6 +615,13 @@ bool placingNote = false;
 // Level-local files created in-session (decal objects) that a save must carry: written straight into the
 // folder on a folder save, upserted into the .rfa on an archive save.
 List<(string RelPath, byte[] Bytes)> pendingLevelFiles = new();
+// Unsaved-work guard. Saving records what it saw (SaveSignature); leaving while the state reads differently asks
+// first. exitPending is the leave that was interrupted, run again once the user has answered.
+string savedSignature = "";
+bool sessionDirty = false;                 // an edit that leaves no trace in the signature
+bool exitConfirmed = false;                // the user chose to leave with unsaved work, so the close goes through
+bool exitPromptRequest = false;            // open the prompt next frame
+Action? exitPending = null;
 // Decal dialog.
 bool showDecalDialog = false;
 string decalName = "poster1";
@@ -1811,6 +1818,7 @@ List<(int idx, Vec3 pos, Vec3 rot, float scale)> dragSnap = new();
 
 window.Load += OnLoad;
 window.Update += OnUpdate;
+window.Closing += OnClosing;   // the title-bar close button and Alt+F4: vetoed while there is unsaved work
 // The render loop reports for itself. Without this an exception in OnRender leaves a window that loaded a level
 // perfectly and then simply never draws - the log stops at "Editor ready" and there is nothing to go on, because
 // the in-app Log box cannot be seen either when nothing renders. Catching also keeps ONE bad frame (a texture that
@@ -3241,6 +3249,7 @@ void OnLoad()
     SplashScreen.Close();       // editor is ready -> dismiss the launch splash
     // Like Battlecraft's "Load Errors" box: if the load produced any warnings (missing meshes etc.), pop the Log window.
     if (ConsoleLog.Snapshot().Any(ConsoleLog.LooksLikeError)) { showLog = true; logErrorsOnly = true; }
+    MarkSaved();   // the level as loaded is the baseline: only what changes from here counts as unsaved
 }
 
 void OnUpdate(double dt)
@@ -4835,11 +4844,80 @@ void AutoBackup()
     catch (Exception ex) { Console.WriteLine($"Auto-backup skipped: {ex.Message}"); }
 }
 
+// ---- Leaving with unsaved work ----------------------------------------------------------------------------------
+//
+// What "unsaved" means here: the undo history has moved since the last save (every object, gameplay, terrain,
+// material and foliage stroke goes through it), files are queued for the save that were not queued then, or one of
+// the environment edits that save writes back is flagged. Saving - and the end of a load - record that reading;
+// anything else is work that would be lost.
+string SaveSignature() => string.Join("|", hist?.UndoDepth ?? 0, pendingLevelFiles.Count, lightingDirty, sunEdited,
+                                          cloudsDirty, skyRotEdited, skyFacesDirty, waterLevelEdited, combatAreaDirty, aiNavDirty);
+bool AnyUnsaved() => so is not null && (sessionDirty || SaveSignature() != savedSignature);
+void MarkSaved() { sessionDirty = false; savedSignature = SaveSignature(); }
+
+// True when leaving is fine: nothing unsaved, or the user already said so. Otherwise the prompt opens and `then` -
+// normally the very call that asked - runs again once they have answered.
+bool MayLeave(Action then)
+{
+    if (exitConfirmed || !AnyUnsaved()) return true;
+    exitPending = then; exitPromptRequest = true;
+    return false;
+}
+
+void ExitEditor()
+{
+    if (!MayLeave(ExitEditor)) return;
+    exitConfirmed = true;
+    window.Close();
+}
+
+// The window's own close button and Alt+F4. By the time this fires GLFW has set the window's should-close flag;
+// clearing it is GLFW's documented veto, and Silk reads that flag afresh every loop rather than latching it - so the
+// editor simply carries on, with the prompt up. Exit chosen from the menu never reaches the veto: it goes through
+// MayLeave first and only calls window.Close() once leaving is allowed.
+void OnClosing()
+{
+    if (exitConfirmed || !AnyUnsaved()) return;
+    unsafe { Silk.NET.GLFW.Glfw.GetApi().SetWindowShouldClose((Silk.NET.GLFW.WindowHandle*)window.Handle, false); }
+    exitPending = ExitEditor; exitPromptRequest = true;
+}
+
+void ExitPromptModal()
+{
+    if (exitPromptRequest) { ImGui.OpenPopup(Loc.TL("Unsaved changes")); exitPromptRequest = false; }
+    var fb = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fb.X * 0.5f, fb.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.Appearing);
+    bool open = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Unsaved changes"), ref open,
+                               ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize))
+    { exitPending = null; return; }   // not open (or closed with Escape): the leave is off
+
+    Theme.Heading(Loc.T("Are you sure you want to exit?"));
+    ImGui.TextWrapped(Loc.T("This level has unsaved changes. Leaving now throws them away."));
+    ImGui.Spacing();
+    bool canSave = so is not null && (soPath is not null || levelDir is not null);
+    if (!canSave) ImGui.BeginDisabled();
+    if (Theme.AccentButton(Loc.TL("Save and exit"), new Vector2(150f * uiScale, 0f)))
+    {
+        DoSave();
+        if (!AnyUnsaved()) { exitConfirmed = true; ImGui.CloseCurrentPopup(); var go = exitPending; exitPending = null; go?.Invoke(); }
+        else Toast(Loc.T("The save did not go through, so the editor stays open. The Log window says why."));
+    }
+    if (!canSave) ImGui.EndDisabled();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Exit without saving"), new Vector2(160f * uiScale, 0f)))
+    { exitConfirmed = true; ImGui.CloseCurrentPopup(); var go = exitPending; exitPending = null; go?.Invoke(); }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Cancel"), new Vector2(100f * uiScale, 0f))) { exitPending = null; ImGui.CloseCurrentPopup(); }
+    ImGui.EndPopup();
+}
+
 void DoSave()
 {
     if (so is null) return;
     AutoBackup();
-    try { DoSaveCore(); } catch (Exception ex) { Console.Error.WriteLine($"Save failed: {ex.Message}"); showLog = true; }
+    try { DoSaveCore(); MarkSaved(); } catch (Exception ex) { Console.Error.WriteLine($"Save failed: {ex.Message}"); showLog = true; }
     // Project workflow: keep the .rfproj manifest + Recent Projects list current on every save.
     if (activeRfProject is not null)
         try { activeRfProject.Save(); RecentProjects.Touch(activeRfProject); } catch { }
@@ -10053,6 +10131,7 @@ void DoCreateNewMap()
 
 void RelaunchAndExit()
 {
+    if (!MayLeave(RelaunchAndExit)) return;
     try
     {
         // --resume is what makes the relaunch reopen what was just chosen (Open Mod / Open Level / New Map / a
@@ -10073,6 +10152,7 @@ void RelaunchAndExit()
 // project + remembered-level auto-load), so the user lands on Recent Projects + Open/New.
 void RelaunchToStartup()
 {
+    if (!MayLeave(RelaunchToStartup)) return;
     ActiveProject.Clear();
     try
     {
@@ -10092,6 +10172,7 @@ void RelaunchToStartup()
 // live swap would leave the new script unrenderable. Keeps the active project, so the same map reopens.
 void SetLanguageAndRestart(string code)
 {
+    if (!MayLeave(() => SetLanguageAndRestart(code))) return;
     try { Loc.SetLanguage(code); } catch (Exception ex) { Toast(Loc.T("Language switch failed: ") + ex.Message); return; }
     Console.WriteLine($"UI language -> {code}; restarting...");
     RelaunchAndExit();
@@ -10596,6 +10677,7 @@ void SavePrefabModal()
 // per-object ops; non-object commands (terrain/material/gameplay) are skipped (object sync only for now).
 void OnLocalEdit(IEditCommand cmd)
 {
+    sessionDirty = true;                             // every committed edit, local or a peer's, is work to keep
     if (collab is null || applyingRemote) return;   // an inbound edit must not be echoed back out
     var wire = cmd.ToWire();
     int v = wire.IndexOf(' ');
@@ -11685,7 +11767,7 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Play map video (.bik in this map)..."), null, false, rfaList.Length > 0)) DoPlayMapBik();
             Theme.Tip(Loc.T("Find + play any .bik video embedded in the loaded map's .rfa."));
             ImGui.Separator();
-            if (ImGui.MenuItem(Loc.TL("Exit"))) window.Close();
+            if (ImGui.MenuItem(Loc.TL("Exit"))) ExitEditor();
             ImGui.EndMenu();
         }
         if (ImGui.BeginMenu(Loc.TL("Edit")))
@@ -12101,6 +12183,7 @@ void BuildUi()
     EditSolModal();
     HelpWindow();
     ValidateModal();
+    ExitPromptModal();
     PointToolOverlay();
     LightGizmos();
     TunnelGizmos();
