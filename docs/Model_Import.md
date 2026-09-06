@@ -1,11 +1,37 @@
 # Importing a 3D model into BF1942 / Battlefield Vietnam
 
-**Status: phase 1 done — a textured prop can be built, packaged and saved into a map. The in-game look is the
-user's gate and has not been run yet.**
+**Status: a textured prop — OBJ, or anything Blender reads — can be brought in, simplified to a triangle budget
+with distance LODs, packaged and saved into a map. The in-game look and the collision are the user's gate and
+have not been run yet.**
 
 *Tools ▸ Import 3D Model...* takes a model from outside and writes it into the map as a level-local static object.
 Nothing goes into the mod: the mesh, its textures and the four `.con` files that register it all live inside the
 level archive, so the map is still one file you can hand to somebody.
+
+## Formats: OBJ directly, everything else through Blender
+
+OBJ + MTL needs nothing. FBX, glTF/GLB, `.blend`, STL, PLY, USD and Alembic are converted by **Blender itself**,
+run in the background (`Formats/Mesh/BlenderBridge.cs`): the importer writes a small Python script, runs
+`blender --background --python-exit-code 3 --python <script> -- <source> model.obj manifest.json` in a scratch
+folder, and reads the OBJ that comes out. Blender is the converter; nothing here parses those formats, which is
+the point — an FBX reader is a career, and Blender's is maintained by people who do nothing else. Blender is found
+from `RF_BLENDER`, the usual install folders (newest version wins) or PATH; without it, OBJ still works.
+
+The script does four things the importer relies on:
+
+- gives every object and material a name the OBJ grammar can carry (no spaces, nothing exotic);
+- saves every texture a material's Base Color reaches as a **PNG beside the OBJ** (`Image.save_render` works
+  whether the image is packed, generated or on disk) and then **writes the `.mtl`'s `map_Kd` lines itself** from
+  the material→PNG map it built. That last step is not optional: the FBX and glTF importers load embedded textures
+  as *packed* images, and Blender's OBJ exporter writes a packed image's path as a bare file name that resolves
+  against the drive root — the `.mtl` came out pointing at `../../../../../../../crate_diffuse.png`;
+- exports **Y-up / -Z-forward** with modifiers applied and faces triangulated, so the dialog's default "Y up"
+  is right for anything that came through here;
+- writes `manifest.json` — the parts (name, parent, position, size, materials) — for the day the importer builds
+  multi-part vehicles.
+
+Verified by `BlenderBridgeTests`, which has Blender author a textured cube, saves it as `.blend`, FBX (textures
+embedded) and GLB, and converts all three. It runs only where Blender is installed.
 
 ## What gets written
 
@@ -72,11 +98,29 @@ mip chain. Uncompressed 32-bit by default, which is what the proven decal path s
 the size and what retail uses. The texture name is prefixed with the template so two imports cannot fight over one
 file.
 
-## Triangle budget
+## Triangle budget and LODs
 
 Measured across 719 shipped BF1942 meshes: a **hero mesh is 1,100–2,200 triangles** (bf109 fuselage 1,382; Sherman
-hull 1,146; B17 fuselage 2,235) and a whole multi-part vehicle 2,000–6,000. The dialog warns past 6,000. Decimation
-inside the editor is phase 2; until then, decimate in Blender.
+hull 1,146; B17 fuselage 2,235) and a whole multi-part vehicle 2,000–6,000. The dialog's **Triangle budget**
+(default 2,000; 0 keeps everything) is what LOD 0 keeps; a denser model is simplified to it on import by
+`Formats/Mesh/MeshDecimator.cs` — quadric-error edge collapse with two choices that make it safe for game art:
+half-edge collapses only (every surviving vertex is one the author placed; no UV is ever interpolated across a
+hand-painted sheet) and UV seams, open borders and material boundaries pinned (the texture cannot tear and two
+materials cannot pull apart). A collapse that would fold a triangle over is refused.
+
+**Extra LODs** (default 2) are coarser copies at half the triangles each, written into the same `.sm`
+(`StandardMeshWriter` now writes `numLods > 1`; the bounding box is LOD 0's, since a coarser copy's own box is
+slightly smaller and would cull the whole object early).
+
+### The LOD ramp, measured
+
+How `GeometryTemplate.setLodDistance` relates to a mesh's LOD count was checked against BfVietnam's `objects.rfa`
++ `standardMesh.rfa` rather than guessed: **the ramp's length never depends on how many LODs the mesh has.** 362
+single-LOD static meshes carry the full six-entry ramp `0 / 50 / 100 / 200 / 400 / 800`; six-LOD weapon meshes
+carry three entries `0 / 3 / 30`; wheels carry four; 84 six-LOD meshes carry none. Entry *i* is where LOD *i*
+takes over, clamped to the last LOD the mesh actually has, and the final entry is where the object stops drawing
+(the decal work established that last part in game). So the importer writes exactly retail's static shape, scaled
+by the dialog's draw distance (default 800 m): a model with three LODs switches at 50 and 100 m and culls at 800.
 
 A material section cannot address more than 65,535 vertices, and the writer used to throw. `MeshFit.SplitOversizedSections`
 now splits it into several sections instead, which share the material name and so share one subshader.
@@ -87,17 +131,17 @@ now splits it into several sections instead, which share the material name and s
 fully decoded **except its BSP**, which is written empty (see `SM_Collision_RE.md`). Whether the engine rebuilds the
 BSP from the faces at load or requires a real one **is the open question, and only an in-game test answers it**. If
 the empty BSP works, imports are solid for free. Beyond 32,767 vertices no section is written and the object's
-`HasCollisionPhysics` goes to 0 rather than promising solidity the `.sm` cannot deliver.
+`HasCollisionPhysics` goes to 0 rather than promising solidity the `.sm` cannot deliver — but first the coarser
+LODs are tried in order, and a LOD-1 collision on a dense model is a far better outcome than none.
 
 ## Not built yet
 
-- **Other formats.** OBJ only. FBX / `.blend` / glTF / DAE go through Blender in phase 2
-  (`blender --background --python`), with OBJ still working with no dependency.
-- **Decimation** to a target triangle count, and a real multi-LOD ramp (`StandardMeshWriter` hardcodes `numLods 1`,
-  so all six LOD distances currently point at the one mesh).
 - **Multi-part objects** — vehicles and weapons. OBJ cannot carry a part hierarchy and `ObjMesh` ignores `g`/`o`
-  groups, so this needs the Blender script to emit one OBJ per part plus a JSON manifest of names, parents and
-  pivots, and an `Objects.con` hierarchy generated from that.
+  groups. The Blender bridge already writes `manifest.json` with every part's name, parent, position, size and
+  materials; what remains is exporting one OBJ per part and generating the `Objects.con` hierarchy
+  (`addTemplate` / `setPosition` / `setRotation`, `RotationalBundle` for wheels and turrets) from it.
+- **Collada (`.dae`)** is in the list but Blender 5 dropped its Collada importer; the branch exists for older
+  Blenders. Export glTF or FBX instead.
 - **BF2 / BF2142 meshes.** Everything is structured as `<any source> -> ObjMesh -> .sm`, so a `.staticMesh` /
   `.bundledMesh` reader is one more front-end. Their meshes are far denser than these games use and their normal
   maps and second UV sets have nowhere to go in a `vf 1041` mesh.

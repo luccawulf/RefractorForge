@@ -631,6 +631,10 @@ float miTarget = 4f, miScale = 1f, miDrawDist = 0f;
 int miOrigin = 0;                            // 0 = on the ground, 1 = centred, 2 = as authored
 bool miCollision = true, miDxt = false;
 int miMaxTexIdx = 1;                         // 0 = 256, 1 = 512, 2 = 1024
+int miBudget = 2000, miExtraLods = 2;        // triangles for LOD 0 (0 = keep every one); coarser copies after it
+string? miObjPath = null;                    // the OBJ actually read: the file itself, or Blender's conversion of it
+bool miBusy = false; string miBlenderNote = "";
+System.Threading.Tasks.Task<BlenderBridge.Result>? miConvert = null;
 // Erosion + river.
 int erodeIterations = 40; float erodeTalus = 1.2f; bool erodeHydraulic = true; float erodeRadius = 60f;
 float riverWidth = 24f, riverDepth = 4f, riverBank = 6f; int riverBankMat = 3, riverBedMat = 4;
@@ -13209,13 +13213,32 @@ bool CreateDecalObject()
 
 // Read the source file and remember what it looks like, so the dialog can tell the user the size and triangle count
 // BEFORE they commit. Nothing is fitted yet - the fit runs on a fresh copy at build time, so the sliders stay live.
+// A model that is not an OBJ goes through Blender first, on a worker so the editor keeps drawing; the dialog
+// watches the task and reads the result when it lands. Blender takes a few seconds even for a cube.
+void BeginModelLoad()
+{
+    miMesh = null; miInfo = ""; miWarn = ""; miObjPath = null; miBlenderNote = "";
+    if (!File.Exists(miPath)) { miWarn = Loc.T("No such file."); return; }
+    if (!BlenderBridge.NeedsBlender(miPath)) { miObjPath = miPath; LoadModelForImport(); return; }
+    var exe = BlenderBridge.FindBlender();
+    if (exe is null)
+    {
+        miWarn = Loc.T("This format needs Blender to convert it, and Blender was not found. Install it from blender.org (or point RF_BLENDER at blender.exe), or export an OBJ from your modelling tool instead.");
+        return;
+    }
+    string src = miPath;
+    string work = Path.Combine(Path.GetTempPath(), "RefractorForge", "import_" + Guid.NewGuid().ToString("N")[..8]);
+    miBusy = true;
+    miConvert = System.Threading.Tasks.Task.Run(() => BlenderBridge.ConvertToObj(src, work, exe));
+}
+
 void LoadModelForImport()
 {
     miMesh = null; miInfo = ""; miWarn = "";
-    if (!File.Exists(miPath)) { miWarn = Loc.T("No such file."); return; }
+    if (miObjPath is null || !File.Exists(miObjPath)) { miWarn = Loc.T("No such file."); return; }
     try
     {
-        var m = ObjMesh.Load(miPath);
+        var m = ObjMesh.Load(miObjPath);
         if (m.TotalFaces == 0) { miWarn = Loc.T("That model has no triangles."); return; }
         miMesh = m;
         if (miName.Trim().Length == 0) miName = SanitizeTemplate(Path.GetFileNameWithoutExtension(miPath));
@@ -13223,11 +13246,21 @@ void LoadModelForImport()
         miInfo = string.Format(Loc.T("{0} triangles, {1} vertices, {2} material(s). Authored size {3:0.##} x {4:0.##} x {5:0.##}."),
                                m.TotalFaces, m.TotalVertices, m.SubMeshes.Count, w, h, d);
         // Measured against 719 shipped BF1942 meshes: a hero mesh is 1,100-2,200 triangles and a whole multi-part
-        // vehicle 2,000-6,000. Ten times that will load, but it costs frames on hardware these games were built for.
+        // vehicle 2,000-6,000. The budget below brings a dense model down to that; this just says so.
         if (m.TotalFaces > 6000)
-            miWarn = string.Format(Loc.T("{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). Decimate it in Blender first."), m.TotalFaces);
+            miWarn = string.Format(Loc.T("{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). The triangle budget below will reduce it on import."), m.TotalFaces);
     }
     catch (Exception ex) { miWarn = Loc.T("Could not read that model: ") + ex.Message; }
+}
+
+// The dialog's line about the detail it will write, from the current budget and LOD settings.
+string ModelDetailNote()
+{
+    if (miMesh is null) return "";
+    int lod0 = miBudget > 0 ? Math.Min(miBudget, miMesh.TotalFaces) : miMesh.TotalFaces;
+    var parts = new List<string> { $"LOD0 {lod0:n0}" };
+    for (int i = 1; i <= miExtraLods; i++) { int t = Math.Max(12, lod0 >> i); if (t >= lod0) break; parts.Add($"LOD{i} {t:n0}"); }
+    return string.Format(Loc.T("Writes {0} triangles."), string.Join(" / ", parts));
 }
 
 void ModelImportDialog()
@@ -13239,19 +13272,41 @@ void ModelImportDialog()
         ImGui.TextWrapped(Loc.T("Brings a model in as a level-local static object: the mesh, its textures and the .con files that register it, all written inside the map so it needs nothing from the mod."));
         ImGui.Spacing();
 
+        // Blender's conversion, when one is running: read the result the frame it lands.
+        if (miConvert is { IsCompleted: true } done)
+        {
+            miConvert = null; miBusy = false;
+            if (done.IsFaulted || done.Result is null)
+                miWarn = Loc.T("Blender could not convert that model: ") + (done.Exception?.GetBaseException().Message ?? "");
+            else
+            {
+                miObjPath = done.Result.ObjPath;
+                var mm = System.Text.RegularExpressions.Regex.Match(done.Result.Log, @"\[rfbridge\] (\d+) mesh object");
+                miBlenderNote = mm.Success
+                    ? string.Format(Loc.T("Converted with Blender: {0} mesh object(s), textures saved as PNG."), mm.Groups[1].Value)
+                    : Loc.T("Converted with Blender.");
+                LoadModelForImport();
+            }
+        }
+
         ImGui.SetNextItemWidth(320f * uiScale);
         InT(Loc.TL("Model file"), ref miPath, 260);
         ImGui.SameLine();
+        if (miBusy) ImGui.BeginDisabled();
         if (ImGui.Button(Loc.TL("Browse...")))
         {
-            var p = Picker.File("Pick a model", "Wavefront OBJ|*.obj|All files|*.*", levelDir);
-            if (p is not null) { miPath = p; miName = ""; LoadModelForImport(); }
+            var p = Picker.File("Pick a model", BlenderBridge.PickerFilter, levelDir);
+            if (p is not null) { miPath = p; miName = ""; BeginModelLoad(); }
         }
+        if (miBusy) ImGui.EndDisabled();
+        Theme.Tip(Loc.T("OBJ needs nothing. FBX, glTF, .blend, STL, PLY, USD and Alembic are converted by Blender in the background - install it from blender.org."));
         ImGui.SetNextItemWidth(220f * uiScale);
         InT(Loc.TL("Template name"), ref miName, 40);
 
         // TextWrapped, not PushTextWrapPos: this window is AlwaysAutoResize, and an explicit wrap position there
         // makes the width oscillate frame to frame. The fixed-width file field above pins the wrap point.
+        if (miBusy) ImGui.TextColored(Theme.Accent, Loc.T("Converting with Blender... this takes a few seconds."));
+        if (miBlenderNote.Length > 0) Theme.Muted(miBlenderNote);
         if (miInfo.Length > 0) ImGui.TextWrapped(miInfo);
         if (miWarn.Length > 0)
         {
@@ -13283,9 +13338,20 @@ void ModelImportDialog()
         if (miCollision) ImGui.TextColored(Theme.Warn, Loc.T("EXPERIMENTAL - the collision BSP is written empty; test in game."));
         ImGui.SetNextItemWidth(120f * uiScale);
         DrgF(Loc.TL("Draw distance"), ref miDrawDist, 5f, 0f, 4000f, miDrawDist > 0f ? "%.0f m" : "default");
+        Theme.Tip(Loc.T("How far away the object still draws. Default is what retail static objects use: 800 m, with the coarser LODs taking over at 50 and 100 m."));
 
         ImGui.Separator();
-        bool ready = miMesh is not null && so is not null && meshLib is not null && levelDir is not null;
+        ImGui.TextUnformatted(Loc.T("Detail"));
+        ImGui.SetNextItemWidth(120f * uiScale);
+        if (InI(Loc.TL("Triangle budget"), ref miBudget)) miBudget = Math.Max(0, miBudget);
+        Theme.Tip(Loc.T("The most triangles LOD 0 keeps; a denser model is simplified to this on import, keeping its UV seams and silhouette. Retail hero meshes are 1,100-2,200. 0 keeps every triangle."));
+        ImGui.SetNextItemWidth(120f * uiScale);
+        SldI(Loc.TL("Extra LODs"), ref miExtraLods, 0, 3);
+        Theme.Tip(Loc.T("Coarser copies for the distance, each with half the triangles of the one before. The game switches to them at 50 and 100 m, so a far-off object costs a fraction of a near one."));
+        if (miMesh is not null) Theme.Muted(ModelDetailNote());
+
+        ImGui.Separator();
+        bool ready = miMesh is not null && !miBusy && so is not null && meshLib is not null && levelDir is not null;
         if (!ready) ImGui.BeginDisabled();
         if (Theme.AccentButton(Loc.TL("Add to level"), new Vector2(160f * uiScale, 0f)))
             if (CreateModelObject()) showModelImport = false;
@@ -13298,10 +13364,11 @@ void ModelImportDialog()
 
 bool CreateModelObject()
 {
-    if (miMesh is null || so is null || meshLib is null || levelDir is null) return false;
+    if (miMesh is null || miObjPath is null || so is null || meshLib is null || levelDir is null) return false;
     try
     {
         int maxTex = miMaxTexIdx == 0 ? 256 : miMaxTexIdx == 2 ? 1024 : 512;
+        string miSource = miObjPath;
 
         // Nothing runs the object's folder unless Init.con says so, and most levels ship no such line - so if there
         // is no Init.con to patch, refuse rather than queue files that can never load. (Same guard as the decal.)
@@ -13313,7 +13380,7 @@ bool CreateModelObject()
 
         // Re-read the source rather than fitting the copy the dialog is describing, so changing a setting and
         // pressing the button again starts from the authored geometry instead of compounding the last fit.
-        var mesh = ObjMesh.Load(miPath);
+        var mesh = ObjMesh.Load(miSource);
         var fit = MeshFit.Apply(mesh, new MeshFitOptions {
             Up = miUpAxis == 1 ? UpAxis.Z : UpAxis.Y,
             Fit = miFitMode == 1 ? FitMode.Height : miFitMode == 2 ? FitMode.LongestSide : FitMode.AsAuthored,
@@ -13325,7 +13392,7 @@ bool CreateModelObject()
         // Materials + textures from the .obj's .mtl, resolved relative to the .obj. Each picture is forced to a
         // power of two (the texture manager silently DROPS anything else) and given a mip chain, or it shimmers at
         // distance. The texture name is prefixed with the template so two imports cannot fight over one file.
-        var dir = Path.GetDirectoryName(miPath) ?? ".";
+        var dir = Path.GetDirectoryName(miSource) ?? ".";
         var mtl = new Dictionary<string, ObjMaterial>(StringComparer.OrdinalIgnoreCase);
         foreach (var lib in mesh.MtlLibs)
         {
@@ -13362,8 +13429,22 @@ bool CreateModelObject()
             bindings.Add(new RefractorForge.Formats.Con.ModelObject.Material(sourceMat, texName, diffuse));
         }
 
-        var built = RefractorForge.Formats.Con.ModelObject.Build(levelName, name, mesh, bindings, textures,
-                                                                 miCollision, baseSub, miDrawDist);
+        // Detail: the budget applies to LOD 0 and each further LOD halves it. A model already under budget is kept
+        // exactly as authored; nothing is invented either way, every surviving vertex is one the author placed.
+        ObjMesh lod0 = miBudget > 0 && mesh.TotalFaces > miBudget ? MeshDecimator.Decimate(mesh, miBudget) : mesh;
+        var extraLods = new List<ObjMesh>();
+        for (int i = 1; i <= miExtraLods; i++)
+        {
+            int target = Math.Max(12, lod0.TotalFaces >> i);
+            if (target >= lod0.TotalFaces) break;
+            extraLods.Add(MeshDecimator.Decimate(lod0, target));
+        }
+        // Build renames every material in place; remember what each section was called so the preview can find
+        // its picture afterwards.
+        var sourceNames = lod0.SubMeshes.Select(s => s.Material).ToList();
+
+        var built = RefractorForge.Formats.Con.ModelObject.Build(levelName, name, lod0, bindings, textures,
+                                                                 miCollision, baseSub, miDrawDist, extraLods);
 
         // Queue every file for the save, then the two registration patches - both built on the newest queued copy,
         // so a second import adds to the first rather than replacing it.
@@ -13379,11 +13460,11 @@ bool CreateModelObject()
         pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
             RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
 
-        // Show it now, under the template name, exactly as an imported .obj is. The renderer is handed the ORIGINAL
-        // material names because Build renamed the mesh's in place, so look up through the submesh order instead.
+        // Show it now, under the template name, exactly as an imported .obj is. The renderer asks by the RENAMED
+        // material, so map each section back to what it was called before Build renamed it.
         var renamedToSource = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (s, i) in mesh.SubMeshes.Select((s, i) => (s, i)))
-            renamedToSource[s.Material] = bindings.Count > 0 ? bindings[Math.Min(i, bindings.Count - 1)].SourceName : s.Material;
+        for (int i = 0; i < built.Mesh.SubMeshes.Count && i < sourceNames.Count; i++)
+            renamedToSource[built.Mesh.SubMeshes[i].Material] = sourceNames[i];
         meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, m =>
         {
             var src = renamedToSource.TryGetValue(m, out var s0) ? s0 : m;
@@ -13399,8 +13480,11 @@ bool CreateModelObject()
         browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
 
         string sizeNote = string.Format(Loc.T("{0:0.##} x {1:0.##} x {2:0.##} m"), fit.Width, fit.Height, fit.Depth);
-        Toast(string.Format(Loc.T("Model '{0}' ready ({1}, {2} tex{3}) - click to place it. {4} file(s) will be written on save."),
-                            built.Template, sizeNote, textures.Count,
+        string detail = built.LodCount > 1
+            ? string.Format(Loc.T("{0} tris in {1} LODs"), lod0.TotalFaces, built.LodCount)
+            : string.Format(Loc.T("{0} tris"), lod0.TotalFaces);
+        Toast(string.Format(Loc.T("Model '{0}' ready ({1}, {2}, {3} tex{4}) - click to place it. {5} file(s) will be written on save."),
+                            built.Template, sizeNote, detail, textures.Count,
                             built.HasCollision ? Loc.T(", solid") : "", built.Files.Count + 2));
         if (missing > 0) Toast(string.Format(Loc.T("{0} texture file(s) named by the .mtl could not be found next to the model."), missing));
         return true;

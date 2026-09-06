@@ -316,7 +316,7 @@ public class ModelImportTests
         // The .con files point where the engine will look. A BF1942 path resolves to nothing in Vietnam.
         Assert.Contains("GeometryTemplate.file ../BfVietnam/levels/Test_Map/StandardMesh/my_prop",
                         Text("Objects/my_prop/Geometries.con"));
-        Assert.Contains("GeometryTemplate.setLodDistance 5 1000", Text("Objects/my_prop/Geometries.con"));
+        Assert.Contains("GeometryTemplate.setLodDistance 5 800", Text("Objects/my_prop/Geometries.con"));   // retail's static ramp
         var obj = Text("Objects/my_prop/Objects.con");
         Assert.Contains("ObjectTemplate.create SimpleObject my_prop", obj);
         Assert.Contains("ObjectTemplate.geometry my_prop", obj);
@@ -334,6 +334,42 @@ public class ModelImportTests
         Assert.False(soft.HasCollision);
         Assert.Contains("ObjectTemplate.HasCollisionPhysics 0",
                         Encoding.UTF8.GetString(soft.Files.First(f => f.RelPath == "Objects/soft/Objects.con").Bytes));
+    }
+
+    [Fact]
+    public void ModelObject_writes_extra_lods_and_takes_collision_from_the_first_one_that_fits()
+    {
+        // LOD 0 is past the collision section's 32,767-vertex ceiling; the coarser copies are not.
+        const int tris = 30000;
+        var sb = new StringBuilder("usemtl dense\n");
+        for (int i = 0; i < tris; i++)
+            sb.Append($"v {i} 0 0\nv {i} 1 0\nv {i} 0 1\n").Append($"f {i * 3 + 1} {i * 3 + 2} {i * 3 + 3}\n");
+        var lod0 = ObjMesh.Parse(sb.ToString());
+        var lod1 = Grid(20, "dense");
+        var lod2 = Grid(6, "dense");
+
+        var b = ModelObject.Build("Test_Map", "tower", lod0,
+            new[] { new ModelObject.Material("dense", null, new Vec3(1, 1, 1)) }, null,
+            collision: true, extraLods: new[] { lod1, lod2 });
+        Assert.Equal(3, b.LodCount);
+        Assert.True(b.HasCollision, "collision came from a LOD that fits");
+
+        var sm = StandardMesh.Parse(b.Files.First(f => f.RelPath == "StandardMesh/tower.sm").Bytes);
+        Assert.Equal(3, sm.NumLods);
+        Assert.Equal(tris, sm.Lods[0].Sum(m => m.Faces.Length));
+        Assert.Equal(lod1.TotalFaces, sm.Lods[1].Sum(m => m.Faces.Length));
+        Assert.Equal(lod2.TotalFaces, sm.Lods[2].Sum(m => m.Faces.Length));
+        Assert.True(sm.Total - sm.Consumed == 8, "every byte accounted for");
+        // Every LOD's sections were renamed to the one shared material name.
+        foreach (var lod in sm.Lods) foreach (var m in lod) Assert.Equal("tower_Material0", m.Name);
+        Assert.True(StandardMesh.TryParseCollision(sm.CollisionSections[0], out var cv, out _)
+                    && cv.Length == lod1.TotalVertices, "the collision is LOD 1's geometry");
+
+        // The ramp is retail's: 0 / 50 / 100 / 200 / 400 / 800 for the default draw distance.
+        var geom = Encoding.UTF8.GetString(b.Files.First(f => f.RelPath == "Objects/tower/Geometries.con").Bytes);
+        Assert.Contains("setLodDistance 1 50\r\n", geom);
+        Assert.Contains("setLodDistance 2 100\r\n", geom);
+        Assert.Contains("setLodDistance 5 800\r\n", geom);
     }
 
     /// <summary>

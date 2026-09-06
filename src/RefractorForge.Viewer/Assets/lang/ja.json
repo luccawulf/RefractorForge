@@ -1315,5 +1315,22 @@
  "Left-drag paints under the brush. The mouse wheel changes the brush size; right-click a slider to type a value.": "左ドラッグでブラシの下を塗ります。マウスホイールでブラシサイズ変更、スライダーを右クリックで数値入力。",
  "Left-drag shapes the ground under the brush. The mouse wheel changes the brush size.": "左ドラッグでブラシの下の地形を変形します。マウスホイールでブラシサイズを変更します。",
  "Left-drag softens the ground under the brush. The mouse wheel changes the brush size.": "左ドラッグでブラシの下の地形をなだらかにします。マウスホイールでブラシサイズを変更します。",
- "Paint the pathfinding grid: where bots may go and where they may not, per vehicle type.": "経路探索グリッドを塗ります: 車両タイプごとに、ボットが通れる場所と通れない場所。"
+ "Paint the pathfinding grid: where bots may go and where they may not, per vehicle type.": "経路探索グリッドを塗ります: 車両タイプごとに、ボットが通れる場所と通れない場所。",
+ "Blender could not convert that model: ": "Blender でそのモデルを変換できませんでした: ",
+ "Coarser copies for the distance, each with half the triangles of the one before. The game switches to them at 50 and 100 m, so a far-off object costs a fraction of a near one.": "遠景用の粗いコピーで、それぞれ前段の半分の三角形数です。ゲームは 50 m と 100 m で切り替えるので、遠くのオブジェクトは近くのものよりずっと軽くなります。",
+ "Converted with Blender.": "Blender で変換しました。",
+ "Converted with Blender: {0} mesh object(s), textures saved as PNG.": "Blender で変換しました: メッシュオブジェクト {0} 個、テクスチャは PNG で保存。",
+ "Converting with Blender... this takes a few seconds.": "Blender で変換中... 数秒かかります。",
+ "Detail": "ディテール",
+ "Extra LODs": "追加 LOD",
+ "How far away the object still draws. Default is what retail static objects use: 800 m, with the coarser LODs taking over at 50 and 100 m.": "オブジェクトが描画される最大距離。既定は製品版の静的オブジェクトと同じ 800 m で、粗い LOD は 50 m と 100 m で切り替わります。",
+ "Model '{0}' ready ({1}, {2}, {3} tex{4}) - click to place it. {5} file(s) will be written on save.": "モデル '{0}' の準備ができました（{1}、{2}、テクスチャ {3}{4}）- クリックで配置。保存時に {5} 個のファイルを書き込みます。",
+ "OBJ needs nothing. FBX, glTF, .blend, STL, PLY, USD and Alembic are converted by Blender in the background - install it from blender.org.": "OBJ はそのまま読めます。FBX、glTF、.blend、STL、PLY、USD、Alembic はバックグラウンドで Blender が変換します - blender.org からインストールしてください。",
+ "The most triangles LOD 0 keeps; a denser model is simplified to this on import, keeping its UV seams and silhouette. Retail hero meshes are 1,100-2,200. 0 keeps every triangle.": "LOD 0 が保持する三角形数の上限。それより密なモデルは読み込み時にここまで簡略化され、UV の継ぎ目とシルエットは保たれます。製品版の主要メッシュは 1,100-2,200 です。0 ですべて保持します。",
+ "This format needs Blender to convert it, and Blender was not found. Install it from blender.org (or point RF_BLENDER at blender.exe), or export an OBJ from your modelling tool instead.": "この形式の変換には Blender が必要ですが、見つかりませんでした。blender.org からインストールする（または RF_BLENDER に blender.exe を指定する）か、モデリングツールから OBJ を書き出してください。",
+ "Triangle budget": "三角形の上限",
+ "Writes {0} triangles.": "{0} 個の三角形を書き込みます。",
+ "{0} tris": "三角形 {0} 個",
+ "{0} tris in {1} LODs": "三角形 {0} 個、LOD {1} 段",
+ "{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). The triangle budget below will reduce it on import.": "三角形 {0} 個は、これらのゲームの水準を大きく超えています（主要メッシュで 1,100-2,200、車両全体で 2,000-6,000）。下の三角形の上限で読み込み時に削減されます。"
 }
