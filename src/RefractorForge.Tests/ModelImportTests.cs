@@ -109,6 +109,134 @@ public class ModelImportTests
         Assert.True(r2.Scale > 1f, "reports the scale it applied");
     }
 
+    /// <summary>A displaced N x N grid: one material, one continuous UV map, a pinned border and a large
+    /// collapsible interior — the shape a decimator should be able to hit its target on.</summary>
+    static ObjMesh Grid(int n, string material = "ground")
+    {
+        var sb = new StringBuilder();
+        for (int y = 0; y <= n; y++)
+            for (int x = 0; x <= n; x++)
+                sb.Append($"v {x} {MathF.Sin(x * 0.4f) * MathF.Cos(y * 0.4f) * 2f} {y}\n");
+        for (int y = 0; y <= n; y++)
+            for (int x = 0; x <= n; x++)
+                sb.Append($"vt {(float)x / n} {(float)y / n}\n");
+        sb.Append($"usemtl {material}\n");
+        int At(int x, int y) => y * (n + 1) + x + 1;
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++)
+            {
+                sb.Append($"f {At(x, y)}/{At(x, y)} {At(x + 1, y)}/{At(x + 1, y)} {At(x + 1, y + 1)}/{At(x + 1, y + 1)}\n");
+                sb.Append($"f {At(x, y)}/{At(x, y)} {At(x + 1, y + 1)}/{At(x + 1, y + 1)} {At(x, y + 1)}/{At(x, y + 1)}\n");
+            }
+        return ObjMesh.Parse(sb.ToString());
+    }
+
+    static void AssertWellFormed(ObjMesh m, string what)
+    {
+        foreach (var s in m.SubMeshes)
+        {
+            Assert.True(s.Positions.Count == s.Normals.Count && s.Positions.Count == s.Uvs.Count,
+                        what + ": parallel vertex arrays stay the same length");
+            foreach (var (a, b, c) in s.Faces)
+            {
+                Assert.True(a >= 0 && b >= 0 && c >= 0 && a < s.Positions.Count && b < s.Positions.Count && c < s.Positions.Count,
+                            what + ": every index is in range");
+                Assert.True(a != b && b != c && a != c, what + ": no degenerate triangle");
+            }
+            foreach (var p in s.Positions)
+                Assert.True(!float.IsNaN(p.X) && !float.IsNaN(p.Y) && !float.IsNaN(p.Z), what + ": no NaN positions");
+        }
+    }
+
+    [Fact]
+    public void Decimation_hits_its_target_and_keeps_the_silhouette()
+    {
+        var src = Grid(40);                                   // 3,200 triangles
+        Assert.Equal(3200, src.TotalFaces);
+        var box = (float[])src.BoundingBox.Clone();
+
+        var lod = MeshDecimator.Decimate(src, 800, out var r);
+        AssertWellFormed(lod, "decimated grid");
+        Assert.Equal(3200, src.TotalFaces);                   // the source is not touched
+        Assert.True(r.Triangles <= 900 && r.Triangles >= 600,
+                    $"asked for 800 triangles, got {r.Triangles} (from {r.SourceTriangles})");
+        Assert.True(r.Collapses > 0, "it actually collapsed something");
+
+        // The silhouette is what a distant LOD is for, so the box must barely move. Half-edge collapses only ever
+        // remove vertices, so the box can shrink a little and can never grow.
+        for (int i = 0; i < 3; i++)
+            Assert.True(lod.BoundingBox[i] >= box[i] - 1e-3f && lod.BoundingBox[i + 3] <= box[i + 3] + 1e-3f,
+                        "the decimated box stays inside the original");
+        Assert.True(MathF.Abs(lod.BoundingBox[3] - box[3]) < 0.5f && MathF.Abs(lod.BoundingBox[0] - box[0]) < 0.5f,
+                    "the footprint is essentially unchanged");
+
+        // Every surviving vertex is one the author placed - nothing is invented, so UVs and positions stay exact.
+        var srcPositions = src.SubMeshes[0].Positions.Select(p => (p.X, p.Y, p.Z)).ToHashSet();
+        foreach (var p in lod.SubMeshes[0].Positions)
+            Assert.Contains((p.X, p.Y, p.Z), srcPositions);
+
+        // And it still writes as a mesh.
+        var sm = StandardMesh.Parse(StandardMeshWriter.Write(lod));
+        Assert.Equal(r.Triangles, sm.Lods[0].Sum(m => m.Faces.Length));
+        Assert.True(sm.Total - sm.Consumed == 8, "the decimated mesh accounts for every byte");
+
+        // A target at or above the source is a no-op rather than a rebuild.
+        var same = MeshDecimator.Decimate(src, 99999, out var r2);
+        Assert.Equal(src.TotalFaces, r2.Triangles);
+        Assert.Equal(0, r2.Collapses);
+    }
+
+    [Fact]
+    public void Decimation_pins_seams_and_material_boundaries()
+    {
+        // Two materials meeting along a shared edge: collapsing across that join opens a gap between them.
+        var a = Grid(12, "left");
+        var b = Grid(12, "right");
+        foreach (var s in b.SubMeshes) { s.Material = "right"; for (int i = 0; i < s.Positions.Count; i++) s.Positions[i] = new Vec3(s.Positions[i].X + 12f, s.Positions[i].Y, s.Positions[i].Z); }
+        var joined = new ObjMesh();
+        joined.SubMeshes.Add(a.SubMeshes[0]);
+        joined.SubMeshes.Add(b.SubMeshes[0]);
+
+        var lod = MeshDecimator.Decimate(joined, 100, out var r);
+        AssertWellFormed(lod, "two-material decimation");
+        Assert.Equal(2, lod.SubMeshes.Count);                              // neither material reduced to nothing
+        Assert.All(lod.SubMeshes, s => Assert.True(s.Faces.Count >= 4, "each material keeps geometry"));
+        Assert.True(r.Triangles < joined.TotalFaces, "it did simplify");
+
+        // The seam between the two materials is at x = 12; every vertex the two share must survive in both, or the
+        // materials pull apart. Compare the sets of positions along that line.
+        var leftSeam = lod.SubMeshes[0].Positions.Where(p => MathF.Abs(p.X - 12f) < 1e-4f).Select(p => MathF.Round(p.Z, 3)).ToHashSet();
+        var rightSeam = lod.SubMeshes[1].Positions.Where(p => MathF.Abs(p.X - 12f) < 1e-4f).Select(p => MathF.Round(p.Z, 3)).ToHashSet();
+        Assert.True(leftSeam.Count > 0 && leftSeam.SetEquals(rightSeam),
+                    $"the shared edge matches on both sides ({leftSeam.Count} vs {rightSeam.Count} vertices)");
+
+        // A closed box whose faces meet at UV seams: nothing should tear, and the box must stay a box.
+        var cube = Cube(half: 2f);
+        var small = MeshDecimator.Decimate(cube, 4, out _);
+        AssertWellFormed(small, "cube decimation");
+        Assert.True(MathF.Abs(small.BoundingBox[3] - 2f) < 1e-3f, "the cube keeps its extent");
+    }
+
+    [Fact]
+    public void A_mesh_can_carry_several_lods()
+    {
+        var l0 = Grid(30);
+        var l1 = MeshDecimator.Decimate(l0, 400);
+        var l2 = MeshDecimator.Decimate(l0, 100);
+
+        var sm = StandardMesh.Parse(StandardMeshWriter.Write(new[] { l0, l1, l2 }));
+        Assert.Equal(3, sm.NumLods);
+        Assert.Equal(l0.TotalFaces, sm.Lods[0].Sum(m => m.Faces.Length));
+        Assert.Equal(l1.TotalFaces, sm.Lods[1].Sum(m => m.Faces.Length));
+        Assert.Equal(l2.TotalFaces, sm.Lods[2].Sum(m => m.Faces.Length));
+        Assert.True(sm.Lods[2].Sum(m => m.Faces.Length) < sm.Lods[0].Sum(m => m.Faces.Length), "they do get coarser");
+        Assert.True(sm.Total - sm.Consumed == 8, "a multi-LOD mesh accounts for every byte");
+
+        // The box is LOD 0's: a coarser copy's own box is slightly smaller, and using it would cull the whole
+        // object early.
+        Assert.True(Near(sm.BoundingBox[3], l0.BoundingBox[3], 1e-3f), "the bounding box is LOD 0's");
+    }
+
     [Fact]
     public void Oversized_sections_are_split_rather_than_refused()
     {

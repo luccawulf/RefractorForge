@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using RefractorForge.Formats.Mesh;
@@ -26,49 +27,70 @@ namespace RefractorForge.Formats.Rfa;
 public static class StandardMeshWriter
 {
     public static byte[] Write(ObjMesh mesh, byte[]? collisionSection = null)
+        => Write(new[] { mesh }, collisionSection);
+
+    /// <summary>
+    /// Write a mesh with several levels of detail — <paramref name="lods"/> in order, coarsest last. The engine
+    /// picks one by the <c>setLodDistance</c> ramp in the object's Geometries.con, so writing several here and
+    /// pointing the ramp at them is what actually makes a distant object cheap; a single-LOD mesh with a full ramp
+    /// (which is what a generated object used to be) draws every triangle right out to the cull distance.
+    ///
+    /// The bounding box comes from LOD 0: it is the object's box, and a decimated copy's own box is slightly
+    /// smaller, which would make the whole object cull early.
+    /// </summary>
+    public static byte[] Write(IReadOnlyList<ObjMesh> lods, byte[]? collisionSection = null)
     {
-        var subs = mesh.SubMeshes.Where(s => s.Faces.Count > 0).ToList();
-        if (subs.Count == 0) throw new InvalidDataException("Mesh has no triangles to write.");
-        foreach (var s in subs)
-            if (s.Positions.Count > 65535)
-                throw new InvalidDataException($"Material '{s.Material}' has {s.Positions.Count} vertices (>65535 u16 limit; split the mesh).");
+        if (lods.Count == 0) throw new InvalidDataException("No LOD given to write.");
+        var levels = new List<List<ObjSubMesh>>(lods.Count);
+        foreach (var lod in lods)
+        {
+            var subs = lod.SubMeshes.Where(s => s.Faces.Count > 0).ToList();
+            if (subs.Count == 0) throw new InvalidDataException("Mesh has no triangles to write.");
+            foreach (var s in subs)
+                if (s.Positions.Count > 65535)
+                    throw new InvalidDataException($"Material '{s.Material}' has {s.Positions.Count} vertices (>65535 u16 limit; split the mesh).");
+            levels.Add(subs);
+        }
 
         using var ms = new MemoryStream();
         var w = new BinaryWriter(ms);   // BinaryWriter is little-endian, matching StandardMesh's LE reads
 
         w.Write((uint)10);                          // version
         w.Write(new byte[4]);                       // unknown (0)
-        for (int i = 0; i < 6; i++) w.Write(mesh.BoundingBox[i]);   // bbox minX,minY,minZ, maxX,maxY,maxZ
+        for (int i = 0; i < 6; i++) w.Write(lods[0].BoundingBox[i]);   // bbox minX,minY,minZ, maxX,maxY,maxZ
         w.Write((byte)0);                           // qflag (version 10)
         if (collisionSection is { Length: > 0 })    // numCollisionMeshes + {u32 size; section bytes}
         { w.Write((uint)1); w.Write((uint)collisionSection.Length); w.Write(collisionSection); }
         else w.Write((uint)0);
-        w.Write((uint)1);                           // numLods
+        w.Write((uint)levels.Count);                // numLods
 
-        // LOD 0: all material headers first, then all geometry.
-        w.Write((uint)subs.Count);
-        foreach (var s in subs)
+        // Per LOD: all material headers first, then all geometry.
+        foreach (var subs in levels)
         {
-            var name = Encoding.Latin1.GetBytes(s.Material);
-            w.Write((uint)name.Length); w.Write(name);
-            w.Write(new byte[12]);                  // unknown (0)
-            w.Write((uint)4);                       // renderType: triangle list
-            w.Write((uint)1041);                    // vertexFormat: pos/normal/uv
-            w.Write((uint)32);                      // vertexByteSize
-            w.Write((uint)s.Positions.Count);       // numVertices
-            w.Write((uint)(s.Faces.Count * 3));     // numFaceValues
-            w.Write((uint)0);                       // materialSettings
-        }
-        foreach (var s in subs)
-        {
-            for (int i = 0; i < s.Positions.Count; i++)
+            w.Write((uint)subs.Count);
+            foreach (var s in subs)
             {
-                var p = s.Positions[i]; var n = s.Normals[i]; var uv = s.Uvs[i];
-                w.Write(p.X); w.Write(p.Y); w.Write(p.Z);
-                w.Write(n.X); w.Write(n.Y); w.Write(n.Z);
-                w.Write(uv.U); w.Write(uv.V);
+                var name = Encoding.Latin1.GetBytes(s.Material);
+                w.Write((uint)name.Length); w.Write(name);
+                w.Write(new byte[12]);                  // unknown (0)
+                w.Write((uint)4);                       // renderType: triangle list
+                w.Write((uint)1041);                    // vertexFormat: pos/normal/uv
+                w.Write((uint)32);                      // vertexByteSize
+                w.Write((uint)s.Positions.Count);       // numVertices
+                w.Write((uint)(s.Faces.Count * 3));     // numFaceValues
+                w.Write((uint)0);                       // materialSettings
             }
-            foreach (var (a, b, c) in s.Faces) { w.Write((ushort)c); w.Write((ushort)b); w.Write((ushort)a); }   // reversed winding
+            foreach (var s in subs)
+            {
+                for (int i = 0; i < s.Positions.Count; i++)
+                {
+                    var p = s.Positions[i]; var n = s.Normals[i]; var uv = s.Uvs[i];
+                    w.Write(p.X); w.Write(p.Y); w.Write(p.Z);
+                    w.Write(n.X); w.Write(n.Y); w.Write(n.Z);
+                    w.Write(uv.U); w.Write(uv.V);
+                }
+                foreach (var (a, b, c) in s.Faces) { w.Write((ushort)c); w.Write((ushort)b); w.Write((ushort)a); }   // reversed winding
+            }
         }
 
         // The trailing section every DICE-authored mesh ends with: u32 flag, u32 size, then size bytes. All 1,997
