@@ -49,7 +49,9 @@ public class MeshTests
         var rsText = RsShaderSet.Write(new (string, string?, Vector3)[] {
             ("wood", "oak", new Vector3(0.6f, 0.4f, 0.2f)), ("glass", null, new Vector3(0.1f, 0.2f, 0.9f)) });
         var rs = RsShaderSet.Parse(rsText);
-        Assert.True(rs.Materials.Count == 2 && rs.Materials["wood"].Texture == "oak" && Near(rs.Materials["wood"].Diffuse.X, 0.6f) && rs.Materials["glass"].Texture is null, ".rs round-trips");
+        // The texture comes back FOLDER-QUALIFIED because that is what the engine needs; a bare "oak" resolves at
+        // the archive root instead of the object's texture folder.
+        Assert.True(rs.Materials.Count == 2 && rs.Materials["wood"].Texture == "texture/oak" && Near(rs.Materials["wood"].Diffuse.X, 0.6f) && rs.Materials["glass"].Texture is null, ".rs round-trips");
         var withMtl = ObjMesh.Parse("mtllib scene.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl wood\nf 1 2 3\n");
         Assert.True(withMtl.MtlLibs.Count == 1 && withMtl.MtlLibs[0] == "scene.mtl" && withMtl.SubMeshes[0].Material == "wood", "mtllib + usemtl captured");
     }

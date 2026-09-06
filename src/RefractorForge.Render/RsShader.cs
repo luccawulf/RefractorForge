@@ -158,20 +158,17 @@ public sealed class RsShaderSet
     }
 
     /// <summary>Write a <c>.rs</c> shader set from material bindings — the inverse of <see cref="Parse"/>. Each
-    /// material becomes a subshader block binding its texture (basename, no extension) + diffuse colour, so an
-    /// exported standard mesh is textured in-game. Round-trips through <see cref="Parse"/>.</summary>
-    public static string Write(IEnumerable<(string Material, string? Texture, Vector3 Diffuse)> materials)
-    {
-        var sb = new System.Text.StringBuilder();
-        foreach (var (mat, tex, dif) in materials)
-        {
-            sb.Append("subshader \"").Append(mat).Append("\" \"StandardMesh/Default\"\r\n{\r\n");
-            if (!string.IsNullOrEmpty(tex)) sb.Append("\ttexture \"").Append(tex).Append("\"\r\n");
-            sb.Append("\tmaterialDiffuse ").Append(Fmt(dif.X)).Append(' ').Append(Fmt(dif.Y)).Append(' ').Append(Fmt(dif.Z)).Append("\r\n");
-            sb.Append("}\r\n\r\n");
-        }
-        return sb.ToString();
-    }
-
-    private static string Fmt(float v) => v.ToString("0.######", CultureInfo.InvariantCulture);
+    /// material becomes a subshader block binding its texture + diffuse colour, so an exported standard mesh is
+    /// textured in-game.
+    ///
+    /// The emitting itself lives in <see cref="RefractorForge.Formats.Mesh.RsWriter"/>, which knows the two rules
+    /// this method used to break: every statement needs a semicolon, and the texture reference must be
+    /// folder-qualified. <see cref="Parse"/> is deliberately lenient about both, so a round-trip through it could
+    /// never tell you whether what you wrote would actually load.</summary>
+    public static string Write(IEnumerable<(string Material, string? Texture, Vector3 Diffuse)> materials,
+                               string textureFolder = "texture")
+        => Formats.Mesh.RsWriter.Write(
+               materials.Select(m => new Formats.Mesh.RsWriter.Material(
+                   m.Material, m.Texture, new Formats.Geometry.Vec3(m.Diffuse.X, m.Diffuse.Y, m.Diffuse.Z))),
+               textureFolder);
 }

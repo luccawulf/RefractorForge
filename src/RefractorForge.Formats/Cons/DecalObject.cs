@@ -59,16 +59,13 @@ public static class DecalObject
 
         files.Add(($"StandardMesh/{name}.sm", StandardMeshWriter.Write(mesh)));
 
-        // The .rs binds the material to the texture. The shader grammar is strict: every statement takes a value
-        // and ends in a semicolon, or the parser throws and the subshader is never registered. The texture value
-        // is folder-qualified — all 4,406 shipped references are, and a bare name resolves at the archive root
-        // instead of the level's Texture folder. `transparent false` + alphatestref is retail's cut-out recipe
-        // (blending would also need `depthWrite false`, and a photo is opaque anyway).
+        // The .rs binds the material to the texture. The grammar's two hard rules — a semicolon on every statement,
+        // a folder-qualified texture — live in RsWriter now, so this recipe and the model importer's cannot drift
+        // apart. `transparent false` + alphaTestRef is retail's cut-out recipe (blending would also need
+        // `depthWrite false`, and a photo is opaque anyway); twosided because a decal is a flat sheet.
         string texLine = textureRef is not null ? textureRef : "texture/" + textureName;
-        string rs = $"subshader \"{material}\" \"StandardMesh/Default\"\r\n{{\r\n" +
-                    "\tlighting true;\r\n\tlightingSpecular false;\r\n\tmaterialDiffuse 1 1 1;\r\n" +
-                    "\ttransparent false;\r\n\talphaTestRef 0.5;\r\n\ttwosided true;\r\n" +
-                    $"\ttexture \"{texLine}\";\r\n}}\r\n";
+        string rs = Mesh.RsWriter.Write(new[] {
+            new Mesh.RsWriter.Material(material, texLine, new Vec3(1, 1, 1), AlphaTestRef: 0.5f, TwoSided: true) });
         files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(rs)));
         if (textureRef is null && ddsBytes is not null) files.Add(($"Texture/{textureName}.dds", ddsBytes));
 

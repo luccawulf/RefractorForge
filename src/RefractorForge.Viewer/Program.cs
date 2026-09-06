@@ -621,6 +621,16 @@ string decalName = "poster1";
 string decalImagePath = "";
 float decalW = 2f, decalH = 1.5f;
 bool decalFlat = false;
+// Model import dialog: a 3D model from outside -> a level-local static object.
+bool showModelImport = false;
+string miPath = "", miName = "", miInfo = "", miWarn = "";
+ObjMesh? miMesh = null;                      // the source as loaded, before any fitting
+int miUpAxis = 0;                            // 0 = Y up (an OBJ from Blender already is), 1 = Z up (FBX / .blend)
+int miFitMode = 1;                           // 0 = as authored, 1 = fit height, 2 = fit longest side
+float miTarget = 4f, miScale = 1f, miDrawDist = 0f;
+int miOrigin = 0;                            // 0 = on the ground, 1 = centred, 2 = as authored
+bool miCollision = true, miDxt = false;
+int miMaxTexIdx = 1;                         // 0 = 256, 1 = 512, 2 = 1024
 // Erosion + river.
 int erodeIterations = 40; float erodeTalus = 1.2f; bool erodeHydraulic = true; float erodeRadius = 60f;
 float riverWidth = 24f, riverDepth = 4f, riverBank = 6f; int riverBankMat = 3, riverBedMat = 4;
@@ -11815,6 +11825,8 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Map Report"), null, showMapReport, mapReport is not null)) showMapReport = !showMapReport;
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
+            if (ImGui.MenuItem(Loc.TL("Import 3D Model..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showModelImport = true;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A model of your own as a placeable static object: the mesh, its textures\nand the .con files that register it, all written inside the map."));
             if (ImGui.MenuItem(Loc.TL("Import Sound (MP3/WAV)..."), null, false, so is not null && levelDir is not null)) showSoundImport = true;
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
             if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
@@ -12125,6 +12137,7 @@ void BuildUi()
     NotesOverlay();
     MapReportWindow();
     DecalDialog();
+    ModelImportDialog();
     SoundImportDialog();
     TunnelsWindow();
     PackageDialog();
@@ -13220,6 +13233,214 @@ bool CreateDecalObject()
         return true;
     }
     catch (Exception ex) { Toast(Loc.T("Decal failed: ") + ex.Message); return false; }
+}
+
+// ---- Importing a 3D model ---------------------------------------------------------------------------------------
+//
+// The decal path above proves the six-file recipe for a level-local object; this is the same recipe carrying a real
+// model instead of a quad. The work that makes an import USABLE rather than merely present is the fitting: a model
+// from outside arrives at unknown units, often on its side (Blender is Z-up), pivoting around wherever the author
+// left its origin. All three are corrected here before anything is written.
+
+// Read the source file and remember what it looks like, so the dialog can tell the user the size and triangle count
+// BEFORE they commit. Nothing is fitted yet - the fit runs on a fresh copy at build time, so the sliders stay live.
+void LoadModelForImport()
+{
+    miMesh = null; miInfo = ""; miWarn = "";
+    if (!File.Exists(miPath)) { miWarn = Loc.T("No such file."); return; }
+    try
+    {
+        var m = ObjMesh.Load(miPath);
+        if (m.TotalFaces == 0) { miWarn = Loc.T("That model has no triangles."); return; }
+        miMesh = m;
+        if (miName.Trim().Length == 0) miName = SanitizeTemplate(Path.GetFileNameWithoutExtension(miPath));
+        float w = m.BoundingBox[3] - m.BoundingBox[0], h = m.BoundingBox[4] - m.BoundingBox[1], d = m.BoundingBox[5] - m.BoundingBox[2];
+        miInfo = string.Format(Loc.T("{0} triangles, {1} vertices, {2} material(s). Authored size {3:0.##} x {4:0.##} x {5:0.##}."),
+                               m.TotalFaces, m.TotalVertices, m.SubMeshes.Count, w, h, d);
+        // Measured against 719 shipped BF1942 meshes: a hero mesh is 1,100-2,200 triangles and a whole multi-part
+        // vehicle 2,000-6,000. Ten times that will load, but it costs frames on hardware these games were built for.
+        if (m.TotalFaces > 6000)
+            miWarn = string.Format(Loc.T("{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). Decimate it in Blender first."), m.TotalFaces);
+    }
+    catch (Exception ex) { miWarn = Loc.T("Could not read that model: ") + ex.Message; }
+}
+
+void ModelImportDialog()
+{
+    if (!showModelImport) return;
+    ImGui.SetNextWindowSize(new Vector2(520f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Import 3D Model") + "###modelimport", ref showModelImport, ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        ImGui.TextWrapped(Loc.T("Brings a model in as a level-local static object: the mesh, its textures and the .con files that register it, all written inside the map so it needs nothing from the mod."));
+        ImGui.Spacing();
+
+        ImGui.SetNextItemWidth(320f * uiScale);
+        InT(Loc.TL("Model file"), ref miPath, 260);
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Browse...")))
+        {
+            var p = Picker.File("Pick a model", "Wavefront OBJ|*.obj|All files|*.*", levelDir);
+            if (p is not null) { miPath = p; miName = ""; LoadModelForImport(); }
+        }
+        ImGui.SetNextItemWidth(220f * uiScale);
+        InT(Loc.TL("Template name"), ref miName, 40);
+
+        // TextWrapped, not PushTextWrapPos: this window is AlwaysAutoResize, and an explicit wrap position there
+        // makes the width oscillate frame to frame. The fixed-width file field above pins the wrap point.
+        if (miInfo.Length > 0) ImGui.TextWrapped(miInfo);
+        if (miWarn.Length > 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.7f, 0.3f, 1f));
+            ImGui.TextWrapped(miWarn);
+            ImGui.PopStyleColor();
+        }
+
+        ImGui.Separator();
+        ImGui.TextUnformatted(Loc.T("Orientation and size"));
+        ImGui.SetNextItemWidth(190f * uiScale);
+        CboZ(Loc.TL("Up axis"), ref miUpAxis, Loc.T("Y up (OBJ default)") + "\0" + Loc.T("Z up (Blender / FBX)") + "\0");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side."));
+        ImGui.SetNextItemWidth(190f * uiScale);
+        CboZ(Loc.TL("Size"), ref miFitMode, Loc.T("Keep the file's units") + "\0" + Loc.T("Fit the height") + "\0" + Loc.T("Fit the longest side") + "\0");
+        if (miFitMode == 0) { ImGui.SetNextItemWidth(120f * uiScale); DrgF(Loc.TL("Scale"), ref miScale, 0.01f, 0.001f, 1000f, "%.3f"); }
+        else { ImGui.SetNextItemWidth(120f * uiScale); DrgF(Loc.TL("Metres"), ref miTarget, 0.1f, 0.05f, 500f, "%.2f m"); }
+        ImGui.SetNextItemWidth(190f * uiScale);
+        CboZ(Loc.TL("Origin"), ref miOrigin, Loc.T("On the ground, centred") + "\0" + Loc.T("Centre of the model") + "\0" + Loc.T("As authored") + "\0");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("The origin is the point you place and the point it rotates about.\nAnything that stands on the terrain wants it on the ground."));
+
+        ImGui.Separator();
+        ImGui.TextUnformatted(Loc.T("Textures and collision"));
+        ImGui.SetNextItemWidth(120f * uiScale);
+        CboZ(Loc.TL("Max texture"), ref miMaxTexIdx, "256\0512\01024\0");
+        ImGui.SameLine(); ImGui.Checkbox(Loc.TL("DXT5"), ref miDxt);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("DXT5 is a quarter the size and what retail ships.\nUncompressed is larger but exact - use it if a texture shows blocking."));
+        ImGui.Checkbox(Loc.TL("Solid (bake collision)"), ref miCollision);
+        if (miCollision) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("EXPERIMENTAL - the collision BSP is written empty; test in game."));
+        ImGui.SetNextItemWidth(120f * uiScale);
+        DrgF(Loc.TL("Draw distance"), ref miDrawDist, 5f, 0f, 4000f, miDrawDist > 0f ? "%.0f m" : "default");
+
+        ImGui.Separator();
+        bool ready = miMesh is not null && so is not null && meshLib is not null && levelDir is not null;
+        if (!ready) ImGui.BeginDisabled();
+        if (ImGui.Button(Loc.TL("Add to level"), new Vector2(160f * uiScale, 0f)))
+            if (CreateModelObject()) showModelImport = false;
+        if (!ready) ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Cancel"))) showModelImport = false;
+    }
+    ImGui.End();
+}
+
+bool CreateModelObject()
+{
+    if (miMesh is null || so is null || meshLib is null || levelDir is null) return false;
+    try
+    {
+        int maxTex = miMaxTexIdx == 0 ? 256 : miMaxTexIdx == 2 ? 1024 : 512;
+
+        // Nothing runs the object's folder unless Init.con says so, and most levels ship no such line - so if there
+        // is no Init.con to patch, refuse rather than queue files that can never load. (Same guard as the decal.)
+        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
+        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the model in.")); return false; }
+
+        var (baseSub, levelName) = LevelIdentity();
+        string name = SanitizeTemplate(miName.Trim().Length > 0 ? miName : Path.GetFileNameWithoutExtension(miPath));
+
+        // Re-read the source rather than fitting the copy the dialog is describing, so changing a setting and
+        // pressing the button again starts from the authored geometry instead of compounding the last fit.
+        var mesh = ObjMesh.Load(miPath);
+        var fit = MeshFit.Apply(mesh, new MeshFitOptions {
+            Up = miUpAxis == 1 ? UpAxis.Z : UpAxis.Y,
+            Fit = miFitMode == 1 ? FitMode.Height : miFitMode == 2 ? FitMode.LongestSide : FitMode.AsAuthored,
+            TargetMeters = miTarget,
+            Scale = miFitMode == 0 ? miScale : 1f,
+            Origin = miOrigin == 1 ? OriginMode.Center : miOrigin == 2 ? OriginMode.Keep : OriginMode.Base,
+        });
+
+        // Materials + textures from the .obj's .mtl, resolved relative to the .obj. Each picture is forced to a
+        // power of two (the texture manager silently DROPS anything else) and given a mip chain, or it shimmers at
+        // distance. The texture name is prefixed with the template so two imports cannot fight over one file.
+        var dir = Path.GetDirectoryName(miPath) ?? ".";
+        var mtl = new Dictionary<string, ObjMaterial>(StringComparer.OrdinalIgnoreCase);
+        foreach (var lib in mesh.MtlLibs)
+        {
+            var mp = Path.Combine(dir, lib);
+            if (File.Exists(mp)) foreach (var kv in ObjMtl.Load(mp)) mtl[kv.Key] = kv.Value;
+        }
+
+        var bindings = new List<RefractorForge.Formats.Con.ModelObject.Material>();
+        var textures = new List<RefractorForge.Formats.Con.ModelObject.Texture>();
+        var previews = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);   // source material -> picture
+        int missing = 0;
+        foreach (var sourceMat in mesh.SubMeshes.Select(s => s.Material).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            mtl.TryGetValue(sourceMat, out var mm);
+            var diffuse = mm?.Diffuse ?? new RefractorForge.Formats.Geometry.Vec3(1f, 1f, 1f);
+            string? texName = null;
+            Texture2D? pic = null;
+            if (mm?.TextureFile is { Length: > 0 } tf)
+            {
+                pic = LoadImageAsTexture(Path.Combine(dir, tf));
+                if (pic is null) missing++;
+                else
+                {
+                    texName = RefractorForge.Formats.Con.DecalObject.Sanitize(name + "_" + (mm.TextureName ?? sourceMat));
+                    if (!textures.Any(t => t.Name.Equals(texName, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        pic = DdsTexture.ToPowerOfTwo(pic, 4, maxTex);
+                        textures.Add(new RefractorForge.Formats.Con.ModelObject.Texture(
+                            texName, miDxt ? DxtEncoder.EncodeDxt5Mipped(pic) : DdsTexture.EncodeUncompressedMipped(pic)));
+                    }
+                }
+            }
+            previews[sourceMat] = pic;
+            bindings.Add(new RefractorForge.Formats.Con.ModelObject.Material(sourceMat, texName, diffuse));
+        }
+
+        var built = RefractorForge.Formats.Con.ModelObject.Build(levelName, name, mesh, bindings, textures,
+                                                                 miCollision, baseSub, miDrawDist);
+
+        // Queue every file for the save, then the two registration patches - both built on the newest queued copy,
+        // so a second import adds to the first rather than replacing it.
+        foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        BroadcastLevelFiles(built.Template, built.Files);
+
+        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine))));
+
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
+
+        // Show it now, under the template name, exactly as an imported .obj is. The renderer is handed the ORIGINAL
+        // material names because Build renamed the mesh's in place, so look up through the submesh order instead.
+        var renamedToSource = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (s, i) in mesh.SubMeshes.Select((s, i) => (s, i)))
+            renamedToSource[s.Material] = bindings.Count > 0 ? bindings[Math.Min(i, bindings.Count - 1)].SourceName : s.Material;
+        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, m =>
+        {
+            var src = renamedToSource.TryGetValue(m, out var s0) ? s0 : m;
+            var b = bindings.FirstOrDefault(x => x.SourceName.Equals(src, StringComparison.OrdinalIgnoreCase));
+            var col = b is not null ? new Vector3(b.Diffuse.X, b.Diffuse.Y, b.Diffuse.Z) : Vector3.One;
+            return (col, previews.TryGetValue(src, out var p) ? p : null);
+        }));
+        importedObjs[built.Template] = built.Mesh;
+        importMaterials[built.Template] = built.MaterialNames.Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select((mn, i) => (mn, (string?)(i < textures.Count ? textures[i].Name : null), Vector3.One)).ToList();
+        BroadcastObjMesh(built.Template);
+        RebuildCatalog();
+        browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
+
+        string sizeNote = string.Format(Loc.T("{0:0.##} x {1:0.##} x {2:0.##} m"), fit.Width, fit.Height, fit.Depth);
+        Toast(string.Format(Loc.T("Model '{0}' ready ({1}, {2} tex{3}) - click to place it. {4} file(s) will be written on save."),
+                            built.Template, sizeNote, textures.Count,
+                            built.HasCollision ? Loc.T(", solid") : "", built.Files.Count + 2));
+        if (missing > 0) Toast(string.Format(Loc.T("{0} texture file(s) named by the .mtl could not be found next to the model."), missing));
+        return true;
+    }
+    catch (Exception ex) { Toast(Loc.T("Model import failed: ") + ex.Message); return false; }
 }
 
 // ---- Importing a sound ------------------------------------------------------------------------------------------

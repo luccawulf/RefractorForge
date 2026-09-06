@@ -40,3 +40,6 @@ CLAUDE.md
 
 # Release packages built by tools/pack-beta.ps1
 dist/
+
+# Local build + deploy staging output (102 MB of published binaries, not source)
+/artifacts/
