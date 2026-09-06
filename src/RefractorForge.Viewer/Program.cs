@@ -2783,7 +2783,7 @@ void OnLoad()
             // they stay DELIBERATELY tight - a 3-cell world radius reached ~12 m on a 2 km map, which is why objects
             // selected themselves from far away and neighbours were hard to tell apart.
             int hit = glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
-            if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, 10f);
+            if (hit < 0) hit = Picking.PickNearestScreen(cam, lastMouse, fb.X, fb.Y, markers, PickPx(10f));
             if (hit < 0) hit = Picking.PickNearest(ray, markers, MathF.Min(cfg.HorizontalSpacing, 3f));
             bool shift = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
             if (hit < 0)
@@ -3403,6 +3403,17 @@ void OnKeyDown(IKeyboard k, Key key, int _)
 
 bool UiWantsMouse() => imgui is not null && ImGui.GetIO().WantCaptureMouse;
 
+// How forgiving a click is, in framebuffer pixels. Every hit-test radius in the editor was written as a raw pixel
+// count on a 1080p screen, so on a 4K panel the target was literally half the size and selecting anything small
+// became a game of patience. Tolerances are quoted against a 1080p-tall reference and scaled by the real
+// framebuffer, so a click covers the same amount of PICTURE on every display - which is what the eye and the hand
+// actually work in. Read fresh each time: the window can be resized or dragged to another monitor mid-session.
+float PickPx(float referencePx)
+{
+    float h = window.FramebufferSize.Y;
+    return referencePx * Math.Clamp(h <= 0 ? 1f : h / 1080f, 1f, 4f);
+}
+
 // Selected object's world position, and a gizmo length that stays ~constant on screen.
 Vector3 SelPos() => selected >= 0 && so is not null
     ? new Vector3(so.Objects[selected].Position.X, so.Objects[selected].Position.Y, so.Objects[selected].Position.Z)
@@ -3430,8 +3441,9 @@ bool TryPickGameplay(Vector2 px, out GpKind kind, out int index)
     var bestKind = GpKind.ControlPoint; int bestIndex = -1;
     var fb = window.FramebufferSize;
     // Tight on purpose. A generous threshold made handles jump to the cursor from far away and turned two spawns
-    // near each other into a coin toss. The mesh tests above are what should catch the normal case.
-    float best = 12f;
+    // near each other into a coin toss. The mesh tests above are what should catch the normal case. "Tight" is
+    // measured against the picture, not the pixel grid, or it means something different on every monitor.
+    float best = PickPx(12f);
     // Test a spawn by projecting several points along its body height so a click anywhere on the mesh hits.
     void Test(GpKind k, int count, bool show, float bodyHeight)
     {
@@ -12334,7 +12346,7 @@ int PickLight(Vector2 mouse)
     var fb = window.FramebufferSize;
     var vp = cam.ViewProjection;
     int best = -1;
-    float bestD2 = 18f * 18f * uiScale * uiScale;      // generous: a lamp is a small target
+    float bestD2 = PickPx(18f) * PickPx(18f);          // generous: a lamp is a small target
     for (int i = 0; i < lightRig.Lights.Count; i++)
     {
         var l = lightRig.Lights[i];
@@ -13751,7 +13763,7 @@ int PickNote(Vector2 mouse)
         var n = notes.Notes[i];
         var sp = Gizmo.Project(new Vector3(n.Position.X, n.Position.Y + 1.5f, n.Position.Z), vp, fb.X, fb.Y);
         if (float.IsNaN(sp.X)) continue;
-        if (mouse.X >= sp.X - 4 && mouse.X <= sp.X + 16f * uiScale && mouse.Y >= sp.Y - 4 && mouse.Y <= sp.Y + 12f * uiScale) return i;
+        if (mouse.X >= sp.X - PickPx(4f) && mouse.X <= sp.X + PickPx(16f) && mouse.Y >= sp.Y - PickPx(4f) && mouse.Y <= sp.Y + PickPx(12f)) return i;
     }
     return -1;
 }
@@ -14197,7 +14209,7 @@ int PickCombatHandle(Vector2 mouse)
         var sp2 = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.5f, wz), vp, fb.X, fb.Y);
         if (float.IsNaN(sp2.X)) continue;
         float dx = sp2.X - mouse.X, dy = sp2.Y - mouse.Y;
-        if (dx * dx + dy * dy <= 14f * 14f * uiScale * uiScale) return tag;
+        if (dx * dx + dy * dy <= PickPx(14f) * PickPx(14f)) return tag;
     }
     return -1;
 }

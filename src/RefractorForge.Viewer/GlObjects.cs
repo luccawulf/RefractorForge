@@ -12,7 +12,7 @@ namespace RefractorForge.Viewer;
 /// world transform. Textured parts sample their bitmap (alpha-tested for foliage cut-outs); untextured
 /// parts use the per-material shader colour. Smooth normals are accumulated per vertex.
 /// </summary>
-sealed class GlObjects
+public sealed class GlObjects
 {
     private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; public float? Opacity; public bool DepthWrite; }
 
@@ -197,28 +197,65 @@ sealed class GlObjects
         if (!Matrix4x4.Invert(world, out var inv)) return false;
         var lo = Vector3.Transform(rayOrigin, inv);
         var ld = Vector3.TransformNormal(rayDir, inv);
-        return RayAabb(lo, ld, tpl.BbMin, tpl.BbMax, out t);
+        return RayAabb(lo, ld, tpl.BbMin, tpl.BbMax, out t, out _);
     }
 
-    public int Raycast(Vector3 rayOrigin, Vector3 rayDir)
+    /// <summary>
+    /// The object under a world ray, or -1. Each placement's bounding box is tested in its own local space
+    /// (the ray parameter t survives the transform unchanged, so t is directly comparable in world units even
+    /// when the placement is scaled).
+    ///
+    /// A box that ENCLOSES the ray's origin is treated as a last resort rather than an instant winner. The camera
+    /// is routinely inside some large object's box — a hangar, a wall run, anything wide — and a slab test started
+    /// at t = 0 hands that object every click in the level, including clicks on empty sky. Since the box is only a
+    /// proxy for the mesh, being inside one says very little; anything the ray genuinely enters is the better
+    /// answer, and among enclosing boxes the SMALLEST is the one you are most plausibly standing in.
+    /// </summary>
+    public int Raycast(Vector3 rayOrigin, Vector3 rayDir) => RaycastBoxes(PickBoxes(), rayOrigin, rayDir);
+
+    /// <summary>One clickable box: a placement's local bounding box and the transform that puts it in the world.</summary>
+    public readonly record struct PickBox(Matrix4x4 World, Vector3 BbMin, Vector3 BbMax, int Index);
+
+    /// <summary>The visible, mesh-resolved placements as pick boxes. Separated from <see cref="RaycastBoxes"/> so
+    /// the selection geometry can be tested without a GL context.</summary>
+    private IEnumerable<PickBox> PickBoxes()
     {
-        int best = -1; float bestT = float.MaxValue;
         foreach (var (tmpl, world, objIndex) in Placements)
         {
             if (!_templates.TryGetValue(tmpl, out var t)) continue;
             if (HiddenIndices is not null && HiddenIndices.Contains(objIndex)) continue;   // hidden = not clickable
-            if (!Matrix4x4.Invert(world, out var inv)) continue;
-            // Transform the ray into the object's local space and slab-test against the local AABB.
-            var lo = Vector3.Transform(rayOrigin, inv);
-            var ld = Vector3.TransformNormal(rayDir, inv);
-            if (RayAabb(lo, ld, t.BbMin, t.BbMax, out float tHit) && tHit < bestT) { bestT = tHit; best = objIndex; }
+            yield return new PickBox(world, t.BbMin, t.BbMax, objIndex);
         }
-        return best;
     }
 
-    private static bool RayAabb(Vector3 o, Vector3 d, Vector3 min, Vector3 max, out float tHit)
+    public static int RaycastBoxes(IEnumerable<PickBox> boxes, Vector3 rayOrigin, Vector3 rayDir)
+    {
+        int best = -1; float bestT = float.MaxValue;
+        int enclosing = -1; float enclosingVol = float.MaxValue;
+        foreach (var b in boxes)
+        {
+            if (!Matrix4x4.Invert(b.World, out var inv)) continue;
+            // Transform the ray into the box's local space and slab-test. The ray parameter t is unchanged by an
+            // affine transform, so t stays in world units and stays comparable across differently-scaled placements.
+            var lo = Vector3.Transform(rayOrigin, inv);
+            var ld = Vector3.TransformNormal(rayDir, inv);
+            if (!RayAabb(lo, ld, b.BbMin, b.BbMax, out float tHit, out bool inside)) continue;
+            if (inside)
+            {
+                var s = b.BbMax - b.BbMin;
+                float vol = MathF.Abs(s.X * s.Y * s.Z);
+                if (vol < enclosingVol) { enclosingVol = vol; enclosing = b.Index; }
+            }
+            else if (tHit < bestT) { bestT = tHit; best = b.Index; }
+        }
+        return best >= 0 ? best : enclosing;
+    }
+
+    /// <param name="inside">The origin is within the box, so <paramref name="tHit"/> is 0 and means nothing.</param>
+    private static bool RayAabb(Vector3 o, Vector3 d, Vector3 min, Vector3 max, out float tHit, out bool inside)
     {
         tHit = 0f;
+        inside = true;
         float tmin = 0f, tmax = float.MaxValue;
         for (int a = 0; a < 3; a++)
         {
@@ -226,6 +263,7 @@ sealed class GlObjects
             float da = a == 0 ? d.X : a == 1 ? d.Y : d.Z;
             float lo = a == 0 ? min.X : a == 1 ? min.Y : min.Z;
             float hi = a == 0 ? max.X : a == 1 ? max.Y : max.Z;
+            if (oa < lo || oa > hi) inside = false;
             if (MathF.Abs(da) < 1e-9f) { if (oa < lo || oa > hi) return false; }
             else
             {
