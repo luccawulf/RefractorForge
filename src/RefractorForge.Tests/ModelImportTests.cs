@@ -94,10 +94,16 @@ public class ModelImportTests
             Assert.True(Near(MathF.Sqrt(n.X * n.X + n.Y * n.Y + n.Z * n.Z), 1f), "normals stay unit length");
 
         // Z-up (x,y,z) -> Y-up (x,z,-y): the source's +Y (its "forward") becomes -Z, Refractor's forward.
-        var probe = ObjMesh.Parse("v 0 1 0\nv 1 1 0\nv 0 1 1\nf 1 2 3\n");
+        var probe = ObjMesh.Parse("v 0 1 0\nv 1 1 0\nv 0 1 1\nvt 0 0.25\nvt 1 0.25\nvt 0 1\nf 1/1 2/2 3/3\n");
         MeshFit.Apply(probe, new MeshFitOptions { Up = UpAxis.Z, Origin = OriginMode.Keep });
         Assert.True(Near(probe.SubMeshes[0].Positions[0].Z, -1f) && Near(probe.SubMeshes[0].Positions[0].Y, 0f),
                     "+Y in the source becomes -Z");
+        // OBJ's texture origin is bottom-left, the engine's is top-left: V turns over on the way in, or every
+        // imported texture hangs upside down. Off by request, it is left alone.
+        Assert.True(Near(probe.SubMeshes[0].Uvs[0].V, 0.75f) && Near(probe.SubMeshes[0].Uvs[2].V, 0f), "V is turned over");
+        var keep = ObjMesh.Parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0.25\nvt 1 0.25\nvt 0 1\nf 1/1 2/2 3/3\n");
+        MeshFit.Apply(keep, new MeshFitOptions { FlipV = false, Origin = OriginMode.Keep });
+        Assert.True(Near(keep.SubMeshes[0].Uvs[0].V, 0.25f), "FlipV=false leaves V alone");
 
         // LongestSide sizes a vehicle by its length; Center is for something that hangs or spins.
         var car = Cube(half: 0.5f);
@@ -235,6 +241,42 @@ public class ModelImportTests
         // The box is LOD 0's: a coarser copy's own box is slightly smaller, and using it would cull the whole
         // object early.
         Assert.True(Near(sm.BoundingBox[3], l0.BoundingBox[3], 1e-3f), "the bounding box is LOD 0's");
+    }
+
+    [Fact]
+    public void Mtl_paths_with_spaces_and_options_parse_and_missing_textures_are_found_nearby()
+    {
+        // A path with spaces from another machine: the file is the REST of the line, not the last token.
+        var m = ObjMtl.Parse("newmtl car\nKd 1 1 1\nmap_Kd D:/Jose Bronze/Documents/3dvenda/car_jeep_ren.jpg\n");
+        Assert.Equal("D:/Jose Bronze/Documents/3dvenda/car_jeep_ren.jpg", m["car"].TextureFile);
+        Assert.Equal("car_jeep_ren", m["car"].TextureName);
+        // Options come first and take a known number of values.
+        Assert.Equal("my tex.png", ObjMtl.MapFileName("map_Kd -o 1 1 0 -s 2 2 2 -clamp on my tex.png".Split(' ')));
+        Assert.Equal("tex.png", ObjMtl.MapFileName("map_Kd -bm 0.5 tex.png".Split(' ')));
+        Assert.Equal("-2.png", ObjMtl.MapFileName("map_Kd -2.png".Split(' ')));   // a name that starts with a dash and a digit
+
+        string dir = Path.Combine(Path.GetTempPath(), "rfmtl_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(Path.Combine(dir, "Jeep_Renegade_2016"));
+        Directory.CreateDirectory(Path.Combine(dir, "textures", "deep"));
+        try
+        {
+            File.WriteAllBytes(Path.Combine(dir, "Jeep_Renegade_2016", "Car_Jeep_Ren.jpg"), new byte[] { 1 });
+            File.WriteAllBytes(Path.Combine(dir, "textures", "deep", "roof.png"), new byte[] { 1 });
+            File.WriteAllBytes(Path.Combine(dir, "beside.tga"), new byte[] { 1 });
+
+            // The Jeep: a dead absolute path, the file in a subfolder under another case.
+            var found = ObjMtl.ResolveTexture(dir, "D:/Jose Bronze/Documents/3dvenda/car_jeep_ren.jpg");
+            Assert.NotNull(found);
+            Assert.EndsWith("Car_Jeep_Ren.jpg", found);
+            // The same stem in another format, two folders down.
+            Assert.EndsWith("roof.png", ObjMtl.ResolveTexture(dir, "textures\\roof.tga"));
+            // As written, relative to the model.
+            Assert.EndsWith("beside.tga", ObjMtl.ResolveTexture(dir, "beside.tga"));
+            // Truly missing.
+            Assert.Null(ObjMtl.ResolveTexture(dir, "nothing_here.png"));
+            Assert.Null(ObjMtl.ResolveTexture(dir, null));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     [Fact]

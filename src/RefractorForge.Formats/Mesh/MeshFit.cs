@@ -47,6 +47,11 @@ public sealed class MeshFitOptions
     /// <summary>Extra uniform scale, applied in every mode. 1 = none.</summary>
     public float Scale = 1f;
     public OriginMode Origin = OriginMode.Base;
+    /// <summary>Turn the texture space over: an OBJ's image origin is bottom-left (V grows up the picture), the
+    /// engine's — and the editor's, which draws retail meshes correctly — is top-left. Without this every imported
+    /// texture arrives upside down, in the editor and in the game alike. On by default; off only for a mesh that
+    /// already speaks the engine's convention.</summary>
+    public bool FlipV = true;
 }
 
 /// <summary>
@@ -66,6 +71,9 @@ public static class MeshFit
     public static Result Apply(ObjMesh mesh, MeshFitOptions o)
     {
         if (mesh.TotalVertices == 0) return default;
+
+        // 0. Texture space. See FlipV: the picture's origin moves from the bottom-left corner to the top-left.
+        if (o.FlipV) FlipV(mesh);
 
         // 1. Axis. Blender is Z-up with -Y forward; Refractor is Y-up with -Z forward, so (x, y, z) -> (x, z, -y).
         //    That is a proper rotation (determinant +1), so the triangle winding still means what it did and only
@@ -100,6 +108,14 @@ public static class MeshFit
 
         if (scale != 1f || offset != Vec3.Zero) mesh.Transform(scale, offset);
         return new Result(scale, offset, w * scale, h * scale, d * scale);
+    }
+
+    /// <summary>V' = 1 - V on every vertex: the OBJ texture convention turned into the engine's. Its own inverse,
+    /// so applying it twice is a no-op — and a mesh that goes out through the OBJ export is turned back.</summary>
+    public static void FlipV(ObjMesh mesh)
+    {
+        foreach (var s in mesh.SubMeshes)
+            for (int i = 0; i < s.Uvs.Count; i++) s.Uvs[i] = (s.Uvs[i].U, 1f - s.Uvs[i].V);
     }
 
     private static Vec3 ZUpToYUp(Vec3 p) => new(p.X, p.Z, -p.Y);

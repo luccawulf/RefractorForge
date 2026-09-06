@@ -195,6 +195,65 @@ for m in bpy.data.materials:
     mseen.add(n)
     m.name = n
 
+# A downloaded FBX names its textures by paths from its author's machine ("D:/Jose Bronze/Documents/.../car.jpg")
+# while the files sit beside it, usually in a subfolder. Blender keeps the dead path and the image has no data,
+# so before anything is saved, a missing image is looked for by name near the source: the source's folder, its
+# subfolders (three deep), and the same stem in any format Blender reads.
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".dds", ".bmp", ".tif", ".tiff", ".psd", ".exr", ".hdr")
+src_dir = os.path.dirname(os.path.abspath(src))
+_index = None
+
+def file_index():
+    global _index
+    if _index is None:
+        _index = {}
+        for root, dirs, files in os.walk(src_dir):
+            if root[len(src_dir):].count(os.sep) >= 3:
+                dirs[:] = []
+            for f in files:
+                stem, ext = os.path.splitext(f)
+                if ext.lower() in IMAGE_EXTS:
+                    _index.setdefault(f.lower(), os.path.join(root, f))
+                    _index.setdefault(stem.lower(), os.path.join(root, f))
+    return _index
+
+def image_on_disk(img):
+    p = bpy.path.abspath(img.filepath) if img.filepath else ""
+    return p if p and os.path.isfile(p) else None
+
+def find_image(img):
+    ref = img.filepath.replace(chr(92), "/") if img.filepath else img.name
+    base = os.path.basename(ref) or img.name
+    stem = os.path.splitext(base)[0]
+    idx = file_index()
+    for key in (base.lower(), stem.lower(), img.name.lower(), os.path.splitext(img.name)[0].lower()):
+        if key in idx:
+            return idx[key]
+    return None
+
+missing = {}
+for m in bpy.data.materials:
+    if not getattr(m, "use_nodes", True) or m.node_tree is None:
+        continue
+    for node in m.node_tree.nodes:
+        if node.type != 'TEX_IMAGE' or node.image is None:
+            continue
+        img = node.image
+        if img.packed_file is not None or img.has_data or image_on_disk(img):
+            continue
+        found = find_image(img)
+        if found:
+            log("texture '" + img.name + "' was at '" + str(img.filepath) + "'; using " + found)
+            img.filepath = found
+            img.source = 'FILE'
+            try:
+                img.reload()
+            except Exception as e:
+                log("could not reload " + found + ": " + str(e))
+        else:
+            missing[img.name] = img.filepath or ""
+            log("texture '" + img.name + "' NOT FOUND (referenced as '" + str(img.filepath) + "')")
+
 # Every image a material reaches, saved as a PNG beside the OBJ. save_render works whether the image is packed
 # (what the FBX and glTF importers make of embedded textures), generated or on disk. The material -> PNG map is
 # what the .mtl will say below; the exporter's own idea of a packed image's path is a bare file name that
@@ -270,15 +329,19 @@ if os.path.exists(mtl_path):
             if cur in mat_tex:
                 fixed.append("map_Kd " + mat_tex[cur])
             continue
-        if s.startswith("map_Kd") and cur in mat_tex:
+        # The exporter's own texture lines go: ours replaced them, or they name a file that was never found
+        # (a dead absolute path from another machine helps nobody downstream).
+        if s.startswith("map_") or s.startswith("bump ") or s.startswith("refl "):
             continue
         fixed.append(line)
     with open(mtl_path, "w", encoding="utf-8") as f:
         f.write("\n".join(fixed) + "\n")
     log(str(len(mat_tex)) + " material(s) bound to a texture")
 
-# The parts, for the day the importer builds multi-part objects.
-man = {"blender": bpy.app.version_string, "source": src, "materials": sorted(mseen), "textures": images, "objects": []}
+# The parts, for the day the importer builds multi-part objects; and the textures that could not be found, by
+# the path the file gave, so the editor can say exactly what to put where.
+man = {"blender": bpy.app.version_string, "source": src, "materials": sorted(mseen), "textures": images,
+       "missing_textures": missing, "objects": []}
 for o in meshes:
     man["objects"].append({
         "name": o.name,

@@ -74,13 +74,17 @@ public class BlenderBridgeTests
         if (exe is null) return;   // no Blender here: nothing to prove
 
         string dir = Path.Combine(Path.GetTempPath(), "rfbridge_" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(dir);
+        // The fixtures live in their own folder and the conversions go BESIDE it, not under it: the bridge looks
+        // for a missing texture three folders deep below the source, and would otherwise find the PNG an earlier
+        // conversion had just written.
+        string srcDir = Path.Combine(dir, "src");
+        Directory.CreateDirectory(srcDir);
         try
         {
             string fixture = Path.Combine(dir, "make_fixture.py");
             File.WriteAllText(fixture, FixtureScript, new UTF8Encoding(false));
             var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-            foreach (var a in new[] { "--background", "--python-exit-code", "3", "--python", fixture, "--", dir }) psi.ArgumentList.Add(a);
+            foreach (var a in new[] { "--background", "--python-exit-code", "3", "--python", fixture, "--", srcDir }) psi.ArgumentList.Add(a);
             using (var p = System.Diagnostics.Process.Start(psi)!)
             {
                 string outp = p.StandardOutput.ReadToEnd(); string err = p.StandardError.ReadToEnd();
@@ -90,7 +94,7 @@ public class BlenderBridgeTests
 
             foreach (var src in new[] { "fixture.blend", "fixture.fbx", "fixture.glb" })
             {
-                string path = Path.Combine(dir, src);
+                string path = Path.Combine(srcDir, src);
                 Assert.True(File.Exists(path), src + " was not written by the fixture script");
                 var r = BlenderBridge.ConvertToObj(path, Path.Combine(dir, "out_" + Path.GetExtension(src).TrimStart('.')), exe);
                 try { CheckConverted(src, r); }
@@ -100,6 +104,33 @@ public class BlenderBridgeTests
                     throw new Xunit.Sdk.XunitException(ex.Message + "\n--- Blender said ---\n" + BlenderBridge.Tail(r.Log, 25));
                 }
             }
+
+            // The downloaded-model case: fixture_ext.fbx names its texture by an ABSOLUTE path (crate_diffuse.png
+            // beside the fixture). Move that file into a subfolder, so the path in the FBX is dead the way a path
+            // from somebody else's machine is, and the file is where sellers put it. The script must find it.
+            string extFbx = Path.Combine(srcDir, "fixture_ext.fbx");
+            Assert.True(File.Exists(extFbx), "fixture_ext.fbx was not written by the fixture script");
+            Directory.CreateDirectory(Path.Combine(srcDir, "Textures"));
+            File.Move(Path.Combine(srcDir, "crate_diffuse.png"), Path.Combine(srcDir, "Textures", "Crate_Diffuse.png"));
+            var ext = BlenderBridge.ConvertToObj(extFbx, Path.Combine(dir, "out_ext"), exe);
+            try
+            {
+                CheckConverted("fixture_ext.fbx (texture moved to a subfolder)", ext);
+                Assert.Contains("\"missing_textures\": {}", File.ReadAllText(ext.ManifestPath));
+            }
+            catch (Xunit.Sdk.XunitException ex)
+            {
+                throw new Xunit.Sdk.XunitException(ex.Message + "\n--- Blender said ---\n" + BlenderBridge.Tail(ext.Log, 25));
+            }
+
+            // And truly gone: the manifest names what could not be found, and the .mtl carries no dead path.
+            Directory.Delete(Path.Combine(srcDir, "Textures"), true);
+            var gone = BlenderBridge.ConvertToObj(extFbx, Path.Combine(dir, "out_gone"), exe);
+            var man = File.ReadAllText(gone.ManifestPath);
+            Assert.DoesNotContain("\"missing_textures\": {}", man);
+            Assert.Contains("crate_diffuse", man, StringComparison.OrdinalIgnoreCase);
+            var mtl = File.ReadAllText(Path.Combine(Path.GetDirectoryName(gone.ObjPath)!, "model.mtl"));
+            Assert.DoesNotContain("map_Kd", mtl);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -159,6 +190,8 @@ cube.data.materials.append(mat)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(out, "fixture.blend"))
 bpy.ops.export_scene.fbx(filepath=os.path.join(out, "fixture.fbx"), path_mode='COPY', embed_textures=True)
 bpy.ops.export_scene.gltf(filepath=os.path.join(out, "fixture.glb"), export_format='GLB')
+# the way a model from a store arrives: the texture referenced by the absolute path of the author's machine
+bpy.ops.export_scene.fbx(filepath=os.path.join(out, "fixture_ext.fbx"), path_mode='ABSOLUTE', embed_textures=False)
 print("fixture ok")
 """;
 }

@@ -1332,5 +1332,9 @@
  "Writes {0} triangles.": "{0} 個の三角形を書き込みます。",
  "{0} tris": "三角形 {0} 個",
  "{0} tris in {1} LODs": "三角形 {0} 個、LOD {1} 段",
- "{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). The triangle budget below will reduce it on import.": "三角形 {0} 個は、これらのゲームの水準を大きく超えています（主要メッシュで 1,100-2,200、車両全体で 2,000-6,000）。下の三角形の上限で読み込み時に削減されます。"
+ "{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). The triangle budget below will reduce it on import.": "三角形 {0} 個は、これらのゲームの水準を大きく超えています（主要メッシュで 1,100-2,200、車両全体で 2,000-6,000）。下の三角形の上限で読み込み時に削減されます。",
+ "Texture(s) not found next to the model: {0}. Put them beside the model file (any subfolder will do) and import again.": "モデルの隣にテクスチャが見つかりません: {0}。モデルファイルの隣（サブフォルダーでも可）に置いて、もう一度読み込んでください。",
+ "No material names a texture, so the model will be flat-coloured in game. Check the material's image in your modelling tool.": "どのマテリアルもテクスチャを指していないため、ゲーム内では単色になります。モデリングツールでマテリアルの画像を確認してください。",
+ "Converted with Blender: {0} mesh object(s), {1} texture(s).": "Blender で変換しました: メッシュオブジェクト {0} 個、テクスチャ {1} 個。",
+ "Blender could not find {0} texture(s): {1}. Put the file next to the model (any subfolder will do) and choose the model again.": "Blender が {0} 個のテクスチャを見つけられませんでした: {1}。ファイルをモデルの隣（サブフォルダーでも可）に置いて、モデルを選び直してください。"
 }

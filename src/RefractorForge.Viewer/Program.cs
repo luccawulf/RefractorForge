@@ -5841,6 +5841,7 @@ void DoImportObj()
     {
         var obj = ObjMesh.Load(path);
         if (obj.TotalFaces == 0) { Toast(Loc.T("That .obj has no triangles.")); return; }
+        MeshFit.FlipV(obj);   // OBJ's picture origin is bottom-left, the engine's top-left: turned over once, here
         string name = SanitizeTemplate(Path.GetFileNameWithoutExtension(path));
 
         // Per-material colours + textures from the .obj's .mtl (resolved relative to the .obj's folder).
@@ -5860,7 +5861,7 @@ void DoImportObj()
             var col = mm is not null ? new Vector3(mm.Diffuse.X, mm.Diffuse.Y, mm.Diffuse.Z) : new Vector3(0.72f, 0.74f, 0.78f);
             Texture2D? tex = null;
             if (mm?.TextureFile is { Length: > 0 } tf && !texCache.TryGetValue(tf, out tex))
-            { tex = LoadImageAsTexture(Path.Combine(dir, tf)); texCache[tf] = tex; }
+            { tex = LoadImageAsTexture(ObjMtl.ResolveTexture(dir, tf) ?? Path.Combine(dir, tf)); texCache[tf] = tex; }
             if (seenMat.Add(m)) matList.Add((m, mm?.TextureName, col));
             return (col, tex);
         }
@@ -13232,6 +13233,29 @@ void BeginModelLoad()
     miConvert = System.Threading.Tasks.Task.Run(() => BlenderBridge.ConvertToObj(src, work, exe));
 }
 
+// What Blender's conversion produced, from the manifest it wrote: a note for the dialog, and a warning naming any
+// texture it could not find - with the path the file gave, which says where its author kept it.
+(string Note, string? Warn) DescribeConversion(BlenderBridge.Result r)
+{
+    try
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(r.ManifestPath));
+        var root = doc.RootElement;
+        int objects = root.TryGetProperty("objects", out var o) ? o.GetArrayLength() : 0;
+        int texCount = root.TryGetProperty("textures", out var t) ? t.EnumerateObject().Count() : 0;
+        var missing = new List<string>();
+        if (root.TryGetProperty("missing_textures", out var m))
+            foreach (var p in m.EnumerateObject())
+                missing.Add(p.Value.GetString() is { Length: > 0 } path ? $"{p.Name} ({path})" : p.Name);
+        string note = string.Format(Loc.T("Converted with Blender: {0} mesh object(s), {1} texture(s)."), objects, texCount);
+        string? warn = missing.Count == 0 ? null
+            : string.Format(Loc.T("Blender could not find {0} texture(s): {1}. Put the file next to the model (any subfolder will do) and choose the model again."),
+                            missing.Count, string.Join("; ", missing));
+        return (note, warn);
+    }
+    catch { return (Loc.T("Converted with Blender."), null); }
+}
+
 void LoadModelForImport()
 {
     miMesh = null; miInfo = ""; miWarn = "";
@@ -13281,11 +13305,12 @@ void ModelImportDialog()
             else
             {
                 miObjPath = done.Result.ObjPath;
-                var mm = System.Text.RegularExpressions.Regex.Match(done.Result.Log, @"\[rfbridge\] (\d+) mesh object");
-                miBlenderNote = mm.Success
-                    ? string.Format(Loc.T("Converted with Blender: {0} mesh object(s), textures saved as PNG."), mm.Groups[1].Value)
-                    : Loc.T("Converted with Blender.");
+                // Blender's own lines go to the editor log, so a conversion can be read back later.
+                foreach (var line in done.Result.Log.Split('\n'))
+                    if (line.Contains("[rfbridge]")) Console.WriteLine(line.TrimEnd());
+                (miBlenderNote, var texWarn) = DescribeConversion(done.Result);
                 LoadModelForImport();
+                if (texWarn is not null) miWarn = texWarn;
             }
         }
 
@@ -13403,7 +13428,7 @@ bool CreateModelObject()
         var bindings = new List<RefractorForge.Formats.Con.ModelObject.Material>();
         var textures = new List<RefractorForge.Formats.Con.ModelObject.Texture>();
         var previews = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);   // source material -> picture
-        int missing = 0;
+        var missingTex = new List<string>();
         foreach (var sourceMat in mesh.SubMeshes.Select(s => s.Material).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             mtl.TryGetValue(sourceMat, out var mm);
@@ -13412,8 +13437,10 @@ bool CreateModelObject()
             Texture2D? pic = null;
             if (mm?.TextureFile is { Length: > 0 } tf)
             {
-                pic = LoadImageAsTexture(Path.Combine(dir, tf));
-                if (pic is null) missing++;
+                // Where the .mtl says, or failing that by name beside the model and in its subfolders - a pack's
+                // .mtl often points at the author's own disk.
+                pic = LoadImageAsTexture(ObjMtl.ResolveTexture(dir, tf) ?? Path.Combine(dir, tf));
+                if (pic is null) missingTex.Add(Path.GetFileName(tf.Replace('\\', '/')));
                 else
                 {
                     texName = RefractorForge.Formats.Con.DecalObject.Sanitize(name + "_" + (mm.TextureName ?? sourceMat));
@@ -13486,7 +13513,19 @@ bool CreateModelObject()
         Toast(string.Format(Loc.T("Model '{0}' ready ({1}, {2}, {3} tex{4}) - click to place it. {5} file(s) will be written on save."),
                             built.Template, sizeNote, detail, textures.Count,
                             built.HasCollision ? Loc.T(", solid") : "", built.Files.Count + 2));
-        if (missing > 0) Toast(string.Format(Loc.T("{0} texture file(s) named by the .mtl could not be found next to the model."), missing));
+        // Say plainly when the model will be flat in game, and which file to go and find. A toast fades; this
+        // matters enough to stay on the dialog too, so it lands in miWarn as well.
+        if (missingTex.Count > 0)
+        {
+            miWarn = string.Format(Loc.T("Texture(s) not found next to the model: {0}. Put them beside the model file (any subfolder will do) and import again."),
+                                   string.Join(", ", missingTex.Distinct()));
+            Toast(miWarn);
+        }
+        else if (textures.Count == 0 && bindings.Count > 0)
+        {
+            miWarn = Loc.T("No material names a texture, so the model will be flat-coloured in game. Check the material's image in your modelling tool.");
+            Toast(miWarn);
+        }
         return true;
     }
     catch (Exception ex) { Toast(Loc.T("Model import failed: ") + ex.Message); return false; }

@@ -98,6 +98,21 @@ mip chain. Uncompressed 32-bit by default, which is what the proven decal path s
 the size and what retail uses. The texture name is prefixed with the template so two imports cannot fight over one
 file.
 
+**Where the texture is, versus where the file says it is.** A model from a store names its textures by the paths
+of its author's machine — the first real import, a Jeep Renegade FBX, said
+`D:/Jose Bronze/Documents/3dvenda/.../car_jeep_ren.jpg` while the file sat in a `Jeep_Renegade_2016/` subfolder
+beside the FBX. Both ends now hunt for a missing texture by name near the model — the model's folder and its
+subfolders three deep, matching without regard to case, and accepting the same stem in any other image format:
+the Blender script before it saves (`find_image`), and the editor for an OBJ's `.mtl` (`ObjMtl.ResolveTexture`).
+When a texture still cannot be found, the manifest lists it under `missing_textures` with the path the file gave,
+the `.mtl` carries no dead path, and the dialog says which file to go and find. An `.mtl` `map_Kd` path may
+contain spaces and is parsed as the rest of the line after the options, not the last token.
+
+**The picture is upside down unless V is turned over.** OBJ's texture origin is bottom-left (V grows up the
+picture); the engine's — and the editor's, which draws retail meshes correctly and whose decal quad was checked
+in game — is top-left. `MeshFit` flips V once (`V' = 1 − V`, its own inverse) on import; `MeshFitOptions.FlipV`
+turns it off for a mesh that already speaks the engine's convention. The plain *Import .obj* path does the same.
+
 ## Triangle budget and LODs
 
 Measured across 719 shipped BF1942 meshes: a **hero mesh is 1,100–2,200 triangles** (bf109 fuselage 1,382; Sherman
