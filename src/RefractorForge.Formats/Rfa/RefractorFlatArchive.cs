@@ -45,6 +45,10 @@ public sealed class RefractorFlatArchive
     // ── State ────────────────────────────────────────────────────────────────
 
     private readonly string? _path;   // set when constructed via Open(string)
+
+    /// <summary>The file this archive was read from, or null for one presented from a folder or built in memory.
+    /// Tools show it so a person can see WHICH layer of a mod chain a file actually came from.</summary>
+    public string? SourcePath => _path;
     private readonly Dictionary<string, string>? _looseFiles;   // folder-backed: entry name -> file on disk
     // The source archive's own container bytes, kept verbatim so a repack can reproduce them rather than
     // substituting our own. Porting work on a real BFV map showed how little slack the container has: a rebuilt

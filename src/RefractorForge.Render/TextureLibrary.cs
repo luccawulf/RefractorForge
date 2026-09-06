@@ -89,6 +89,33 @@ public sealed class TextureLibrary
         catch { return null; }
     }
 
+    /// <summary>Every copy of a texture across the opened archives, in the order the engine would prefer them:
+    /// the winner first, then the ones it shadows. A mod that ships a small stand-in for a base-game texture -
+    /// GCMOD replaces BF1942's 4096-square bf109 skin with a 64-square placeholder - is invisible otherwise, and
+    /// looks like the tool picked a low-detail file. Each entry carries the archive it came from and its size.</summary>
+    public IReadOnlyList<(string EntryName, string? Archive, int Width, bool Dxt, int Bytes)> AllCopies(string? shaderTextureName)
+    {
+        var result = new List<(string, string?, int, bool, int)>();
+        if (string.IsNullOrWhiteSpace(shaderTextureName)) return result;
+        string n = shaderTextureName.Replace('\\', '/').Trim();
+        string baseN = (n.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) || n.EndsWith(".tga", StringComparison.OrdinalIgnoreCase)) ? n[..^4] : n;
+        var leaf = baseN[(baseN.LastIndexOf('/') + 1)..];
+        var seen = new HashSet<(string, string?)>();
+        foreach (var arc in _archives)
+            foreach (var e in arc.Entries)
+            {
+                var norm = e.Name.Replace('\\', '/');
+                var bn = norm[(norm.LastIndexOf('/') + 1)..];
+                if (!bn.Equals(leaf + ".dds", StringComparison.OrdinalIgnoreCase)
+                    && !bn.Equals(leaf + ".tga", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!seen.Add((e.Name, arc.SourcePath))) continue;
+                int width = 0; bool dxt = false;
+                try { var head = arc.Read(e); (width, dxt) = DdsTexture.HeaderInfo(head); } catch { }
+                result.Add((e.Name, arc.SourcePath, width, dxt, e.UncompressedSize));
+            }
+        return result;
+    }
+
     private RefractorFlatArchiveEntry? Find(string name)
     {
         string n = name.Replace('\\', '/').Trim();
