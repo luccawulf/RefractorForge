@@ -76,6 +76,19 @@ public sealed class TextureLibrary
         return tex;
     }
 
+    /// <summary>The archive entry a shader texture reference resolves to - its exact name inside the archive and
+    /// its undecoded bytes. This is what a tool needs to write a REPLACEMENT: a patch archive must carry the
+    /// texture under the same name the base does, and the base file's own header says which DDS format the game
+    /// expects back. Null when nothing resolves.</summary>
+    public (string EntryName, byte[] Bytes)? ResolveRaw(string? shaderTextureName)
+    {
+        if (string.IsNullOrWhiteSpace(shaderTextureName)) return null;
+        var entry = Find(shaderTextureName);
+        if (entry is null) return null;
+        try { return (entry.Name, Owner(entry).Read(entry)); }
+        catch { return null; }
+    }
+
     private RefractorFlatArchiveEntry? Find(string name)
     {
         string n = name.Replace('\\', '/').Trim();

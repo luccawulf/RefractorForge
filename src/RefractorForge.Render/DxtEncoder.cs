@@ -64,6 +64,84 @@ public static class DxtEncoder
     }
 
     public static int Dxt1Size(int w, int h) => Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * 8;
+    public static int Dxt5Size(int w, int h) => Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * 16;
+
+    /// <summary>
+    /// DXT5 (BC3) with a full mip chain: the format the games ship for any object texture whose alpha matters -
+    /// window glass, cut-out grilles, decals with soft edges, and every BFVietnam texture whose alpha is a gloss
+    /// mask. Each 4x4 block is an 8-byte interpolated-alpha block followed by the same colour block DXT1 uses.
+    /// The alpha block is written in the 8-value mode (a0 &gt; a1), whose palette is exactly what
+    /// <see cref="DdsTexture"/>'s decoder rebuilds, so an encode/decode round trip holds every endpoint texel.
+    /// </summary>
+    public static byte[] EncodeDxt5Mipped(Texture2D top)
+    {
+        var levels = new List<Texture2D> { top };
+        while (levels[^1].Width > 1 || levels[^1].Height > 1) levels.Add(HalveBox(levels[^1]));
+
+        int total = 0;
+        foreach (var l in levels) total += Dxt5Size(l.Width, l.Height);
+        var buf = new byte[128 + total];
+        buf[0] = (byte)'D'; buf[1] = (byte)'D'; buf[2] = (byte)'S'; buf[3] = (byte)' ';
+        void U32(int off, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off), v);
+        U32(4, 124);
+        U32(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000);   // CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT|LINEARSIZE
+        U32(12, (uint)top.Height);
+        U32(16, (uint)top.Width);
+        U32(20, (uint)Dxt5Size(top.Width, top.Height));
+        U32(28, (uint)levels.Count);
+        U32(76, 32);
+        U32(80, 0x4);                                           // DDPF_FOURCC
+        buf[84] = (byte)'D'; buf[85] = (byte)'X'; buf[86] = (byte)'T'; buf[87] = (byte)'5';
+        U32(108, 0x1000 | 0x8 | 0x400000);                      // TEXTURE|COMPLEX|MIPMAP
+        int o = 128;
+        foreach (var l in levels) o += EncodeLevelDxt5(l, buf, o);
+        return buf;
+    }
+
+    private static int EncodeLevelDxt5(Texture2D t, byte[] dst, int at)
+    {
+        int w = t.Width, h = t.Height, bw = Math.Max(1, (w + 3) / 4), bh = Math.Max(1, (h + 3) / 4);
+        var px = t.Rgba;
+        Span<byte> r = stackalloc byte[16], g = stackalloc byte[16], b = stackalloc byte[16], a = stackalloc byte[16];
+        int o = at;
+        for (int by = 0; by < bh; by++)
+            for (int bx = 0; bx < bw; bx++)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    int x = Math.Min(w - 1, bx * 4 + (i & 3)), y = Math.Min(h - 1, by * 4 + (i >> 2));
+                    int p = (y * w + x) * 4;
+                    r[i] = px[p]; g[i] = px[p + 1]; b[i] = px[p + 2]; a[i] = px[p + 3];
+                }
+                EncodeAlphaBlock(a, dst, o);
+                EncodeBlock(r, g, b, dst, o + 8);
+                o += 16;
+            }
+        return o - at;
+    }
+
+    // The 8-value alpha block: endpoints are the block's extremes, six interpolants between them (the decoder's own
+    // formula), and each texel takes the nearest. a0 == a1 is legal and means a flat block.
+    private static void EncodeAlphaBlock(ReadOnlySpan<byte> a, byte[] dst, int o)
+    {
+        int lo = 255, hi = 0;
+        for (int i = 0; i < 16; i++) { if (a[i] < lo) lo = a[i]; if (a[i] > hi) hi = a[i]; }
+        dst[o] = (byte)hi; dst[o + 1] = (byte)lo;
+        if (hi == lo) { for (int i = 2; i < 8; i++) dst[o + i] = 0; return; }
+
+        Span<int> pal = stackalloc int[8];
+        pal[0] = hi; pal[1] = lo;
+        for (int i = 1; i <= 6; i++) pal[i + 1] = ((7 - i) * hi + i * lo) / 7;
+
+        ulong bits = 0;
+        for (int i = 0; i < 16; i++)
+        {
+            int best = 0, bestD = int.MaxValue;
+            for (int k = 0; k < 8; k++) { int d = Math.Abs(a[i] - pal[k]); if (d < bestD) { bestD = d; best = k; } }
+            bits |= (ulong)best << (3 * i);
+        }
+        for (int i = 0; i < 6; i++) dst[o + 2 + i] = (byte)(bits >> (8 * i));
+    }
 
     private static int EncodeLevel(Texture2D t, byte[] dst, int at)
     {
