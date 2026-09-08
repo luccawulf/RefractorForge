@@ -35,6 +35,42 @@ public sealed class RsShaderSet
 
     public IReadOnlyDictionary<string, MaterialShader> Materials => _byName;
 
+    /// <summary>
+    /// The file's statements, one per yield. NOT one per line: the grammar terminates a statement with <c>;</c> and
+    /// retail packs more than one onto a line. <c>standardMesh/C02F_rice_M1.rs</c> ends
+    /// <c>materialSpecularPower 12.5;\ttexture "texture/C04F_rice_grass";</c> - so a line-based reader saw only the
+    /// specular power, never the texture, and the rice paddies loaded untextured. A trailing <c>//</c> comment is
+    /// cut first (retail shaders carry them), and quotes are respected so neither a <c>;</c> nor a <c>//</c> inside
+    /// a texture name can split anything.
+    /// </summary>
+    private static IEnumerable<string> Statements(string text)
+    {
+        foreach (var rawLine in text.Split('\n'))
+        {
+            string line = rawLine.TrimEnd('\r');
+            bool q = false;
+            for (int i = 0; i + 1 < line.Length; i++)
+            {
+                if (line[i] == '"') q = !q;
+                else if (!q && line[i] == '/' && line[i + 1] == '/') { line = line[..i]; break; }
+            }
+            q = false;
+            int start = 0;
+            for (int i = 0; i < line.Length; i++)
+            {
+                if (line[i] == '"') q = !q;
+                else if (!q && line[i] == ';')
+                {
+                    var frag = line[start..i].Trim();
+                    if (frag.Length > 0) yield return frag;
+                    start = i + 1;
+                }
+            }
+            var tail = line[start..].Trim();
+            if (tail.Length > 0) yield return tail;
+        }
+    }
+
     public static RsShaderSet Parse(string text)
     {
         var set = new RsShaderSet();
@@ -42,9 +78,8 @@ public sealed class RsShaderSet
         Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
         float? alphaRef = null; bool gloss = false; float? opacity = null; bool depthWrite = true;
 
-        foreach (var rawLine in text.Split('\n'))
+        foreach (var line in Statements(text))
         {
-            string line = rawLine.Trim().TrimEnd('\r');
             if (line.StartsWith("subshader", StringComparison.OrdinalIgnoreCase))
             {
                 // subshader "Name" "StandardMesh/Default"

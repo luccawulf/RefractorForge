@@ -112,6 +112,11 @@ uniform vec2 uTerUvScale; uniform vec2 uTerUvOffset;
 uniform int uShowMat; uniform sampler2D uMat;
 uniform int uHasDetail; uniform sampler2D uDetail; uniform float uDetailScale;
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map
+// The BAKED terrain sun-shadow - the level's LightmapShadowBits.lsb on load, or what 'Bake Sun Shadows' just made.
+// This is the one the GAME reads, so showing it is the only way to see what a bake actually did; the real-time map
+// above is a camera-following preview that is never written anywhere. Sampled with the raw terrain UV because
+// TerrainShadow.Bake writes texel (x,y) -> world (x/size*worldSize, y/size*worldSize), the untouched mapping.
+uniform int uUseBakedShadow; uniform sampler2D uBakedShadow;
 // The level's lighting (Init.con renderer.ambientColor / diffuseColor), balanced so the pair sums to the editor's
 // old flat 0.4/0.6 exposure - the level tints the light, it does not change how bright the editor is.
 uniform vec3 uAmbLight; uniform vec3 uDifLight;
@@ -180,6 +185,7 @@ void main(){
     if (uHasDetail==1) baseCol *= clamp(texture(uDetail, vUv*uDetailScale).rgb*2.0, 0.0, 1.0);
     vec3 n = normalize(vN);
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
+    if (uUseBakedShadow==1) vis *= texture(uBakedShadow, vUv).r;   // and the baked .lsb the game will read
     vec3 d = uAmbLight + uDifLight*max(0.0, dot(n, normalize(uLightDir)))*vis;
     d = mix(d, uNightAmb, uNight);                 // night pulls the sun down toward moonlight
     // A texel cannot hold more than white, so a pool can never be brighter than the scene light itself. Showing
@@ -243,6 +249,7 @@ uniform vec2 uScroll1; uniform vec2 uScroll2; uniform vec2 uScrollN;   // direct
 uniform float uTile1; uniform float uTile2; uniform float uTileN;     // water.tileLayer*
 uniform vec3 uSpecColor;
 uniform float uReflect; uniform int uHasSkyCube; uniform samplerCube uSkyCube;   // levelWater.rs 'reflectivity', mirrored off the level's own sky
+uniform float uWaterOpacityMul;   // levelWater.rs 'opacity', as the engine applies it - see where it is set
 // The sky is DRAWN turned by this; its reflection has to be turned by the same amount or the water mirrors a sky
 // that is not the one overhead. Same convention as the sky shader: rotating the LOOKUP is the inverse of rotating
 // the box, so the signs here are the mirror of a CreateRotationY.
@@ -310,6 +317,11 @@ void main(){
         col = mix(col, uFogColor, fres*0.35);                                   // grazing-angle reflection of the sky/haze
         alpha = mix(uWaterAlpha, 1.0, fres*0.4);                          // transparent looking down, opaque at grazing
     }
+    // levelWater.rs 'opacity'. The engine multiplies the water's alpha by it directly (RaShaderWater.fx:
+    // alpha = pow(1-dirToEye.y, uvSpeed.z) * opacity * clamp(dist/waterFade,0,4) * vertexAlpha), and everything
+    // above is our stand-in for the rest of that expression. Without this the .rs opacity - the value that
+    // actually decides how see-through BfVietnam's water is - changed nothing in the viewport.
+    alpha = clamp(alpha * uWaterOpacityMul, 0.0, 1.0);
     // Sky reflection: the levelWater.rs reflectivity knob, off the real cubemap when the level has one, else the haze.
     vec3 rd = reflect(-viewDir, n);
     float scr = cos(uSkyRot), ssr = sin(uSkyRot);
@@ -615,6 +627,9 @@ bool placingNote = false;
 // Level-local files created in-session (decal objects) that a save must carry: written straight into the
 // folder on a folder save, upserted into the .rfa on an archive save.
 List<(string RelPath, byte[] Bytes)> pendingLevelFiles = new();
+// The level's StandardMesh/*.rs paths, found once. The inspector asks every frame whether the selected object has
+// a shader it could brighten, and re-walking the archives for that would be absurd.
+List<string>? shaderFilesCache = null;
 // Unsaved-work guard. Saving records what it saw (SaveSignature); leaving while the state reads differently asks
 // first. exitPending is the leave that was interrupted, run again once the user has answered.
 string savedSignature = "";
@@ -628,6 +643,11 @@ string decalName = "poster1";
 string decalImagePath = "";
 float decalW = 2f, decalH = 1.5f;
 bool decalFlat = false;
+// Light pools: the additive glow quads that put a lamp's light ON a surface. See Formats/Cons/LightPool.cs for why
+// this, and not the lightmap, is what makes a lamp visible.
+float lpDiameter = 8f, lpBrightness = 0.7f, lpSoftness = 0.6f, lpDrop = 3f;
+Vector3 lpColour = new(0.972f, 0.933f, 0.804f);   // retail's own bulb glow, 248/238/205
+int lpShape = 0;                                   // 0 = pool on the floor, 1 = glow at the bulb
 // Model import dialog: a 3D model from outside -> a level-local static object.
 bool showModelImport = false;
 string miPath = "", miName = "", miInfo = "", miWarn = "";
@@ -677,9 +697,56 @@ RefractorForge.Formats.Validation.IssueSeverity mapReportMin = RefractorForge.Fo
 Dictionary<uint, int[]> plLocs = new();
 int selLight = -1;              // index into lightRig.Lights, -1 = none
 bool showLightGizmos = true;
+bool showSoundRings = true;       // how far each placed ambient sound carries, drawn on the ground
 bool groundLightsLive = true;     // draw the placed lights on the terrain live; a ground bake turns this off (the pool is in the texture then)
 float groundBakeStrength = 1f;    // scales the pool a ground bake burns in
 bool showTunnels = false;         // the Tunnels (BFV 1.2) window
+// Object lightmap bake quality. Three knobs move together, so they are one choice: sub-samples per texel AXIS
+// (what smooths a shadow edge - one sample per texel is what makes a bake look jagged), texels per metre of
+// surface, and a ceiling on any one map. The bake is pure CPU across every core, and the cost is roughly
+// samples squared times the texel count, so the top setting is minutes rather than seconds on a big map - which
+// is why it runs in the background behind a progress bar instead of freezing the editor.
+int lmQuality = 2;                 // 0 draft, 1 good, 2 high - and High is the ceiling, see ApplyLightmapQuality
+int lmBakeSamples = 3;
+float lmTexelsPerMetre = 40f;
+int lmBakeMaxSize = 1024;
+// A bake in flight: the worker, its progress, and everything the finish step needs back on the GL thread.
+bool lmBaking = false;
+int lmDone = 0, lmTotal = 0;
+double lmBakeStarted = 0;
+System.Threading.CancellationTokenSource? lmCancel = null;
+System.Threading.Tasks.Task? lmTask = null;
+List<(StaticObject O, string MeshName, MeshLibrary.Mesh Mesh, bool Primary)>? lmJobs = null;
+Texture2D?[]? lmResults = null;
+float[]? lmFallbackLit = null;          // for jobs with no unwrap: the fraction of the mesh the sun reaches
+int lmNoSlot = 0;
+
+// ---- Terrain sun-shadow bake (LightmapShadowBits.lsb) ------------------------------------------------------------
+// Same shape as the lightmap bake above, and for the same reason: it now casts every placed object into the terrain
+// shadow, not just the heightmap against itself. On a city map the heightmap-only bake was effectively empty - the
+// buildings ARE the shadows - and it read in game as "the bake did nothing".
+bool sbBaking = false;
+int sbDone = 0, sbTotal = 0;
+double sbBakeStarted = 0;
+int sbTriangles = 0;                    // occluder size, for the progress readout
+bool sbWithObjects = true;              // include placed objects as shadow casters
+System.Threading.CancellationTokenSource? sbCancel = null;
+System.Threading.Tasks.Task? sbTask = null;
+Texture2D? sbPreview = null;            // the visibility map, for the viewport + the .dds export
+RefractorForge.Formats.Terrain.LightmapShadowBits? sbLsb = null;     // what the worker packed
+// The packed shadow the SAVE writes. Held from the bake so saving does not silently re-run a minutes-long bake -
+// and so what the game gets is exactly what the viewport showed.
+RefractorForge.Formats.Terrain.LightmapShadowBits? bakedShadowLsb = null;
+bool showBakedShadow = false;           // viewport layer for the baked shadow (separate from the real-time preview)
+bool sbThenObjects = false;             // "Bake Both": run the object lightmaps once the shadow bake finishes
+// Merge the baked shadow into the ground texture. This is the ONLY thing that makes a terrain sun-shadow visible
+// in game: retail paints the shadow into the tx tiles (measured on Fall_of_Saigon - see
+// LightBake.MultiplyShadowIntoAtlas), and a .lsb on its own changes nothing on screen, proven with a 50%
+// checkerboard .lsb that rendered identically in game.
+bool sbMergeToGround = true;
+float sbShadowLevel = 0.5f;             // what fully shadowed ground keeps; 0.5 matches retail
+HashSet<string>? lmExisting = null;      // lightmap files the level already ships, snapshotted when a bake starts
+Dictionary<byte, byte[]> uniformLightmapCache = new();   // flat fallback lightmaps, cached by their grey value
 bool showTunnelEntries = true;    // draw the entry-point spheres: where a soldier passes through the terrain
 // The BFV water shader (standardMesh/levelWater.rs): reflectivity + opacity, shipped as a level-side override.
 float waterReflect = 0.20f, waterOpacity = 0.35f; bool waterShaderLoaded = false; string? waterRsText = null;
@@ -690,12 +757,14 @@ RefractorForge.Formats.Terrain.WaterShaderSettings waterShaderBase = RefractorFo
 bool decalKeepAspect = true; int decalImgW = 0, decalImgH = 0; string decalInfoPath = ""; bool decalVideo = false;
 // A video decal gets a voice: the movie's own audio track, written as a level sound script on the decal object, so
 // it plays from the middle of the screen and fades with distance like any other ambient sound.
-bool decalSound = true; float decalSoundVol = 0.8f, decalSoundNear = 8f, decalSoundFar = 60f;
+bool decalSound = true; float decalSoundVol = 0.8f, decalSoundNear = 10f, decalSoundFar = 30f;   // ~100 ft of carry
 // How the screen's sound behaves. "Ambient" is autoPlaySound 1 - started with the level, heard by distance, the way
 // every retail speaker and generator works. Without that line the engine ties the sound to the object being DRAWN, so
 // it snaps on at full volume when you look at the screen and stops when you look away; a real effect, and some maps
 // want exactly that, so it is offered rather than fixed.
-int decalSoundMode = 0;                     // 0 = ambient (by distance), 1 = only while looked at
+int decalSoundMode = 1;                     // 0 = separate emitter (by distance), 1 = the .bik's own track
+// Default 1: the .bik's own track is the only way picture and sound stay in step, and the bink DLL patch
+// (bfv_bink_always) is what removes the "only while you look at it" limit that used to make mode 0 necessary.
 bool decalLimitDraw = false;                // stop drawing the screen past a distance...
 float decalLookRange = 120f;                // ...this one. In look-at mode it is also how far the sound carries.
 bool decalSoundStereo = false;              // mono places the sound at the screen; stereo is fuller but not positional
@@ -982,6 +1051,7 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     groupsDirty = true;
     notes = RefractorForge.Formats.Editing.Annotations.Load(levelDir);
     pendingLevelFiles.Clear();
+    shaderFilesCache = null;                     // a new level has its own shaders
     sounds = SoundLibrary.LoadFolder(levelDir);   // recognise + edit placed sound emitters (.ssc)
     loadedShadowBits = LightmapShadowBits.TryLoadFolder(levelDir);   // the level's baked terrain sun-shadow, if present
     // object lightmaps loaded lazily (EnsureObjectLightmaps) - see the .rfa branch note above.
@@ -1315,6 +1385,18 @@ bool foliageDirty = true;                                    // rebuild the foli
 bool showUnderFoliage = false;                               // undergrowth overlay (underGrowth.wst grass/bushes), the same model as the trees
 float underSpacing = 17.5f;                                  // BfVietnam.exe spaces under-growth patches 17.5 m (over-growth 12.5 m)
 float underDensity = 1f;
+// Which BfVietnam build the overgrowth preview should look like. The stock exe and the Veg_* builds do not plant
+// remotely the same amount: stock keeps a 10x10 patch window spaced viewDistance/4 apart, the Veg builds an 80x80
+// one at a hardcoded 12.5 m. On Saigon68 (viewdistance 450) that is 112.5 m vs 12.5 m - the editor was showing
+// about eighty times the trees the retail game does. Default STOCK: that is BfVietnam.exe, what you launch.
+float ogStaticKeep = 1f;                                     // fraction of the forest to keep when baking to static
+// Brighten-decals dialog: which of the level's StandardMesh shaders to lift, and by how much.
+bool showBrightenDialog = false;
+float brightenLevel = 0.65f;
+bool brightenUnlit = false;
+List<(string Rel, bool On)> brightenList = new();
+string brightenFilter = "";                                  // search box in the Brighten Decals dialog
+bool ogStaticDisableProcedural = true;                       // empty the .wst types so the engine stops planting too
 int underFoliageCount = 0;
 int foliageCount = 0;                                        // instances currently in the overlay (for the Layers readout)
 // Weather (rain/snow/dust): a view-only preview overlay + optional generate-into-level on save.
@@ -1446,12 +1528,15 @@ int[] matToSurf = { 0, 2, 3, 4, 5, 6, 10, 11, 8, 12, 14, 13, 15, 15, 9, 1 };
 // terrain sculpting state
 TerrainStroke? stroke = null;          // active sculpt drag (mouse-down..up), coalesced into one undo
 bool terrainDirty = false;             // heightmap changed this frame -> re-upload the terrain VBO
-float brushRadius = 40f;               // metres
-float brushStrength = 2.0f;            // metres-at-centre per dab (Raise/Lower)
+float brushRadius = 1f;                // metres - start small and deliberate; the wheel grows it
+float brushStrength = 0.1f;            // metres per dab (Raise/Lower) - the slider's minimum, so a first drag nudges
 float smoothStrength = 0.5f;           // 0..1 blend-at-centre per dab (Smooth/Flatten)
 // Sculpt brush mode + falloff (the model already supports all of these; the UI now exposes them).
 int sculptModeIdx = 0;                  // Sculpt tool: 0 Raise, 1 Lower, 2 Flatten, 3 Set
-int falloffIdx = 0;                     // 0 Smooth, 1 Linear, 2 Constant, 3 Gaussian (== BrushFalloff order)
+// CONSTANT by default: the whole area inside the brush moves by the same amount, so a square brush raises a
+// SQUARE. Smooth weights the centre and tapers to the rim, which turns every drag into a pointy hill - fine for
+// blending, wrong for building a shape.
+int falloffIdx = 2;                     // 0 Smooth, 1 Linear, 2 Constant, 3 Gaussian (== BrushFalloff order)
 bool flattenLockGround = true;          // Flatten/Set: lock target to the height under the cursor at stroke start
 float flattenTarget = 30f;              // explicit Flatten/Set target height (m) when not locked
 string[] sculptModeLabels = { "Raise", "Lower", "Flatten", "Set", "Hole", "Fill hole" };
@@ -1570,6 +1655,7 @@ float lastShadowRadius = 0f;
 uint depthProg = 0;
 int uLightSpaceD = -1, uModelD = -1;                            // depth-pass program uniforms
 int uLightSpaceT = -1, uShadowMapT = -1, uUseShadowMapT = -1;   // terrain program shadow uniforms
+int uUseBakedShadowT = -1;                                      // baked .lsb layer (sampler is on texture unit 4)
 int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object program shadow uniforms
 // Sun-direction control (azimuth + elevation). When sunOverride is on, the editor lights with these instead of the
 // level's SkyAndSun.con; moving them relights terrain + objects + re-renders the shadow map in real time.
@@ -1611,6 +1697,9 @@ bool lightPreview = true;      // shade the editor with the level's light colour
 bool lightingDirty = false;    // user touched the lighting -> patch Init.con on save
 // Editable fog state (seeded from the level's Init.con; tweaked live in the Environment panel).
 bool fogEnabled = false; Vector3 fogColor = new(0.72f, 0.83f, 0.83f); float fogStart = 100f, fogEnd = 450f;
+// Fog the editor changed to match a swapped skybox, and what it was before, so it can be put straight back.
+bool fogChangedBySky = false;
+(bool On, Vector3 Col, float Start, float End) fogSkyPrev;
 float waterLevelLoaded = 30f; bool waterLevelEdited = false;   // live Water Level slider: original for Reset + dirty flag for save
 Vector3 waterColor = new(0.10f, 0.22f, 0.30f); float waterAlpha = 0.6f;   // water surface colour + transparency (from the level's water.color)
 Vector3 deepColor = new(0.16f, 0.35f, 0.55f);   // submerged-terrain tint (from the level's water.deepcolor)
@@ -2929,6 +3018,8 @@ void OnLoad()
     ApplyTerrainUv();
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uDetail"), 2); // detail sampler -> texture unit 2
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uShadowMap"), 3); // shadow-map sampler -> texture unit 3
+    gl.Uniform1(gl.GetUniformLocation(terrainProg, "uBakedShadow"), 4); // baked .lsb sampler -> texture unit 4
+    uUseBakedShadowT = gl.GetUniformLocation(terrainProg, "uUseBakedShadow");
     gl.Uniform1(uShowMat, 0);
     // Sun shadow-map depth program (depth render of terrain + objects from the sun).
     depthProg = BuildProgram(DepthVert, DepthFrag);
@@ -2955,7 +3046,7 @@ void OnLoad()
         if (terrainTex.HasLegacyTiles)
         {
             atlasPainted = true;
-            Console.WriteLine("Terrain tiles are in a format the game cannot draw (uncompressed / oversized) - they will be re-encoded as DXT1 + mipmaps on the next save.");
+            Console.WriteLine("Terrain tiles are uncompressed, a format the game cannot draw - they will be re-encoded as DXT1 + mipmaps on the next save.");
             Toast(Loc.T("This map's terrain tiles are in a format the game draws BLACK. Save (Ctrl+S) to re-encode them."));
         }
         terrainTexId = UploadTexture(atlasCpu);
@@ -3118,6 +3209,10 @@ void OnLoad()
     uWaterYW = gl.GetUniformLocation(waterProg, "uWaterY");
     uWaterColorW = gl.GetUniformLocation(waterProg, "uWaterColor");
     uWaterAlphaW = gl.GetUniformLocation(waterProg, "uWaterAlpha");
+    // A GL uniform starts at ZERO, and this one MULTIPLIES the water's alpha - so a draw that forgot to set it
+    // would render the water perfectly invisible rather than merely wrong. Seed it neutral at link time; both
+    // draw paths set it properly, and anything added later fails visible instead of vanishing.
+    { gl.UseProgram(waterProg); int uo0 = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo0 >= 0) gl.Uniform1(uo0, 1f); }
     uHasWaterTexW = gl.GetUniformLocation(waterProg, "uHasWaterTex");
     uTexL1W = gl.GetUniformLocation(waterProg, "uTexL1");
     uTexL2W = gl.GetUniformLocation(waterProg, "uTexL2");
@@ -4764,7 +4859,15 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? BakeShadowLsb()
         Console.WriteLine($"Writing a fully lit LightmapShadowBits.lsb ({gridDim}x{gridDim} grid) - lighting unbaked.");
         return TerrainShadow.UnshadowedLsb(gridDim);
     }
-    Console.WriteLine($"Baking LightmapShadowBits.lsb ({gridDim}x{gridDim} grid{(shadowLsbFlipX ? ", flipX" : "")}{(shadowLsbFlipY ? ", flipY" : "")})...");
+    // What "Bake Sun Shadows" produced, if it has run. Saving must write exactly what the viewport showed, and it
+    // must not silently re-run a bake that now casts every building and takes minutes.
+    if (bakedShadowLsb is { } ready)
+    {
+        Console.WriteLine("Writing the LightmapShadowBits.lsb from the last sun shadow bake (objects included).");
+        return ready;
+    }
+    // No bake this session: fall back to the quick terrain-only one so an old save path still writes something.
+    Console.WriteLine($"Baking LightmapShadowBits.lsb ({gridDim}x{gridDim} grid{(shadowLsbFlipX ? ", flipX" : "")}{(shadowLsbFlipY ? ", flipY" : "")}) - terrain only; Tools > Lighting > Bake Sun Shadows also casts the objects.");
     return TerrainShadow.BakeToLsb(heightmap, cfg, sun, gridDim, flipX: shadowLsbFlipX, flipY: shadowLsbFlipY);
 }
 
@@ -4980,7 +5083,12 @@ void DoSaveCore()
             System.IO.Directory.CreateDirectory(dir);
             int n = 0;
             foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu))
-            { System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, fileName), DxtEncoder.EncodeDxt1Mipped(tile)); n++; }
+            {
+                // SplitToTiles yields the tile's ARCHIVE PATH now (Textures/tx00x00.dds); a folder save already
+                // has the Textures dir, so take the leaf or it would nest a second Textures/ inside it.
+                var leaf = System.IO.Path.GetFileName(fileName.Replace('\\', '/'));
+                System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, leaf), DxtEncoder.EncodeDxt1Mipped(tile)); n++;
+            }
             Console.WriteLine($"   Baked {n} terrain texture tile(s) -> {dir}");
             atlasPainted = false;
         }
@@ -5716,7 +5824,7 @@ void InitTerrainShadowOnLoad()
     else
     {
         var sun = env?.SunDirection ?? new Vec3(-0.5f, 0.8f, -0.35f);
-        try { shadowTexId = UploadTexture(TerrainShadow.Bake(1024, heightmap, cfg, sun)); } catch { return; }
+        try { shadowTexId = UploadTexture(TerrainShadow.Bake(2048, heightmap, cfg, sun, blurRadius: 1)); } catch { return; }
         Console.WriteLine("Baked terrain sun-shadow on load (no level lightmap present). Toggle with 'Shadows'.");
     }
 }
@@ -5727,18 +5835,128 @@ void InitTerrainShadowOnLoad()
 // Bake the terrain's sun cast-shadow and ARM IT FOR SAVING. Arming used to live only in the caller, so the
 // standalone "Bake Sun Shadows (terrain)" lit the viewport and the save then wrote nothing - while the combined
 // "Bake Lightmaps" worked, because that one set the flags itself. Every caller wants them, so they belong here.
+//
+// The placed objects are the shadow casters. A heightmap-only bake asks whether the ground shadows ITSELF, which on
+// a city map is close to nothing: Saigon68 came out 5.8% shadowed and looked, correctly, like the bake had done
+// nothing - the buildings that cast every real shadow were not in the calculation at all. So the objects go into a
+// MeshOccluder and every texel casts a ray at the sun through them. That is millions of ray/triangle tests, hence
+// the worker and the progress bar.
+List<(System.Numerics.Vector3 a, System.Numerics.Vector3 b, System.Numerics.Vector3 c)> ShadowCasterTriangles()
+{
+    var tris = new List<(System.Numerics.Vector3, System.Numerics.Vector3, System.Numerics.Vector3)>();
+    if (so is null || meshLib is null) return tris;
+    foreach (var o in so.Objects)
+    {
+        // The PRIMARY LOD only. Adding _m2 as well would double the triangle count for a silhouette that is,
+        // by definition, the same shape seen from further away.
+        var meshName = meshLib.LodGeometryNames(o.Template).FirstOrDefault();
+        if (meshName is null || !meshLib.TryGet(meshName, out var m)) continue;
+        var world = LevelScene.MeshWorld(o);
+        var pos = m.Positions;
+        foreach (var part in m.Parts)
+        {
+            // Skip foliage cards and anything alpha-blended: a tree billboard is a flat quad that would cast a
+            // hard rectangular slab of shadow, which is worse than casting none.
+            if (part.Foliage || part.Blend) continue;
+            var idx = part.Indices;
+            for (int t = 0; t + 2 < idx.Length; t += 3)
+            {
+                int a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
+                tris.Add((System.Numerics.Vector3.Transform(pos[a], world),
+                          System.Numerics.Vector3.Transform(pos[b], world),
+                          System.Numerics.Vector3.Transform(pos[c], world)));
+            }
+        }
+    }
+    return tris;
+}
+
+// Bake the terrain's sun cast-shadow and ARM IT FOR SAVING. Arming used to live only in the caller, so the
+// standalone "Bake Sun Shadows" lit the viewport and the save then wrote nothing - while the combined
+// "Bake Lightmaps" worked, because that one set the flags itself. Every caller wants them, so they belong here.
 void DoBakeShadows(bool announce = true)
 {
     if (heightmap is null) { if (announce) Toast(Loc.T("Load a level with terrain first.")); return; }
+    if (sbBaking) { Toast(Loc.T("A sun shadow bake is already running.")); return; }
     var sun = env?.SunDirection ?? new Vec3(-0.5f, 0.8f, -0.35f);
-    var shadow = TerrainShadow.Bake(1024, heightmap, cfg, sun);
+    var es = EffectiveSun(); sun = new Vec3(es.X, es.Y, es.Z);      // bake from the sun the viewport is showing
+
+    // Resolve the meshes on THIS thread: the mesh library's cache is not thread-safe.
+    MeshOccluder? occ = null;
+    sbTriangles = 0;
+    if (sbWithObjects)
+    {
+        var tris = ShadowCasterTriangles();
+        sbTriangles = tris.Count;
+        occ = MeshOccluder.Build(tris);
+    }
+
+    // gridDim comes from the level's own .lsb when it has one (8x8 or 4x4 is per-map and authoritative).
+    int gridDim = Math.Clamp(cfg.MaterialSize / 64, 1, 16);
+    if (loadedShadowBits is { GridDim: > 0 } lb) gridDim = lb.GridDim;
+    else if (levelDir is not null && System.IO.Directory.Exists(levelDir)
+             && RefractorForge.Formats.Terrain.LightmapShadowBits.TryLoadFolder(levelDir) is { GridDim: > 0 } ex2) gridDim = ex2.GridDim;
+
+    var hmRef = heightmap; var cfgRef = cfg;
+    bool flipX = shadowLsbFlipX, flipY = shadowLsbFlipY;
+    int bakeSize = 2048;
+    sbDone = 0; sbTotal = bakeSize * 2;   // one pass for the preview, one for the packed .lsb
+    sbBaking = true; sbBakeStarted = appClock;
+    sbCancel = new System.Threading.CancellationTokenSource();
+    var token = sbCancel.Token;
+    Console.WriteLine($"Baking sun shadows: {bakeSize}^2, {gridDim}x{gridDim} .lsb grid, "
+                      + (occ is null ? "terrain only" : $"{sbTriangles:N0} object triangle(s) casting")
+                      + (flipX ? ", flipX" : "") + (flipY ? ", flipY" : "") + ".");
+    sbTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        try
+        {
+            // The viewport/.dds preview: soft edges, sub-sampled.
+            sbPreview = TerrainShadow.Bake(bakeSize, hmRef, cfgRef, sun, blurRadius: 1, samples: 2,
+                                           objects: occ, onRow: () => System.Threading.Interlocked.Increment(ref sbDone), cancel: token);
+            // The packed .lsb the game reads: one bit per texel, so no blur and no sub-sampling.
+            sbLsb = TerrainShadow.BakeToLsb(hmRef, cfgRef, sun, gridDim, bakeSize: bakeSize, flipX: flipX, flipY: flipY,
+                                            objects: occ, onRow: () => System.Threading.Interlocked.Increment(ref sbDone), cancel: token);
+        }
+        catch (OperationCanceledException) { }
+    }, token);
+    if (!announce) return;
+}
+
+// The GL-side half: upload the preview, arm the save, export the .dds. Runs on the render thread.
+void FinishShadowBake()
+{
+    sbBaking = false;
+    var shadow = sbPreview; var lsb = sbLsb;
+    sbPreview = null; sbLsb = null;
+    sbCancel?.Dispose(); sbCancel = null; sbTask = null;
+    if (shadow is null || lsb is null) { Toast(Loc.T("Sun shadow bake produced nothing.")); return; }
+
     if (shadowTexId != 0) { gl.DeleteTexture(shadowTexId); shadowTexId = 0; }
     shadowTexId = UploadTexture(shadow);
-    // shadowTexId feeds the .dds export only - the viewport's shadowing comes from the real-time map, so turning the
-    // layer on without marking it dirty left the screen looking identical and the bake looking like it did nothing.
-    showShadows = true; shadowMapDirty = true;
+    showBakedShadow = true;                      // SHOW it - a bake you cannot see reads as a bake that did nothing
+    bakedShadowLsb = lsb;                        // and hand the save exactly what the viewport is showing
     writeShadowLsb = true; bakedLsb = true;      // what actually gets LightmapShadowBits.lsb written on save
     unbakeLighting = false;                      // baking again undoes an unbake
+
+    // How much of the world the bake actually darkened - the number that says whether it did anything.
+    long dark = 0; var rgba = shadow.Rgba;
+    for (int i = 0; i < rgba.Length; i += 4) if (rgba[i] < 128) dark++;
+    double pct = 400.0 * dark / Math.Max(rgba.Length, 1);
+
+    // ...and paint it into the ground, which is the only way the game shows it. The .lsb is written too (retail
+    // ships both), but the .lsb alone is invisible - a 50%-of-the-world checkerboard .lsb rendered no differently
+    // in game, while retail's own tiles are ~x0.5 darker exactly where its .lsb flags shadow.
+    if (sbMergeToGround && atlasCpu is not null)
+    {
+        AtlasFullEdit(() => LightBake.MultiplyShadowIntoAtlas(atlasCpu!, shadow, sbShadowLevel));
+        Console.WriteLine($"   Merged the shadow into the ground texture at {sbShadowLevel:0.00} (Z undoes it; save re-encodes the tiles as DXT1).");
+    }
+    else if (sbMergeToGround)
+        Console.WriteLine("   No terrain texture atlas on this level, so the shadow could not be merged into the ground - the .lsb alone will not be visible in game.");
+    Console.WriteLine($"Sun shadows baked: {pct:0.0}% of the terrain in shadow"
+                      + (sbTriangles > 0 ? $" ({sbTriangles:N0} object triangle(s) cast)" : " (terrain only - no objects cast)") + ".");
 
     // The .dds is a convenience export for folder levels; the .lsb the game reads rides the save either way, so a
     // level opened straight from a .rfa is not a failure - say which happened rather than swallowing it.
@@ -5757,13 +5975,60 @@ void DoBakeShadows(bool announce = true)
     }
     catch (Exception ex) { failed = ex.Message; wrote = null; }
 
-    if (!announce) return;
     BroadcastLightBake();
+    // "Bake Both" chains here so the two progress windows never overlap.
+    if (sbThenObjects)
+    {
+        sbThenObjects = false;
+        if (so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
+        return;
+    }
     Toast(failed is not null
-            ? Loc.T("Sun shadows baked. Save writes LightmapShadowBits.lsb. (TerrainShadow.dds export failed: ") + failed + ")"
+            ? string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow. Save writes LightmapShadowBits.lsb. (TerrainShadow.dds export failed: "), pct) + failed + ")"
         : wrote is not null
-            ? Loc.T("Sun shadows baked, and TerrainShadow.dds written. Save writes LightmapShadowBits.lsb.")
-            : Loc.T("Sun shadows baked. Save writes LightmapShadowBits.lsb into the level."));
+            ? string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow, and TerrainShadow.dds written. Save writes LightmapShadowBits.lsb."), pct)
+            : string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow. Save writes LightmapShadowBits.lsb into the level."), pct));
+}
+
+// What the user sees while the shadow bake runs, and the pump that hands the result back to the GL thread -
+// polled every frame from BuildUi, exactly like the lightmap bake's.
+void ShadowBakeProgress()
+{
+    if (!sbBaking) return;
+    if (sbTask is { IsCompleted: true })
+    {
+        if (sbCancel?.IsCancellationRequested == true)
+        {
+            sbBaking = false; sbPreview = null; sbLsb = null;
+            sbCancel?.Dispose(); sbCancel = null; sbTask = null;
+            Toast(Loc.T("Sun shadow bake cancelled - the level keeps the shadows it had."));
+            return;
+        }
+        FinishShadowBake();
+        return;
+    }
+    var fbS = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbS.X * 0.5f, fbS.Y * 0.5f), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.Always);
+    if (ImGui.Begin("###sbbakeprogress", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                    | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking))
+    {
+        Theme.Heading(Loc.T("Baking sun shadows"));
+        int done = System.Threading.Volatile.Read(ref sbDone);
+        float frac = sbTotal > 0 ? Math.Clamp(done / (float)sbTotal, 0f, 1f) : 0f;
+        ImGui.ProgressBar(frac, new Vector2(-1f, 0f), $"{done} / {sbTotal}");
+        double el = appClock - sbBakeStarted;
+        Theme.Muted(frac > 0.05f
+            ? string.Format(Loc.T("{0:0} s elapsed, about {1:0} s left"), el, Math.Max(0d, el / frac - el))
+            : string.Format(Loc.T("{0:0} s elapsed"), el));
+        Theme.Muted(sbTriangles > 0
+            ? string.Format(Loc.T("{0:N0} object triangle(s) casting into the terrain shadow"), sbTriangles)
+            : Loc.T("Terrain only - no objects are casting"));
+        Theme.Muted(Loc.T("The editor stays usable while this runs."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Cancel##sbbake"), new Vector2(120f * uiScale, 0f))) sbCancel?.Cancel();
+    }
+    ImGui.End();
 }
 // Re-sync GPU buffers after a transform change (no geometry change).
 void SyncTransformEdit() { SyncMarkers(); glObjects?.Sync(so!); UploadMarkers(); }
@@ -6961,9 +7226,96 @@ void RebuildObjects()
 // sun N-L Ã— terrain cast-shadow, rendered into each object's lightmap-UV atlas (ObjectLightmapBaker). Shows the result
 // immediately AND queues the .tga files so a Save writes them into the level (the engine then reads them). This is the
 // object half of "bake lighting to the game"; the terrain half is the .lsb (File > Write LightmapShadowBits on Save).
+// A lightmap's resolution should follow the SURFACE it covers, not be one number for everything: 256 across a hut
+// is generous and 256 across a hangar is a handful of texels per metre, which is the other half of why a bake can
+// look coarse. Sized from the mesh's own extent at roughly `lmTexelsPerMetre` texels per metre, rounded to a power
+// of two and clamped - the atlas packs every face of the object into that one square, so the number is a budget for
+// the whole surface rather than for one wall.
+int LightmapSizeFor(MeshLibrary.Mesh mesh)
+{
+    float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+    float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+    foreach (var p in mesh.Positions)
+    {
+        minX = MathF.Min(minX, p.X); minY = MathF.Min(minY, p.Y); minZ = MathF.Min(minZ, p.Z);
+        maxX = MathF.Max(maxX, p.X); maxY = MathF.Max(maxY, p.Y); maxZ = MathF.Max(maxZ, p.Z);
+    }
+    if (minX > maxX) return 256;
+    float ext = MathF.Max(maxX - minX, MathF.Max(maxY - minY, maxZ - minZ));
+    int want = (int)MathF.Round(ext * lmTexelsPerMetre);
+    int p2 = 64;
+    while (p2 < want && p2 < lmBakeMaxSize) p2 <<= 1;
+    return Math.Clamp(p2, 64, lmBakeMaxSize);
+}
+
+// The three quality settings, as one choice. Sub-samples per texel AXIS smooth the shadow edges; texels per
+// metre decide how much of the surface a map actually resolves; the per-map ceiling stops one large building
+// eating a whole texture budget on its own.
+//
+// HIGH IS THE TOP, AND 1024px IS A HARD ENGINE LIMIT - not a taste. A 2048px setting was offered briefly and it
+// CRASHED THE GAME. That matches what the shipped data says: across all 35 retail Battlefield Vietnam levels,
+// 4,152 object lightmaps are 256px (68%), 128px (15%), 512px (15%) and 1024px (1.6%) - and not one is larger.
+// Saigon68, Fall_of_Saigon, Operation_Cedar_Falls and Landing_Zone_Albany are the four that use 1024s, so that
+// size is proven; anything above it is not a frontier worth revisiting.
+void ApplyLightmapQuality()
+{
+    lmQuality = Math.Clamp(lmQuality, 0, 2);
+    // These are the settings that produced the reference bake the user confirmed looks good AND loads: measured
+    // back off that archive at median 10.9 texels/m, p90 44.3, with 133 maps at 1024px and 161.8 MB of lightmap
+    // surface in total. A previous attempt to "keep the bake inside a texture budget" (32 MB, sizes capped) was
+    // based on a wrong diagnosis and simply made every map coarse - nothing above 256px. Do not reintroduce it
+    // without evidence that texture memory is actually the constraint; 161.8 MB demonstrably is not too much.
+    (lmBakeSamples, lmTexelsPerMetre, lmBakeMaxSize) = lmQuality switch
+    {
+        0 => (1, 16f, 256),
+        1 => (2, 24f, 512),
+        _ => (3, 40f, 1024),
+    };
+}
+
+// The bake runs on a worker; this is what the user sees while it does. Also the pump that hands the finished
+// result back to the GL thread - polled every frame from BuildUi.
+void LightmapBakeProgress()
+{
+    if (!lmBaking) return;
+    if (lmTask is { IsCompleted: true })
+    {
+        if (lmCancel?.IsCancellationRequested == true)
+        {
+            lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null;
+            lmCancel?.Dispose(); lmCancel = null; lmTask = null;
+            Toast(Loc.T("Lightmap bake cancelled - the level keeps the lightmaps it had."));
+            return;
+        }
+        FinishObjectLightmapBake();
+        return;
+    }
+    var fbL = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbL.X * 0.5f, fbL.Y * 0.5f), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.Always);
+    if (ImGui.Begin("###lmbakeprogress", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                    | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking))
+    {
+        Theme.Heading(Loc.T("Baking object lightmaps"));
+        int done = System.Threading.Volatile.Read(ref lmDone);
+        float frac = lmTotal > 0 ? Math.Clamp(done / (float)lmTotal, 0f, 1f) : 0f;
+        ImGui.ProgressBar(frac, new Vector2(-1f, 0f), $"{done} / {lmTotal}");
+        double el = appClock - lmBakeStarted;
+        // Only guess at a finish once enough of it is done for the guess to mean anything.
+        Theme.Muted(frac > 0.05f
+            ? string.Format(Loc.T("{0:0} s elapsed, about {1:0} s left"), el, Math.Max(0d, el / frac - el))
+            : string.Format(Loc.T("{0:0} s elapsed"), el));
+        Theme.Muted(Loc.T("The editor stays usable while this runs."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Cancel##lmbake"), new Vector2(120f * uiScale, 0f))) lmCancel?.Cancel();
+    }
+    ImGui.End();
+}
+
 void BakeObjectLightmaps()
 {
     if (so is null || meshLib is null || heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    if (lmBaking) { Toast(Loc.T("A lightmap bake is already running.")); return; }
     var es = EffectiveSun(); var sunV = new Vec3(es.X, es.Y, es.Z);
     // One job per LOD MESH of each placed object, because that is how the game files lightmaps: O_HueHouse_B's is
     // O_HueHouse_B_M1_<pos>.tga (and _M2_ for the far LOD), never O_HueHouse_B_<pos>.tga - a file named after the
@@ -6982,25 +7334,71 @@ void BakeObjectLightmaps()
         if (!any) noSlot++;
     }
     if (jobs.Count == 0) { Toast(Loc.T("No placed objects with bakeable lightmap UVs on this map.")); return; }
+
+    // Bake on a worker so the editor keeps drawing and the progress bar can move. Everything the baker touches is
+    // pure CPU - meshes already resolved, the heightmap, the light rig - and the GL-side finish happens back on
+    // this thread in FinishObjectLightmapBake when the task reports done.
     var results = new Texture2D?[jobs.Count];
-    System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
-        // Ambient 0: shadow goes to black in the file, as in every retail lightmap, and renderer.LMambientColor is
-        // what lifts it - in the game and in this viewport alike. Baking a floor in as well lit everything twice.
-        results[i] = ObjectLightmapBaker.Bake(jobs[i].Mesh, LevelScene.MeshWorld(jobs[i].O), heightmap, cfg, sunV, 256,
-            ambient: 0f, rig: lightRig.Lights.Count > 0 ? lightRig : null));
+    var fallbackLit = new float[jobs.Count];
+    var hmRef = heightmap; var cfgRef = cfg; var rigRef = lightRig.Lights.Count > 0 ? lightRig : null;
+    int samplesRef = lmBakeSamples;
+    var worlds = new Matrix4x4[jobs.Count];
+    var sizes = new int[jobs.Count];
+    for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
+
+    lmExisting = ExistingLightmapNames();
+    lmJobs = jobs; lmResults = results; lmFallbackLit = fallbackLit; lmNoSlot = noSlot;
+    lmDone = 0; lmTotal = jobs.Count; lmBaking = true; lmBakeStarted = appClock;
+    lmCancel = new System.Threading.CancellationTokenSource();
+    var token = lmCancel.Token;
+    var jobMeshes = jobs.Select(j => j.Mesh).ToArray();
+    lmTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        try
+        {
+            System.Threading.Tasks.Parallel.For(0, jobMeshes.Length,
+                new System.Threading.Tasks.ParallelOptions { CancellationToken = token }, i =>
+            {
+                // Ambient 0: shadow goes to black in the file, as in every retail lightmap, and
+                // renderer.LMambientColor is what lifts it - in the game and in this viewport alike. Baking a
+                // floor in as well lit everything twice.
+                results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
+                    sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef);
+                System.Threading.Interlocked.Increment(ref lmDone);
+            });
+        }
+        catch (OperationCanceledException) { }
+    }, token);
+}
+
+// The GL-side half of the bake: runs on the render thread once the worker is done, because uploading the maps and
+// touching the scene are not the worker's business.
+void FinishObjectLightmapBake()
+{
+    if (lmJobs is not { } jobs || lmResults is not { } results || so is null || meshLib is null) { lmBaking = false; return; }
+    int noSlot = lmNoSlot;
     var olm = new ObjectLightmaps();
     bakedObjectLightmaps.Clear();
     int baked = 0, noUnwrap = 0, lodMaps = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
         var (o, meshName, _, primary) = jobs[i];
-        // Null = the mesh carries the lightmap-UV slot but no unwrap in it (BfVietnam props and walls ship 0,0 on
-        // every vertex). The game's own generator unwraps those itself; we have nothing to write, and writing an
-        // all-black map used to turn them black. They stay dynamically lit.
-        if (results[i] is not { } tex) { if (primary) noUnwrap++; continue; }
         int x = (int)o.Position.X, y = (int)o.Position.Y, z = (int)o.Position.Z;
+        // The leaf, never the raw GeometryTemplate.file - that can be a PATH. See ObjectLightmaps.FileBase.
+        string fileBase = ObjectLightmaps.FileBase(meshName);
+
+        // Null = the mesh carries the lightmap-UV slot but no unwrap in it (BfVietnam props and walls ship 0,0
+        // on every vertex). WRITE NOTHING. The retail client is perfectly happy with a lightmap-channel mesh that
+        // has no map - it simply lights the object dynamically - and that is how these levels have always looked.
+        //
+        // Do NOT be tempted by the debug build's assertion here. A DEBUG BfVietnam asserts on the null texture
+        // handle (RaShaderPVLS1DifLmp.cpp:84, m_LightMapD3DH) and it is easy to read that as "a file is required".
+        // It is not. Supplying a flat white map to satisfy it sets Prelight to 1 over the whole object, and the
+        // shader's saturate(2 * (Prelight * sun * N.L + LMambient)) then blows the entire scene out to solid
+        // white. That is a real regression this code has already shipped once; absence is the correct answer.
+        if (results[i] is not { } tex) { if (primary) noUnwrap++; continue; }
         if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
-        bakedObjectLightmaps[$"{meshName}_{x}-{y}-{z}.tga"] = TgaTexture.EncodeGrayColormapped(tex);
+        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = TgaTexture.EncodeGrayColormapped(tex);
     }
     // The palette the engine loads before the maps: every lightmapped retail level ships one, so a level that
     // never had lightmaps gets one with its first bake (an existing one - Battlecraft's is a colour palette - is kept).
@@ -7008,13 +7406,76 @@ void BakeObjectLightmaps()
     objectLightmaps = olm; objectLightmapsLoaded = true;
     sunOverride = false; showObjectLightmaps = true;     // turn off the dynamic-sun preview so the baked result shows
     glObjects?.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
-    Console.WriteLine($"Baked {baked} object lightmap(s) (256^2) + {lodMaps} far-LOD map(s) from the editor sun; {noUnwrap} mesh(es) have no lightmap unwrap, {noSlot} no lightmap slot at all (both stay sun-lit in the game).");
+    string qName = lmQuality switch { 0 => "draft", 1 => "good", _ => "high" };
+    Console.WriteLine($"Baked {baked} object lightmap(s) + {lodMaps} far-LOD map(s) from the editor sun at {qName} quality " +
+                      $"({lmBakeSamples}x{lmBakeSamples} samples/texel, {lmTexelsPerMetre:0} texels/m, max {lmBakeMaxSize}px) " +
+                      $"in {appClock - lmBakeStarted:0.0}s; {noUnwrap} mesh(es) have no lightmap unwrap and are left without a map " +
+                      $"(the retail game lights those dynamically - writing a blank one turns the scene white), " +
+                      $"{noSlot} object(s) have no lightmap slot at all and are sun-lit in the game.");
+    lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null;
+    lmCancel?.Dispose(); lmCancel = null; lmTask = null;
     Toast(noUnwrap + noSlot > 0
         ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
         : string.Format(Loc.T("Baked {0} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level."), baked));
 }
 
 // Does the level already ship Objectlightmaps/Palette.pal (folder or any of its archives)?
+// A flat lightmap at a given light level, encoded once per distinct value - a hundred props sharing a level cost
+// one 128px TGA. Used for meshes whose lightmap-UV slot carries no unwrap: they cannot hold a varying map, but
+// they can hold the level a real bake would have averaged (see ObjectLightmapBaker.AverageLit), which is what
+// stops them glowing beside the objects that could be unwrapped.
+byte[] UniformLightmap(float lit)
+{
+    byte v = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(lit, 0f, 1f) * 255f), 0, 255);
+    if (uniformLightmapCache.TryGetValue(v, out var cached)) return cached;
+    var enc = TgaTexture.EncodeGrayColormapped(
+        new Texture2D(128, 128, System.Linq.Enumerable.Repeat(v, 128 * 128 * 4).ToArray()));
+    uniformLightmapCache[v] = enc;
+    return enc;
+}
+
+// The lightmap files the level ALREADY ships that hold REAL lighting, by leaf. Snapshotted before a bake, because
+// a bake must never destroy lighting it merely failed to reproduce: a level's un-unwrappable objects are lit by
+// the maps that shipped with it, and overwriting those with a computed flat value throws away real information.
+//
+// FLAT maps are deliberately excluded. They are placeholders - very often ones an earlier bake of ours wrote - and
+// keeping them is how a level got stuck with 293 blank white maps that every later bake politely preserved. A flat
+// map holds nothing worth protecting, so the bake is free to replace it with a properly computed level.
+HashSet<string> ExistingLightmapNames()
+{
+    var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    bool Detailed(byte[] b) { try { return ObjectLightmaps.HasDetail(b); } catch { return true; } }
+    try
+    {
+        if (levelDir is not null && Directory.Exists(levelDir))
+        {
+            foreach (var d in Directory.EnumerateDirectories(levelDir, "*", SearchOption.AllDirectories))
+            {
+                if (!Path.GetFileName(d).Contains("lightmap", StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (var f in Directory.EnumerateFiles(d))
+                {
+                    if (!f.EndsWith(".tga", StringComparison.OrdinalIgnoreCase) && !f.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) continue;
+                    try { if (Detailed(File.ReadAllBytes(f))) set.Add(Path.GetFileName(f)); } catch { }
+                }
+            }
+        }
+        foreach (var rp in rfaList)
+        {
+            if (!File.Exists(rp)) continue;
+            var arch = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rp);
+            foreach (var e in arch.Entries)
+            {
+                var n = e.Name.Replace('\\', '/');
+                if (n.IndexOf("/objectlightmap", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (!n.EndsWith(".tga", StringComparison.OrdinalIgnoreCase) && !n.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) continue;
+                try { if (Detailed(arch.Read(e))) set.Add(n[(n.LastIndexOf('/') + 1)..]); } catch { }
+            }
+        }
+    }
+    catch { /* a bake must not fail because one archive would not open */ }
+    return set;
+}
+
 bool LevelHasLightmapPalette()
 {
     try
@@ -7039,12 +7500,14 @@ bool LevelHasLightmapPalette()
 void BakeAllLighting()
 {
     if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    // Both bakes are background tasks with their own modal progress window, so they are CHAINED rather than
+    // started together: the object lightmaps begin when the shadow bake finishes (see FinishShadowBake).
+    sbThenObjects = so is not null && meshLib is not null;
     DoBakeShadows(announce: false);
-    if (so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
     if (lightRig.Lights.Count > 0 && atlasCpu is not null) { BakeLightsToGround(); bakedGround = true; }
-    showShadows = true; showObjectLightmaps = true;
+    showObjectLightmaps = true;
     BroadcastLightBake();
-    Toast(Loc.T("Lighting baked: terrain shadow, object lightmaps and ground pools. Save writes them all."));
+    Toast(Loc.T("Baking: terrain sun shadows first, then the object lightmaps. Save writes them all."));
 }
 
 // Lazily decode + match the level's per-object lightmaps the first time the layer is enabled. The decode re-opens the
@@ -7204,6 +7667,11 @@ void OnRender(double dt)
         gl.Uniform1(uUseShadowMapT, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
         unsafe { var ls = lightSpace; gl.UniformMatrix4(uLightSpaceT, 1, false, (float*)&ls); }
         if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
+        // The BAKED terrain shadow - the level's .lsb, or the one a bake just produced. Independent of the
+        // real-time map above: this is what the game will draw, so it is the layer to judge a bake by.
+        bool bakedOn = showBakedShadow && shadowTexId != 0;
+        gl.Uniform1(uUseBakedShadowT, bakedOn ? 1 : 0);
+        if (bakedOn) { gl.ActiveTexture(TextureUnit.Texture4); gl.BindTexture(TextureTarget.Texture2D, shadowTexId); gl.ActiveTexture(TextureUnit.Texture0); }
         bool showPaint = toolNames[tool] == "Paint" && paintLayer != 3 && matTexId != 0;   // Texture layer shows the real atlas, no tint
         bool showNav = toolNames[tool] == "AIPath";
         if (showNav) { EnsureAiNav(); if (aiNavTexDirty) UploadAiNavTexture(); if (aiNav is null || aiNavTexId == 0) showNav = false; }
@@ -7404,6 +7872,7 @@ void OnRender(double dt)
         gl.Uniform1(uWaterAlphaW, waterAlpha);                                  // level's transparency
         SetWaterDepthUniforms(shallowColor, deepColor, env?.ColorDepth ?? 20f, cfg.WaterLevel);
         { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
+        { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterOpacity)); }
         { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
         { int usr = gl.GetUniformLocation(waterProg, "uSkyRot"); if (usr >= 0) gl.Uniform1(usr, SkyPreviewYawRad()); }
         if (skyCubeTex != 0)
@@ -7458,6 +7927,7 @@ void OnRender(double dt)
             SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater(), useDepth: false);
             gl.Uniform1(uWaterAlphaW, belowAlpha);
             { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
+            { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterBelowOpacity)); }
             gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
         }
         gl.DepthMask(true);
@@ -8386,15 +8856,41 @@ void Inspector()
             var pal = paintLayer == 1 ? growth?.UnderPalette : growth?.OverPalette;
             int gside = paintLayer == 1 ? (growth?.UnderSide ?? 0) : (growth?.OverSide ?? 0);
             ImGui.TextColored(new Vector4(0.49f, 0.86f, 0.55f, 1f), $"{(paintLayer == 1 ? "Undergrowth" : "Overgrowth")} - {gside}x{gside}");
-            ImGui.Text($"Foliage value #{activeFoliage}{(activeFoliage == 0 ? "  (clear)" : "")}");
+            // WHAT the selected value grows, by name. A growth cell's value is not a density - it selects one of the
+            // palette's material slots, and that slot's types are what the engine plants there. Showing only
+            // "value #6" left you painting a number with no way to know it meant mud, or what grows on mud, on THIS
+            // map (the slots are matched by name, so the same number differs between levels - see
+            // FoliagePalette.SlotForIndex).
+            var folSlot = pal?.SlotForIndex(activeFoliage);
+            string slotName = folSlot?.Name ?? (activeFoliage < RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames.Length
+                                             ? RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames[activeFoliage] : "?");
+            ImGui.Text($"Value #{activeFoliage}  -  {slotName}{(activeFoliage == 0 ? "  (clear)" : "")}");
+            if (activeFoliage != 0)
+            {
+                if (folSlot is null || folSlot.Types.Count == 0)
+                    ImGui.TextColored(new Vector4(1f, 0.72f, 0.3f, 1f), Loc.T("This map grows NOTHING on this value - painting it leaves bare ground."));
+                else
+                    foreach (var t in folSlot.Types)
+                        ImGui.BulletText($"{t.GeometryName}   p {t.Probability:0.##}   scale {t.Scale}");
+            }
             for (int i = 0; i < 16; i++)
             {
                 bool sel = i == activeFoliage;
                 var col = i == 0 ? new Vector4(0.12f, 0.12f, 0.13f, 1f) : matPalette[i];   // value 0 = dark "clear" swatch
+                var iSlot = pal?.SlotForIndex(i);
+                bool grows = iSlot is { Types.Count: > 0 };
+                // A value this map plants nothing on is dimmed, so an empty slot is visible before you paint it.
+                if (!grows && i != 0) col = new Vector4(col.X * 0.35f, col.Y * 0.35f, col.Z * 0.35f, 1f);
                 if (sel) { ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(1f, 1f, 1f, 1f)); ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 2f); }
                 if (ImGui.ColorButton($"fol{i}", col, ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)))
                     activeFoliage = (byte)i;
                 if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
+                string iName = iSlot?.Name ?? (i < RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames.Length
+                                               ? RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames[i] : "?");
+                Theme.Tip(i == 0 ? $"#0  {iName}\n" + Loc.T("Clears the cell.")
+                                 : $"#{i}  {iName}\n" + (grows
+                                     ? string.Join("\n", iSlot!.Types.Select(t => $"   {t.GeometryName}  p {t.Probability:0.##}"))
+                                     : Loc.T("   nothing defined on this map")));
                 if (i % 8 != 7 && i != 15) ImGui.SameLine();
             }
             SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
@@ -8404,12 +8900,21 @@ void Inspector()
             ImGui.Spacing();
             if (pal is not null && pal.DistinctGeometries.Count > 0)
             {
-                ImGui.TextDisabled($"{pal.TypeCount} foliage types defined:");
-                foreach (var gname in pal.DistinctGeometries) ImGui.BulletText(gname);
+                if (ImGui.TreeNode(string.Format(Loc.T("Everything this map can grow here: {0} type(s) over {1} value(s)"),
+                                                 pal.TypeCount, pal.Materials.Count(m => m.Types.Count > 0)) + "###growthall"))
+                {
+                    foreach (var m in pal.Materials)
+                    {
+                        if (m.Types.Count == 0) continue;
+                        ImGui.TextColored(new Vector4(0.49f, 0.86f, 0.55f, 1f), m.Name);
+                        foreach (var t in m.Types) ImGui.BulletText($"{t.GeometryName}   p {t.Probability:0.##}   scale {t.Scale}");
+                    }
+                    ImGui.TreePop();
+                }
                 ImGui.Spacing();
             }
-            ImGui.BulletText(Loc.T("Value 0 clears; 1+ paint foliage."));
-            ImGui.BulletText(Loc.T("The type per cell comes from its material + this map."));
+            ImGui.BulletText(Loc.T("Value 0 clears; 1+ pick which of the map's types grow."));
+            ImGui.BulletText(Loc.T("A value names a palette slot, not an amount."));
             ImGui.BulletText(Loc.T("Wheel resizes; Z / Y undo and redo."));
             return;
         }
@@ -8672,6 +9177,28 @@ void Inspector()
     ImGui.PopItemWidth();
     if (selLocked) ImGui.EndDisabled();   // pairs with the BeginDisabled above the transform fields
 
+    // Appearance: only for an object whose shader the LEVEL carries - a decal or an imported model. A stock game
+    // object's .rs lives in the shared archives, and rewriting that would change it for every map on the install.
+    var selShaders = ShadersForTemplate(o.Template);
+    var selLightmaps = selShaders.Count > 0 ? new List<string>() : LightmapsForObject(o);
+    if (selShaders.Count > 0 || selLightmaps.Count > 0)
+    {
+        Theme.Section(Loc.T("APPEARANCE"));
+        ImGui.TextDisabled(selShaders.Count == 1 ? selShaders[0]
+            : selShaders.Count > 1 ? string.Format(Loc.T("{0} shader(s)"), selShaders.Count)
+            : string.Format(Loc.T("shared shader - {0} lightmap(s) in this level"), selLightmaps.Count));
+        if (selShaders.Count == 0)
+            Theme.Tip(Loc.T("This object's .rs lives in the shared archives, so changing it would change the object on\nEVERY map on this install. Its baked lightmap is level-local though - and on a dark object\nlike the sewers that lightmap IS why it is dark - so the brightness below lifts that instead."));
+        ImGui.SetNextItemWidth(-110f);
+        SldF(Loc.TL("Brightness in shade"), ref brightenLevel, 0f, 1f, "%.2f");
+        Theme.Tip(Loc.T("The game multiplies every surface by the light reaching it, so this object goes dark\nwhere the sun does not reach. This raises `selfillum`, the engine's floor under that\nshading. 0 leaves it alone; 1 renders it at its texture's own brightness everywhere."));
+        if (ImGui.Button(Loc.TL("Brighten this object")))
+            BrightenSelectedObject();
+        Theme.Tip(Loc.T("Applies the brightness above to this object's own shader(s), and to anything else selected.\nSave writes them. Tools > Brighten Decals does the whole level at once."));
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("All decals..."))) OpenBrightenDialog();
+    }
+
     // Sound emitter: edit the .ssc script this object loads (shared by every placement of the template).
     if (sounds.IsSound(o.Template))
     {
@@ -8732,7 +9259,13 @@ void LayerMenu()
     ImGui.MenuItem(Loc.TL("Combat Area"), null, ref showCombatArea);
     ImGui.MenuItem(Loc.TL("Notes"), null, ref showNotes);
     ImGui.MenuItem(Loc.TL("Light markers"), null, ref showLightGizmos);
-    if (!gameIsBf1942) ImGui.MenuItem(Loc.TL("Tunnel entry points"), null, ref showTunnelEntries);
+    ImGui.MenuItem(Loc.TL("Sound rings"), null, ref showSoundRings);
+    Theme.Tip(Loc.T("How far each placed ambient sound carries, drawn on the ground: an inner ring at full\nvolume (its minDistance) and an outer one where it fades to silence. A sound is invisible\nand its reach is its whole behaviour, so this is the difference between placing one and\nguessing."));
+    if (!gameIsBf1942)
+    {
+        ImGui.MenuItem(Loc.TL("Tunnel entry point rings + labels"), null, ref showTunnelEntries);
+        Theme.Tip(Loc.T("The coloured spheres drawn at tunnel entrances and the text beside them -\n'entry point', 'no hole above', 'under water', 'isTunnelMap OFF'.\nTurn it off for an uncluttered view. Battlefield Vietnam only."));
+    }
     ImGui.Separator();
     if (!gameIsBf1942 && growth?.Over is not null && growth.OverPalette is not null)
         if (ImGui.MenuItem(Loc.TL("Overgrowth Trees"), null, ref showFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
@@ -8833,11 +9366,45 @@ string? OvergrowthSettingsPath()
 
 // What the game itself does: over-growth patches every 12.5 m, under-growth every 17.5 m (both hard-coded in
 // BfVietnam.exe's generator), at x1.0. A freshly opened map shows those, and only a sidecar it saved earlier moves them.
+// Patch spacing for the selected build, from THIS level's palette (the stock exe derives it from the .wst's own
+// viewdistance, so it is per-map: Saigon68's 450 gives 112.5 m, a jungle map with 150 gives 37.5 m).
+// The preview always models the RETAIL exe - BfVietnam.exe, what a player runs. It derives its patch spacing from
+// this level's own .wst viewdistance (viewDistance / (COUNT/2 - 1), COUNT 10), so Saigon68's 450 gives 112.5 m.
+// There is no build selector any more: matching a BfVietnam_Veg_* build was never a shippable answer, because a
+// player would have to install that .exe. Converting the overgrowth to STATIC OBJECTS is - see Tools > Overgrowth.
+float VegPatchMeters(bool over) => RefractorForge.Formats.Terrain.OvergrowthFoliage.PatchMetersFor(
+    RefractorForge.Formats.Terrain.VegetationBuild.Stock,
+    over ? growth?.OverPalette : growth?.UnderPalette, over);
+
 void ResetGrowthSettingsToMap()
 {
-    foliageSpacing = 12.5f; foliageDensity = 1f; showFoliage = false;
-    underSpacing = 17.5f; underDensity = 1f; showUnderFoliage = false;
+    foliageDensity = 1f; underDensity = 1f;
+    foliageSpacing = VegPatchMeters(over: true);
+    underSpacing = VegPatchMeters(over: false);
+    // SHOW what the map declares. These overlays used to open OFF, so a map with a full overgrowth palette looked
+    // bare until you found two checkboxes - and you could not judge a baked sun shadow against ground that was
+    // missing every tree casting into it. On when the level actually paints growth AND names something to grow
+    // there; still off for a map with an empty palette or an unpainted map, where there is nothing to show.
+    showFoliage = GrowthHasContent(over: true);
+    showUnderFoliage = GrowthHasContent(over: false);
     foliageDirty = true;
+}
+
+// Does this level actually grow anything on this layer - a palette with types AND at least one painted cell whose
+// value names one of them? Cheap: it stops at the first hit.
+bool GrowthHasContent(bool over)
+{
+    var map = over ? growth?.Over : growth?.Under;
+    var pal = over ? growth?.OverPalette : growth?.UnderPalette;
+    if (map is null || pal is null || pal.TypeCount == 0) return false;
+    var seen = new bool[256];
+    foreach (var v in map.Samples)
+    {
+        if (v == 0 || seen[v]) continue;
+        seen[v] = true;
+        if (pal.SlotForIndex(v) is { Types.Count: > 0 }) return true;
+    }
+    return false;
 }
 
 void SaveOvergrowthSettings()
@@ -8937,6 +9504,367 @@ void DoBakeOvergrowthToCon()
     catch (Exception ex) { Toast(Loc.T("Overgrowth bake failed: ") + ex.Message); }
 }
 
+// ---- Brightening decals that are already in the map --------------------------------------------------------------
+//
+// The engine shades a standard mesh as saturate(2*(prelight*N.L + ambient)) * texture, so anything the sun does not
+// reach is multiplied down to the level's ambient - and a decal is usually a SIGN. A poster in a tunnel, a map board
+// in an alley, a notice on a north wall: all of them go unreadable, and there is nothing wrong with the picture.
+// `selfillum` is the engine's own floor under that lighting term, so this raises it on shaders already shipped in
+// the level rather than only on decals made from here.
+
+// Every .rs the level carries under a folder, as level-relative paths. Works for a folder level and a packed one.
+List<string> LevelShaderFiles()
+{
+    var outp = new List<string>();
+    try
+    {
+        if (levelDir is null) return outp;
+        if (System.IO.Directory.Exists(levelDir))
+        {
+            foreach (var f in System.IO.Directory.EnumerateFiles(levelDir, "*.rs", System.IO.SearchOption.AllDirectories))
+            {
+                var rel = System.IO.Path.GetRelativePath(levelDir, f).Replace('\\', '/');
+                if (rel.StartsWith("StandardMesh/", StringComparison.OrdinalIgnoreCase)) outp.Add(rel);
+            }
+        }
+        else
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rfa in rfaList.Where(LevelArchive.IsRfa))
+                try
+                {
+                    var arch = new RefractorFlatArchive(rfa);
+                    var prefix = RefractorForge.Formats.LevelSaver.ArchivePrefix(arch).Replace('\\', '/');
+                    foreach (var e in arch.Entries)
+                    {
+                        var n = e.Name.Replace('\\', '/');
+                        if (!n.EndsWith(".rs", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                        var rel = n[prefix.Length..];
+                        if (rel.StartsWith("StandardMesh/", StringComparison.OrdinalIgnoreCase) && seen.Add(rel)) outp.Add(rel);
+                    }
+                }
+                catch { }
+        }
+    }
+    catch { }
+    outp.Sort(StringComparer.OrdinalIgnoreCase);
+    return outp;
+}
+
+// Found once per level - see shaderFilesCache.
+List<string> LevelShaderFilesCached() => shaderFilesCache ??= LevelShaderFiles();
+
+// The shader files that dress ONE placed object. A level-local decal's .rs is named after its template; a model
+// import's after each LOD geometry - so ask the mesh library for both and keep whatever the level actually carries.
+List<string> ShadersForTemplate(string template)
+{
+    var want = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { template };
+    if (meshLib is not null)
+        foreach (var g in meshLib.LodGeometryNames(template)) want.Add(g);
+    return LevelShaderFilesCached()
+           .Where(rel => want.Contains(System.IO.Path.GetFileNameWithoutExtension(rel)))
+           .ToList();
+}
+
+// Brighten just these shaders, at the current setting. Shared by the dialog's Apply and the inspector's button.
+void BrightenShaders(IEnumerable<string> rels, out int done, out int missed)
+{
+    done = 0; missed = 0;
+    foreach (var rel in rels)
+    {
+        string? text = PendingText(rel) ?? ReadLevelText(rel);
+        if (text is null) { missed++; continue; }
+        QueueLevelFile(rel, System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Mesh.RsWriter.Brighten(text, brightenLevel, brightenUnlit)));
+        done++;
+    }
+}
+
+// One of the level's own files, as BYTES. ReadLevelText cannot stand in: the folder branch decodes as UTF-8, which
+// mangles a .tga.
+byte[]? ReadLevelBytes(string relPath)
+{
+    try
+    {
+        if (levelDir is null) return null;
+        if (System.IO.Directory.Exists(levelDir))
+        {
+            var leaf = relPath[(relPath.LastIndexOf('/') + 1)..];
+            var hit = System.IO.Directory.EnumerateFiles(levelDir, leaf, System.IO.SearchOption.AllDirectories)
+                        .FirstOrDefault(f => f.Replace('\\', '/').EndsWith(relPath, StringComparison.OrdinalIgnoreCase));
+            return hit is null ? null : System.IO.File.ReadAllBytes(hit);
+        }
+        byte[]? bytes = null;
+        foreach (var rfa in rfaList.Where(LevelArchive.IsRfa))
+            try
+            {
+                var arch = new RefractorFlatArchive(rfa);
+                var want = (RefractorForge.Formats.LevelSaver.ArchivePrefix(arch) + relPath).Replace('\\', '/');
+                var e = arch.Entries.FirstOrDefault(x => string.Equals(x.Name.Replace('\\', '/'), want, StringComparison.OrdinalIgnoreCase));
+                if (e is not null) bytes = arch.Read(e);
+            }
+            catch { }
+        return bytes;
+    }
+    catch { return null; }
+}
+
+// The lightmap files the level stores for one placed object - the same names the bake writes.
+List<string> LightmapsForObject(StaticObject o)
+{
+    var outp = new List<string>();
+    if (meshLib is null) return outp;
+    foreach (var meshName in meshLib.LodGeometryNames(o.Template))
+    {
+        string rel = $"ObjectLightMaps/{ObjectLightmaps.FileBase(meshName)}_{(int)o.Position.X}-{(int)o.Position.Y}-{(int)o.Position.Z}.tga";
+        if (PendingText(rel) is not null || ReadLevelBytes(rel) is not null) outp.Add(rel);
+    }
+    return outp;
+}
+
+// The inspector's one-click path: brighten whatever is selected, without opening the dialog.
+//
+// TWO WAYS, because a level does not own every object it places. A decal or an imported model carries its own .rs
+// in the level, so `selfillum` is the lever. A STOCK object's .rs lives in the shared archives - Saigon68's sewers
+// are standardMesh/O_sewers_A_M1.rs - and rewriting that would change the object on every map on the install. What
+// the level DOES own for such an object is its baked lightmap, and that is what makes it dark in the first place:
+// the sewers ship a 1024x1024 lightmap of solid zero, so the engine has only renderer.LMambientColor to light them
+// with. Raising that lightmap's floor brightens the object in THIS map and nowhere else.
+void BrightenSelectedObject()
+{
+    if (so is null || selected < 0 || selected >= so.Objects.Count) return;
+    // Every selected object, not just the primary - brightening one sign of a row of six is rarely what you meant.
+    var picked = new List<StaticObject> { so.Objects[selected] };
+    foreach (var i in multi) if (i >= 0 && i < so.Objects.Count && i != selected) picked.Add(so.Objects[i]);
+
+    var rels = picked.Select(p => p.Template).Distinct(StringComparer.OrdinalIgnoreCase)
+                     .SelectMany(ShadersForTemplate).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    int shaders = 0, missed = 0;
+    if (rels.Count > 0) BrightenShaders(rels, out shaders, out missed);
+
+    // Lightmaps for the ones with no level-local shader.
+    int lifted = 0, flat = 0;
+    byte floor = (byte)Math.Clamp((int)MathF.Round(brightenLevel * 255f), 0, 255);
+    foreach (var o2 in picked)
+    {
+        if (ShadersForTemplate(o2.Template).Count > 0) continue;          // handled above, by its shader
+        foreach (var rel in LightmapsForObject(o2))
+        {
+            var src = PendingText(rel) is { } p ? System.Text.Encoding.Latin1.GetBytes(p) : ReadLevelBytes(rel);
+            if (src is null) { missed++; continue; }
+            var outBytes = ObjectLightmaps.LiftFloor(src, floor);
+            if (outBytes is null) { flat++; continue; }
+            QueueLevelFile(rel, outBytes);
+            lifted++;
+        }
+    }
+
+    if (shaders == 0 && lifted == 0)
+    {
+        Toast(Loc.T("Nothing to brighten here: this object's shader belongs to the shared archives and the level stores no lightmap for it."));
+        return;
+    }
+    Console.WriteLine($"Brighten: {shaders} shader(s) at selfillum {brightenLevel:0.##}, {lifted} lightmap(s) lifted to a floor of {floor}"
+                      + (missed > 0 ? $"; {missed} could not be read" : "") + (flat > 0 ? $"; {flat} were not 8-bit lightmaps" : "") + ".");
+    Toast(shaders > 0 && lifted > 0
+            ? string.Format(Loc.T("Brightened {0} shader(s) and lifted {1} lightmap(s). Save writes them."), shaders, lifted)
+        : shaders > 0
+            ? string.Format(Loc.T("Brightened {0} shader(s). Save writes them into the level."), shaders)
+            : string.Format(Loc.T("Lifted {0} lightmap(s) - this object's shader is shared, so its lightmap is the lever. Save writes them."), lifted));
+}
+
+void ApplyDecalBrightness()
+{
+    int done = 0, missed = 0;
+    foreach (var (rel, on) in brightenList)
+    {
+        if (!on) continue;
+        // The newest queued copy first, so brightening twice in a session builds on the last result rather than
+        // starting again from what is on disk.
+        string? text = PendingText(rel) ?? ReadLevelText(rel);
+        if (text is null) { missed++; continue; }
+        var lifted = RefractorForge.Formats.Mesh.RsWriter.Brighten(text, brightenLevel, brightenUnlit);
+        QueueLevelFile(rel, System.Text.Encoding.Latin1.GetBytes(lifted));
+        done++;
+    }
+    Console.WriteLine($"Decal brightness: selfillum {brightenLevel:0.##}{(brightenUnlit && brightenLevel >= 1f ? " + lighting off" : "")} on {done} shader(s)"
+                      + (missed > 0 ? $"; {missed} could not be read" : "") + ". Save writes them.");
+    Toast(done == 0 ? Loc.T("No shaders were changed.")
+                    : string.Format(Loc.T("Brightened {0} shader(s). Save writes them into the level."), done));
+}
+
+void BrightenDialog()
+{
+    if (!showBrightenDialog) return;
+    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Brighten Decals") + "###brightendlg", ref showBrightenDialog, ImGuiWindowFlags.AlwaysAutoResize))
+    {
+        ImGui.TextWrapped(Loc.T("The game multiplies every surface by the light reaching it, so a decal in shade - a tunnel, an alley, a north-facing wall - goes dark and unreadable even though the picture is fine. This raises selfillum on the level's own shaders, which is the engine's floor under that shading."));
+        ImGui.Spacing();
+        ImGui.SetNextItemWidth(220f * uiScale);
+        SldF(Loc.TL("Brightness in shade"), ref brightenLevel, 0f, 1f, "%.2f");
+        Theme.Tip(Loc.T("0 leaves the shading alone (and removes any selfillum already there).\n1 renders the decal at its texture's own brightness everywhere.\n0.5-0.7 keeps some shading while staying readable."));
+        ImGui.Checkbox(Loc.TL("Fully unlit at 1.00"), ref brightenUnlit);
+        Theme.Tip(Loc.T("At maximum brightness, also turn `lighting` off - the strongest form, and what retail uses\nfor a surface that must never be shaded at all. Flat everywhere, not just in shade."));
+        ImGui.Separator();
+        // Search. A level with an imported model set can carry dozens of shaders, and picking two of them out of an
+        // unfiltered list is the whole reason this dialog felt like work.
+        ImGui.SetNextItemWidth(-90f * uiScale);
+        InT(Loc.TL("Search"), ref brightenFilter, 80);
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("Clear##brsearch"))) brightenFilter = "";
+        bool Shown(string rel) => brightenFilter.Length == 0
+                                  || rel.Contains(brightenFilter, StringComparison.OrdinalIgnoreCase);
+        int visible = brightenList.Count(b => Shown(b.Rel));
+        int on = brightenList.Count(b => b.On);
+        ImGui.Text(brightenFilter.Length == 0
+            ? string.Format(Loc.T("{0} of {1} shader(s) selected"), on, brightenList.Count)
+            : string.Format(Loc.T("{0} selected; {1} of {2} shown"), on, visible, brightenList.Count));
+        ImGui.SameLine();
+        // All / None act on WHAT YOU CAN SEE, so a search plus "None" then "All" is how you narrow to a few.
+        if (ImGui.SmallButton(Loc.TL("All")))
+            for (int i = 0; i < brightenList.Count; i++) if (Shown(brightenList[i].Rel)) brightenList[i] = (brightenList[i].Rel, true);
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("None")))
+            for (int i = 0; i < brightenList.Count; i++) if (Shown(brightenList[i].Rel)) brightenList[i] = (brightenList[i].Rel, false);
+        if (ImGui.BeginChild("###brightenlist", new Vector2(0f, Math.Min(260f, 24f * Math.Max(visible, 1) + 8f) * uiScale), ImGuiChildFlags.Border))
+        {
+            if (visible == 0) ImGui.TextDisabled(Loc.T("Nothing matches that search."));
+            for (int i = 0; i < brightenList.Count; i++)
+            {
+                if (!Shown(brightenList[i].Rel)) continue;
+                bool v = brightenList[i].On;
+                if (ImGui.Checkbox(brightenList[i].Rel + "###br" + i, ref v)) brightenList[i] = (brightenList[i].Rel, v);
+            }
+        }
+        ImGui.EndChild();
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Apply"), new Vector2(120f * uiScale, 0f))) { ApplyDecalBrightness(); showBrightenDialog = false; }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Cancel##brighten"), new Vector2(120f * uiScale, 0f))) showBrightenDialog = false;
+    }
+    ImGui.End();
+}
+
+void OpenBrightenDialog()
+{
+    var files = LevelShaderFiles();
+    if (files.Count == 0) { Toast(Loc.T("This level carries no StandardMesh shaders to brighten.")); return; }
+    brightenList = files.Select(f => (f, true)).ToList();
+    showBrightenDialog = true;
+}
+
+// ---- Overgrowth -> static objects -------------------------------------------------------------------------------
+//
+// The point of this is MULTIPLAYER. How much overgrowth the engine plants is decided by the .exe, not the map: the
+// stock BfVietnam.exe keeps a 10x10 patch window spaced viewDistance/4 apart, every BfVietnam_Veg_* build uses 80x80
+// at a hardcoded 12.5 m. So a forest authored against one build is a different forest on another, and shipping a map
+// that only looks right with a patched executable is not something you can ask players to install. Baked to static
+// objects the trees stop being procedural: they are level content, in the archive, identical on every client, on the
+// stock game.
+//
+// Two sources. The editor's own scatter matches the game's DENSITY and species mix. A tree_dump.bin captured from
+// the running game by the bfvVegetationCapture tool is exact tree-for-tree, because it reads the instances the
+// engine already generated - verified on Flaming Dart at 41,559 trees, 99.74% on a tree-bearing material and heights
+// matching the heightmap to a mean 0.028 m.
+void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z, float Yaw)> trees, string source)
+{
+    if (so is null || hist is null) { Toast(Loc.T("Load a level first.")); return; }
+    if (trees.Count == 0) { Toast(Loc.T("Nothing to convert - paint some overgrowth first.")); return; }
+
+    var rng = new Random(1337);                       // same seed the capture tool thins with, so runs agree
+    var cmds = new List<IEditCommand>();
+    var unresolved = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    var used = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    int skipped = 0;
+    foreach (var (geom, x, y, z, yaw) in trees)
+    {
+        if (ogStaticKeep < 1f && rng.NextDouble() > ogStaticKeep) { skipped++; continue; }
+        // Overgrowth ships as _m2 impostor geometry; the same tree exists as an _M1 object template that stock
+        // BfVietnam already defines, so a baked forest needs nothing declared. Fall back to the raw geometry name
+        // when the _M1 does not resolve, and only give up if neither does.
+        string tmpl = RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateFor(geom);
+        if (meshLib is not null && !meshLib.TryGet(tmpl, out _))
+        {
+            if (meshLib.TryGet(geom, out _)) tmpl = geom;
+            else { unresolved[tmpl] = unresolved.GetValueOrDefault(tmpl) + 1; continue; }
+        }
+        used[tmpl] = used.GetValueOrDefault(tmpl) + 1;
+        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), tmpl, new Vec3(x, y, z), new Vec3(yaw, 0f, 0f)));
+    }
+    if (cmds.Count == 0)
+    {
+        Toast(Loc.T("None of the overgrowth resolved to a static template - nothing was added."));
+        foreach (var kv in unresolved) Console.WriteLine($"   unresolved template: {kv.Key} x{kv.Value}");
+        return;
+    }
+
+    hist.Do(cmds.Count == 1 ? cmds[0] : new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
+
+    // The other half: stop the engine planting them as well, or every tree draws twice.
+    string wstNote = "";
+    if (ogStaticDisableProcedural && growth?.OverPalette is { } opal)
+    {
+        var emptied = RefractorForge.Formats.Terrain.OvergrowthCapture.EmptyTypes(opal.RawXml);
+        QueueLevelFile("growth/overGrowth.wst", System.Text.Encoding.Latin1.GetBytes(emptied));
+        showFoliage = false; foliageDirty = true;
+        wstNote = Loc.T(" Procedural overgrowth switched off in overGrowth.wst (undergrowth left alone).");
+    }
+
+    Console.WriteLine($"Overgrowth -> static: {cmds.Count:N0} object(s) from {source}"
+                      + (skipped > 0 ? $", {skipped:N0} thinned out at keep {ogStaticKeep:0.##}" : "")
+                      + (unresolved.Count > 0 ? $", {unresolved.Values.Sum():N0} unresolved" : "") + ".");
+    foreach (var kv in used.OrderByDescending(k => k.Value)) Console.WriteLine($"   {kv.Key} x{kv.Value:N0}");
+    foreach (var kv in unresolved) Console.WriteLine($"   UNRESOLVED (skipped): {kv.Key} x{kv.Value:N0}");
+    // BFV has no per-object scale command (setScale is not in the binary at all), so the procedural 0.6-1.2 size
+    // variation cannot survive the bake - every tree of a type renders at its template's own size. Say so rather
+    // than letting it be noticed in game.
+    Console.WriteLine("   Note: positions and yaw are exact; per-tree SCALE is lost - BfVietnam has no per-object scale command.");
+    Toast(string.Format(Loc.T("Converted {0} tree(s) to static objects ({1}). Save writes them into the level."), cmds.Count, source) + wstNote);
+}
+
+// Replace-or-add a file in the save queue, so converting twice does not queue two copies of the same entry.
+void QueueLevelFile(string rel, byte[] bytes)
+{
+    pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(rel, StringComparison.OrdinalIgnoreCase));
+    pendingLevelFiles.Add((rel, bytes));
+}
+
+void DoConvertOvergrowthFromScatter()
+{
+    var inst = ScatterOvergrowthResolved();
+    ConvertOvergrowthToStatic(inst.Select(i => (i.Tmpl, i.X, i.Y, i.Z, i.Yaw)).ToList(), Loc.T("the editor's scatter"));
+}
+
+// The exact path: a tree_dump.bin the user captured from the running game.
+void DoConvertOvergrowthFromDump()
+{
+    if (growth?.OverPalette is not { } pal) { Toast(Loc.T("This level has no overgrowth palette.")); return; }
+    var path = Picker.File("Choose the captured tree_dump.bin", "Tree dump|*.bin|All files|*.*", levelDir);
+    if (path is null) return;
+    try
+    {
+        var caps = RefractorForge.Formats.Terrain.OvergrowthCapture.LoadDump(File.ReadAllBytes(path));
+        var trees = new List<(string, float, float, float, float)>();
+        int unknownType = 0;
+        foreach (var c in caps)
+        {
+            // The instance's type field indexes the palette's types flattened in declaration order. A dump taken on
+            // a different level names types this palette does not have - skip those rather than guess a species.
+            var ft = pal.TypeByIndex(c.Type);
+            if (ft is null || string.IsNullOrWhiteSpace(ft.GeometryName)) { unknownType++; continue; }
+            trees.Add((ft.GeometryName, c.X, c.Y, c.Z, c.YawDeg));
+        }
+        Console.WriteLine($"Read {caps.Count:N0} captured instance(s) from {Path.GetFileName(path)}"
+                          + (unknownType > 0 ? $"; {unknownType:N0} had a type index this level's palette does not declare and were skipped" : "") + ".");
+        if (trees.Count == 0) { Toast(Loc.T("The dump's tree types do not match this level's overGrowth.wst - was it captured on this map?")); return; }
+        ConvertOvergrowthToStatic(trees, Loc.T("a captured dump (exact)"));
+    }
+    catch (Exception ex) { Toast(Loc.T("Could not read the dump: ") + ex.Message); Console.WriteLine("tree dump: " + ex); }
+}
+
 void LayersPanel()
 {
     GroupsPanel();
@@ -8950,6 +9878,13 @@ void LayersPanel()
     ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
     ImGui.Checkbox(string.Format(Loc.T("Spawn Points ({0})"), gameplayEdit.SoldierSpawns.Count) + "###spawnLayer", ref showSpawns);
     ImGui.Checkbox(Loc.TL("Spawn Links"), ref showSpawnLinks);
+    // The tunnel entry-point spheres are a viewport overlay like everything else on this panel, so this is where
+    // you look to turn them off - not buried in the Tunnels window (they are also in the View menu).
+    if (!gameIsBf1942)
+    {
+        ImGui.Checkbox(Loc.TL("Tunnel Entry Points"), ref showTunnelEntries);
+        Theme.Tip(Loc.T("The coloured spheres at tunnel entrances and the text beside them -\n'entry point', 'no hole above', 'under water', 'isTunnelMap OFF'."));
+    }
     if (sounds.Count > 0)
     {
         ImGui.Checkbox(string.Format(Loc.T("Sounds ({0})"), sounds.Count) + "###soundLayer", ref showSounds);
@@ -8971,12 +9906,12 @@ void LayersPanel()
         {
             // Patch size + density use the game's patch model (default 12.5 m / x1.0 = the density BfVietnam generates).
             ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Patch size (m)"), ref foliageSpacing, 6f, 32f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            if (SldF(Loc.TL("Patch size (m)"), ref foliageSpacing, 6f, 200f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
             ImGui.SetNextItemWidth(150f);
             // Density tops out at 1.5x: x1.0 is already the game-matched density, so the useful range is a small over/under.
             if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = 12.5f; foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
-            Theme.Tip(Loc.T("Back to what the game generates for this map: 12.5 m patches at x1.0."));
+            if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = VegPatchMeters(over: true); foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
+            Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
             GrowthDefinitionTree(growth.OverPalette, "overdef");
         }
     }
@@ -8986,11 +9921,11 @@ void LayersPanel()
         if (showUnderFoliage)
         {
             ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, 6f, 40f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, 6f, 120f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
             ImGui.SetNextItemWidth(150f);
             if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = 17.5f; underDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
-            Theme.Tip(Loc.T("Back to what the game generates for this map: 17.5 m patches at x1.0."));
+            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = VegPatchMeters(over: false); underDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
+            Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
             GrowthDefinitionTree(growth.UnderPalette, "underdef");
         }
     }
@@ -9333,7 +10268,63 @@ void ApplySkyBox(string meshName)
     LoadSkyboxMesh();                    // the mesh, drawn as the box
     LoadSkyCubemap();                    // and its faces as the cube map the sky shader samples
     ReapplySkyFacePreviews();
-    Toast(string.Format(Loc.T("Sky set to {0}. Save writes it to SkyAndSun.con."), meshName));
+    // A level's fog was chosen for the level's OWN sky, so carrying it over to a different one is what makes a
+    // swapped skybox look wrong: the horizon goes one colour and the haze in front of it another. Match the fog
+    // colour to the new sky's own horizon band. Only the colour - whether there is fog at all, and how far it
+    // reaches, are the mapper's decisions and none of the skybox's business.
+    string fogNote = "";
+    if (SkyHorizonColour(meshName) is { } haze)
+    {
+        if (!fogChangedBySky) { fogSkyPrev = (fogEnabled, fogColor, fogStart, fogEnd); fogChangedBySky = true; }
+        fogColor = haze;
+        fogNote = " " + Loc.T("Fog colour matched to it.");
+    }
+    Toast(string.Format(Loc.T("Sky set to {0}. Save writes it to SkyAndSun.con."), meshName) + fogNote);
+}
+
+/// The haze colour a sky implies: the average of the LOWER HALF of its four side faces, which is the band the fog
+/// has to blend into at the horizon. Sampled on a stride - a 2048px face is four million texels and the answer is
+/// an average either way. Null when the faces cannot be resolved (a mesh-only skybox).
+Vector3? SkyHorizonColour(string meshName)
+{
+    if (meshLib?.Textures is null) return null;
+    try
+    {
+        var levelTexF = rfaList.Length > 0 ? TextureLibrary.Open(rfaList.Where(File.Exists).ToArray()) : null;
+        Texture2D? RF(string n) => levelTexF?.Resolve(n) ?? meshLib.Textures.Resolve(n);
+        var stem = System.Text.RegularExpressions.Regex.Replace(meshName, @"_m\d+$", "",
+                       System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        double r = 0, g = 0, b = 0; long n = 0;
+        for (int i = 1; i <= 4; i++)                       // 01..04 are the sides; 05 is up and 06 down
+        {
+            if (RF($"{stem}_0{i}") is not { } f || f.Width < 2 || f.Height < 2) continue;
+            int stride = Math.Max(1, f.Width / 64);
+            for (int y = f.Height / 2; y < f.Height; y += stride)
+                for (int x = 0; x < f.Width; x += stride)
+                {
+                    int o = (y * f.Width + x) * 4;
+                    r += f.Rgba[o]; g += f.Rgba[o + 1]; b += f.Rgba[o + 2]; n++;
+                }
+        }
+        if (n == 0) return null;
+        return new Vector3((float)(r / n / 255.0), (float)(g / n / 255.0), (float)(b / n / 255.0));
+    }
+    catch { return null; }
+}
+
+/// Write the fog the editor is showing into the level, so the game gets it too. Until this is pressed the fog
+/// sliders are a PREVIEW: nothing in the Environment panel reached Init.con before, which is why a fog you liked
+/// never survived the trip into the game.
+void SaveFog()
+{
+    if (env is null) { Toast(Loc.T("No level loaded.")); return; }
+    env.FogEnabled = fogEnabled;
+    env.FogColor = new Vec3(fogColor.X, fogColor.Y, fogColor.Z);
+    env.FogStart = fogStart; env.FogEnd = fogEnd;
+    env.WriteFog = true;
+    lightingDirty = true;              // Init.con is patched on the next save
+    fogChangedBySky = false;           // this IS the level's fog now
+    Toast(Loc.T("Fog saved to the level - Ctrl+S writes it to Init.con."));
 }
 
 // The level's own skybox as a cube map the WATER can mirror. Both .rcm files the game ships name the same generic
@@ -9586,36 +10577,56 @@ void AfterFoliageMapsChanged()
 // Fully lit terrain shadow, fully lit object lightmaps: what the level looked like before anyone baked it. Writing
 // "no shadow" beats deleting the files - the level keeps the entries it shipped, and every save path already knows
 // how to write them.
-void UnbakeLighting()
+// The two unbakes, kept apart like the two bakes. Each is the exact inverse of its own bake and touches only its
+// own files: object lightmaps -> ObjectLightMaps/*.tga, terrain shadow -> Textures/LightmapShadowBits.lsb.
+void UnbakeObjectLightmaps()
 {
-    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
-    unbakeLighting = true;
-    writeShadowLsb = true;                      // the unshadowed map still has to be WRITTEN to replace the baked one
-    bakedLsb = false; bakedObjects = false; bakedGround = false;
+    if (so is null || meshLib is null) { Toast(Loc.T("Load a level with objects first.")); return; }
+    bakedObjects = false;
 
     // An all-white lightmap is "lit everywhere". Only the maps this level would bake are written, which is exactly
     // the set a bake would have replaced.
     int maps = 0;
     bakedObjectLightmaps.Clear();
-    if (so is not null && meshLib is not null)
-    {
-        var white = new Texture2D(64, 64, System.Linq.Enumerable.Repeat((byte)255, 64 * 64 * 4).ToArray());
-        var encoded = TgaTexture.EncodeGrayColormapped(white);
-        foreach (var o in so.Objects)
-            foreach (var meshName in meshLib.LodGeometryNames(o.Template))
-            {
-                if (!meshLib.TryGet(meshName, out var lm) || lm.LightmapUvs is null) continue;
-                bakedObjectLightmaps[$"{meshName}_{(int)o.Position.X}-{(int)o.Position.Y}-{(int)o.Position.Z}.tga"] = encoded;
-                maps++;
-            }
-    }
+    var white = new Texture2D(128, 128, System.Linq.Enumerable.Repeat((byte)255, 128 * 128 * 4).ToArray());   // 128 is retail's smallest observed lightmap
+    var encoded = TgaTexture.EncodeGrayColormapped(white);
+    foreach (var o in so.Objects)
+        foreach (var meshName in meshLib.LodGeometryNames(o.Template))
+        {
+            if (!meshLib.TryGet(meshName, out var lm) || lm.LightmapUvs is null) continue;
+            // The leaf, never the raw GeometryTemplate.file - see ObjectLightmaps.FileBase.
+            bakedObjectLightmaps[$"{ObjectLightmaps.FileBase(meshName)}_{(int)o.Position.X}-{(int)o.Position.Y}-{(int)o.Position.Z}.tga"] = encoded;
+            maps++;
+        }
 
     objectLightmaps = null; objectLightmapsLoaded = true;      // stop showing the baked maps in the viewport
     glObjects?.SetObjectLightmaps(gl, null, so, meshLib);
     showObjectLightmaps = false;
-    showShadows = false; shadowMapDirty = true;
     BroadcastLightBake();
-    Toast(string.Format(Loc.T("Lighting unbaked: a fully lit terrain shadow and {0} lightmap(s). Save writes it. The ground-texture bake is separate - undo that with Z."), maps));
+    Toast(string.Format(Loc.T("Object lightmaps unbaked: {0} fully lit map(s) queued. Save writes them. The terrain shadow is untouched."), maps));
+}
+
+void UnbakeTerrainShadow()
+{
+    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    unbakeLighting = true;
+    writeShadowLsb = true;                      // the unshadowed map still has to be WRITTEN to replace the baked one
+    bakedLsb = false;
+    bakedShadowLsb = null;                      // drop any baked map so the save cannot prefer it over the unbake
+    showShadows = false; shadowMapDirty = true;
+    showBakedShadow = false;
+    BroadcastLightBake();
+    Toast(Loc.T("Sun shadows unbaked: Save writes a fully lit LightmapShadowBits.lsb. Object lightmaps are untouched."));
+}
+
+// Both at once - the old single command, for a map that wants to go all the way back to unlit.
+void UnbakeLighting()
+{
+    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    UnbakeTerrainShadow();
+    if (so is not null && meshLib is not null) UnbakeObjectLightmaps();
+    bakedGround = false;
+    Toast(Loc.T("Lighting unbaked: terrain shadow and object lightmaps, written on Save. The ground-texture bake is separate - undo that with Z."));
 }
 
 // The slider is a viewport OFFSET on top of whatever the level declared; saving folds the two into one angle and
@@ -9736,7 +10747,11 @@ void EnvironmentPanel()
         if (ImGui.SmallButton(Loc.TL("Match##wshallow"))) { shallowColor = waterColor; wcol = true; }
     }
     ImGui.SetNextItemWidth(150f);
-    wcol |= SldF(Loc.TL("Water transparency"), ref waterAlpha, 0.08f, 1f, "%.2f");
+    // OPACITY, not transparency. The value IS water.waterShallowAlpha, so 1 is solid and 0.08 is nearly clear -
+    // labelling it "transparency" made the slider read backwards, which is exactly how it was reported. Naming it
+    // for what it holds keeps it equal to the .con field, like every other value in this panel.
+    wcol |= SldF(Loc.TL("Shallow water alpha"), ref waterAlpha, 0.08f, 1f, "%.2f");
+    Theme.Tip(Loc.T("Init.con's water.waterShallowAlpha: how solid the water is where it is SHALLOW, before the\ndepth ramp takes over. HIGHER IS MORE SOLID. In BfVietnam this is NOT what decides how\nsee-through the surface looks in game - that is 'Water opacity (in game)' below, which\nwrites levelWater.rs."));
     if (wcol) MarkWaterColorsEdited();
     if (ImGui.SmallButton(Loc.TL("Reset##water")) && env is not null)
     {
@@ -9754,6 +10769,12 @@ void EnvironmentPanel()
         ImGui.SetNextItemWidth(150f);
         bool wchg = SldF(Loc.TL("Reflectivity"), ref waterReflect, 0f, 1f, "%.2f");
         Theme.Tip(Loc.T("How much of the sky the surface mirrors (the .rs 'reflectivity'). Retail: 0.18 Fall of Saigon,\n0.25 Con Thien, 0.3 Ho Chi Minh Trail. Written to StandardMesh/levelWater.rs on save."));
+        ImGui.SetNextItemWidth(150f);
+        // THIS is the one that decides how see-through BfVietnam's water looks. Init.con's waterShallowAlpha is
+        // the shallow-depth ramp; the surface MATERIAL's opacity lives in levelWater.rs - which is why editing
+        // Init.con alone appeared to do nothing in game.
+        wchg |= SldF(Loc.TL("Water opacity (in game)"), ref waterOpacity, 0f, 1f, "%.2f");
+        Theme.Tip(Loc.T("The levelWater.rs 'opacity' - what actually decides how see-through the water looks in\nBfVietnam. Base 0.35; the jungle rivers ship 0.5-0.75. Turn it DOWN to see the bottom.\nWritten to StandardMesh/levelWater.rs on save."));
         if (wchg) QueueWaterShader();
         ImGui.TextDisabled(waterSeqTex.Length > 1
             ? string.Format(Loc.T("Animation: {0} frames (the game's own water ripple)"), waterSeqTex.Length)
@@ -9812,8 +10833,11 @@ void EnvironmentPanel()
                 ImGui.SameLine();
                 if (ImGui.SmallButton(Loc.TL("Match##twshallow"))) { belowShallowColor = belowColor; bcol = true; }
             }
-            bcol |= SldF(Loc.TL("Tunnel water transparency"), ref belowAlpha, 0.08f, 1f, "%.2f");
-            // How fast that transparency runs out with depth. Taking these from the surface is what made a brown,
+            ImGui.SetNextItemWidth(150f);
+            // Same correction as the surface slider above: this is waterBelowTerrain.waterShallowAlpha, an OPACITY.
+            bcol |= SldF(Loc.TL("Tunnel water opacity"), ref belowAlpha, 0.08f, 1f, "%.2f");
+            Theme.Tip(Loc.T("waterBelowTerrain.waterShallowAlpha. HIGHER IS MORE SOLID - turn it DOWN to see\nthrough the tunnel water. The number is the level's own value."));
+            // How fast that opacity builds with depth. Taking these from the surface is what made a brown,
             // see-through sewer come out opaque: a surface tuned to hide its bottom hides the tunnel's too.
             ImGui.SetNextItemWidth(150f);
             bcol |= SldF(Loc.TL("Tunnel opaque at depth"), ref belowAlphaDepth, 0.1f, 8f, "%.2f m");
@@ -9835,6 +10859,9 @@ void EnvironmentPanel()
             ImGui.SetNextItemWidth(150f);
             bool bchg = SldF(Loc.TL("Tunnel reflectivity"), ref waterBelowReflect, 0f, 1f, "%.2f");
             Theme.Tip(Loc.T("The second body's own WaterSettingBelowTerrain subshader. Saigon68, the only retail\ntunnel map, uses 0.1 - a still sewer."));
+            ImGui.SetNextItemWidth(150f);
+            bchg |= SldF(Loc.TL("Tunnel water opacity (in game)"), ref waterBelowOpacity, 0f, 1f, "%.2f");
+            Theme.Tip(Loc.T("The WaterSettingBelowTerrain 'opacity' - what decides how see-through the tunnel water\nlooks in game. Saigon68 ships 0.85, a nearly opaque sewer. Written to levelWater.rs on save."));
             if (bchg) QueueWaterShader();
         }
     }
@@ -9957,6 +10984,22 @@ void EnvironmentPanel()
         fogEnabled = env.FogEnabled;
         fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
         fogStart = env.FogStart; fogEnd = env.FogEnd;
+        fogChangedBySky = false;
+    }
+    Theme.Tip(Loc.T("Back to the fog the level shipped."));
+    ImGui.SameLine();
+    if (Theme.AccentButton(Loc.TL("Save fog to level")) && env is not null) SaveFog();
+    Theme.Tip(Loc.T("Writes the fog above into the level's Init.con (renderer.vertexFogEnable, fogColorVec,\nfogstart, fogend) on the next Ctrl+S. Until you press this the sliders are only a\npreview here, and the game keeps whatever the level shipped."));
+    if (fogChangedBySky)
+    {
+        ImGui.TextColored(Theme.Warn, Loc.T("fog colour matched to the skybox"));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("Put fog back##sky")))
+        {
+            fogEnabled = fogSkyPrev.On; fogColor = fogSkyPrev.Col;
+            fogStart = fogSkyPrev.Start; fogEnd = fogSkyPrev.End;
+            fogChangedBySky = false;
+        }
     }
 
     Theme.Section(Loc.T("SKY"));
@@ -10355,8 +11398,33 @@ bool Cbo(string label, ref int v, string[] items, int count)
     { FitLabel(label); return ImGui.Combo(label, ref v, items, count); }
 bool CboZ(string label, ref int v, string itemsZeroSeparated)
     { FitLabel(label); return ImGui.Combo(label, ref v, itemsZeroSeparated); }
+// Every text box in the editor, with a right-click menu on it. Ctrl+C / Ctrl+X / Ctrl+V work too - Dear ImGui
+// handles those itself and ClipboardBridge points them at the Windows clipboard - but a shortcut you have to know
+// about is not a feature you can find, and it depends on the host routing Ctrl through to ImGui at all. The menu
+// is the discoverable route and it goes straight to the OS clipboard either way.
 bool InT(string label, ref string v, uint maxLen, ImGuiInputTextFlags flags = ImGuiInputTextFlags.None)
-    { FitLabel(label); return ImGui.InputText(label, ref v, maxLen, flags); }
+{
+    FitLabel(label);
+    bool changed = ImGui.InputText(label, ref v, maxLen, flags);
+    bool readOnly = (flags & ImGuiInputTextFlags.ReadOnly) != 0;
+    // BeginPopupContextItem attaches to the item just submitted, so this has to sit directly after InputText.
+    if (ImGui.BeginPopupContextItem(label + "##txtctx"))
+    {
+        string cur = v ?? "";
+        if (ImGui.MenuItem(Loc.TL("Copy"), "Ctrl+C", false, cur.Length > 0)) ImGui.SetClipboardText(cur);
+        if (ImGui.MenuItem(Loc.TL("Cut"), "Ctrl+X", false, !readOnly && cur.Length > 0))
+        { ImGui.SetClipboardText(cur); v = ""; changed = true; }
+        // Paste REPLACES the field rather than inserting at the caret: a right-click menu has no caret to insert
+        // at, and these boxes hold one value each - a path, an address, a name - which is what you are replacing.
+        string clip = "";
+        try { clip = ImGui.GetClipboardText() ?? ""; } catch { }
+        if (ImGui.MenuItem(Loc.TL("Paste"), "Ctrl+V", false, !readOnly && clip.Length > 0))
+        { v = clip.Length > maxLen ? clip[..(int)maxLen] : clip; changed = true; }
+        if (ImGui.MenuItem(Loc.TL("Clear"), null, false, !readOnly && cur.Length > 0)) { v = ""; changed = true; }
+        ImGui.EndPopup();
+    }
+    return changed;
+}
 bool InI(string label, ref int v)
     { FitLabel(label); return ImGui.InputInt(label, ref v); }
 bool InF(string label, ref float v, float step, float stepFast, string fmt)
@@ -11853,23 +12921,84 @@ void BuildUi()
             ImGui.Separator();
             if (ImGui.BeginMenu(Loc.TL("Lighting")))
             {
-                if (ImGui.MenuItem(Loc.TL("Bake Lightmaps (sun + placed lights)"), null, false, heightmap is not null)) BakeAllLighting();
-                Theme.Tip(Loc.T("Everything the game reads for light, in one go: the terrain sun-shadow (.lsb), every\nobject's lightmap (sun + your placed lights) and the placed lights' colour in the ground\ntexture. Shown at once; Save writes it all. Set the sun and lights first."));
-                ImGui.Separator();
-                if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain)"), null, false, heightmap is not null)) DoBakeShadows();
-                Theme.Tip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads."));
+                // Two separate processes, kept apart on purpose. OBJECT LIGHTMAPS is every per-object map the game
+                // reads (ObjectLightMaps/*.tga) - any lightmap in general. SUN SHADOWS + TERRAIN is the terrain's
+                // own light: the packed sun shadow (LightmapShadowBits.lsb) and the placed lights burned into the
+                // ground tiles. Each heading has its own bake, its own unbake and its own save switch, and nothing
+                // under one heading touches the other's files. The combined commands sit last, named as both.
+                ImGui.TextDisabled(Loc.T("OBJECT LIGHTMAPS"));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
-                Theme.Tip(Loc.T("Each object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor."));
-                if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
-                Theme.Tip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
+                Theme.Tip(Loc.T("Each placed object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor.\nWrites lightmaps only - the terrain shadow below is a separate bake."));
+                // The quality choice belongs beside the button that uses it. It also lives in the Lights panel,
+                // but that is not where anyone goes to start a bake.
+                if (ImGui.BeginMenu(Loc.TL("   Lightmap quality")))
+                {
+                    for (int q = 0; q < 3; q++)
+                    {
+                        string qLabel = q switch
+                        {
+                            0 => Loc.T("Draft - 1 sample, 256px max (fast)"),
+                            1 => Loc.T("Good - 2x2, 512px max"),
+                            _ => Loc.T("High - 3x3, 1024px max (the engine's limit)"),
+                        };
+                        if (ImGui.MenuItem(qLabel, null, lmQuality == q)) { lmQuality = q; ApplyLightmapQuality(); }
+                    }
+                    ImGui.EndMenu();
+                }
+                // Measured across every retail Battlefield Vietnam level: 4,152 object lightmaps, 68% of them
+                // 256px, 15% 512px, 1.6% at 1024 - and none larger. A 2048px option was tried and it CRASHED the
+                // game, so High's 1024 is the engine's limit, not a preference.
+                Theme.Tip(Loc.T("How finely each object is lit. High is as far as the engine goes: 1024px, which is what\nthe game's own biggest maps use (Saigon68 and three other retail levels). Larger than\nthat crashes the game. The bake shows a progress bar and can be cancelled."));
+                if (ImGui.MenuItem(Loc.TL("Show baked object lightmaps"), null, showObjectLightmaps, so is not null)) { showObjectLightmaps = !showObjectLightmaps; if (showObjectLightmaps) EnsureObjectLightmaps(); }
+                if (ImGui.MenuItem(Loc.TL("Unbake Object Lightmaps (fully lit)"), null, false, so is not null && meshLib is not null)) UnbakeObjectLightmaps();
+                Theme.Tip(Loc.T("Replaces every placed object's lightmap with a fully lit one on Save - the map as it was\nbefore any object bake. Leaves the terrain shadow exactly as it is."));
                 ImGui.Separator();
+                ImGui.TextDisabled(Loc.T("SUN SHADOWS + TERRAIN"));
+                if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain .lsb)"), null, false, heightmap is not null)) DoBakeShadows();
+                Theme.Tip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads.\nTerrain only - no object lightmap is touched."));
                 if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
                 if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
                 if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
-                if (ImGui.MenuItem(Loc.TL("Show the level's baked terrain shadow (.lsb)"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showShadows = true; }
+                if (ImGui.MenuItem(Loc.TL("Show baked terrain shadow"), null, showBakedShadow, heightmap is not null))
+                {
+                    showBakedShadow = !showBakedShadow;
+                    if (showBakedShadow && shadowTexId == 0) InitTerrainShadowOnLoad();
+                }
+                Theme.Tip(Loc.T("Draws the BAKED terrain shadow on the ground - the level's LightmapShadowBits.lsb, or\nwhat the last bake made. This is the one the game reads. The real-time toggle above is a\npreview that follows the camera and is never saved."));
+                if (ImGui.MenuItem(Loc.TL("   Reload the level's shadow from its .lsb"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showBakedShadow = true; }
+                if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
+                Theme.Tip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
+                if (ImGui.MenuItem(Loc.TL("Unbake Sun Shadows (fully lit .lsb)"), null, unbakeLighting, heightmap is not null)) UnbakeTerrainShadow();
+                Theme.Tip(Loc.T("Save writes a fully lit LightmapShadowBits.lsb - the terrain as it was before any shadow\nbake. Leaves the object lightmaps exactly as they are. Baking shadows again undoes it."));
                 ImGui.Separator();
-                if (ImGui.MenuItem(Loc.TL("Unbake Lighting (back to unlit)"), null, unbakeLighting, heightmap is not null)) UnbakeLighting();
-                Theme.Tip(Loc.T("Put the map back to how it looked before anything was baked: a fully lit terrain\nshadow and fully lit object lightmaps, written on Save. Baking again undoes it.\nThe ground-texture bake is separate - undo that with Z."));
+                if (ImGui.MenuItem(Loc.TL("Bake Both (object lightmaps + sun shadows)"), null, false, heightmap is not null)) BakeAllLighting();
+                Theme.Tip(Loc.T("Both processes in one go, for a map that wants everything: the terrain sun-shadow (.lsb),\nevery object's lightmap and the placed lights' colour in the ground texture. Save writes it all."));
+                if (ImGui.MenuItem(Loc.TL("Unbake Both (back to unlit)"), null, false, heightmap is not null)) UnbakeLighting();
+                Theme.Tip(Loc.T("Both unbakes at once: a fully lit terrain shadow and fully lit object lightmaps, written on\nSave. The ground-texture bake is separate - undo that with Z."));
+                ImGui.EndMenu();
+            }
+            if (ImGui.MenuItem(Loc.TL("Brighten Decals (readable in shade)..."), null, false, levelDir is not null)) OpenBrightenDialog();
+            Theme.Tip(Loc.T("The game multiplies every surface by the light reaching it, so a decal in a tunnel or an\nalley goes dark and unreadable even though the picture is fine. This raises `selfillum` on\nthe level's own StandardMesh shaders - the engine's floor under that shading - so signs stay\nreadable where the sun does not reach. Works on decals and imported models already in the map."));
+            ImGui.Separator();
+            if (ImGui.BeginMenu(Loc.TL("Overgrowth")))
+            {
+                bool canBakeOver = growth?.Over is not null && growth.OverPalette is not null;
+                ImGui.TextDisabled(Loc.T("CONVERT TO STATIC OBJECTS (multiplayer-safe)"));
+                if (ImGui.MenuItem(Loc.TL("Convert Overgrowth to Static Objects"), null, false, canBakeOver && so is not null))
+                    DoConvertOvergrowthFromScatter();
+                Theme.Tip(Loc.T("Places the trees as ordinary static objects and switches the procedural overgrowth off.\nHow much the ENGINE plants is decided by the .exe, not the map - the stock game and the\nBfVietnam_Veg_* builds plant wildly different amounts - so a procedural forest only looks\nright for players running the same build you authored on. Baked to static it is level\ncontent: same trees, every client, stock game, no patched .exe."));
+                if (ImGui.MenuItem(Loc.TL("Convert from a captured tree_dump.bin..."), null, false, canBakeOver && so is not null))
+                    DoConvertOvergrowthFromDump();
+                Theme.Tip(Loc.T("Exact, tree for tree. Run the bfvVegetationCapture tool while the game sits in this level\nand it reads the instances the engine already generated; this places those. Positions, yaw\nand species are the game's own. Per-tree SCALE cannot survive - BfVietnam has no per-object\nscale command - so every tree of a type comes out at its template's size."));
+                ImGui.SetNextItemWidth(150f * uiScale);
+                SldF(Loc.TL("Keep fraction"), ref ogStaticKeep, 0.05f, 1f, "%.2f");
+                Theme.Tip(Loc.T("Thin the forest as it is baked, for a tree budget. 1.00 keeps every tree."));
+                if (ImGui.MenuItem(Loc.TL("   Switch procedural overgrowth off when converting"), null, ogStaticDisableProcedural))
+                    ogStaticDisableProcedural = !ogStaticDisableProcedural;
+                Theme.Tip(Loc.T("Empties the <types> in overGrowth.wst so the engine stops planting the trees you just\nbaked - otherwise the map draws every tree twice. Undergrowth (grass) is left alone."));
+                ImGui.Separator();
+                if (ImGui.MenuItem(Loc.TL("Export Overgrowth as a separate .con..."), null, false, growth?.Over is not null))
+                    DoBakeOvergrowthToCon();
                 ImGui.EndMenu();
             }
             if (ImGui.BeginMenu(Loc.TL("AI")))
@@ -11900,11 +13029,14 @@ void BuildUi()
             }
             if (ImGui.MenuItem(Loc.TL("Map Report"), null, showMapReport, mapReport is not null)) showMapReport = !showMapReport;
             ImGui.Separator();
+            // Each tooltip goes directly after the item it describes: Theme.Tip attaches to the LAST item
+            // submitted, so the decal's description had been sitting on Import Sound and describing a picture.
             if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
+            Theme.Tip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
             if (ImGui.MenuItem(Loc.TL("Import 3D Model..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showModelImport = true;
             Theme.Tip(Loc.T("A model of your own as a placeable static object: the mesh, its textures\nand the .con files that register it, all written inside the map."));
             if (ImGui.MenuItem(Loc.TL("Import Sound (MP3/WAV)..."), null, false, so is not null && levelDir is not null)) showSoundImport = true;
-            Theme.Tip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
+            Theme.Tip(Loc.T("An ambient sound you can place: the audio, a sound script with its distance falloff,\nand an object that carries them, all written inside the map. The game plays .wav, so\nan mp3 (or anything else FFmpeg reads) is converted on the way in."));
             if (ImGui.MenuItem(Loc.TL("Package Level..."), null, false, levelDir is not null)) showPackage = true;
             Theme.Tip(Loc.T("One zip: the map archive, a server-side copy, minimap, thumbnail and a readme."));
             ImGui.Separator();
@@ -12220,8 +13352,12 @@ void BuildUi()
     HelpWindow();
     ValidateModal();
     ExitPromptModal();
+    LightmapBakeProgress();
+    ShadowBakeProgress();
+    BrightenDialog();
     PointToolOverlay();
     LightGizmos();
+    SoundGizmos();
     TunnelGizmos();
     CombatAreaOverlay();
     NotesOverlay();
@@ -12700,7 +13836,8 @@ void TunnelsWindow()
             ImGui.SameLine(); ImGui.TextDisabled(string.Format(Loc.T("surface water {0:0.0} m"), cfg.WaterLevel));
             ImGui.TextDisabled(Loc.T("Its colour and look: Inspector > Water."));
         }
-        ImGui.Checkbox(Loc.TL("Show entry points in the viewport"), ref showTunnelEntries);
+        ImGui.Checkbox(Loc.TL("Show entry point rings + labels in the viewport"), ref showTunnelEntries);
+        Theme.Tip(Loc.T("The spheres and the text beside them ('no hole above' and the rest).\nAlso in the View menu."));
         Theme.Tip(Loc.T("Draws the sphere the engine actually tests: touch the entrance object within this\nradius of the point and you pass through the terrain. Green = it will work.\nThe blue circle is where the water surface cuts it - below that line you swim."));
         ImGui.Separator();
 
@@ -12784,6 +13921,13 @@ void TunnelsWindow()
 
 // Read the level's water shader once the mesh library is up: the level's own StandardMesh/levelWater.rs when it
 // ships one (the library resolves level archives first), else the base game's.
+// How much levelWater.rs' 'opacity' multiplies the water's alpha by, as RaShaderWater.fx does it:
+//   alpha = pow(1-dirToEye.y, uvSpeed.z) * opacity * clamp(distance/waterFade, 0, 4) * vertexAlpha
+// Every level in both games ships `waterFade 0`, which makes that clamp a constant 4 - so the factor is 4*opacity.
+// The retail default 0.35 therefore lands on 1.4 and leaves the viewport looking as it always has, while 0.1 reads
+// as genuinely see-through and 1.0 as solid. BF1942 has no levelWater.rs, so it gets a neutral 1.
+float WaterOpacityMul(float opacity) => gameIsBf1942 ? 1f : Math.Clamp(opacity, 0f, 1f) * 4f;
+
 void EnsureWaterShaderLoaded()
 {
     if (waterShaderLoaded || meshLib is null) return;
@@ -13067,17 +14211,25 @@ void DecalDialog()
                 Cbo(Loc.TL("When it plays"), ref decalSoundMode,
                             new[] { Loc.T("Always - fades with distance"), Loc.T("In the video, in sync") }, 2);
                 Theme.Tip(Loc.T("The engine only advances a video while its screen is DRAWN, and a .bik's own audio track is part of\nthat playback - so out of the box the two cannot both be in sync AND always audible.\n\nAlways: the .bik is made silent and a separate AreaObject emitter carries the sound, heard by\ndistance wherever you look. The sound does not follow the frames.\n\nIn the video, in sync: the .bik keeps its own track and nothing else is added. Perfectly in sync,\nand out of the box it plays only while the screen is in view - the bink DLL patch removes that limit."));
-                ImGui.TextDisabled(decalSoundMode == 0
-                    ? Loc.T("The .bik is made silent and a separate emitter carries the sound (not frame-synced).")
-                    : Loc.T("The .bik's own track is the sound - nothing else is added, so it cannot play twice."));
-                ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref decalSoundVol, 0.05f, 1f, "%.2f");
                 if (decalSoundMode == 0)
+                    ImGui.TextDisabled(Loc.T("The .bik is made silent and a separate emitter carries the sound (not frame-synced)."));
+                else
                 {
-                    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref decalSoundNear, 1f, 100f, "%.0f");
-                    ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref decalSoundFar, 5f, 400f, "%.0f");
-                    Theme.Tip(Loc.T("The sound is gone past this - it can never carry across the map. Keep it modest (40-80 m)\nfor a screen you only hear when you are near it, or raise it to cover an area."));
-                    if (decalSoundFar < decalSoundNear + 1f) decalSoundFar = decalSoundNear + 1f;
+                    ImGui.TextDisabled(Loc.T("The .bik's own track is the sound - nothing else is added, so it cannot play twice."));
+                    Theme.Muted(Loc.T("Needs the bink DLL patch installed, or it only plays while you look at the screen."));
                 }
+                // Volume is only ours to set on the separate emitter; in the other mode it is baked into the .bik.
+                if (decalSoundMode == 0)
+                { ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Volume"), ref decalSoundVol, 0.05f, 1f, "%.2f"); }
+                // BOTH modes need the distances. For the emitter they are its own falloff; for the in-sync mode
+                // they are what gets written into the mod's bfv_bink_always.ini, which is how the DLL knows how
+                // far that screen carries. Hiding them here left the DLL on its fallback numbers.
+                ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Full volume within (m)"), ref decalSoundNear, 1f, 100f, "%.0f");
+                ImGui.SetNextItemWidth(150f * uiScale); SldF(Loc.TL("Silent beyond (m)"), ref decalSoundFar, 5f, 400f, "%.0f");
+                Theme.Tip(decalSoundMode == 0
+                    ? Loc.T("The emitter's own falloff. The sound is gone past this - it can never carry across the\nmap. Keep it modest (40-80 m) for a screen you only hear when you are near it.")
+                    : Loc.T("How far this screen carries, written into the mod's bfv_bink_always.ini on save and\napplied by the bink DLL. 30 m is about 100 feet - roughly a television in a room."));
+                if (decalSoundFar < decalSoundNear + 1f) decalSoundFar = decalSoundNear + 1f;
                 ImGui.TextDisabled(string.Format(Loc.T("Audio: {0}, {1} - set beside the Convert button above."), decalSoundStereo ? Loc.T("stereo") : Loc.T("mono"), decalAudioRate >= 44100 ? "44 kHz" : "22 kHz"));
             }
         }
@@ -13322,6 +14474,95 @@ bool CreateDecalObject()
         return true;
     }
     catch (Exception ex) { Toast(Loc.T("Decal failed: ") + ex.Message); return false; }
+}
+
+// ---- Light pools ------------------------------------------------------------------------------------------------
+//
+// The one way to put visible light on a surface in an engine with no dynamic lights: an unlit, additively blended
+// quad, exactly the material every muzzle flash uses. Formats/Cons/LightPool.cs carries the reasoning and the
+// measurements; this is the editor side of it. The object is built by the same six-file recipe as a decal, so it
+// packs and saves down a path that is already proven.
+
+// A name no template in the level is using yet, so making a second pool never overwrites the first.
+string NextPoolName()
+{
+    for (int i = 1; i < 1000; i++)
+    {
+        string n = (lpShape == 1 ? "lampglow" : "lightpool") + i;
+        bool taken = importedObjs.ContainsKey(n)
+                  || (meshLib is not null && meshLib.TryGet(n, out _))
+                  || (so is not null && so.Objects.Any(o => string.Equals(o.Template, n, StringComparison.OrdinalIgnoreCase)));
+        if (!taken) return n;
+    }
+    return "lightpool" + Guid.NewGuid().ToString("N")[..6];
+}
+
+// Build the pool as a level-local object and arm the Place tool with it. Returns the template name, or null if the
+// level cannot carry one.
+string? CreateLightPool()
+{
+    if (so is null || meshLib is null || levelDir is null) { Toast(Loc.T("Open a level first.")); return null; }
+    try
+    {
+        // Nothing runs a level-local object's folder unless Init.con says so. Same guard as the decal path: refuse
+        // rather than queue files that can never load.
+        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
+        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the light pool in.")); return null; }
+
+        var (baseSub, levelName) = LevelIdentity();
+        string name = NextPoolName();
+
+        var built = RefractorForge.Formats.Con.LightPool.Build(
+            levelName, name, lpDiameter,
+            new Vec3(lpColour.X, lpColour.Y, lpColour.Z),
+            lpBrightness, lpSoftness,
+            lpShape == 1 ? RefractorForge.Formats.Con.LightPool.Shape.Glow
+                         : RefractorForge.Formats.Con.LightPool.Shape.Floor,
+            baseSub, 128,
+            // The gradient is authored in the Formats layer, which cannot reach the DDS encoder; hand it one.
+            // Uncompressed 32-bit keeps the alpha ramp clean - DXT1 has one bit of alpha and would band the falloff
+            // into a hard circle, which is the whole thing this is trying to avoid.
+            rgba => DdsTexture.EncodeUncompressedMipped(new Texture2D(128, 128, rgba)));
+
+        foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        BroadcastLevelFiles(built.Template, built.Files);
+
+        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine))));
+
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
+
+        // Show it in the viewport the same way an imported model is shown.
+        var preview = new Texture2D(128, 128,
+            RefractorForge.Formats.Con.LightPool.Gradient(128, new Vec3(lpColour.X, lpColour.Y, lpColour.Z), lpBrightness, lpSoftness));
+        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, preview)));
+        importedObjs[built.Template] = built.Mesh;
+        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)>
+            { (built.Template + "_Material0", "lightpool_" + built.Template, Vector3.One) };
+        BroadcastObjMesh(built.Template);
+        RebuildCatalog();
+        browserTemplate = built.Template; gpPlaceKind = null; tool = Array.IndexOf(toolNames, "Place"); mapper = 2;
+        return built.Template;
+    }
+    catch (Exception ex) { Toast(Loc.T("Light pool failed: ") + ex.Message); return null; }
+}
+
+// Drop instances of `template` at each of `spots`. Straight through the history, so one Undo takes the whole batch
+// back - and with no terrain raycast, which is what makes this work INSIDE a tunnel where the Place tool's click
+// would hit the terrain far overhead instead of the floor you meant.
+void PlacePoolsAt(string template, IEnumerable<Vec3> spots)
+{
+    if (so is null || hist is null) return;
+    var cmds = new List<IEditCommand>();
+    foreach (var p in spots)
+        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), template, p, Vec3.Zero));
+    if (cmds.Count == 0) return;
+    hist.Do(cmds.Count == 1 ? cmds[0] : new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
 }
 
 // ---- Importing a 3D model ---------------------------------------------------------------------------------------
@@ -13723,7 +14964,13 @@ bool ImportSoundObject()
             return false;
         }
         var name = sndImportName.Trim().Length > 0 ? sndImportName : Path.GetFileNameWithoutExtension(sndImportPath);
-        var built = RefractorForge.Formats.Sound.SoundObject.Build(name, wav, sndVol, sndNear, sndFar, sndLoop, sndFar, stereo: sndStereo, wav44kBytes: wav44);
+        // BuildArea, not Build. The SimpleObject shape hangs the sound on a DRAWN object, so the engine culls it
+        // with the geometry: it is heard only while the thing is on screen and stops at the draw distance, whatever
+        // the script's distances say - which is "placing a sound does nothing in game". An AreaObject has no
+        // geometry, so nothing can cull it and the player's POSITION is all that decides. Every retail level does it
+        // this way (Hue's river1 / river3 / island1), and the decal's own sound path already did.
+        var built = RefractorForge.Formats.Sound.SoundObject.BuildArea(name, wav, sndVol, sndNear, sndFar, sndLoop,
+                                                                      stereo: sndStereo, wav44kBytes: wav44);
         foreach (var f in built.Files) pendingLevelFiles.Add(f);
         BroadcastLevelFiles(built.Template, built.Files);
 
@@ -14757,6 +16004,65 @@ void BakeLightsToGround()
 // Draw a marker and a reach ring for every placed light, so a rig can be aimed rather than guessed at. Uses the
 // ImGui draw list rather than new GL buffers: these are a handful of circles, and the projection helper the
 // gizmos already use is enough.
+// How far a placed ambient sound carries, drawn on the ground as two rings.
+//
+// A sound is invisible, and its two distances are the whole of its behaviour: minDistance is the radius that stays
+// at FULL volume, and the script's Distance->Volume ramp carries it down to silence at maxDistance. Without a
+// picture you are placing something whose reach you cannot see, which is why "I placed a sound and heard nothing"
+// is so easy to arrive at - a 20 m ambient dropped in the middle of a 1024 m map is inaudible everywhere you
+// happen to stand.
+void SoundGizmos()
+{
+    if (!showSoundRings || so is null || sounds.Count == 0) return;
+    var fb = window.FramebufferSize;
+    var vp = cam.ViewProjection;
+    var dl = ImGui.GetBackgroundDrawList();
+
+    for (int i = 0; i < so.Objects.Count; i++)
+    {
+        var o = so.Objects[i];
+        if (!sounds.IsSound(o.Template)) continue;
+        var wpos = new Vector3(o.Position.X, o.Position.Y, o.Position.Z);
+        if (Vector3.Distance(wpos, cam.Position) > 3000f) continue;
+
+        var em = sounds.Get(o.Template);
+        float minD = em?.MinDistance ?? 10f;
+        float maxD = em?.Script?.MaxDistance ?? (minD * 3f);
+        bool sel = i == selected || multi.Contains(i);
+
+        // Drawn as a ring of world-space points projected individually, so it follows the terrain's perspective
+        // instead of being a flat screen circle that lies about where the sound reaches.
+        void Ring(float radius, uint col, float thick)
+        {
+            const int N = 48;
+            Vector2 first = default, prev = default;
+            bool have = false, started = false;
+            for (int k = 0; k <= N; k++)
+            {
+                float a = k / (float)N * MathF.PI * 2f;
+                float wx = o.Position.X + MathF.Cos(a) * radius, wz = o.Position.Z + MathF.Sin(a) * radius;
+                var p = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.35f, wz), vp, fb.X, fb.Y);
+                if (float.IsNaN(p.X)) { have = false; continue; }      // behind the camera: break the line
+                if (!started) { first = p; started = true; }
+                if (have) dl.AddLine(prev, p, col, thick);
+                prev = p; have = true;
+            }
+            if (started && have) dl.AddLine(prev, first, col, thick);
+        }
+
+        // Inner ring = full volume, outer = where it fades to silence.
+        Ring(minD, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, sel ? 0.95f : 0.45f)), sel ? 2.5f : 1.5f);
+        Ring(maxD, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, sel ? 0.45f : 0.20f)), sel ? 2f : 1.2f);
+
+        var scr = Gizmo.Project(wpos, vp, fb.X, fb.Y);
+        if (float.IsNaN(scr.X)) continue;
+        dl.AddCircleFilled(scr, (sel ? 6f : 4f) * uiScale, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, 0.95f)));
+        if (sel) dl.AddText(scr + new Vector2(9f * uiScale, -7f * uiScale),
+                            ImGui.GetColorU32(new Vector4(0.7f, 0.95f, 1f, 1f)),
+                            $"{o.Template}  {minD:0}m / {maxD:0}m");
+    }
+}
+
 void LightGizmos()
 {
     if (!showLightGizmos || lightRig.Lights.Count == 0) return;
@@ -14852,13 +16158,6 @@ void LightsPanel()
     ImGui.SameLine();
     ImGui.Checkbox(Loc.TL("Live on ground"), ref groundLightsLive);
     Theme.Tip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
-    if (ImGui.Button(Loc.TL("Bake Lightmaps (sun + placed lights)"))) BakeAllLighting();
-    Theme.Tip(Loc.T("Terrain sun-shadow, every object's lightmap (with these lights) and the ground pools, in one go.\nShown at once; Save writes them. Also under Tools > Lighting."));
-    ImGui.SetNextItemWidth(150f * uiScale);
-    SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
-    if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
-    Theme.Tip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
-
     float night = lightRig.NightAmount;
     ImGui.SetNextItemWidth(150f);
     if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
@@ -14898,6 +16197,119 @@ void LightsPanel()
         Toast(Loc.T("Night lighting applied - written to Init.con on save."));
     }
     Theme.Tip(Loc.T("Sets the level's renderer ambient/diffuse/fog to night values\n(the same recipe DC_Basrah_Nights uses). Written to Init.con on save."));
+
+    // ---- Object lightmaps: one process ---------------------------------------------------------------------------
+    ImGui.Separator();
+    Theme.Section(Loc.T("OBJECT LIGHTMAPS"));
+    Theme.Tip(Loc.T("Everything that is a lightmap: the ObjectLightMaps/*.tga the game reads for each placed\nobject (sun + placed lights, as brightness). Nothing here touches the terrain - the sun\nshadow and the ground bake are the separate process below."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    if (CboZ(Loc.TL("Lightmap quality"), ref lmQuality,
+             Loc.T("Draft (fast)") + "\0" + Loc.T("Good") + "\0" + Loc.T("High (engine limit)") + "\0"))
+        ApplyLightmapQuality();
+    Theme.Tip(Loc.T("How the object lightmaps are baked. Sub-samples per texel is what smooths a shadow edge -\none sample per texel is what makes a bake look jagged - and texels per metre is how much\ndetail a surface gets. High is the engine's ceiling; larger maps crash the game.\nThe bake runs in the background with a progress bar, so a long one is not a freeze."));
+    Theme.Muted(string.Format(Loc.T("{0}x{0} samples per texel, {1:0} texels/m, up to {2}px"), lmBakeSamples, lmTexelsPerMetre, lmBakeMaxSize));
+    // Measured over all 35 retail BFV levels: 4,152 object lightmaps - 68% at 256px, 15% at 512, 1.6% at 1024
+    // (Saigon68, Fall_of_Saigon, Cedar_Falls, Landing_Zone_Albany) and NONE larger. 2048 was tried and crashed
+    // the game, so this is a real limit rather than a stylistic one.
+    Theme.Muted(Loc.T("1024px is the engine's per-map ceiling - 2048 crashes it. A bake ADDS to the maps the\nlevel already has; it never removes them, because an object left without one renders wrong."));
+    if (ImGui.Button(Loc.TL("Bake Object Lightmaps")) && so is not null && meshLib is not null && heightmap is not null) BakeObjectLightmaps();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Unbake lightmaps")) && so is not null && meshLib is not null) UnbakeObjectLightmaps();
+    Theme.Tip(Loc.T("Bake writes a lightmap per placed object (with these lights); Unbake queues fully lit ones\ninstead. Either way Save writes them, and the terrain shadow is left alone."));
+
+    // ---- Sun shadows + terrain: the other process ----------------------------------------------------------------
+    ImGui.Separator();
+    Theme.Section(Loc.T("SUN SHADOWS + TERRAIN"));
+    Theme.Tip(Loc.T("The terrain's own light: the sun cast-shadow the game reads from LightmapShadowBits.lsb,\nand the placed lights' colour burned into the ground texture tiles. Separate from the object\nlightmaps above - baking or unbaking one never touches the other."));
+    ImGui.Checkbox(Loc.TL("Merge into ground texture"), ref sbMergeToGround);
+    Theme.Tip(Loc.T("THIS is what makes a sun shadow visible in game. The engine does not draw the .lsb on the ground -\na deliberately unmissable checkerboard .lsb rendered no differently in game - it is painted into the\nterrain tiles, exactly as retail does (Fall_of_Saigon's tiles are about half as bright where its own\n.lsb flags shadow). Destructive to the ground art and it COMPOUNDS if you bake twice, so undo with Z\nbefore re-baking."));
+    ImGui.SameLine();
+    ImGui.SetNextItemWidth(120f * uiScale);
+    SldF(Loc.TL("Shadow darkness"), ref sbShadowLevel, 0.15f, 1f, "%.2f");
+    Theme.Tip(Loc.T("What fully shadowed ground keeps of its brightness. 0.50 is what retail measures at; 1.00 is off."));
+    ImGui.Checkbox(Loc.TL("Objects cast shadows"), ref sbWithObjects);
+    Theme.Tip(Loc.T("Every placed object casts into the terrain shadow. Leave this ON: with it off the bake only asks\nwhether the ground shadows itself, which on a flat or built-up map is almost nothing and looks\nlike the bake did nothing. It is what makes the bake take a minute instead of a second."));
+    ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Show baked shadow"), ref showBakedShadow);
+    Theme.Tip(Loc.T("Draw the BAKED terrain shadow on the ground - what the game reads. The real-time sun shadow\nis a separate camera-following preview that is never saved."));
+    if (ImGui.Button(Loc.TL("Bake Sun Shadows")) && heightmap is not null) DoBakeShadows();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Unbake sun shadows")) && heightmap is not null) UnbakeTerrainShadow();
+    ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Write .lsb on save"), ref writeShadowLsb);
+    Theme.Tip(Loc.T("Bake shows the sun's cast-shadow on the terrain at once and arms it for saving; Unbake arms a\nfully lit one. Save writes LightmapShadowBits.lsb while the box is ticked - object lightmaps\nare a separate file and a separate bake."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
+    if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
+    Theme.Tip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
+    if (ImGui.Button(Loc.TL("Bake both (lightmaps + sun shadows)")) && heightmap is not null) BakeAllLighting();
+    Theme.Tip(Loc.T("Both processes in one go. Also under Tools > Lighting."));
+
+    // ---- Light pools: the part that is actually VISIBLE in the game --------------------------------------------
+    ImGui.Separator();
+    Theme.Section(Loc.T("LAMP LIGHT (SHOWS IN GAME)"));
+    Theme.Tip(Loc.T("A lightmap can only take the sun AWAY - the engine reads it as a mask that multiplies\nthe sun, so a lamp can never be brighter or warmer than the sun and lights nothing in\na tunnel. This makes a real pool of light instead: an additively blended glow object,\nthe same material the game's own muzzle flashes use. It brightens whatever it is laid\nover, in any lighting, on terrain or on a mesh."));
+
+    ImGui.SetNextItemWidth(150f * uiScale);
+    CboZ(Loc.TL("Shape"), ref lpShape, Loc.T("Pool on the floor") + "\0" + Loc.T("Glow at the bulb") + "\0");
+    Theme.Tip(Loc.T("A pool lies flat, for the light a lamp throws down. A glow stands upright,\nfor the halo around the bulb itself. Both are the same additive quad."));
+    Col3(Loc.TL("Lamp colour"), ref lpColour);
+    Theme.Tip(Loc.T("The colour of the light, not of the object. Retail's own bulb glow is 248/238/205,\na warm off-white - which is what this starts at."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    SldF(Loc.TL("Size (m)"), ref lpDiameter, 0.5f, 60f, "%.1f");
+    Theme.Tip(Loc.T("How wide the pool is. A ceiling bulb throws roughly its own height across;\n6-10 m is a street lamp."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    SldF(Loc.TL("Brightness"), ref lpBrightness, 0.05f, 2f, "%.2f");
+    Theme.Tip(Loc.T("How much light it adds. The blend is additive, so past about 1.5 the middle\nburns out to white."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    SldF(Loc.TL("Softness"), ref lpSoftness, 0f, 1f, "%.2f");
+    Theme.Tip(Loc.T("0 is a hard-edged disc, 1 fades from the very centre. Around 0.6 reads as a lamp."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    SldF(Loc.TL("Drop below light (m)"), ref lpDrop, 0f, 30f, "%.1f");
+    Theme.Tip(Loc.T("How far under the light the pool sits - the lamp's height above the floor.\nUsed by the two buttons below, which place without a terrain raycast so they\nwork inside a tunnel, where clicking would hit the terrain overhead instead."));
+
+    if (ImGui.Button(Loc.TL("Make light pool")))
+    {
+        var t = CreateLightPool();
+        if (t is not null) Toast(string.Format(Loc.T("'{0}' ready - click the floor to place it."), t));
+    }
+    Theme.Tip(Loc.T("Builds the object and arms the Place tool with it, exactly like a decal.\nGood outdoors, where clicking lands it on the terrain."));
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Put one under this light")) && selLight >= 0 && selLight < lightRig.Lights.Count)
+    {
+        var l = lightRig.Lights[selLight];
+        // Take the pool's colour and size from the light it belongs to, so the two agree without being told twice:
+        // the editor preview and the thing the game draws are then the same lamp.
+        lpColour = new Vector3(l.ColorR, l.ColorG, l.ColorB);
+        lpDiameter = MathF.Max(1f, MathF.Min(60f, l.Radius * 0.8f));
+        var t = CreateLightPool();
+        if (t is not null)
+        {
+            PlacePoolsAt(t, new[] { new Vec3(l.Position.X, l.Position.Y - lpDrop, l.Position.Z) });
+            Toast(string.Format(Loc.T("Light pool placed under '{0}'."), l.Name));
+        }
+    }
+    Theme.Tip(Loc.T("Takes the colour and size from the selected light and drops a pool straight under it.\nNo raycast, so it lands on a tunnel floor as happily as on terrain."));
+
+    if (ImGui.Button(Loc.TL("Put one under every lamp object")) && so is not null)
+    {
+        // Ask the level which of its objects are lamps rather than making the user find them all by eye.
+        var lamps = so.Objects
+            .Where(o => RefractorForge.Formats.Con.LightPool.LooksLikeLamp(o.Template))
+            .Select(o => o.Position).ToList();
+        if (lamps.Count == 0) Toast(Loc.T("No lamp-like objects found in this level."));
+        else
+        {
+            var t = CreateLightPool();
+            if (t is not null)
+            {
+                PlacePoolsAt(t, lamps.Select(p => new Vec3(p.X, p.Y - lpDrop, p.Z)));
+                Toast(string.Format(Loc.T("{0} light pool(s) placed under lamp objects."), lamps.Count));
+            }
+        }
+    }
+    Theme.Tip(Loc.T("Every placed object whose name reads as a lamp - lamp, light, lantern, torch, candle,\nbulb, streetlight - gets a pool under it, all in one undo step."));
+    ImGui.Separator();
 
     if (ImGui.Button(Loc.TL("Add light here")))
     {

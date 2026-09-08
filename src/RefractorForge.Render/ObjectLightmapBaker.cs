@@ -17,14 +17,74 @@ namespace RefractorForge.Render;
 /// </summary>
 public static class ObjectLightmapBaker
 {
+    /// <summary>
+    /// The fraction of this mesh's surface the sun actually reaches, 0..1 — what a baked map for it would average.
+    ///
+    /// <para>For a mesh whose lightmap-UV slot carries no unwrap there is nothing to rasterise, so it can only be
+    /// given a FLAT map. Choosing that flat value badly is very visible: testing the sun at the object's origin
+    /// alone answers "does the terrain shade this spot", which is nearly always yes, so every such object came out
+    /// at 255 and glowed beside its baked neighbours. Real baked maps average far lower — 26 to 80 across retail
+    /// Saigon68 — because a mesh SHADOWS ITSELF: undersides, interiors and back faces are dark.</para>
+    ///
+    /// <para>So this samples the surface the same way <see cref="Bake"/> does — triangle centroids against the
+    /// terrain and against the mesh's own geometry — and returns the mean. The flat map then carries the level a
+    /// real bake would have produced, and the object sits correctly among the ones that could be unwrapped.</para>
+    /// </summary>
+    /// <param name="maxSamples">Triangles to sample. The whole point is that this is cheap next to a bake.</param>
+    public static float AverageLit(MeshLibrary.Mesh mesh, Matrix4x4 world, Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
+                                   LightRig? rig = null, int maxSamples = 256)
+    {
+        var pos = mesh.Positions;
+        if (pos is null || pos.Length == 0) return 1f;
+        var (_, maxH) = TerrainShadow.HeightSpan(hm, cfg);
+        var sun = Vector3.Normalize(new Vector3(sunDir.X, sunDir.Y, sunDir.Z));
+
+        // Every triangle in world space: the occluder needs them all, even though only a sample is tested.
+        var tris = new List<(Vector3 A, Vector3 B, Vector3 C)>();
+        foreach (var part in mesh.Parts)
+        {
+            var idx = part.Indices;
+            for (int t = 0; t + 2 < idx.Length; t += 3)
+            {
+                int a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
+                tris.Add((Vector3.Transform(pos[a], world), Vector3.Transform(pos[b], world), Vector3.Transform(pos[c], world)));
+            }
+        }
+        if (tris.Count == 0) return 1f;
+        var occ = MeshOccluder.Build(tris);
+
+        // Walk the list with a stride rather than taking the first N: the first triangles of a mesh are all one
+        // part, and a stride spreads the samples over the whole object.
+        int stride = Math.Max(1, tris.Count / Math.Max(maxSamples, 1));
+        float sum = 0f; int n = 0;
+        for (int i = 0; i < tris.Count; i += stride)
+        {
+            var (a, b, c) = tris[i];
+            var p = (a + b + c) / 3f;
+            // Nudge off the surface so a face never shadows itself at its own centroid.
+            var probe = p + sun * 0.05f;
+            float v = (TerrainShadow.PointLit(probe.X, probe.Y, probe.Z, sunDir, hm, cfg, maxH)
+                       && !occ.Occluded(probe, sun)) ? 1f : 0f;
+            if (rig is not null && rig.Lights.Count > 0) v += LightBake.Intensity(p.X, p.Y, p.Z, rig, hm, cfg);
+            sum += Math.Clamp(v, 0f, 1f); n++;
+        }
+        return n == 0 ? 1f : sum / n;
+    }
+
     /// <summary>Bake one object's lightmap. <paramref name="mesh"/> must carry lightmap UVs (40-byte / format-9233 mesh);
     /// returns null otherwise. <paramref name="world"/> places the mesh in world space. Intensity = ambient + (1-ambient)·
     /// N·L · shadow.</summary>
+    /// <param name="samples">Sub-samples per texel AXIS: 2 means a 2x2 grid inside each texel, 3 a 3x3. The sun
+    /// test is binary — a texel is lit or it is not — so one sample per texel puts a hard staircase along every
+    /// shadow edge and every triangle border, which is exactly what a baked map looks like when it looks "jagged".
+    /// Averaging several sub-samples turns that step into a proper gradient. Cost is samples² rays per texel.</param>
     public static Texture2D? Bake(MeshLibrary.Mesh mesh, Matrix4x4 world, Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
-        int size = 256, float ambient = 0.4f, LightRig? rig = null, bool selfShadow = true)
+        int size = 256, float ambient = 0.4f, LightRig? rig = null, bool selfShadow = true, int samples = 2)
     {
         var lm = mesh.LightmapUvs;
         if (lm is null || lm.Length == 0 || size < 4) return null;
+        samples = Math.Clamp(samples, 1, 4);
         var pos = mesh.Positions;
         var (_, maxH) = TerrainShadow.HeightSpan(hm, cfg);
         var sun = Vector3.Normalize(new Vector3(sunDir.X, sunDir.Y, sunDir.Z));
@@ -48,11 +108,18 @@ public static class ObjectLightmapBaker
 
         var inten = new float[size * size];
         var cover = new bool[size * size];
+        // Sub-sample accumulators. `owner` keeps the first-triangle-wins rule while still letting every sub-sample
+        // of THAT triangle contribute, so the averaging smooths shadow edges without smearing across an atlas seam.
+        var sum = new float[size * size];
+        var cnt = new int[size * size];
+        var owner = new int[size * size];
+        Array.Fill(owner, -1);
+        int triId = 0;
 
         foreach (var part in mesh.Parts)
         {
             var idx = part.Indices;
-            for (int t = 0; t + 2 < idx.Length; t += 3)
+            for (int t = 0; t + 2 < idx.Length; t += 3, triId++)
             {
                 int a = idx[t], b = idx[t + 1], c = idx[t + 2];
                 if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
@@ -67,10 +134,12 @@ public static class ObjectLightmapBaker
                 // A vertex with a NaN in its second UV set (retail BfVietnam meshes carry a few) would turn the
                 // whole triangle's texel range into int.MinValue and skip - silently. Skip it on purpose.
                 if (!float.IsFinite(ta.X) || !float.IsFinite(ta.Y) || !float.IsFinite(tb.X) || !float.IsFinite(tb.Y) || !float.IsFinite(tc.X) || !float.IsFinite(tc.Y)) continue;
-                RasterTriangle(ta, tb, tc, size, (px, py, w0, w1, w2) =>
+                int thisTri = triId;
+                RasterTriangle(ta, tb, tc, size, samples, (px, py, w0, w1, w2) =>
                 {
                     int o = py * size + px;
-                    if (cover[o]) return;                              // first triangle wins (atlas overlaps are rare)
+                    if (owner[o] == -1) owner[o] = thisTri;
+                    else if (owner[o] != thisTri) return;               // first triangle wins (atlas overlaps are rare)
                     var wp = w0 * wa + w1 * wb + w2 * wc;
                     // Visibility only. Which side of the face the sun is on is the shader's business (N.L); whether
                     // the object's own roof or wall is in the way is ours. The ray starts a little along the sun
@@ -99,11 +168,14 @@ public static class ObjectLightmapBaker
                         v += add * (lndl * 0.85f + 0.15f);
                     }
 
-                    inten[o] = MathF.Min(v, 1f);
-                    cover[o] = true;
+                    sum[o] += MathF.Min(v, 1f);
+                    cnt[o]++;
                 });
             }
         }
+
+        for (int i = 0; i < inten.Length; i++)
+            if (cnt[i] > 0) { inten[i] = sum[i] / cnt[i]; cover[i] = true; }
 
         // A mesh whose second UV set is all one point (BfVietnam props and walls ship 0,0 on every vertex - the slot
         // exists, the unwrap does not) rasterises nothing. Baking it anyway shipped an all-black map that turned the
@@ -123,8 +195,10 @@ public static class ObjectLightmapBaker
         return new Texture2D(size, size, rgba);
     }
 
-    // Half-space barycentric triangle rasterizer in texel space.
-    private static void RasterTriangle(Vector2 a, Vector2 b, Vector2 c, int size, Action<int, int, float, float, float> px)
+    // Half-space barycentric triangle rasterizer in texel space. `samples` sub-divides each texel on both axes and
+    // calls back once per sub-sample that lands inside the triangle, so the caller can average them.
+    private static void RasterTriangle(Vector2 a, Vector2 b, Vector2 c, int size, int samples,
+                                       Action<int, int, float, float, float> px)
     {
         int minX = Math.Max(0, (int)MathF.Floor(MathF.Min(a.X, MathF.Min(b.X, c.X))));
         int maxX = Math.Min(size - 1, (int)MathF.Ceiling(MathF.Max(a.X, MathF.Max(b.X, c.X))));
@@ -133,13 +207,28 @@ public static class ObjectLightmapBaker
         float area = Edge(a, b, c);
         if (MathF.Abs(area) < 1e-6f) return;
         float inv = 1f / area;
+        float step = 1f / samples;
         for (int y = minY; y <= maxY; y++)
             for (int x = minX; x <= maxX; x++)
             {
-                var p = new Vector2(x + 0.5f, y + 0.5f);
-                float w0 = Edge(b, c, p) * inv, w1 = Edge(c, a, p) * inv, w2 = Edge(a, b, p) * inv;
-                if (w0 < -0.002f || w1 < -0.002f || w2 < -0.002f) continue;   // outside (epsilon catches seam texels)
-                px(x, y, w0, w1, w2);
+                bool any = false;
+                for (int sy = 0; sy < samples; sy++)
+                    for (int sx = 0; sx < samples; sx++)
+                    {
+                        var p = new Vector2(x + (sx + 0.5f) * step, y + (sy + 0.5f) * step);
+                        float w0 = Edge(b, c, p) * inv, w1 = Edge(c, a, p) * inv, w2 = Edge(a, b, p) * inv;
+                        if (w0 < -0.002f || w1 < -0.002f || w2 < -0.002f) continue;   // outside (epsilon catches seam texels)
+                        px(x, y, w0, w1, w2);
+                        any = true;
+                    }
+                // A texel whose centre-ish samples all missed but which the triangle still clips: keep the old
+                // single-centre behaviour so thin geometry does not lose its texels entirely.
+                if (!any && samples > 1)
+                {
+                    var p = new Vector2(x + 0.5f, y + 0.5f);
+                    float w0 = Edge(b, c, p) * inv, w1 = Edge(c, a, p) * inv, w2 = Edge(a, b, p) * inv;
+                    if (w0 >= -0.002f && w1 >= -0.002f && w2 >= -0.002f) px(x, y, w0, w1, w2);
+                }
             }
     }
 

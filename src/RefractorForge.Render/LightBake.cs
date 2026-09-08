@@ -220,6 +220,48 @@ public static class LightBake
         return (R / 255f, G / 255f, B / 255f);
     }
 
+    /// <summary>
+    /// Darken the terrain atlas where the sun does not reach - the engine's <c>mergeTerrainShadows</c> step.
+    ///
+    /// MEASURED, not guessed. Retail Battlefield Vietnam paints its terrain sun-shadow straight into the ground
+    /// tiles: on Fall_of_Saigon the tile texels the level's own LightmapShadowBits.lsb flags as shadow are ~21 units
+    /// darker than the unflagged ones (tx03x06 21.3 vs 43.3, tx02x05 25.4 vs 48.4, tx05x03 27.0 vs 47.6;
+    /// correlation -0.60/-0.52/-0.52, and near zero under a swapped tile orientation, which also confirms the
+    /// tx{col}x{row} to tile-index mapping). Roughly a x0.5 multiply, hence the default. The .lsb alone changes
+    /// NOTHING you can see - a deliberately unmissable 50%-of-the-world checkerboard .lsb rendered no differently
+    /// in game - so writing the .lsb without this step is why a shadow bake looked like it did nothing.
+    ///
+    /// The ground art is the only copy, so this is destructive and compounds if run twice: it belongs behind an
+    /// undoable atlas edit.
+    /// </summary>
+    /// <param name="shadowVis">Visibility map as <see cref="TerrainShadow.Bake"/> makes it: 255 = fully sunlit,
+    /// 0 = fully in shadow. Sampled by normalised position, so it need not match the atlas's size.</param>
+    /// <param name="shadowLevel">What a fully shadowed texel keeps, 0..1. 0.5 is retail-like; 1 is a no-op.</param>
+    public static void MultiplyShadowIntoAtlas(Texture2D atlas, Texture2D shadowVis, float shadowLevel = 0.5f)
+    {
+        shadowLevel = Math.Clamp(shadowLevel, 0f, 1f);
+        if (shadowLevel >= 1f) return;
+        int aw = atlas.Width, ah = atlas.Height;
+        int sw = shadowVis.Width, sh = shadowVis.Height;
+        var ap = atlas.Rgba;
+        var sp = shadowVis.Rgba;
+        for (int y = 0; y < ah; y++)
+        {
+            float v = (y + 0.5f) / ah;
+            for (int x = 0; x < aw; x++)
+            {
+                float u = (x + 0.5f) / aw;
+                var (r, _, _) = Bilinear(sp, sw, sh, u, v);      // grey map: the red channel IS the visibility
+                float k = shadowLevel + (1f - shadowLevel) * Math.Clamp(r, 0f, 1f);
+                if (k >= 0.999f) continue;
+                int ao = (y * aw + x) * 4;
+                ap[ao + 0] = Scale(ap[ao + 0], k);
+                ap[ao + 1] = Scale(ap[ao + 1], k);
+                ap[ao + 2] = Scale(ap[ao + 2], k);
+            }
+        }
+    }
+
     private static byte Scale(byte v, float k) => (byte)Math.Clamp((int)(v * k + 0.5f), 0, 255);
 
     /// <summary>

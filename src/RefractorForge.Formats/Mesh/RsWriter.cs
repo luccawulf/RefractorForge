@@ -31,10 +31,32 @@ public static class RsWriter
     /// emitting one on an opaque material mislabels it for both the engine and our own viewer.</param>
     /// <param name="TwoSided">Draw back faces too. A flat sheet (sign, leaf card) needs it; a solid object does not,
     /// and turning it on there doubles the fill for nothing.</param>
+    /// <param name="SelfIllum">Brightness the surface carries on its own, before any light reaches it. This is the
+    /// state that makes a material immune to a dark level: 1 1 1 draws the texture at full strength at midnight.</param>
+    /// <param name="BlendSrc">/<param name="BlendDest">How the surface combines with what is already drawn.
+    /// <c>sourcealpha</c> + <c>one</c> is ADDITIVE — the texture only ever brightens the pixels behind it, which is
+    /// how the engine draws a muzzle flash, and the only way to put a pool of light on a surface in a game with no
+    /// dynamic lights. Leave both null for ordinary alpha blending.</param></param>
     public sealed record Material(string Name, string? Texture, Vec3 Diffuse,
                                   bool Transparent = false, float? AlphaTestRef = null,
                                   bool TwoSided = false, bool Lighting = true,
-                                  bool LightingSpecular = false, bool DepthWrite = true);
+                                  bool LightingSpecular = false, bool DepthWrite = true,
+                                  Vec3? SelfIllum = null, Vec3? Specular = null, float? Opacity = null,
+                                  bool SortedBlend = false, string? BlendSrc = null, string? BlendDest = null);
+
+    /// <summary>
+    /// The retail ADDITIVE-GLOW material, copied statement for statement from <c>e_MuzzAK47_m1.rs</c> (41 shipped
+    /// materials use exactly these states). Unlit, self-illuminated and additively blended, so it brightens whatever
+    /// it is laid over and never darkens with the level — which is what makes it usable as a pool of lamplight.
+    /// The COLOUR lives in the texture, not here: <c>materialDiffuse</c> stays white so the picture comes through
+    /// unchanged.
+    /// </summary>
+    public static Material Glow(string name, string? texture, bool twoSided = true) =>
+        new(name, texture, new Vec3(1, 1, 1),
+            Transparent: true, AlphaTestRef: 0f, TwoSided: twoSided, Lighting: false,
+            LightingSpecular: false, DepthWrite: false,
+            SelfIllum: new Vec3(1, 1, 1), Specular: new Vec3(0, 0, 0), Opacity: 1f,
+            SortedBlend: true, BlendSrc: "sourcealpha", BlendDest: "one");
 
     /// <param name="textureFolder">Prepended to any texture name carrying no '/' of its own. Level-local objects
     /// use <c>texture</c>, which is where <c>textureManager.alternativePath</c> points them.</param>
@@ -44,10 +66,18 @@ public static class RsWriter
         foreach (var m in materials)
         {
             sb.Append("subshader \"").Append(m.Name).Append("\" \"StandardMesh/Default\"\r\n{\r\n");
+            // Statement order follows a real shipped shader rather than our own taste, so a generated file diffs
+            // cleanly against retail and nothing depends on us having guessed the parser's tolerance right.
             Stmt(sb, "lighting", m.Lighting ? "true" : "false");
             Stmt(sb, "lightingSpecular", m.LightingSpecular ? "true" : "false");
+            if (m.Specular is { } sp) Stmt(sb, "materialSpecular", $"{Fmt(sp.X)} {Fmt(sp.Y)} {Fmt(sp.Z)}");
             Stmt(sb, "materialDiffuse", $"{Fmt(m.Diffuse.X)} {Fmt(m.Diffuse.Y)} {Fmt(m.Diffuse.Z)}");
+            if (m.SelfIllum is { } si) Stmt(sb, "selfillum", $"{Fmt(si.X)} {Fmt(si.Y)} {Fmt(si.Z)}");
+            if (m.Opacity is { } op) Stmt(sb, "opacity", Fmt(op));
             Stmt(sb, "transparent", m.Transparent ? "true" : "false");
+            if (m.SortedBlend) Stmt(sb, "sortedBlend", "true");
+            if (!string.IsNullOrWhiteSpace(m.BlendSrc)) Stmt(sb, "blendSrc", m.BlendSrc!);
+            if (!string.IsNullOrWhiteSpace(m.BlendDest)) Stmt(sb, "blendDest", m.BlendDest!);
             if (m.AlphaTestRef is { } ar) Stmt(sb, "alphaTestRef", Fmt(ar));
             // A blended surface that also writes depth hides whatever is drawn behind it afterwards — retail glass
             // always turns this off, so honour it rather than leaving the caller to remember.
@@ -58,6 +88,62 @@ public static class RsWriter
             sb.Append("}\r\n\r\n");
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Lift a shader out of the scene's shading so a picture stays readable where the sun does not reach.
+    ///
+    /// The engine shades a standard mesh as <c>saturate(2*(prelight*N.L + ambient)) * texture</c>, so a decal in a
+    /// tunnel, an alley or any north-facing wall is multiplied down to its ambient - a sign you cannot read. The
+    /// engine's own answer is <c>selfillum</c>, which adds a floor to that lighting term; at 1 the surface renders
+    /// at its texture's own brightness everywhere, which is what a sign, a poster or a map board wants.
+    ///
+    /// This EDITS an existing <c>.rs</c> as text rather than regenerating it, so it works on shaders the editor did
+    /// not write (an imported model's, a decal from an older build) and preserves every other state in the file.
+    /// A statement already present is replaced in place; a missing one is inserted after <c>materialDiffuse</c>,
+    /// which is where a shipped shader carries it.
+    /// </summary>
+    /// <param name="level">0 = leave the shading alone (any existing selfillum is removed), 1 = fully self-lit.</param>
+    /// <param name="unlitAtFull">At level 1, also turn <c>lighting</c> off - the strongest form, and what retail
+    /// uses for a surface that must never be shaded at all.</param>
+    public static string Brighten(string rs, float level, bool unlitAtFull = false)
+    {
+        level = Math.Clamp(level, 0f, 1f);
+        var lines = rs.Replace("\r\n", "\n").Split('\n').ToList();
+
+        // Drop whatever selfillum is there now; we are about to state it (or deliberately not to).
+        lines.RemoveAll(l => l.TrimStart().StartsWith("selfillum", StringComparison.OrdinalIgnoreCase));
+
+        if (level > 0f)
+        {
+            string stmt = null!;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                var t = lines[i].TrimStart();
+                if (!t.StartsWith("materialDiffuse", StringComparison.OrdinalIgnoreCase)) continue;
+                string indent = lines[i][..(lines[i].Length - t.Length)];
+                stmt = $"{indent}selfillum {Fmt(level)} {Fmt(level)} {Fmt(level)};";
+                lines.Insert(i + 1, stmt);
+                i++;                                    // skip the line we just inserted
+            }
+            // A shader with no materialDiffuse at all: put it just inside each subshader block instead.
+            if (stmt is null)
+                for (int i = 0; i < lines.Count; i++)
+                    if (lines[i].Trim() == "{")
+                        lines.Insert(++i, $"\tselfillum {Fmt(level)} {Fmt(level)} {Fmt(level)};");
+        }
+
+        // `lighting` only moves at full brightness, and only when asked: turning it off on a normal decal would
+        // flatten it everywhere, not just in shade.
+        if (unlitAtFull && level >= 1f)
+            for (int i = 0; i < lines.Count; i++)
+            {
+                var t = lines[i].TrimStart();
+                if (t.StartsWith("lighting ", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("lightingSpecular", StringComparison.OrdinalIgnoreCase))
+                    lines[i] = lines[i][..(lines[i].Length - t.Length)] + "lighting false;";
+            }
+
+        return string.Join("\r\n", lines);
     }
 
     private static void Stmt(StringBuilder sb, string name, string value) =>

@@ -32,6 +32,27 @@ public sealed class TerrainConfig
     public string? HeightmapRef { get; set; }
     public string? MaterialMapRef { get; set; }
 
+    /// <summary>The level's <c>GeometryTemplate.texBaseName</c>, e.g.
+    /// <c>BfVietnam\levels\Saigon68\Textures\Tx</c>. Its DIRECTORY is where the terrain's txCOLxROW tiles live, and
+    /// that matters: a level can carry copies of the same tile names elsewhere (Saigon68 ships a
+    /// <c>BACKUP_SAIGON_TERRAIN/</c> folder holding a full set), and matching tiles by bare file name picked those
+    /// instead - so the editor read and re-saved the BACKUP tiles while the ground the game draws never changed.
+    /// This is the engine's own answer to "which tiles are the terrain's".</summary>
+    public string? TexBaseName { get; set; }
+
+    /// <summary>The folder part of <see cref="TexBaseName"/>, forward-slashed and without a trailing slash
+    /// (e.g. <c>BfVietnam/levels/Saigon68/Textures</c>). Null when the level declares no texBaseName.</summary>
+    public string? TileFolder
+    {
+        get
+        {
+            var t = TexBaseName?.Replace('\\', '/').Trim();
+            if (string.IsNullOrEmpty(t)) return null;
+            int i = t.LastIndexOf('/');
+            return i <= 0 ? null : t[..i];
+        }
+    }
+
     /// <summary>Horizontal distance in meters between adjacent heightmap samples.</summary>
     public float HorizontalSpacing => (float)WorldSize / MaterialSize;
 
@@ -74,6 +95,7 @@ public sealed class TerrainConfig
                 case "geometrytemplate.targettricount":t.TargetTriCount = I(val); break;
                 case "geometrytemplate.file":          t.HeightmapRef   = val;    break;
                 case "geometrytemplate.materialmap":   t.MaterialMapRef = val;    break;
+                case "geometrytemplate.texbasename":   t.TexBaseName    = val;    break;
             }
         }
         return t;

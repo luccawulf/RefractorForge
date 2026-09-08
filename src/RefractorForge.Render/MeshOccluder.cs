@@ -16,10 +16,25 @@ public sealed class MeshOccluder
     private readonly Vector3 _min, _max, _cellSize;
     private readonly int _nx, _ny, _nz;
     private readonly int[][] _cells;
-    private readonly int[] _stamp;
-    private int _ray;
+    private readonly Cursor _default;
 
     public int TriangleCount => _a.Length;
+
+    /// <summary>Per-thread scratch for <see cref="Occluded(Vector3, Vector3, Cursor, float)"/>. The grid and the
+    /// triangles are immutable once built and can be shared by any number of threads; the only mutable state is the
+    /// "already tested on this ray" stamp, so a parallel bake takes ONE OCCLUDER and one cursor per thread rather
+    /// than rebuilding the grid per thread. The terrain shadow bake casts a ray per texel against every placed
+    /// object, which is where that matters.</summary>
+    public sealed class Cursor
+    {
+        internal readonly int[] Stamp;
+        internal int Ray;
+        internal Cursor(int triangles) { Stamp = new int[triangles]; }
+    }
+
+    /// <summary>A cursor for one thread. Its stamp array is one int per triangle, so a big occluder wants a bounded
+    /// number of these - see the shadow bake's degree-of-parallelism cap.</summary>
+    public Cursor NewCursor() => new Cursor(_a.Length);
 
     public static MeshOccluder? Build(IReadOnlyList<(Vector3 a, Vector3 b, Vector3 c)> tris)
         => tris.Count == 0 ? null : new MeshOccluder(tris);
@@ -59,7 +74,7 @@ public sealed class MeshOccluder
         }
         _cells = new int[lists.Length][];
         for (int i = 0; i < lists.Length; i++) _cells[i] = lists[i]?.ToArray() ?? Array.Empty<int>();
-        _stamp = new int[n];
+        _default = new Cursor(n);
     }
 
     private (int, int, int) Cell(Vector3 p) => (
@@ -73,8 +88,13 @@ public sealed class MeshOccluder
 
     /// <summary>True when the ray from <paramref name="origin"/> along <paramref name="dir"/> (normalised) hits the
     /// mesh. It starts <paramref name="skip"/> along the ray, so the surface the point sits on is not its own
-    /// occluder. Not thread-safe: one occluder per bake.</summary>
+    /// occluder. This overload uses the occluder's own cursor and is NOT thread-safe; pass a per-thread
+    /// <see cref="Cursor"/> to share one occluder across threads.</summary>
     public bool Occluded(Vector3 origin, Vector3 dir, float skip = 0.02f)
+        => Occluded(origin, dir, _default, skip);
+
+    /// <summary>Thread-safe form: every thread passes its own <see cref="NewCursor"/>.</summary>
+    public bool Occluded(Vector3 origin, Vector3 dir, Cursor cur, float skip = 0.02f)
     {
         origin += dir * skip;
         float tEnter = 0f, tExit = float.MaxValue;
@@ -94,13 +114,13 @@ public sealed class MeshOccluder
         Step(dir.X, origin.X, _min.X, _cellSize.X, x, out int sx, out float tMaxX, out float tDeltaX);
         Step(dir.Y, origin.Y, _min.Y, _cellSize.Y, y, out int sy, out float tMaxY, out float tDeltaY);
         Step(dir.Z, origin.Z, _min.Z, _cellSize.Z, z, out int sz, out float tMaxZ, out float tDeltaZ);
-        _ray++;
+        cur.Ray++;
         while (true)
         {
             foreach (int ti in _cells[Index(x, y, z)])
             {
-                if (_stamp[ti] == _ray) continue;
-                _stamp[ti] = _ray;
+                if (cur.Stamp[ti] == cur.Ray) continue;
+                cur.Stamp[ti] = cur.Ray;
                 if (Hit(ti, origin, dir)) return true;
             }
             if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += sx; if (x < 0 || x >= _nx) return false; tMaxX += tDeltaX; }

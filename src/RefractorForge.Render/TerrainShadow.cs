@@ -1,4 +1,6 @@
 using System;
+using System.Numerics;
+using System.Threading;
 using RefractorForge.Formats.Geometry;
 using RefractorForge.Formats.Terrain;
 
@@ -18,9 +20,20 @@ namespace RefractorForge.Render;
 public static class TerrainShadow
 {
     /// <summary>Visibility map: 255 = fully lit by the sun, 0 = in cast shadow (soft penumbra in between).</summary>
-    public static Texture2D Bake(int size, Heightmap hm, TerrainConfig cfg, Vec3 sunDir, int blurRadius = 1)
+    /// <param name="samples">Sub-samples per texel AXIS (2 = a 2x2 grid inside each texel). The sun test is
+    /// binary — a point is blocked or it is not — so one sample per texel puts a hard staircase along every shadow
+    /// edge. Averaging several turns that into a real gradient, which is most of what "jagged shadows" means.
+    /// Leave at 1 for the packed <c>.lsb</c>, which is one bit per texel and cannot carry a gradient anyway.</param>
+    /// <param name="objects">Placed static objects as world-space triangles. WITHOUT this the bake only asks whether
+    /// the TERRAIN shadows itself, which on a flat city map is almost nothing - Saigon68 came out 5.8% shadowed and
+    /// read in game as "the bake did nothing", because the buildings that actually cast the shadows were not in it.
+    /// Null keeps the old heightmap-only behaviour.</param>
+    /// <param name="onRow">Called once per finished row, for a progress bar. Invoked from worker threads.</param>
+    public static Texture2D Bake(int size, Heightmap hm, TerrainConfig cfg, Vec3 sunDir, int blurRadius = 1, int samples = 1,
+                                 MeshOccluder? objects = null, Action? onRow = null, CancellationToken cancel = default)
     {
         if (size < 1) size = 1;
+        samples = Math.Clamp(samples, 1, 4);
         int hw = hm.Width, hh = hm.Height;
         float ws = cfg.WorldSize;
 
@@ -34,37 +47,81 @@ public static class TerrainShadow
         for (int i = 0; i < hm.Samples.Length; i++)
         { float m = cfg.HeightToMeters(hm.Samples[i]); if (m < minH) minH = m; if (m > maxH) maxH = m; }
 
-        float step = ws / size;                              // one output texel, in world metres
-        float bias = rise * step * 0.5f + 0.05f;             // avoid self-shadowing on the first step
-        int maxSteps = Math.Min(size * 2, (int)((maxH - minH) / MathF.Max(rise * step, 1e-3f)) + 4);
+        // March at HALF a texel. A ray stepping a whole texel at a time can stride straight over a thin ridge and
+        // report the ground behind it lit, which reads as a shadow with holes punched along its length.
+        float texel = ws / size;
+        float step = texel * 0.5f;
+        float bias = rise * texel * 0.5f + 0.05f;            // avoid self-shadowing on the first step
+        int maxSteps = Math.Min(size * 4, (int)((maxH - minH) / MathF.Max(rise * step, 1e-3f)) + 8);
 
+        // BILINEAR, not nearest. The heightmap is far coarser than the shadow map (a 256² heightmap under a 2048²
+        // shadow is one height per 8x8 block), and sampling it nearest makes every shadow edge follow the
+        // heightmap's own grid — a staircase with 8-pixel treads, which is exactly the jaggedness you see.
         float HeightAtWorld(float wx, float wz)
         {
             float fx = wx / ws * (hw - 1), fz = wz / ws * (hh - 1);
-            int x = (int)(fx + 0.5f), y = (int)(fz + 0.5f);
-            if (x < 0) x = 0; else if (x > hw - 1) x = hw - 1;
-            if (y < 0) y = 0; else if (y > hh - 1) y = hh - 1;
-            return cfg.HeightToMeters(hm[x, y]);
+            if (fx < 0f) fx = 0f; else if (fx > hw - 1) fx = hw - 1;
+            if (fz < 0f) fz = 0f; else if (fz > hh - 1) fz = hh - 1;
+            int x0 = (int)fx, y0 = (int)fz;
+            int x1 = x0 + 1 > hw - 1 ? hw - 1 : x0 + 1;
+            int y1 = y0 + 1 > hh - 1 ? hh - 1 : y0 + 1;
+            float tx = fx - x0, tz = fz - y0;
+            float h00 = cfg.HeightToMeters(hm[x0, y0]), h10 = cfg.HeightToMeters(hm[x1, y0]);
+            float h01 = cfg.HeightToMeters(hm[x0, y1]), h11 = cfg.HeightToMeters(hm[x1, y1]);
+            return (h00 * (1f - tx) + h10 * tx) * (1f - tz) + (h01 * (1f - tx) + h11 * tx) * tz;
+        }
+
+        bool Blocked(float wx, float wz)
+        {
+            float rh = HeightAtWorld(wx, wz) + bias;
+            float cx = wx, cz = wz;
+            for (int s = 1; s <= maxSteps; s++)
+            {
+                cx += dirX * step; cz += dirZ * step; rh += rise * step;
+                if (rh > maxH) return false;                  // ray cleared all terrain -> lit
+                if (cx < 0f || cz < 0f || cx > ws || cz > ws) return false;   // marched off-map -> lit
+                if (HeightAtWorld(cx, cz) > rh) return true;
+            }
+            return false;
         }
 
         var vis = new byte[size * size];
-        for (int py = 0; py < size; py++)
+        float sub = 1f / samples;
+        var sunV = Vector3.Normalize(new Vector3(sunDir.X, sunDir.Y, sunDir.Z));   // points TOWARD the sun
+        // Lift the ray off the ground before testing objects: a building's own floor polygons sit ON the terrain, and
+        // starting exactly at ground level makes every texel under a building shadow itself at grazing angles.
+        const float groundLift = 0.25f;
+
+        // One cursor per thread, one shared occluder. The stamp array is an int per triangle, so on a city map the
+        // cursors are the memory cost - cap the threads when objects are in play rather than letting the scheduler
+        // allocate one per core.
+        var po = new System.Threading.Tasks.ParallelOptions { CancellationToken = cancel };
+        if (objects is not null) po.MaxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, 8));
+
+        System.Threading.Tasks.Parallel.For(0, size, po,
+            () => objects?.NewCursor(),
+            (py, _, cur) =>
+        {
             for (int px = 0; px < size; px++)
             {
-                float wx = (px + 0.5f) / size * ws;
-                float wz = (py + 0.5f) / size * ws;          // UV-aligned: v -> worldZ (matches BakeAtlas)
-                float rh = HeightAtWorld(wx, wz) + bias;
-                float cx = wx, cz = wz;
-                bool blocked = false;
-                for (int s = 1; s <= maxSteps; s++)
-                {
-                    cx += dirX * step; cz += dirZ * step; rh += rise * step;
-                    if (rh > maxH) break;                    // ray cleared all terrain -> lit
-                    if (cx < 0f || cz < 0f || cx > ws || cz > ws) break;   // marched off-map -> lit
-                    if (HeightAtWorld(cx, cz) > rh) { blocked = true; break; }
-                }
-                vis[py * size + px] = blocked ? (byte)0 : (byte)255;
+                int lit = 0, n = 0;
+                for (int sy = 0; sy < samples; sy++)
+                    for (int sx = 0; sx < samples; sx++)
+                    {
+                        float wx = (px + (sx + 0.5f) * sub) / size * ws;
+                        float wz = (py + (sy + 0.5f) * sub) / size * ws;   // UV-aligned: v -> worldZ (matches BakeAtlas)
+                        bool blocked = Blocked(wx, wz);
+                        if (!blocked && objects is not null && cur is not null)
+                            blocked = objects.Occluded(new Vector3(wx, HeightAtWorld(wx, wz) + groundLift, wz), sunV, cur);
+                        if (!blocked) lit++;
+                        n++;
+                    }
+                vis[py * size + px] = (byte)Math.Clamp(lit * 255 / Math.Max(n, 1), 0, 255);
             }
+            onRow?.Invoke();
+            return cur;
+        },
+            _ => { });
 
         if (blurRadius > 0) BoxBlur(vis, size, size, blurRadius);
 
@@ -89,13 +146,15 @@ public static class TerrainShadow
     /// look before fully trusting (X mirror is invisible here because the test shadow is near-X-symmetric).
     /// </summary>
     public static LightmapShadowBits BakeToLsb(Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
-        int gridDim, int tilePx = 1024, int bakeSize = 0, bool invertLit = true, bool flipX = false, bool flipY = false)
+        int gridDim, int tilePx = 1024, int bakeSize = 0, bool invertLit = true, bool flipX = false, bool flipY = false,
+        MeshOccluder? objects = null, Action? onRow = null, CancellationToken cancel = default)
     {
         if (gridDim < 1) throw new ArgumentOutOfRangeException(nameof(gridDim));
         int fullSide = gridDim * tilePx;
         if (bakeSize <= 0) bakeSize = Math.Min(fullSide, 2048);
 
-        var baked = Bake(bakeSize, hm, cfg, sunDir, blurRadius: 0);   // crisp binary shadow (no penumbra)
+        // crisp binary shadow (no penumbra) - the .lsb is one bit per texel and cannot carry a gradient
+        var baked = Bake(bakeSize, hm, cfg, sunDir, blurRadius: 0, samples: 1, objects: objects, onRow: onRow, cancel: cancel);
         var full = new byte[fullSide * fullSide];
         // flipX/flipY mirror the written raster so the user can correct an in-game L/R or top/bottom shadow mirror
         // (the offline polarity test can't see an X-mirror — the test shadow is near-X-symmetric) without a recompile.

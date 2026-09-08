@@ -77,14 +77,32 @@ public static class LevelArchive
         var so = StaticObjectsFile.Parse(Lines(Need("StaticObjects.con")));
 
         // Terrain tiles: gather txNNxNN from ALL archives (later archives override same-named tiles).
+        //
+        // ONLY from the folder the level's own texBaseName names. A level can ship several full sets of identically
+        // named tiles - Saigon68 carries a BACKUP_SAIGON_TERRAIN/ copy - and keying them by bare file name let
+        // whichever came last win. That silently pointed the editor at the backup: the ground shown was the
+        // backup's, and every texture paint and shadow merge was written back into the backup, so the terrain the
+        // game actually draws never changed. The engine resolves tiles from texBaseName, so we do too.
+        string? tileFolder = cfg.TileFolder;
         var tileMap = new Dictionary<string, (RefractorFlatArchive Arc, RefractorFlatArchiveEntry Entry)>(StringComparer.OrdinalIgnoreCase);
         foreach (var a in arcs)
             foreach (var e in a.Entries)
-                if (System.Text.RegularExpressions.Regex.IsMatch(
-                        Path.GetFileNameWithoutExtension(e.Name.Replace('\\', '/')), @"^tx\d+x\d+$",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase))
-                    tileMap[Path.GetFileName(e.Name.Replace('\\', '/'))] = (a, e);
-        var tiles = tileMap.Select(kv => (kv.Key, kv.Value.Arc.Read(kv.Value.Entry)));
+            {
+                string norm = e.Name.Replace('\\', '/');
+                if (!System.Text.RegularExpressions.Regex.IsMatch(
+                        Path.GetFileNameWithoutExtension(norm), @"^tx\d+x\d+$",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase)) continue;
+                if (tileFolder is not null)
+                {
+                    var dir = Path.GetDirectoryName(norm)?.Replace('\\', '/') ?? "";
+                    if (!dir.Equals(tileFolder, StringComparison.OrdinalIgnoreCase)) continue;
+                }
+                // Key on the LEAF so a later archive still overrides the same tile, but carry the full path.
+                tileMap[Path.GetFileName(norm)] = (a, e);
+            }
+        // Hand the FULL entry path through: TerrainTexture keeps it and SplitToTiles yields it back on save, so a
+        // painted tile is written to the entry it came from instead of being matched by leaf name all over again.
+        var tiles = tileMap.Select(kv => (kv.Value.Entry.Name.Replace('\\', '/'), kv.Value.Arc.Read(kv.Value.Entry)));
         var tex = TerrainTexture.FromTileBytes(tiles, cfg.WorldSize, Opt("detail.dds"));
 
         // Gameplay layer: prefer the multiplayer Conquest/ copies of each file (later archives win).

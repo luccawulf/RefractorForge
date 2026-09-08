@@ -37,6 +37,10 @@ public static class DecalObject
     /// <param name="doubleSided">Emit a second, reversed quad so it is visible from behind.</param>
     /// <param name="baseSub">The game's archive mount root: "bf1942" or "BfVietnam". The two games share no
     /// namespace, so a BF1942 path resolves to nothing in Vietnam and the object silently gets no mesh.</param>
+    /// <param name="selfIllum">Lift the decal out of the scene's shading so it stays readable where the sun does
+    /// not reach. The engine shades a mesh as <c>saturate(2*(prelight*N.L + ambient)) * texture</c>, so a sign in a
+    /// tunnel or an alley is multiplied down to its ambient; <c>selfillum</c> puts a floor under that. 0 = shaded
+    /// like everything else, 1 = renders at the texture's own brightness everywhere.</param>
     /// <param name="textureRef">When set, the shader points at this reference VERBATIM instead of the level's
     /// <c>Texture/</c> folder, and no picture file is emitted. A Bink movie path (<c>Mods/&lt;mod&gt;/Movies/x.bik</c>)
     /// makes a video decal: the texture loader plays Bink paths, the trick the mod movie-screens use.</param>
@@ -44,7 +48,8 @@ public static class DecalObject
                               string textureName, byte[]? ddsBytes, bool flat = false, bool doubleSided = true,
                               string baseSub = "bf1942", string? textureRef = null,
                               string? soundScript = null, float soundRadius = 0f, bool soundAutoPlay = true,
-                              float uMax = 1f, float vMax = 1f, float maxDrawDistance = 0f)
+                              float uMax = 1f, float vMax = 1f, float maxDrawDistance = 0f,
+                              bool additive = false, float selfIllum = 0f)
     {
         name = Sanitize(name);
         textureName = Sanitize(textureName);
@@ -64,8 +69,13 @@ public static class DecalObject
         // apart. `transparent false` + alphaTestRef is retail's cut-out recipe (blending would also need
         // `depthWrite false`, and a photo is opaque anyway); twosided because a decal is a flat sheet.
         string texLine = textureRef is not null ? textureRef : "texture/" + textureName;
+        // `additive` swaps the cut-out recipe for the engine's own glow recipe, so the same six files can carry a
+        // pool of lamplight instead of a picture. See RsWriter.Glow.
         string rs = Mesh.RsWriter.Write(new[] {
-            new Mesh.RsWriter.Material(material, texLine, new Vec3(1, 1, 1), AlphaTestRef: 0.5f, TwoSided: true) });
+            additive
+                ? Mesh.RsWriter.Glow(material, texLine)
+                : new Mesh.RsWriter.Material(material, texLine, new Vec3(1, 1, 1), AlphaTestRef: 0.5f, TwoSided: true,
+                                             SelfIllum: selfIllum > 0f ? new Vec3(selfIllum, selfIllum, selfIllum) : null) });
         files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(rs)));
         if (textureRef is null && ddsBytes is not null) files.Add(($"Texture/{textureName}.dds", ddsBytes));
 

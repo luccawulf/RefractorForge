@@ -15,6 +15,101 @@ public sealed class ObjectLightmaps
 {
     public sealed record Entry(string Template, int X, int Y, int Z, Texture2D Texture);
 
+    /// <summary>
+    /// Does this lightmap file carry REAL baked lighting, or is it a flat placeholder?
+    ///
+    /// <para>The distinction decides whether a bake may replace it. A mesh with no lightmap unwrap can only be given
+    /// a FLAT map, and a bake must not overwrite a map that DICE (or an earlier good bake) actually produced — but
+    /// it MUST be free to replace a blank. Without this test the two are indistinguishable, and a level got stuck
+    /// with 293 blank white maps that every subsequent bake politely preserved.</para>
+    ///
+    /// <para>A shipped lightmap is an 8-bit colour-mapped TGA: one palette index per texel, so "flat" is every index
+    /// being the same byte — no decode and no palette needed. Anything of another shape (a <c>.dds</c>, say) counts
+    /// as detailed, because refusing to overwrite is the safe direction.</para>
+    /// </summary>
+    public static bool HasDetail(byte[] file)
+    {
+        if (file is null || file.Length < 18) return true;
+        int idLen = file[0], cmType = file[1], imgType = file[2], bpp = file[16];
+        if (cmType != 1 || imgType != 1 || bpp != 8) return true;
+        int cmLen = file[5] | (file[6] << 8), cmBits = file[7];
+        long data = 18L + idLen + (long)cmLen * ((cmBits + 7) / 8);
+        if (data >= file.Length) return true;
+        byte first = file[data];
+        for (long i = data + 1; i < file.Length; i++) if (file[i] != first) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Raise a baked object lightmap so nothing on the object is darker than <paramref name="floor"/>.
+    ///
+    /// This is how you brighten an object the level does NOT own the shader for. A stock object's <c>.rs</c> lives
+    /// in the shared archives - Saigon68's sewers are <c>standardMesh/O_sewers_A_M1.rs</c> - and editing that would
+    /// change the object on every map on the install. Its LIGHTMAP, though, is level-local
+    /// (<c>ObjectLightMaps/&lt;mesh&gt;_&lt;x&gt;-&lt;y&gt;-&lt;z&gt;.tga</c>), and the lightmap is exactly what makes
+    /// it dark: the engine shades it <c>saturate(2*(prelight*N.L + LMambient)) * texture</c>, and Saigon68's sewers
+    /// ship a lightmap that is 1024x1024 of solid ZERO, so only <c>renderer.LMambientColor</c> survives.
+    ///
+    /// The header and palette are left byte-identical; only the index bytes move, each to the palette entry whose
+    /// grey is nearest the floor. Returns null when the file is not an 8-bit colour-mapped TGA - the one shape
+    /// every shipped lightmap uses - because guessing at another format is how you corrupt a map.
+    /// </summary>
+    public static byte[]? LiftFloor(byte[] file, byte floor)
+    {
+        if (file is null || file.Length < 18) return null;
+        int idLen = file[0], cmType = file[1], imgType = file[2], bpp = file[16];
+        if (cmType != 1 || imgType != 1 || bpp != 8) return null;
+        int cmLen = file[5] | (file[6] << 8), cmBits = file[7];
+        int cmBytes = (cmBits + 7) / 8;
+        long palOff = 18L + idLen;
+        long data = palOff + (long)cmLen * cmBytes;
+        if (data >= file.Length || cmLen <= 0 || cmBytes < 3) return null;
+
+        // Grey value of every palette entry, and the entry closest to the floor from ABOVE (so lifting can never
+        // darken a texel). The shipped palette is an identity ramp, but read it rather than assume it.
+        var grey = new int[cmLen];
+        for (int i = 0; i < cmLen; i++)
+        {
+            long o = palOff + (long)i * cmBytes;
+            grey[i] = (file[o] + file[o + 1] + file[o + 2]) / 3;      // BGR, and every entry is grey anyway
+        }
+        int best = -1, bestGrey = int.MaxValue;
+        for (int i = 0; i < cmLen; i++)
+            if (grey[i] >= floor && grey[i] < bestGrey) { bestGrey = grey[i]; best = i; }
+        if (best < 0) { best = 0; for (int i = 1; i < cmLen; i++) if (grey[i] > grey[best]) best = i; }   // nothing that bright
+
+        var outp = (byte[])file.Clone();
+        bool moved = false;
+        for (long i = data; i < file.Length; i++)
+        {
+            int idx = file[i];
+            if (idx < cmLen && grey[idx] < floor) { outp[i] = (byte)best; moved = true; }
+        }
+        return moved ? outp : file;
+    }
+
+    /// <summary>
+    /// The file BASE a lightmap must be stored under for a given LOD mesh name — the leaf, never a path.
+    ///
+    /// <para><c>GeometryTemplate.file</c> is free to carry a relative path (<c>../standardMesh/city_dumpster1</c> is
+    /// real, and appears in Saigon68). Used verbatim as a file name that writes the map to
+    /// <c>ObjectLightMaps/../standardMesh/city_dumpster1_449-10-173.tga</c>, which normalises straight OUT of the
+    /// folder the engine reads. The object then has no lightmap, and because its mesh still carries a lightmap
+    /// channel the engine binds the lightmap shader anyway and asserts on the null texture handle
+    /// (<c>RaShaderPVLS1DifLmp.cpp:84, m_LightMapD3DH</c>). Every retail level stores leaf names only.</para>
+    /// </summary>
+    public static string FileBase(string meshName)
+    {
+        if (string.IsNullOrWhiteSpace(meshName)) return "";
+        var n = meshName.Replace('\\', '/').Trim();
+        int slash = n.LastIndexOf('/');
+        if (slash >= 0) n = n[(slash + 1)..];
+        // A trailing extension would double up ("x.sm_10-2-3.tga"); the engine's own names carry none.
+        int dot = n.LastIndexOf('.');
+        if (dot > 0 && n.Length - dot <= 5) n = n[..dot];
+        return n.Trim();
+    }
+
     private readonly List<Entry> _entries = new();
     // (normalised template, position) -> texture. Keying on BOTH is essential: a lightmap belongs to one specific
     // template at one position, and dense maps pack different templates (e.g. citymesh1_m1 vs ruin_citymesh1_m1) a

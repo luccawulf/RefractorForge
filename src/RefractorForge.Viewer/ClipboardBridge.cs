@@ -11,7 +11,7 @@ namespace RefractorForge.Viewer;
 /// built-in fallback is app-local only, so without this you can't paste text from outside the editor. Uses the
 /// Win32 clipboard directly (callable from the GL thread — unlike WinForms' Clipboard, which needs STA).
 /// </summary>
-internal static unsafe class ClipboardBridge
+public static unsafe class ClipboardBridge
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate byte* GetTextDelegate(IntPtr userData);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void SetTextDelegate(IntPtr userData, byte* text);
@@ -47,7 +47,7 @@ internal static unsafe class ClipboardBridge
 }
 
 /// <summary>Minimal Win32 CF_UNICODETEXT clipboard get/set (thread-agnostic, unlike WinForms).</summary>
-internal static class Win32Clipboard
+public static class Win32Clipboard
 {
     [DllImport("user32.dll", SetLastError = true)] private static extern bool OpenClipboard(IntPtr hWndNewOwner);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool CloseClipboard();
@@ -61,9 +61,25 @@ internal static class Win32Clipboard
     private const uint CF_UNICODETEXT = 13;
     private const uint GMEM_MOVEABLE = 0x0002;
 
+    /// <summary>
+    /// The clipboard is a single global resource and only one process may hold it open at a time, so OpenClipboard
+    /// genuinely fails every so often — a clipboard manager, Office, a remote-desktop agent or the shell taking its
+    /// turn. Failing the whole copy on the first refusal is what makes paste "sometimes not work"; Windows' own
+    /// guidance is to retry briefly, which is what every robust implementation does.
+    /// </summary>
+    private static bool Open()
+    {
+        for (int attempt = 0; attempt < 10; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero)) return true;
+            System.Threading.Thread.Sleep(attempt < 3 ? 1 : 10);
+        }
+        return false;
+    }
+
     public static string? GetText()
     {
-        if (!OpenClipboard(IntPtr.Zero)) return null;
+        if (!Open()) return null;
         try
         {
             var h = GetClipboardData(CF_UNICODETEXT);
@@ -78,7 +94,7 @@ internal static class Win32Clipboard
 
     public static void SetText(string s)
     {
-        if (!OpenClipboard(IntPtr.Zero)) return;
+        if (!Open()) return;
         try
         {
             EmptyClipboard();

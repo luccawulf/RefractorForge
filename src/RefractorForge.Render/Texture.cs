@@ -555,10 +555,11 @@ public sealed class TerrainTexture
     /// <summary>Representative tile resolution (largest tile width) — for reporting.</summary>
     public int AtlasSize => _maxTile;
 
-    /// <summary>True when this level's terrain tiles are in a form the game cannot draw: not block-compressed, or
-    /// larger than the 512 px retail tiles ever go. Only one thing ever wrote those - an older RefractorForge, which
-    /// saved 1024x1024 uncompressed mip-less tiles and left the ground BLACK in game. The editor re-encodes them on
-    /// the next save.</summary>
+    /// <summary>True when this level's terrain tiles are in a form the game cannot draw: not block-compressed. Only
+    /// one thing ever wrote those - an older RefractorForge, which saved 1024x1024 uncompressed mip-less tiles and
+    /// left the ground BLACK in game. The editor re-encodes them on the next save. SIZE is not a fault: retail BFV
+    /// ships 256 px, mods 512, and Saigon68 / PoE_El_Alamein ship 1024 px DXT1 tiles the game draws fine - flagging
+    /// those made every save of such a map re-encode (and slightly degrade) sixteen perfectly good tiles.</summary>
     public bool HasLegacyTiles
     {
         get
@@ -568,7 +569,7 @@ public sealed class TerrainTexture
                 for (int c = 0; c < _gridW; c++)
                 {
                     var n = _tileNative[c, r];
-                    if (n.W > 0 && (!n.Dxt || n.W > 512)) return true;
+                    if (n.W > 0 && !n.Dxt) return true;
                 }
             return false;
         }
@@ -756,7 +757,10 @@ public sealed class TerrainTexture
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             if (!m.Success) continue;
             int col = int.Parse(m.Groups[1].Value), row = int.Parse(m.Groups[2].Value);
-            parsed[(col, row)] = dds; pnames[(col, row)] = leaf; maxCol = Math.Max(maxCol, col); maxRow = Math.Max(maxRow, row);
+            // Keep the name AS GIVEN, not the bare leaf. When the caller passes a full archive path
+            // (Textures/tx00x00.dds) SplitToTiles yields it back, and the save resolves that one entry instead of
+            // leaf-matching into whatever folder happens to hold a same-named tile - a level's BACKUP_ copy, say.
+            parsed[(col, row)] = dds; pnames[(col, row)] = fileName.Replace('\\', '/'); maxCol = Math.Max(maxCol, col); maxRow = Math.Max(maxRow, row);
         }
         if (parsed.Count == 0) return null;
 
@@ -764,7 +768,7 @@ public sealed class TerrainTexture
         var grid = new Texture2D?[gw, gh];
         var names = new string?[gw, gh];
         var native = new (int W, bool Dxt)[gw, gh];
-        foreach (var kv in pnames) names[kv.Key.col, kv.Key.row] = kv.Value;   // preserve the in-archive name (e.g. tx00x00.dds)
+        foreach (var kv in pnames) names[kv.Key.col, kv.Key.row] = kv.Value;   // the in-archive name, path and all
         System.Threading.Tasks.Parallel.ForEach(parsed, kv =>
         {
             try

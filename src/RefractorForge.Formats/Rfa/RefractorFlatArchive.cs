@@ -411,13 +411,20 @@ public sealed class RefractorFlatArchive
     /// Writes to a sibling temp file first so the original is never locked while being read,
     /// then atomically replaces <paramref name="path"/>. Names in <paramref name="replacements"/> that the
     /// archive already has REPLACE those entries in place; names it does not have are appended.</summary>
+    /// <param name="drop">Optional: return <c>true</c> for an entry name that should NOT be carried over. Used to
+    /// retire entries an archive can never load — a name like <c>ObjectLightMaps/../standardMesh/foo.tga</c>, which
+    /// normalises out of its own folder, is dead weight the engine cannot read. Kept entries are still copied as raw
+    /// regions, so dropping costs nothing and re-compresses nothing.</param>
     public static void RepackToFile(
         string path,
         RefractorFlatArchive original,
-        IReadOnlyDictionary<string, byte[]> replacements)
+        IReadOnlyDictionary<string, byte[]> replacements,
+        Func<string, bool>? drop = null)
     {
         var ci = new Dictionary<string, byte[]>(replacements, StringComparer.OrdinalIgnoreCase);
-        var ents = original.Entries;
+        IReadOnlyList<RefractorFlatArchiveEntry> ents = drop is null
+            ? original.Entries
+            : original.Entries.Where(e => !drop(e.Name)).ToList();
 
         // A name the archive does not carry yet is APPENDED, not dropped. A repack IS a save, and a save has to
         // be able to add a file: a level-local object - a decal's mesh, shader, texture and its four .con files -

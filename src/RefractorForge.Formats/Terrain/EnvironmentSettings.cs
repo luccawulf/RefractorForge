@@ -147,7 +147,8 @@ public sealed class EnvironmentSettings
     public bool HasShallowColor { get; set; }
     /// <summary>Deep-water colour, RGB 0..1 (water.deepcolor); the submerged-terrain tint. Defaults to a blue.</summary>
     public Vec3 DeepColor { get; set; } = new(0.16f, 0.35f, 0.55f);
-    /// <summary>Water surface transparency 0..1 (water.waterShallowAlpha); lower = more see-through.</summary>
+    /// <summary>Water surface OPACITY 0..1 (water.waterShallowAlpha): 1 is solid, lower is more see-through.
+    /// Named for what it holds - calling it "transparency" is what made the editor's slider read backwards.</summary>
     public float WaterAlpha { get; set; } = 0.6f;
 
     // The SECOND water body of a tunnel map (waterBelowTerrain.*) has the same properties as the surface and is

@@ -58,6 +58,22 @@ public sealed class FoliagePalette
 
     public int TypeCount => Materials.Sum(m => m.Types.Count);
 
+    /// <summary>Every type in declaration order: materials as the <c>.wst</c> lists them, each slot's types in
+    /// order. This IS the engine's type index - a captured instance's type field indexes this flattened list, which
+    /// is how Flaming Dart's dump reads 0/1/2 as juicyGrass's c05f/c03f/c07f and 3 as wetDirt's c02f.</summary>
+    public IReadOnlyList<FoliageType> FlatTypes => Materials.SelectMany(m => m.Types).ToList();
+
+    /// <summary>The type a captured instance's index names, or null when the dump came from a level whose palette
+    /// declared more types than this one (the capture tool skips those rather than guessing).</summary>
+    public FoliageType? TypeByIndex(int index)
+    {
+        if (index < 0) return null;
+        foreach (var m in Materials)
+            foreach (var t in m.Types)
+                if (index-- == 0) return t;
+        return null;
+    }
+
     /// <summary>The engine's terrain materials, in the order a growth map's cell values index them. Verified against
     /// every retail BFVietnam level: 79 of 82 list exactly these 16 names in exactly this order.</summary>
     public static readonly string[] MaterialNames =

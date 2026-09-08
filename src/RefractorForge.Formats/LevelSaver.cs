@@ -322,6 +322,43 @@ public static class LevelSaver
             if (IsEditorOnlyFile(rel)) continue;
             entries.Add((prefix + rel, File.ReadAllBytes(f)));
         }
+
+        // NEVER let packing a folder DESTROY content that only exists in the archive being overwritten.
+        //
+        // A level folder is not always a complete copy of its .rfa - a level opened straight from an archive keeps
+        // most of its content there, and per-object lightmaps in particular routinely live only in the archive.
+        // Packing the folder over that archive silently deleted them: one real map went from 539 object lightmaps
+        // to ZERO this way, and every object in it rendered wrong until they were restored from a backup.
+        //
+        // So anything the destination already holds that the folder does not provide is CARRIED OVER. The folder
+        // still wins for every file it does contain, which is the whole point of packing it; what changes is that
+        // packing can no longer be a deletion.
+        if (File.Exists(outRfaPath))
+        {
+            try
+            {
+                var existing = new RefractorFlatArchive(outRfaPath);
+                var have = new HashSet<string>(entries.Select(e => e.Item1.Replace('\\', '/')), System.StringComparer.OrdinalIgnoreCase);
+                int carried = 0;
+                foreach (var e in existing.Entries)
+                {
+                    if (have.Contains(e.Name.Replace('\\', '/'))) continue;
+                    entries.Add((e.Name, existing.Read(e)));
+                    carried++;
+                }
+                if (carried > 0)
+                    System.Console.WriteLine($"PackFolder: kept {carried} file(s) that exist only in {Path.GetFileName(outRfaPath)} " +
+                                             $"and not in the folder (object lightmaps and other archive-only content).");
+            }
+            catch (System.Exception ex)
+            {
+                // An unreadable destination is not a reason to fail the pack, but it IS a reason to say so - the
+                // result will be folder-only, which is the lossy case this guard exists to prevent.
+                System.Console.WriteLine($"PackFolder: could not read the existing {Path.GetFileName(outRfaPath)} " +
+                                         $"({ex.GetType().Name}), so it is being replaced by the folder alone.");
+            }
+        }
+
         RefractorFlatArchive.WriteFile(outRfaPath, entries, compress: true, xPackId: xPackId);
         return entries.Count;
     }
@@ -337,16 +374,26 @@ public static class LevelSaver
         // BACKUP_SAIGON_TERRAIN/Terrain.con at the same depth, and taking the first in archive order aimed every
         // tunnel-water edit at the backup - a file the game never reads, so the level looked like it had not saved.
         // Init/ is what the level's own `run Init/Terrain` names.
+        // Separators are normalised on BOTH sides: archives carry either, and a caller that passes a qualified
+        // suffix (Textures/tx00x00.dds - see TerrainTexture.SplitToTiles) must still match an entry stored with
+        // backslashes. A qualified suffix is the whole point: it is what stops a terrain tile resolving into a
+        // level's BACKUP_ copy of the same file name.
+        string want = suffix.Replace('\\', '/');
         string? best = null; int bestDepth = int.MaxValue; bool bestInInit = false;
         foreach (var e in a.Entries)
         {
-            if (!e.Name.EndsWith(suffix, System.StringComparison.OrdinalIgnoreCase)) continue;
-            if (preferConquest && e.Name.ToLowerInvariant().Contains("conquest")) return e.Name;
-            int depth = e.Name.Count(c => c == '/' || c == '\\');
-            bool inInit = e.Name.Replace('\\', '/').Contains("/init/", System.StringComparison.OrdinalIgnoreCase);
+            string norm = e.Name.Replace('\\', '/');
+            if (!norm.EndsWith(want, System.StringComparison.OrdinalIgnoreCase)) continue;
+            if (preferConquest && norm.Contains("conquest", System.StringComparison.OrdinalIgnoreCase)) return e.Name;
+            int depth = norm.Count(c => c == '/');
+            bool inInit = norm.Contains("/init/", System.StringComparison.OrdinalIgnoreCase);
             if (depth < bestDepth || (depth == bestDepth && inInit && !bestInInit))
             { bestDepth = depth; best = e.Name; bestInInit = inInit; }
         }
+        // A qualified suffix that matches nothing falls back to its leaf, so a level whose tiles moved (or that was
+        // opened from a folder) still saves rather than silently dropping the file.
+        int slash = want.LastIndexOf('/');
+        if (best is null && slash > 0) return FindEntry(a, want[(slash + 1)..], preferConquest);
         return best;
     }
 
@@ -517,7 +564,15 @@ public static class LevelSaver
                 if (target is null)
                 {
                     var leaf = relNorm[(relNorm.LastIndexOf('/') + 1)..];
-                    var byLeaf = FindEntries(arch, "/" + leaf);
+                    // NEVER resolve onto an entry whose stored path escapes its own folder. An archive can carry
+                    // `ObjectLightMaps/../standardMesh/foo.tga` — a name a former bug wrote, which normalises out
+                    // of the folder the engine reads, so the engine can never load it. Such an entry is the ONLY
+                    // one holding its leaf, so the unique-leaf fallback matched it and wrote the corrected file
+                    // straight back into the corrupt path: the bad name regenerated itself on every save and the
+                    // naming fix looked like it had done nothing. A traversal entry is dead weight, never a target.
+                    var byLeaf = FindEntries(arch, "/" + leaf)
+                        .Where(n => !n.Replace('\\', '/').Contains("/../"))
+                        .ToList();
                     if (byLeaf.Count == 1) target = byLeaf[0];
                 }
                 Put(target ?? full, bytes);
