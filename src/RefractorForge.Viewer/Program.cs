@@ -131,6 +131,8 @@ uniform int uPlCount;
 uniform vec3 uPlPos[MAXPL];      // world position
 uniform vec3 uPlColor[MAXPL];    // colour premultiplied by intensity
 uniform vec2 uPlParam[MAXPL];    // x = radius (m), y = falloff exponent
+uniform vec4 uPlSpot[MAXPL];     // xyz = spot direction, w = cos(outer half-angle); w = -2 for a point light
+uniform float uPlSpotIn[MAXPL];  // cos(inner half-angle), where the cone is at full strength
 uniform float uNight;            // 0 = daylight, 1 = only moon ambient + placed lights
 uniform vec3 uNightAmb;
 vec3 placedLights(vec3 wp, vec3 nrm){
@@ -143,6 +145,12 @@ vec3 placedLights(vec3 wp, vec3 nrm){
         float t = dist / r;
         float w = 1.0 - t*t; w *= w;
         float atten = pow(1.0 - t, max(uPlParam[i].y, 0.1)) * w;
+        if (uPlSpot[i].w > -1.5) {
+            // A spot: nothing outside its cone, a smooth ring where the cone ends.
+            float ca = dot(dv / max(dist, 1e-4), uPlSpot[i].xyz);
+            float co = uPlSpot[i].w, ci = uPlSpotIn[i];
+            atten *= (ci - co > 1e-4) ? smoothstep(co, ci, ca) : step(co, ca);
+        }
         float ndl = max(dot(nrm, normalize(-dv)), 0.0);
         // A little wrap: a bare lamp in the open lights the ground around it rather than only the facing
         // half, and without this a flat surface under a light reads as a hard disc.
@@ -484,6 +492,7 @@ uniform int uUseTex; uniform int uAlphaTest; uniform int uAlphaEnable; uniform s
 uniform float uAlphaRef;   // 0 = this material never discards
 uniform float uMinOpacity; // blended glass: what it keeps face-on, from the .rs `opacity` (0.30 when unstated)
 uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lightmap (sampled via the 2nd UV)
+uniform int uLmColour;                                   // 1 = the map carries colour (BF1942 24-bit), 0 = .b only (BFV)
 uniform vec3 uLmAmbient;                                  // renderer.LMambientColor: added to every lightmapped surface, as the engine does
 uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
 // ---- Placed lights -------------------------------------------------------------------------------
@@ -497,6 +506,8 @@ uniform int uPlCount;
 uniform vec3 uPlPos[MAXPL];      // world position
 uniform vec3 uPlColor[MAXPL];    // colour premultiplied by intensity
 uniform vec2 uPlParam[MAXPL];    // x = radius (m), y = falloff exponent
+uniform vec4 uPlSpot[MAXPL];     // xyz = spot direction, w = cos(outer half-angle); w = -2 for a point light
+uniform float uPlSpotIn[MAXPL];  // cos(inner half-angle), where the cone is at full strength
 uniform float uNight;            // 0 = daylight, 1 = only moon ambient + placed lights
 uniform vec3 uNightAmb;
 vec3 placedLights(vec3 wp, vec3 nrm){
@@ -509,6 +520,12 @@ vec3 placedLights(vec3 wp, vec3 nrm){
         float t = dist / r;
         float w = 1.0 - t*t; w *= w;
         float atten = pow(1.0 - t, max(uPlParam[i].y, 0.1)) * w;
+        if (uPlSpot[i].w > -1.5) {
+            // A spot: nothing outside its cone, a smooth ring where the cone ends.
+            float ca = dot(dv / max(dist, 1e-4), uPlSpot[i].xyz);
+            float co = uPlSpot[i].w, ci = uPlSpotIn[i];
+            atten *= (ci - co > 1e-4) ? smoothstep(co, ci, ca) : step(co, ca);
+        }
         float ndl = max(dot(nrm, normalize(-dv)), 0.0);
         // A little wrap: a bare lamp in the open lights the ground around it rather than only the facing
         // half, and without this a flat surface under a light reads as a hard disc.
@@ -551,10 +568,12 @@ void main(){
         // way - combined by max(), not added, so a light already in the map is not counted twice and one placed after
         // the bake still appears. The editor's light pair is normalised, so the 2x is folded into the ambient only.
         vec3 ln = normalize(vN);
-        float pl = dot(placedLights(vWorld, ln), vec3(0.2126, 0.7152, 0.0722));
-        float lm = max(texture(uLightmap, vLmUv).b, pl);
+        vec4 lmt = texture(uLightmap, vLmUv);
+        // BF1942 keeps a lamp's COLOUR in a 24-bit map (GC_Bespin_Night ships them); BfVietnam's shader reads .b only.
+        vec3 lmc = (uLmColour == 1) ? lmt.rgb : vec3(lmt.b);
+        vec3 lmv = max(lmc, placedLights(vWorld, ln));
         float ndl = abs(dot(ln, normalize(uLightDir)));
-        vec3 d = lm * uDifLight * ndl + min(2.0 * uLmAmbient, vec3(0.6));
+        vec3 d = lmv * uDifLight * ndl + min(2.0 * uLmAmbient, vec3(0.6));
         c = base * uTint * min(d, vec3(1.0));
     } else {
         vec3 n = normalize(vN);
@@ -1392,6 +1411,20 @@ float underDensity = 1f;
 float ogStaticKeep = 1f;                                     // fraction of the forest to keep when baking to static
 // Brighten-decals dialog: which of the level's StandardMesh shaders to lift, and by how much.
 bool showBrightenDialog = false;
+// ---- Night Lighting window + bake ---------------------------------------------------------------------------
+bool showNightWindow = false;
+bool nightColourLightmaps = true;      // BF1942 keeps a lamp's colour in a 24-bit object lightmap; BFV reads .b only
+int nightQuality = 1;                  // 0 draft (hard shadows), 1 good, 2 high (soft, many samples)
+bool nightBakeGround = true, nightBakeObjects = true, nightBakeGlows = true;
+bool nightPlacing = false;             // next click on the ground adds a light there (Shift keeps placing)
+int nightPresetIdx = 0;                // LightPreset.All index for new lights
+NightBake.Scene? nightScene = null;    // the level's geometry as lamp occluders, built per bake
+int nbStage = 0;                       // 0 idle, 1 ground pools baking, 2 object lightmaps baking, 3 glows
+int nbDone = 0, nbTotal = 0; double nbStarted = 0;
+System.Threading.Tasks.Task? nbTask = null; System.Threading.CancellationTokenSource? nbCancel = null;
+Texture2D? nbGround = null;            // the ground stage's result, burned into the atlas on the render thread
+HashSet<string> glowTemplates = new(StringComparer.OrdinalIgnoreCase);   // glow objects built this session
+NightBake.Scene? lmNightScene = null; bool lmColour = false; int lmLampSamples = 1;   // what the object bake uses
 float brightenLevel = 0.65f;
 bool brightenUnlit = false;
 List<(string Rel, bool On)> brightenList = new();
@@ -2535,6 +2568,17 @@ void OnLoad()
             // A placed light behaves like any other object you can grab: Select, Move and Nudge all pick it and
             // start a drag. Tested before the object/terrain picks so a lamp standing in front of a building is
             // still reachable.
+            // Night Lighting's "place on click": the next click on the ground drops a lamp there (Shift keeps going).
+            if (nightPlacing && terrainPick is not null && heightmap is not null)
+            {
+                var pray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, window.FramebufferSize.X, window.FramebufferSize.Y);
+                if (terrainPick.Raycast(pray, out var pg))
+                {
+                    AddNightLight(new Vector3(pg.X, pg.Y, pg.Z), true);
+                    if (!(kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight)))) nightPlacing = false;
+                    return;
+                }
+            }
             if (toolNames[tool] is "Select" or "Move" or "Nudge")
             {
                 int lHit = PickLight(new Vector2(lastMouse.X, lastMouse.Y));
@@ -7358,6 +7402,13 @@ void BakeObjectLightmaps()
     var fallbackLit = new float[jobs.Count];
     var hmRef = heightmap; var cfgRef = cfg; var rigRef = lightRig.Lights.Count > 0 ? lightRig : null;
     int samplesRef = lmBakeSamples;
+    // Placed lights are shadowed by the whole level (every building and prop as an occluder), softened over each
+    // lamp's source size, and keep their colour on BF1942. The occluder is shared with the night bake when one is
+    // running; otherwise it is built here, on this thread, from meshes that are already resolved.
+    if (rigRef is not null && lmNightScene is null && so is not null && meshLib is not null)
+        lmNightScene = NightBake.Build(heightmap, cfg, LevelScene.ObjectTriangles(so, meshLib));
+    if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); }
+    var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples;
     var worlds = new Matrix4x4[jobs.Count];
     var sizes = new int[jobs.Count];
     for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
@@ -7379,7 +7430,8 @@ void BakeObjectLightmaps()
                 // renderer.LMambientColor is what lifts it - in the game and in this viewport alike. Baking a
                 // floor in as well lit everything twice.
                 results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
-                    sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef);
+                    sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef,
+                    night: nightRef, colour: colourRef, lampSamples: lampRef);
                 System.Threading.Interlocked.Increment(ref lmDone);
             });
         }
@@ -7414,7 +7466,9 @@ void FinishObjectLightmapBake()
         // white. That is a real regression this code has already shipped once; absence is the correct answer.
         if (results[i] is not { } tex) { if (primary) noUnwrap++; continue; }
         if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
-        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = TgaTexture.EncodeGrayColormapped(tex);
+        // A 24-bit map keeps the lamps' colour (BF1942 reads it - GC_Bespin_Night ships exactly this); the grey
+        // palette form is what BfVietnam's .b-only shader wants and what every retail map is.
+        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = lmColour ? TgaTexture.EncodeRgb24(tex) : TgaTexture.EncodeGrayColormapped(tex);
     }
     // The palette the engine loads before the maps: every lightmapped retail level ships one, so a level that
     // never had lightmaps gets one with its first bake (an existing one - Battlecraft's is a colour palette - is kept).
@@ -7430,6 +7484,7 @@ void FinishObjectLightmapBake()
                       $"{noSlot} object(s) have no lightmap slot at all and are sun-lit in the game.");
     lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null;
     lmCancel?.Dispose(); lmCancel = null; lmTask = null;
+    if (nbStage == 2) { NightBakeContinue(); return; }
     Toast(noUnwrap + noSlot > 0
         ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
         : string.Format(Loc.T("Baked {0} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level."), baked));
@@ -9322,6 +9377,7 @@ void WindowMenu()
     ImGui.MenuItem(Loc.TL("Model Viewer"), null, ref meshViewerOpen);
     ImGui.MenuItem(Loc.TL("AI Pathmap Preview"), null, ref pathmapPreviewOpen);
     ImGui.MenuItem(Loc.TL("Import Sound"), null, ref showSoundImport);
+    ImGui.MenuItem(Loc.TL("Night Lighting"), null, ref showNightWindow);
     ImGui.Separator();
     ImGui.MenuItem(Loc.TL("User Guide / Controls"), null, ref showHelp);
     ImGui.EndMenu();
@@ -9718,6 +9774,408 @@ void ApplyDecalBrightness()
                       + (missed > 0 ? $"; {missed} could not be read" : "") + ". Save writes them.");
     Toast(done == 0 ? Loc.T("No shaders were changed.")
                     : string.Format(Loc.T("Brightened {0} shader(s). Save writes them into the level."), done));
+}
+
+
+// ============================================================================================================
+// NIGHT LIGHTING - lamps and spots that get BAKED into the game.
+//
+// Neither engine has a runtime point light. A frame capture of BfVietnam shows none, and BF1942's `Light` object
+// class stores a colour that nothing in the executable ever reads (static RE of the retail exe). What a night map
+// really is: dark renderer values, lamp pools painted into the ground tiles, lamp light in the per-object
+// lightmaps (24-bit with COLOUR on BF1942 - GC_Bespin_Night ships them - brightness only on BFV, whose shader reads
+// .b), and an additive sprite at each bulb. That is exactly what this bakes.
+// ============================================================================================================
+
+int NightLampSamples() => nightQuality switch { 0 => 1, 1 => 4, _ => 8 };
+
+void AddNightLight(Vector3 at, bool onGround)
+{
+    var preset = RefractorForge.Formats.Terrain.LightPreset.All[Math.Clamp(nightPresetIdx, 0, RefractorForge.Formats.Terrain.LightPreset.All.Count - 1)];
+    var l = new PointLight { Name = $"{preset.Name} {lightRig.Lights.Count + 1}" };
+    preset.ApplyTo(l);
+    float y = onGround && heightmap is not null ? GroundUnder(at.X, at.Z) + preset.Height : at.Y;
+    l.Position = new Vec3(at.X, y, at.Z);
+    lightRig.Lights.Add(l);
+    selLight = lightRig.Lights.Count - 1;
+    showLightGizmos = true;
+}
+
+// The Night Lighting window: night look -> lights -> bake, top to bottom.
+void NightLightingWindow()
+{
+    if (!showNightWindow) return;
+    ImGui.SetNextWindowSize(new Vector2(560f * uiScale, 760f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(420f * uiScale, 360f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
+    if (!ImGui.Begin(Loc.TL("Night Lighting") + "###nightwin", ref showNightWindow)) { ImGui.End(); return; }
+    ImGui.PushTextWrapPos(0f);
+
+    // ---- 1. the night ------------------------------------------------------------------------------------------
+    Theme.Section(Loc.T("1. THE NIGHT"));
+    Theme.Muted(Loc.T("The level's own light, written to Init.con on save. A lamp only reads as a lamp against a dark scene."));
+    foreach (var tod in RefractorForge.Formats.Terrain.TimeOfDayPreset.Nights)
+    {
+        if (ImGui.SmallButton(tod.Name + "##night")) ApplyTimeOfDay(tod);
+        ImGui.SameLine();
+    }
+    if (ImGui.SmallButton(Loc.TL("Noon##night"))) ApplyTimeOfDay(RefractorForge.Formats.Terrain.TimeOfDayPreset.Noon);
+    Theme.Tip(Loc.T("Night (BF1942) is Dystopia City's TDM night; Night - blue is Bespin Night's deep-blue look; Night (BFV)\nis DC_Basrah_Nights. All keep the moon HIGH: both games show a lamp's lightmap only on faces the sun\ndirection reaches, so a low moon would leave every floor dark however bright the lamp."));
+    ImGui.SetNextItemWidth(180f * uiScale);
+    var amb = lightAmb; if (Col3(Loc.TL("Ambient"), ref amb)) { lightAmb = amb; lightingDirty = true; BroadcastLight(); }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    var gam = lightGlobalAmb; if (Col3(Loc.TL("Global ambient"), ref gam)) { lightGlobalAmb = gam; lightingDirty = true; BroadcastLight(); }
+    Theme.Tip(Loc.T("BfVietnam ignores globalAmbientColor (an unknown function there); BF1942 adds it to the ambient."));
+    ImGui.SetNextItemWidth(180f * uiScale);
+    var dif = lightDiffuse; if (Col3(Loc.TL("Moon / sun colour"), ref dif)) { lightDiffuse = dif; lightingDirty = true; BroadcastLight(); }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    float el = sunElevationDeg;
+    if (SldF(Loc.TL("Moon height (deg)"), ref el, 5f, 89f, "%.0f")) { sunOverride = true; sunElevationDeg = el; shadowMapDirty = true; BroadcastLight(); }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    var fc = fogColor; if (Col3(Loc.TL("Fog colour"), ref fc)) { fogColor = fc; fogEnabled = true; if (env is not null) { env.FogColor = new Vec3(fc.X, fc.Y, fc.Z); env.WriteFog = true; } BroadcastLight(); }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    float fs = fogStart, fe = fogEnd;
+    if (SldF(Loc.TL("Fog start (m)"), ref fs, 10f, 2000f, "%.0f")) { fogStart = MathF.Min(fs, fogEnd - 5f); if (env is not null) { env.FogStart = fogStart; env.WriteFog = true; } }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    if (SldF(Loc.TL("Fog end (m)"), ref fe, 20f, 4000f, "%.0f")) { fogEnd = MathF.Max(fe, fogStart + 5f); if (env is not null) { env.FogEnd = fogEnd; env.WriteFog = true; } }
+    ImGui.SetNextItemWidth(180f * uiScale);
+    float night = lightRig.NightAmount;
+    if (SldF(Loc.TL("Preview darkness"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
+    Theme.Tip(Loc.T("Editor-only: how far the viewport is pulled down to the level's real light so the lamps read as\nthey will in the game. Set it high once the night preset is on."));
+
+    // ---- 2. the lights -----------------------------------------------------------------------------------------
+    ImGui.Separator();
+    Theme.Section(Loc.T("2. THE LIGHTS"));
+    var presets = RefractorForge.Formats.Terrain.LightPreset.All;
+    var presetNames = new string[presets.Count];
+    for (int i = 0; i < presets.Count; i++) presetNames[i] = presets[i].Name;
+    ImGui.SetNextItemWidth(200f * uiScale);
+    Cbo(Loc.TL("New light"), ref nightPresetIdx, presetNames, presetNames.Length);
+    Theme.Tip(Loc.T("What the next light starts as. Sodium is orange, halide is cold, a fire is amber -\na street lit by one uniform warm white is the first thing that looks like a game."));
+    if (ImGui.Button(nightPlacing ? Loc.TL("Click the ground... (Esc)") : Loc.TL("Place on click")))
+        nightPlacing = !nightPlacing;
+    Theme.Tip(Loc.T("Then click the ground where the lamp stands; it goes in at the preset's height.\nHold Shift to keep placing."));
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Add at camera")) && heightmap is not null)
+        AddNightLight(new Vector3(cam.Position.X, 0f, cam.Position.Z), true);
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Under lamp objects")) && so is not null)
+    {
+        var lamps = so.Objects.Where(o => RefractorForge.Formats.Con.LightPool.LooksLikeLamp(o.Template)).ToList();
+        if (lamps.Count == 0) Toast(Loc.T("No lamp-like objects found in this level."));
+        else
+        {
+            int n = 0;
+            foreach (var o in lamps)
+            {
+                // Skip a lamp that already has a light within a metre - this button is safe to press twice.
+                if (lightRig.Lights.Any(x => MathF.Abs(x.Position.X - o.Position.X) < 1f && MathF.Abs(x.Position.Z - o.Position.Z) < 1f)) continue;
+                AddNightLight(new Vector3(o.Position.X, 0f, o.Position.Z), true); n++;
+            }
+            Toast(string.Format(Loc.T("{0} light(s) added under lamp objects."), n));
+        }
+    }
+    Theme.Tip(Loc.T("Every placed object whose name reads as a lamp (lamp, light, lantern, torch, candle, bulb,\nstreetlight) gets a light of the chosen preset at its position."));
+
+    if (lightRig.Lights.Count > 0)
+    {
+        float listH = Math.Min(8, lightRig.Lights.Count) * 20f * uiScale + 8f;
+        if (ImGui.BeginListBox("##nightlights", new Vector2(-1f, listH)))
+        {
+            for (int i = 0; i < lightRig.Lights.Count; i++)
+            {
+                var l = lightRig.Lights[i];
+                string tag = (l.Enabled ? "" : "(off) ") + l.Name + (l.IsSpot ? "  [spot]" : "") + (l.Glow ? "" : "  [no glow]");
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.55f + 0.45f * l.ColorR, 0.55f + 0.45f * l.ColorG, 0.55f + 0.45f * l.ColorB, l.Enabled ? 1f : 0.5f));
+                if (ImGui.Selectable(tag + "##NL" + i, i == selLight)) selLight = i;
+                ImGui.PopStyleColor();
+            }
+            ImGui.EndListBox();
+        }
+    }
+    else Theme.Muted(Loc.T("No lights yet. Place one, or add them under the level's lamp objects."));
+
+    if (selLight >= 0 && selLight < lightRig.Lights.Count)
+    {
+        var l = lightRig.Lights[selLight];
+        ImGui.PushID(selLight);
+        string nm = l.Name;
+        ImGui.SetNextItemWidth(200f * uiScale);
+        if (InT(Loc.TL("Name"), ref nm, 40)) l.Name = nm;
+        bool on = l.Enabled; if (ImGui.Checkbox(Loc.TL("Enabled"), ref on)) l.Enabled = on;
+        ImGui.SameLine();
+        int kind = l.Kind;
+        ImGui.SetNextItemWidth(110f * uiScale);
+        if (CboZ(Loc.TL("Type"), ref kind, Loc.T("Point") + "\0" + Loc.T("Spot") + "\0")) l.Kind = kind;
+        ImGui.SameLine();
+        int pi = -1;
+        ImGui.SetNextItemWidth(150f * uiScale);
+        if (Cbo(Loc.TL("Preset"), ref pi, presetNames, presetNames.Length) && pi >= 0) presets[pi].ApplyTo(l);
+        Theme.Tip(Loc.T("Apply a preset's look to this light, keeping its position."));
+
+        var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (Col3(Loc.TL("Colour"), ref colv)) { l.ColorR = colv.X; l.ColorG = colv.Y; l.ColorB = colv.Z; }
+        float inten = l.Intensity, rad = l.Radius, fall = l.Falloff, src = l.SourceSize;
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (SldF(Loc.TL("Brightness"), ref inten, 0f, 5f, "%.2f")) l.Intensity = inten;
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (SldF(Loc.TL("Reach (m)"), ref rad, 1f, 200f, "%.0f")) l.Radius = rad;
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 4f, "%.2f")) l.Falloff = fall;
+        Theme.Tip(Loc.T("2 is inverse-square, physically right and quite tight. Lower spreads the pool out."));
+        float ground = GroundUnder(l.Position.X, l.Position.Z);
+        float above = l.Position.Y - ground;
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (SldF(Loc.TL("Height above ground (m)"), ref above, 0f, 40f, "%.1f")) l.Position = new Vec3(l.Position.X, ground + above, l.Position.Z);
+        ImGui.SetNextItemWidth(180f * uiScale);
+        if (SldF(Loc.TL("Shadow softness (m)"), ref src, 0f, 3f, "%.2f")) l.SourceSize = src;
+        Theme.Tip(Loc.T("The size of the bulb or fixture. It is what gives a shadow a soft edge that widens with\ndistance - 0 is razor-sharp, 0.3 a bulb, 1 a big fixture or a fire."));
+        if (l.IsSpot)
+        {
+            float yaw = l.SpotYawDeg, pitch = l.SpotPitchDeg, cone = l.ConeDeg, soft = l.ConeSoft;
+            ImGui.SetNextItemWidth(180f * uiScale);
+            if (SldF(Loc.TL("Aim - heading (deg)"), ref yaw, -180f, 180f, "%.0f")) l.SpotYawDeg = yaw;
+            ImGui.SetNextItemWidth(180f * uiScale);
+            if (SldF(Loc.TL("Aim - tilt (deg)"), ref pitch, -90f, 20f, "%.0f")) l.SpotPitchDeg = pitch;
+            Theme.Tip(Loc.T("-90 points straight down (a street lamp head); -30 is a floodlight on a wall."));
+            ImGui.SetNextItemWidth(180f * uiScale);
+            if (SldF(Loc.TL("Cone (deg)"), ref cone, 5f, 170f, "%.0f")) l.ConeDeg = cone;
+            ImGui.SetNextItemWidth(180f * uiScale);
+            if (SldF(Loc.TL("Cone edge softness"), ref soft, 0f, 1f, "%.2f")) l.ConeSoft = soft;
+        }
+        bool sh = l.CastsShadows; if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) l.CastsShadows = sh;
+        ImGui.SameLine();
+        bool og = l.OnGround; if (ImGui.Checkbox(Loc.TL("Ground"), ref og)) l.OnGround = og;
+        ImGui.SameLine();
+        bool oo = l.OnObjects; if (ImGui.Checkbox(Loc.TL("Objects"), ref oo)) l.OnObjects = oo;
+        Theme.Tip(Loc.T("Which bake this light goes into: the ground tiles, the object lightmaps, or both."));
+        bool gw = l.Glow; if (ImGui.Checkbox(Loc.TL("Glow at the bulb"), ref gw)) l.Glow = gw;
+        if (l.Glow)
+        {
+            ImGui.SameLine();
+            float gs = l.GlowSize, gb = l.GlowBrightness;
+            ImGui.SetNextItemWidth(90f * uiScale);
+            if (SldF(Loc.TL("Size (m)##glow"), ref gs, 0.5f, 12f, "%.1f")) l.GlowSize = gs;
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(90f * uiScale);
+            if (SldF(Loc.TL("Bright##glow"), ref gb, 0.2f, 3f, "%.1f")) l.GlowBrightness = gb;
+        }
+        Theme.Tip(Loc.T("An additive sprite at the light itself, so the lamp reads as switched on. The retail recipe:\nBfVietnam's e_Streetlight and Dystopia City's lamps are a 1.5-4 m additive sprite."));
+        if (ImGui.Button(Loc.TL("Duplicate")))
+        {
+            var c = l.Clone(); c.Name = l.Name + " copy"; c.Position = new Vec3(l.Position.X + 2f, l.Position.Y, l.Position.Z);
+            lightRig.Lights.Add(c); selLight = lightRig.Lights.Count - 1;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Delete##nightlight"))) { lightRig.Lights.RemoveAt(selLight); selLight = -1; }
+        ImGui.PopID();
+    }
+
+    // ---- 3. the bake -------------------------------------------------------------------------------------------
+    ImGui.Separator();
+    Theme.Section(Loc.T("3. BAKE"));
+    ImGui.SetNextItemWidth(160f * uiScale);
+    CboZ(Loc.TL("Quality"), ref nightQuality, Loc.T("Draft - hard shadows") + "\0" + Loc.T("Good - soft shadows") + "\0" + Loc.T("High - softest") + "\0");
+    Theme.Tip(Loc.T("Shadow samples per lamp: 1, 4 or 8. Draft is for placing; High for the final bake."));
+    ImGui.Checkbox(Loc.TL("Ground pools"), ref nightBakeGround); ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Object lightmaps"), ref nightBakeObjects); ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Bulb glows"), ref nightBakeGlows);
+    if (gameIsBf1942)
+    {
+        ImGui.Checkbox(Loc.TL("Colour in object lightmaps (BF1942)"), ref nightColourLightmaps);
+        Theme.Tip(Loc.T("Writes 24-bit lightmaps that keep each lamp's colour on walls and props - the format GC_Bespin_Night\nships. Off writes the usual grey maps (brightness only)."));
+    }
+    else Theme.Muted(Loc.T("BfVietnam reads only the brightness of an object lightmap; the lamp colour lives in the ground."));
+    ImGui.SetNextItemWidth(160f * uiScale);
+    SldF(Loc.TL("Ground pool strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
+    Theme.Tip(Loc.T("Scales the pools burned into the ground tiles. They go in as a RATIO to the level's night light, so\nbake with the night preset applied or the game will be brighter than the preview."));
+    bool busy = nbStage != 0 || lmBaking || sbBaking;
+    if (busy) Theme.Muted(Loc.T("A bake is running..."));
+    else if (ImGui.Button(Loc.TL("Bake Night Lighting"), new Vector2(200f * uiScale, 0f))) BakeNightLighting();
+    Theme.Tip(Loc.T("Ground pools (with building shadows) -> object lightmaps -> bulb glows, in the background with progress.\nZ undoes the ground bake and the glows; Save writes everything the game needs."));
+    ImGui.SameLine();
+    if (!busy && ImGui.Button(Loc.TL("Remove glows"))) RemoveLampGlows();
+    Theme.Muted(Loc.T("The game then shows: dark ambient + lamp pools in the ground + lamp light on lightmapped objects + the glows.\nObjects with no lightmap unwrap (most small props) get no lamp light in either game; their pool still shows on the ground."));
+
+    ImGui.PopTextWrapPos();
+    ImGui.End();
+}
+
+// One button, three stages, each on a worker with progress: pools -> object lightmaps -> glows.
+void BakeNightLighting()
+{
+    if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    if (nbStage != 0 || lmBaking || sbBaking) { Toast(Loc.T("A bake is already running.")); return; }
+    if (lightRig.Lights.Count(l => l.Enabled) == 0) { Toast(Loc.T("Place at least one light first.")); return; }
+
+    // The level's geometry as lamp occluders. Meshes resolve on this thread (the library cache is not thread-safe);
+    // the grid itself is built on the worker with the first stage.
+    var tris = so is not null && meshLib is not null ? LevelScene.ObjectTriangles(so, meshLib) : null;
+    int samples = NightLampSamples();
+    var hmRef = heightmap; var cfgRef = cfg; var rigRef = lightRig;
+    nbStarted = appClock; nbDone = 0; nbTotal = 1;
+    nbCancel = new System.Threading.CancellationTokenSource();
+    var token = nbCancel.Token;
+
+    if (nightBakeGround && atlasCpu is not null && lightRig.Lights.Any(l => l.Enabled && l.OnGround))
+    {
+        int size = Math.Min(atlasCpu.Width, 2048);
+        nbTotal = size; nbStage = 1;
+        nbTask = System.Threading.Tasks.Task.Run(() =>
+        {
+            nightScene = NightBake.Build(hmRef, cfgRef, tris);
+            nbGround = NightBake.BakeGround(nightScene, rigRef, size, samples, (d, t) => { nbDone = d; nbTotal = t; }, token);
+        }, token);
+    }
+    else
+    {
+        nightScene = NightBake.Build(hmRef, cfgRef, tris);
+        nbStage = 1; nbTask = System.Threading.Tasks.Task.CompletedTask; nbGround = null;
+    }
+    Console.WriteLine($"Night bake: {lightRig.Lights.Count(l => l.Enabled)} light(s), {(tris?.Count ?? 0):N0} occluder triangle(s), {samples} shadow sample(s) per lamp.");
+}
+
+// Per frame: the progress window for the ground stage, and the hand-off to the next stage when a worker is done.
+void NightBakeProgress()
+{
+    if (nbStage != 1) return;
+    if (nbTask is { IsCompleted: true })
+    {
+        if (nbCancel?.IsCancellationRequested == true || nbTask.IsFaulted)
+        {
+            if (nbTask.IsFaulted) Console.WriteLine("Night bake failed: " + nbTask.Exception?.GetBaseException().Message);
+            nbStage = 0; nbGround = null; nbTask = null; nbCancel?.Dispose(); nbCancel = null;
+            Toast(Loc.T("Night bake cancelled."));
+            return;
+        }
+        // Burn the pools into the ground, then move on to the objects.
+        if (nbGround is not null && atlasCpu is not null)
+        {
+            int size = nbGround.Width;
+            var (amb, dif) = SceneLight();
+            float night = Math.Clamp(lightRig.NightAmount, 0f, 1f);
+            var ambN = amb * (1f - night) + NightSceneLight() * night;
+            var difN = dif * (1f - night);
+            var sun = EffectiveSun();
+            var scene = LightBake.SceneLight(heightmap!, cfg, size, new Vec3(ambN.X, ambN.Y, ambN.Z), new Vec3(difN.X, difN.Y, difN.Z), new Vec3(sun.X, sun.Y, sun.Z));
+            var g = nbGround;
+            AtlasFullEdit(() => LightBake.MultiplyIntoAtlas(atlasCpu!, g, scene, size, groundBakeStrength));
+            groundLightsLive = false;
+            Console.WriteLine($"Night bake: ground pools burned at {size}x{size} in {appClock - nbStarted:0.0}s.");
+        }
+        nbGround = null; nbTask = null;
+        if (nightBakeObjects && so is not null && meshLib is not null)
+        {
+            nbStage = 2;
+            lmNightScene = nightScene; lmColour = gameIsBf1942 && nightColourLightmaps; lmLampSamples = NightLampSamples();
+            BakeObjectLightmaps();
+            if (!lmBaking) { nbStage = 2; NightBakeContinue(); }   // nothing bakeable: go straight on
+        }
+        else { nbStage = 2; NightBakeContinue(); }
+        return;
+    }
+    var fbS = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbS.X * 0.5f, fbS.Y * 0.5f), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.Always);
+    if (ImGui.Begin("###nightbakeprogress", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                    | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking))
+    {
+        Theme.Heading(Loc.T("Baking lamp pools into the ground"));
+        int done = System.Threading.Volatile.Read(ref nbDone);
+        float frac = nbTotal > 0 ? Math.Clamp(done / (float)nbTotal, 0f, 1f) : 0f;
+        ImGui.ProgressBar(frac, new Vector2(-1f, 0f), $"{done} / {nbTotal}");
+        double elapsed = appClock - nbStarted;
+        Theme.Muted(frac > 0.05f
+            ? string.Format(Loc.T("{0:0} s elapsed, about {1:0} s left"), elapsed, Math.Max(0d, elapsed / frac - elapsed))
+            : string.Format(Loc.T("{0:0} s elapsed"), elapsed));
+        Theme.Muted(Loc.T("Every building and prop casts a shadow from every lamp. The editor stays usable."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Cancel##nightbake"), new Vector2(120f * uiScale, 0f))) nbCancel?.Cancel();
+    }
+    ImGui.End();
+}
+
+// After the object lightmaps: the glows, then done.
+void NightBakeContinue()
+{
+    nbStage = 3;
+    int glows = 0;
+    if (nightBakeGlows) glows = PlaceLampGlows();
+    nbStage = 0; nbCancel?.Dispose(); nbCancel = null;
+    lmNightScene = null;
+    showObjectLightmaps = true; sunOverride = false;
+    BroadcastLightBake();
+    Toast(string.Format(Loc.T("Night lighting baked in {0:0} s: pools in the ground, lamps in the lightmaps, {1} glow(s). Save writes it all."),
+        appClock - nbStarted, glows));
+}
+
+// One glow object per (colour, size, brightness), placed at every glowing light; the previous set is swept first so
+// a re-bake never doubles up. Returns how many were placed.
+int PlaceLampGlows()
+{
+    if (so is null || hist is null || meshLib is null || levelDir is null) return 0;
+    var cmds = new List<IEditCommand>();
+    foreach (var o in so.Objects) if (RefractorForge.Formats.Con.LampGlow.IsGlow(o.Template)) cmds.Add(new DeleteObject(o.Id));
+    int placed = 0;
+    foreach (var l in lightRig.Lights)
+    {
+        if (!l.Enabled || !l.Glow || l.GlowSize <= 0f) continue;
+        var t = EnsureGlowTemplate(new Vec3(l.ColorR, l.ColorG, l.ColorB), l.GlowSize, l.GlowBrightness);
+        if (t is null) continue;
+        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), t, new Vec3(l.Position.X, l.Position.Y, l.Position.Z), Vec3.Zero));
+        placed++;
+    }
+    if (cmds.Count == 0) return 0;
+    hist.Do(cmds.Count == 1 ? cmds[0] : new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
+    return placed;
+}
+
+void RemoveLampGlows()
+{
+    if (so is null || hist is null) return;
+    var cmds = new List<IEditCommand>();
+    foreach (var o in so.Objects) if (RefractorForge.Formats.Con.LampGlow.IsGlow(o.Template)) cmds.Add(new DeleteObject(o.Id));
+    if (cmds.Count == 0) { Toast(Loc.T("No glows placed.")); return; }
+    hist.Do(cmds.Count == 1 ? cmds[0] : new CompositeCommand(cmds));
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
+    Toast(string.Format(Loc.T("{0} glow(s) removed."), cmds.Count));
+}
+
+// The level-local glow object for a colour/size/brightness, built once per session and once per level: a template
+// the level already has (from an earlier save) is reused as it is.
+string? EnsureGlowTemplate(Vec3 colour, float size, float brightness)
+{
+    if (so is null || meshLib is null || levelDir is null) return null;
+    string name = RefractorForge.Formats.Con.LampGlow.TemplateName(colour, size, brightness);
+    if (glowTemplates.Contains(name) || meshLib.TryGet(name, out _)) return name;
+    try
+    {
+        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
+        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the glow in.")); return null; }
+        var (baseSub, levelName) = LevelIdentity();
+        var built = RefractorForge.Formats.Con.LampGlow.Build(levelName, colour, size, brightness, baseSub,
+            rgba => DdsTexture.EncodeUncompressedMipped(new Texture2D(128, 128, rgba)));
+        foreach (var f in built.Files) pendingLevelFiles.Add(f);
+        BroadcastLevelFiles(built.Template, built.Files);
+        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Objects/objects.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine))));
+        pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
+        pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
+        var preview = new Texture2D(128, 128, RefractorForge.Formats.Con.LampGlow.Texture(128, colour, brightness));
+        meshLib.AddMesh(built.Template, MeshLibrary.MeshFromObj(built.Mesh, _ => (Vector3.One, preview)));
+        importedObjs[built.Template] = built.Mesh;
+        importMaterials[built.Template] = new List<(string Mat, string? TexName, Vector3 Diffuse)>
+            { (built.Template + "_Material0", built.Template + "_tex", Vector3.One) };
+        BroadcastObjMesh(built.Template);
+        RebuildCatalog();
+        glowTemplates.Add(built.Template);
+        return built.Template;
+    }
+    catch (Exception ex) { Toast(Loc.T("Glow object failed: ") + ex.Message); return null; }
 }
 
 void BrightenDialog()
@@ -10528,7 +10986,20 @@ void UploadPlacedLights(uint prog)
         if (loc[2] >= 0) gl.Uniform3(gl.GetUniformLocation(prog, $"uPlColor[{i}]"),
             l.ColorR * l.Intensity, l.ColorG * l.Intensity, l.ColorB * l.Intensity);
         if (loc[3] >= 0) gl.Uniform2(gl.GetUniformLocation(prog, $"uPlParam[{i}]"), l.Radius, l.Falloff);
+        if (loc[3] >= 0)
+        {
+            if (l.IsSpot)
+            {
+                var sd = l.Direction();
+                float half = Math.Clamp(l.ConeDeg, 1f, 179f) * 0.5f * MathF.PI / 180f;
+                float co = MathF.Cos(half), ci = MathF.Cos(half * (1f - Math.Clamp(l.ConeSoft, 0f, 1f)));
+                gl.Uniform4(gl.GetUniformLocation(prog, $"uPlSpot[{i}]"), sd.X, sd.Y, sd.Z, co);
+                gl.Uniform1(gl.GetUniformLocation(prog, $"uPlSpotIn[{i}]"), ci);
+            }
+            else gl.Uniform4(gl.GetUniformLocation(prog, $"uPlSpot[{i}]"), 0f, -1f, 0f, -2f);
+        }
     }
+    { int lc = gl.GetUniformLocation(prog, "uLmColour"); if (lc >= 0) gl.Uniform1(lc, gameIsBf1942 && nightColourLightmaps ? 1 : 0); }
     if (loc[4] >= 0) gl.Uniform1(loc[4], lightRig.NightAmount);
     if (loc[5] >= 0) { var na = NightSceneLight(); gl.Uniform3(loc[5], na.X, na.Y, na.Z); }
     if (loc[6] >= 0) { var la = env?.LMAmbientColor ?? new Vec3(0.25f, 0.25f, 0.25f); gl.Uniform3(loc[6], la.X, la.Y, la.Z); }
@@ -13389,6 +13860,8 @@ void BuildUi()
     LightmapBakeProgress();
     ShadowBakeProgress();
     BrightenDialog();
+    NightLightingWindow();
+    NightBakeProgress();
     PointToolOverlay();
     LightGizmos();
     TunnelGizmos();
@@ -16134,53 +16607,12 @@ void LightGizmos()
 // that then gets baked.
 void LightsPanel()
 {
-    Theme.Section(Loc.T("PLACED LIGHTS"));
-
-    Theme.Tip(Loc.T("Refractor renders no dynamic point lights - a night map's lamps are BAKED.\nThese light the editor so you can aim them, then Bake writes them into\nthe lightmaps the game reads."));
-
-    ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);
+    Theme.Section(Loc.T("NIGHT LIGHTING"));
+    Theme.Muted(string.Format(Loc.T("{0} placed light(s)"), lightRig.Lights.Count));
+    if (ImGui.Button(Loc.TL("Open Night Lighting..."))) showNightWindow = true;
+    Theme.Tip(Loc.T("Lamps and spots, the night look, and the bake that puts them into the game - all in one window."));
     ImGui.SameLine();
-    ImGui.Checkbox(Loc.TL("Live on ground"), ref groundLightsLive);
-    Theme.Tip(Loc.T("Draw the placed lights on the terrain live. A ground bake switches this off,\nbecause the pool is in the texture then and drawing it live as well would show\nit twice over - with this off, the ground you see is the ground the game shows."));
-    float night = lightRig.NightAmount;
-    ImGui.SetNextItemWidth(150f);
-    if (SldF(Loc.TL("Night preview"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
-    Theme.Tip(Loc.T("Editor-side only: shows the level's REAL light level (its Init.con ambient and diffuse)\ninstead of the editor's always-readable lighting, so placed lights read as they will\nin the game. Apply a Night preset first - on a daylight level there is nothing to darken."));
-
-    ImGui.TextDisabled(Loc.T("Time of day"));
-    foreach (var tod in RefractorForge.Formats.Terrain.TimeOfDayPreset.All)
-    {
-        if (ImGui.SmallButton(tod.Name + "##tod")) ApplyTimeOfDay(tod);
-        ImGui.SameLine();
-    }
-    ImGui.NewLine();
-    Theme.Tip(Loc.T("Sun, ambient, fog and sky moved together. Each is a set of the Init.con\nrenderer values a real level declares, so it is what the game will show once saved."));
-
-    if (ImGui.Button(Loc.TL("Apply night preset to level")))
-    {
-        // The values a real night map uses. DC_Basrah_Nights ships almost exactly this: a near-black ambient,
-        // a dim cool diffuse and tight fog. These are written to Init.con on save, so unlike the preview
-        // slider this is what the game will actually show.
-        lightGlobalAmb = new Vector3(0.080f, 0.082f, 0.085f);
-        lightAmb = new Vector3(0.080f, 0.082f, 0.085f);
-        lightDiffuse = new Vector3(0.18f, 0.20f, 0.22f);
-        lightSpecular = new Vector3(0.40f, 0.50f, 0.60f);
-        lightingDirty = true;
-        fogEnabled = true;
-        fogColor = new Vector3(0.09f, 0.10f, 0.11f);
-        fogStart = 85f; fogEnd = 130f;
-
-        // Basrah Nights ships NO skybox of its own - neither its archive nor its patch contains sky textures or
-        // a SkyAndSun.con. At fogend 130 the sky is simply never seen: the fog colour IS the horizon. So the
-        // night "skybox" is the fog above, plus dimming whatever sky the level does have, and darkening the
-        // clouds so a bright daytime cloud layer does not hang over a night map.
-        cloudColor = new Vector3(0.13f, 0.15f, 0.20f);
-        cloudsDirty = true;
-        if (lightRig.NightAmount < 0.85f) lightRig.NightAmount = 0.85f;
-        BroadcastLight();
-        Toast(Loc.T("Night lighting applied - written to Init.con on save."));
-    }
-    Theme.Tip(Loc.T("Sets the level's renderer ambient/diffuse/fog to night values\n(the same recipe DC_Basrah_Nights uses). Written to Init.con on save."));
+    ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);
 
     // ---- Object lightmaps: one process ---------------------------------------------------------------------------
     ImGui.Separator();
@@ -16229,177 +16661,6 @@ void LightsPanel()
     if (ImGui.Button(Loc.TL("Bake both (lightmaps + sun shadows)")) && heightmap is not null) BakeAllLighting();
     Theme.Tip(Loc.T("Both processes in one go. Also under Tools > Lighting."));
 
-    // ---- Light pools: the part that is actually VISIBLE in the game --------------------------------------------
-    ImGui.Separator();
-    Theme.Section(Loc.T("LAMP LIGHT (SHOWS IN GAME)"));
-    Theme.Tip(Loc.T("A lightmap can only take the sun AWAY - the engine reads it as a mask that multiplies\nthe sun, so a lamp can never be brighter or warmer than the sun and lights nothing in\na tunnel. This makes a real pool of light instead: an additively blended glow object,\nthe same material the game's own muzzle flashes use. It brightens whatever it is laid\nover, in any lighting, on terrain or on a mesh."));
-
-    ImGui.SetNextItemWidth(150f * uiScale);
-    CboZ(Loc.TL("Shape"), ref lpShape, Loc.T("Pool on the floor") + "\0" + Loc.T("Glow at the bulb") + "\0");
-    Theme.Tip(Loc.T("A pool lies flat, for the light a lamp throws down. A glow stands upright,\nfor the halo around the bulb itself. Both are the same additive quad."));
-    Col3(Loc.TL("Lamp colour"), ref lpColour);
-    Theme.Tip(Loc.T("The colour of the light, not of the object. Retail's own bulb glow is 248/238/205,\na warm off-white - which is what this starts at."));
-    ImGui.SetNextItemWidth(150f * uiScale);
-    SldF(Loc.TL("Size (m)"), ref lpDiameter, 0.5f, 60f, "%.1f");
-    Theme.Tip(Loc.T("How wide the pool is. A ceiling bulb throws roughly its own height across;\n6-10 m is a street lamp."));
-    ImGui.SetNextItemWidth(150f * uiScale);
-    SldF(Loc.TL("Brightness"), ref lpBrightness, 0.05f, 2f, "%.2f");
-    Theme.Tip(Loc.T("How much light it adds. The blend is additive, so past about 1.5 the middle\nburns out to white."));
-    ImGui.SetNextItemWidth(150f * uiScale);
-    SldF(Loc.TL("Softness"), ref lpSoftness, 0f, 1f, "%.2f");
-    Theme.Tip(Loc.T("0 is a hard-edged disc, 1 fades from the very centre. Around 0.6 reads as a lamp."));
-    ImGui.SetNextItemWidth(150f * uiScale);
-    SldF(Loc.TL("Drop below light (m)"), ref lpDrop, 0f, 30f, "%.1f");
-    Theme.Tip(Loc.T("How far under the light the pool sits - the lamp's height above the floor.\nUsed by the two buttons below, which place without a terrain raycast so they\nwork inside a tunnel, where clicking would hit the terrain overhead instead."));
-
-    if (ImGui.Button(Loc.TL("Make light pool")))
-    {
-        var t = CreateLightPool();
-        if (t is not null) Toast(string.Format(Loc.T("'{0}' ready - click the floor to place it."), t));
-    }
-    Theme.Tip(Loc.T("Builds the object and arms the Place tool with it, exactly like a decal.\nGood outdoors, where clicking lands it on the terrain."));
-    ImGui.SameLine();
-    if (ImGui.Button(Loc.TL("Put one under this light")) && selLight >= 0 && selLight < lightRig.Lights.Count)
-    {
-        var l = lightRig.Lights[selLight];
-        // Take the pool's colour and size from the light it belongs to, so the two agree without being told twice:
-        // the editor preview and the thing the game draws are then the same lamp.
-        lpColour = new Vector3(l.ColorR, l.ColorG, l.ColorB);
-        lpDiameter = MathF.Max(1f, MathF.Min(60f, l.Radius * 0.8f));
-        var t = CreateLightPool();
-        if (t is not null)
-        {
-            PlacePoolsAt(t, new[] { new Vec3(l.Position.X, l.Position.Y - lpDrop, l.Position.Z) });
-            Toast(string.Format(Loc.T("Light pool placed under '{0}'."), l.Name));
-        }
-    }
-    Theme.Tip(Loc.T("Takes the colour and size from the selected light and drops a pool straight under it.\nNo raycast, so it lands on a tunnel floor as happily as on terrain."));
-
-    if (ImGui.Button(Loc.TL("Put one under every lamp object")) && so is not null)
-    {
-        // Ask the level which of its objects are lamps rather than making the user find them all by eye.
-        var lamps = so.Objects
-            .Where(o => RefractorForge.Formats.Con.LightPool.LooksLikeLamp(o.Template))
-            .Select(o => o.Position).ToList();
-        if (lamps.Count == 0) Toast(Loc.T("No lamp-like objects found in this level."));
-        else
-        {
-            var t = CreateLightPool();
-            if (t is not null)
-            {
-                PlacePoolsAt(t, lamps.Select(p => new Vec3(p.X, p.Y - lpDrop, p.Z)));
-                Toast(string.Format(Loc.T("{0} light pool(s) placed under lamp objects."), lamps.Count));
-            }
-        }
-    }
-    Theme.Tip(Loc.T("Every placed object whose name reads as a lamp - lamp, light, lantern, torch, candle,\nbulb, streetlight - gets a pool under it, all in one undo step."));
-    ImGui.Separator();
-
-    if (ImGui.Button(Loc.TL("Add light here")))
-    {
-        // At the camera, dropped to just above the ground so it lights something immediately.
-        var pos = cam.Position;
-        if (heightmap is not null)
-        {
-            // ALWAYS put a new light at lamp height, never at the camera. Placing it where the camera happens to
-            // be floating is what made a new light appear to do nothing: fly at 30 m, add a light with a 25 m
-            // reach, and the ground is simply out of range. A lamp is a lamp - it belongs near the ground, and
-            // the height is easy to change afterwards.
-            pos.Y = GroundUnder(pos.X, pos.Z) + 3f;
-        }
-        lightRig.Lights.Add(new PointLight
-        {
-            Name = $"Light {lightRig.Lights.Count + 1}",
-            Position = new Vec3(pos.X, pos.Y, pos.Z),
-            Radius = 25f, Intensity = 1.2f,
-        });
-        selLight = lightRig.Lights.Count - 1;
-    }
-    ImGui.SameLine();
-    if (ImGui.Button(Loc.TL("Delete light")) && selLight >= 0 && selLight < lightRig.Lights.Count)
-    {
-        lightRig.Lights.RemoveAt(selLight);
-        selLight = -1;
-    }
-
-    if (lightRig.Lights.Count > 0)
-    {
-        ImGui.SetNextItemWidth(220f);
-        if (ImGui.BeginListBox("##lightlist", new Vector2(220f, Math.Min(6, lightRig.Lights.Count) * 18f + 6f)))
-        {
-            for (int i = 0; i < lightRig.Lights.Count; i++)
-            {
-                var l = lightRig.Lights[i];
-                if (ImGui.Selectable($"{(l.Enabled ? "" : "(off) ")}{l.Name}##L{i}", i == selLight))
-                    selLight = i;
-            }
-            ImGui.EndListBox();
-        }
-    }
-
-    if (selLight >= 0 && selLight < lightRig.Lights.Count)
-    {
-        var l = lightRig.Lights[selLight];
-        bool on = l.Enabled;
-        if (ImGui.Checkbox(Loc.TL("Enabled"), ref on)) l.Enabled = on;
-        ImGui.SameLine();
-        bool sh = l.CastsShadows;
-        if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) l.CastsShadows = sh;
-        Theme.Tip(Loc.T("Bake traces terrain occlusion for this light. Off is much faster and\nis right for a fill light that only lifts the ambient."));
-
-        var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
-        if (Col3(Loc.TL("Colour"), ref colv))
-        { l.ColorR = colv.X; l.ColorG = colv.Y; l.ColorB = colv.Z; }
-
-        float inten = l.Intensity, rad = l.Radius, fall = l.Falloff;
-        ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Intensity"), ref inten, 0f, 5f, "%.2f")) l.Intensity = inten;
-        ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Radius (m)"), ref rad, 1f, 400f, "%.0f")) l.Radius = rad;
-        ImGui.SetNextItemWidth(150f);
-        if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 6f, "%.2f")) l.Falloff = fall;
-        Theme.Tip(Loc.T("2 is physically correct inverse-square. Lower is flatter and easier\nto light a scene with."));
-
-        var pv = new Vector3(l.Position.X, l.Position.Y, l.Position.Z);
-        ImGui.SetNextItemWidth(220f);
-        if (DrgF3(Loc.TL("Position"), ref pv, 0.25f))
-            l.Position = new Vec3(pv.X, pv.Y, pv.Z);
-
-        float gnd = GroundUnder(l.Position.X, l.Position.Z);
-        float above = l.Position.Y - gnd;
-
-        // Height above the GROUND rather than absolute Y: that is the number that decides whether the light
-        // reaches anything, and it is the one a mapper actually thinks in ("a lamp is 4 m up").
-        float aboveEdit = above;
-        ImGui.SetNextItemWidth(150f);
-        if (DrgF(Loc.TL("Height above ground"), ref aboveEdit, 0.1f, -50f, 400f, "%.1f m"))
-            l.Position = new Vec3(l.Position.X, gnd + aboveEdit, l.Position.Z);
-        Theme.Tip(Loc.T("Also: PageUp / PageDown with a light selected (Ctrl for fine),\nor Shift-drag the light in the viewport."));
-
-        // The failure that looks like a broken feature: a light further above the ground than its own reach
-        // lights nothing at all, and from a floating marker there is no way to tell. Say so, and offer the fix.
-        if (l.Radius < above)
-        {
-            ImGui.TextColored(new Vector4(1f, 0.45f, 0.4f, 1f), Loc.T("Reach does not touch the ground."));
-            if (ImGui.Button(Loc.TL("Drop to lamp height")))
-                l.Position = new Vec3(l.Position.X, gnd + 3f, l.Position.Z);
-            ImGui.SameLine();
-            if (ImGui.Button(Loc.TL("Grow reach to fit")))
-                l.Radius = MathF.Ceiling(above * 1.6f);
-        }
-
-        if (ImGui.Button(Loc.TL("Move to camera")))
-            l.Position = new Vec3(cam.Position.X, cam.Position.Y, cam.Position.Z);
-        ImGui.SameLine();
-        if (ImGui.Button(Loc.TL("Drop to ground")))
-            l.Position = new Vec3(l.Position.X, GroundUnder(l.Position.X, l.Position.Z) + 3f, l.Position.Z);
-        ImGui.SameLine();
-        if (ImGui.Button(Loc.TL("Go to light")))
-            cam.Position = new Vector3(l.Position.X, l.Position.Y + 8f, l.Position.Z + 14f);
-        ImGui.TextDisabled(Loc.T("Click a light in the viewport to select it; drag to move, Shift-drag for height."));
-    }
-
-    ImGui.TextDisabled($"{lightRig.Lights.Count} light(s)");
 }
 
 // Point tool: draw the heightmap lattice near the camera and highlight the selected vertex, plus a small panel

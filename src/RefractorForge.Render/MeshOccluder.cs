@@ -129,6 +129,67 @@ public sealed class MeshOccluder
         }
     }
 
+    /// <summary>
+    /// Segment form: is anything within <paramref name="maxDist"/> along <paramref name="dir"/> (unit length)?
+    /// A lamp is a finite distance away, so a texel-to-lamp test has to STOP at the lamp: the sun form would count
+    /// a wall on the far side of the light as a shadow caster. Same grid walk, cut off at the distance.
+    /// </summary>
+    public bool Occluded(Vector3 origin, Vector3 dir, float maxDist, Cursor cur, float skip = 0.02f)
+    {
+        origin += dir * skip;
+        maxDist -= skip;
+        if (maxDist <= 0f) return false;
+        float tEnter = 0f, tExit = maxDist;
+        for (int ax = 0; ax < 3; ax++)
+        {
+            float o = Comp(origin, ax), d = Comp(dir, ax), lo = Comp(_min, ax), hi = Comp(_max, ax);
+            if (MathF.Abs(d) < 1e-9f) { if (o < lo || o > hi) return false; continue; }
+            float t0 = (lo - o) / d, t1 = (hi - o) / d;
+            if (t0 > t1) (t0, t1) = (t1, t0);
+            tEnter = MathF.Max(tEnter, t0); tExit = MathF.Min(tExit, t1);
+            if (tEnter > tExit) return false;
+        }
+
+        var p = origin + dir * (tEnter + 1e-4f);
+        var (x, y, z) = Cell(p);
+        Step(dir.X, origin.X, _min.X, _cellSize.X, x, out int sx, out float tMaxX, out float tDeltaX);
+        Step(dir.Y, origin.Y, _min.Y, _cellSize.Y, y, out int sy, out float tMaxY, out float tDeltaY);
+        Step(dir.Z, origin.Z, _min.Z, _cellSize.Z, z, out int sz, out float tMaxZ, out float tDeltaZ);
+        cur.Ray++;
+        while (true)
+        {
+            foreach (int ti in _cells[Index(x, y, z)])
+            {
+                if (cur.Stamp[ti] == cur.Ray) continue;
+                cur.Stamp[ti] = cur.Ray;
+                float t = HitDistance(ti, origin, dir);
+                if (t > 1e-4f && t <= maxDist) return true;
+            }
+            // Leaving the last cell the segment touches: nothing further along can be closer than the end.
+            float tNext = MathF.Min(tMaxX, MathF.Min(tMaxY, tMaxZ));
+            if (tNext > maxDist) return false;
+            if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += sx; if (x < 0 || x >= _nx) return false; tMaxX += tDeltaX; }
+            else if (tMaxY < tMaxZ)             { y += sy; if (y < 0 || y >= _ny) return false; tMaxY += tDeltaY; }
+            else                                { z += sz; if (z < 0 || z >= _nz) return false; tMaxZ += tDeltaZ; }
+        }
+    }
+
+    // Moller-Trumbore returning the hit distance along the ray, or -1 for a miss.
+    private float HitDistance(int i, Vector3 o, Vector3 d)
+    {
+        var pvec = Vector3.Cross(d, _e2[i]);
+        float det = Vector3.Dot(_e1[i], pvec);
+        if (MathF.Abs(det) < 1e-9f) return -1f;
+        float inv = 1f / det;
+        var tvec = o - _a[i];
+        float u = Vector3.Dot(tvec, pvec) * inv;
+        if (u < 0f || u > 1f) return -1f;
+        var qvec = Vector3.Cross(tvec, _e1[i]);
+        float v = Vector3.Dot(d, qvec) * inv;
+        if (v < 0f || u + v > 1f) return -1f;
+        return Vector3.Dot(_e2[i], qvec) * inv;
+    }
+
     private static void Step(float d, float o, float lo, float size, int cell, out int step, out float tMax, out float tDelta)
     {
         if (MathF.Abs(d) < 1e-9f) { step = 0; tMax = float.MaxValue; tDelta = float.MaxValue; return; }

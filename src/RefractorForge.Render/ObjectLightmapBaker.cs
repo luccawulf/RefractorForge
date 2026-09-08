@@ -79,8 +79,16 @@ public static class ObjectLightmapBaker
     /// test is binary — a texel is lit or it is not — so one sample per texel puts a hard staircase along every
     /// shadow edge and every triangle border, which is exactly what a baked map looks like when it looks "jagged".
     /// Averaging several sub-samples turns that step into a proper gradient. Cost is samples² rays per texel.</param>
+    /// <param name="night">The level's geometry as lamp occluders (see <see cref="NightBake.Build"/>). With it, a
+    /// placed light is shadowed by every building and prop on the map and softened over its source size; without
+    /// it lights fall back to terrain-only occlusion.</param>
+    /// <param name="colour">Keep the lamps' COLOUR in the map (a 24-bit map, which Battlefield 1942 reads with the
+    /// hue intact - GC_Bespin_Night ships exactly that). False folds them to brightness for BfVietnam, whose shader
+    /// reads only the blue channel.</param>
+    /// <param name="lampSamples">Shadow samples per lamp per texel; 1 is a hard shadow, 4-8 a penumbra.</param>
     public static Texture2D? Bake(MeshLibrary.Mesh mesh, Matrix4x4 world, Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
-        int size = 256, float ambient = 0.4f, LightRig? rig = null, bool selfShadow = true, int samples = 2)
+        int size = 256, float ambient = 0.4f, LightRig? rig = null, bool selfShadow = true, int samples = 2,
+        NightBake.Scene? night = null, bool colour = false, int lampSamples = 1)
     {
         var lm = mesh.LightmapUvs;
         if (lm is null || lm.Length == 0 || size < 4) return null;
@@ -88,6 +96,7 @@ public static class ObjectLightmapBaker
         var pos = mesh.Positions;
         var (_, maxH) = TerrainShadow.HeightSpan(hm, cfg);
         var sun = Vector3.Normalize(new Vector3(sunDir.X, sunDir.Y, sunDir.Z));
+        var lampCursor = night?.NewCursor();
 
         MeshOccluder? occ = null;
         if (selfShadow)
@@ -110,7 +119,10 @@ public static class ObjectLightmapBaker
         var cover = new bool[size * size];
         // Sub-sample accumulators. `owner` keeps the first-triangle-wins rule while still letting every sub-sample
         // of THAT triangle contribute, so the averaging smooths shadow edges without smearing across an atlas seam.
+        // Three channels: the sun term is grey, the lamps may not be.
         var sum = new float[size * size];
+        var sumG = new float[size * size];
+        var sumB = new float[size * size];
         var cnt = new int[size * size];
         var owner = new int[size * size];
         Array.Fill(owner, -1);
@@ -148,34 +160,56 @@ public static class ObjectLightmapBaker
                                && (occ is null || !occ.Occluded(wp, sun));
                     float v = ambient + (1f - ambient) * (lit ? 1f : 0f);
 
-                    // Placed lights add on top of the sun, as INTENSITY. Every shipped object lightmap checked
-                    // across retail levels is a grey-palette TGA, so the format carries brightness and the
-                    // engine is never handed a hue here: a coloured lamp brightens an object without tinting
-                    // it, and the colour lives in the ground texture instead.
+                    // Placed lights add on top of the sun. With a night scene they are shadowed by the whole level
+                    // and softened over the lamp's size; without one, terrain-only occlusion as before. The colour
+                    // is kept for a 24-bit map (BF1942) and folded to Rec. 709 luma for a grey one (BfVietnam).
+                    float lr = 0f, lg = 0f, lb = 0f;
                     if (rig is not null && rig.Lights.Count > 0)
                     {
-                        float add = LightBake.Intensity(wp.X, wp.Y, wp.Z, rig, hm, cfg);
-                        // Angle still matters - a face turned away from a lamp should not brighten - but with
-                        // the same soft wrap the viewport preview uses, so the bake matches what was aimed.
-                        float lndl = 0f;
-                        foreach (var l in rig.Lights)
+                        if (night is not null)
                         {
-                            if (!l.Enabled) continue;
-                            var toL = new Vector3(l.Position.X - wp.X, l.Position.Y - wp.Y, l.Position.Z - wp.Z);
-                            if (toL.LengthSquared() < 1e-8f) { lndl = 1f; break; }
-                            lndl = MathF.Max(lndl, MathF.Max(0f, Vector3.Dot(fn, Vector3.Normalize(toL))));
+                            var c = NightBake.Lamp(night, wp, fn, rig, lampCursor, lampSamples, ground: false,
+                                                   seed: (uint)(px * 73856093 ^ py * 19349663));
+                            lr = c.X; lg = c.Y; lb = c.Z;
                         }
-                        v += add * (lndl * 0.85f + 0.15f);
+                        else
+                        {
+                            float add = LightBake.Intensity(wp.X, wp.Y, wp.Z, rig, hm, cfg);
+                            // Angle still matters - a face turned away from a lamp should not brighten - but with
+                            // the same soft wrap the viewport preview uses, so the bake matches what was aimed.
+                            float lndl = 0f;
+                            foreach (var l in rig.Lights)
+                            {
+                                if (!l.Enabled) continue;
+                                var toL = new Vector3(l.Position.X - wp.X, l.Position.Y - wp.Y, l.Position.Z - wp.Z);
+                                if (toL.LengthSquared() < 1e-8f) { lndl = 1f; break; }
+                                lndl = MathF.Max(lndl, MathF.Max(0f, Vector3.Dot(fn, Vector3.Normalize(toL))));
+                            }
+                            lr = lg = lb = add * (lndl * 0.85f + 0.15f);
+                        }
                     }
-
-                    sum[o] += MathF.Min(v, 1f);
+                    if (colour)
+                    {
+                        sum[o] += MathF.Min(v + lr, 1f); sumG[o] += MathF.Min(v + lg, 1f); sumB[o] += MathF.Min(v + lb, 1f);
+                    }
+                    else
+                    {
+                        float luma = 0.2126f * lr + 0.7152f * lg + 0.0722f * lb;
+                        sum[o] += MathF.Min(v + luma, 1f);
+                    }
                     cnt[o]++;
                 });
             }
         }
 
+        var intenG = colour ? new float[size * size] : inten;
+        var intenB = colour ? new float[size * size] : inten;
         for (int i = 0; i < inten.Length; i++)
-            if (cnt[i] > 0) { inten[i] = sum[i] / cnt[i]; cover[i] = true; }
+            if (cnt[i] > 0)
+            {
+                inten[i] = sum[i] / cnt[i]; cover[i] = true;
+                if (colour) { intenG[i] = sumG[i] / cnt[i]; intenB[i] = sumB[i] / cnt[i]; }
+            }
 
         // A mesh whose second UV set is all one point (BfVietnam props and walls ship 0,0 on every vertex - the slot
         // exists, the unwrap does not) rasterises nothing. Baking it anyway shipped an all-black map that turned the
@@ -184,13 +218,22 @@ public static class ObjectLightmapBaker
         foreach (var c in cover) if (c) covered++;
         if (covered < size * size / 2000) return null;
 
-        Dilate(inten, cover, size);                                   // spread into the UV gutter so seams don't bleed black
+        // Spread into the UV gutter so seams don't bleed black. Dilate fills `cover` as it goes, so each channel
+        // gets its own copy of the pre-dilation coverage.
+        if (colour)
+        {
+            var coverG = (bool[])cover.Clone(); var coverB = (bool[])cover.Clone();
+            Dilate(inten, cover, size); Dilate(intenG, coverG, size); Dilate(intenB, coverB, size);
+        }
+        else Dilate(inten, cover, size);
 
         var rgba = new byte[size * size * 4];
         for (int i = 0; i < size * size; i++)
         {
-            byte v = (byte)Math.Clamp((int)(inten[i] * 255f + 0.5f), 0, 255);
-            rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
+            rgba[i * 4] = (byte)Math.Clamp((int)(inten[i] * 255f + 0.5f), 0, 255);
+            rgba[i * 4 + 1] = (byte)Math.Clamp((int)(intenG[i] * 255f + 0.5f), 0, 255);
+            rgba[i * 4 + 2] = (byte)Math.Clamp((int)(intenB[i] * 255f + 0.5f), 0, 255);
+            rgba[i * 4 + 3] = 255;
         }
         return new Texture2D(size, size, rgba);
     }

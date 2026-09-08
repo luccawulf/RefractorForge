@@ -58,6 +58,24 @@ public static class DecalObject
         // picture, which could collide with a mod's material.
         string material = name + "_Material0";
         var mesh = Quad(widthMeters, heightMeters, material, flat, doubleSided, uMax, vMax);
+        return Emit(levelName, name, mesh, textureName, ddsBytes, baseSub, textureRef, soundScript, soundAutoPlay,
+                    maxDrawDistance, additive, selfIllum);
+    }
+
+    /// <summary>
+    /// The six-file level-local object recipe for ANY single-material mesh whose material is named
+    /// <c>&lt;name&gt;_Material0</c> - the decal's quad, a lamp's glow cross, whatever the caller built. Split out
+    /// of <see cref="Build"/> so every level-local object goes to disk by the one path that has been proven to
+    /// load in both games, rather than each recipe growing its own copy of it.
+    /// </summary>
+    public static Built Emit(string levelName, string name, ObjMesh mesh, string textureName, byte[]? ddsBytes,
+                             string baseSub = "bf1942", string? textureRef = null, string? soundScript = null,
+                             bool soundAutoPlay = true, float maxDrawDistance = 0f, bool additive = false,
+                             float selfIllum = 0f)
+    {
+        name = Sanitize(name);
+        textureName = Sanitize(textureName);
+        string material = name + "_Material0";
 
         var files = new List<(string, byte[])>();
         var crlf = new UTF8Encoding(false);

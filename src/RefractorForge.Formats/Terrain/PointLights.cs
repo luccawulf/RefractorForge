@@ -45,11 +45,82 @@ public sealed class PointLight
     /// </summary>
     public float Falloff { get; set; } = 2f;
 
-    public PointLight Clone() => (PointLight)MemberwiseClone();
+    // ---- What a lamp is, beyond a point ------------------------------------------------------------------------
+    // Everything below is optional in the sidecar: a rig written before these existed loads with the defaults, which
+    // reproduce the old behaviour exactly (an omnidirectional point, a hard shadow, a glow of the light's own colour).
+
+    /// <summary>0 = point (a bulb, shines everywhere), 1 = spot (a cone - a street lamp head, a floodlight).</summary>
+    public int Kind { get; set; }
+
+    /// <summary>Where a spot points, as compass yaw (degrees, 0 = +Z north, 90 = +X east) and pitch (degrees,
+    /// -90 = straight down, 0 = level). A street lamp is pitch -90; a floodlight on a wall is about -30.</summary>
+    public float SpotYawDeg { get; set; }
+    public float SpotPitchDeg { get; set; } = -90f;
+
+    /// <summary>Full cone angle of a spot, in degrees. Nothing outside it is lit.</summary>
+    public float ConeDeg { get; set; } = 90f;
+
+    /// <summary>How much of the cone is a soft edge, 0..1: 0 is a hard-edged circle, 1 fades from the axis out.</summary>
+    public float ConeSoft { get; set; } = 0.5f;
 
     /// <summary>
-    /// How much this light delivers to a point, ignoring occlusion. Zero past the radius, so the bake can skip
-    /// whole regions cheaply.
+    /// The physical size of the emitter in metres - the radius of the bulb, tube or fixture. This is what gives a
+    /// shadow a PENUMBRA: the bake samples the light across this disc, so a wall's shadow on the ground goes from
+    /// sharp at its base to soft further out, the way real lamp shadows do. 0 is a mathematical point and a
+    /// razor-edged shadow; 0.3 is a bulb; 1.0 is a big fixture or a fire.
+    /// </summary>
+    public float SourceSize { get; set; } = 0.3f;
+
+    /// <summary>Put an additive glow sprite at the bulb when the rig is baked, so the lamp itself reads as lit.</summary>
+    public bool Glow { get; set; } = true;
+
+    /// <summary>Diameter of the glow sprite, metres. Retail street lamps use 1.5-4.</summary>
+    public float GlowSize { get; set; } = 2f;
+
+    /// <summary>Scales the glow's colour; past ~1.5 the centre burns to white, which suits a bare bulb.</summary>
+    public float GlowBrightness { get; set; } = 1f;
+
+    /// <summary>Whether this light is baked into the ground texture (its pool on the floor).</summary>
+    public bool OnGround { get; set; } = true;
+
+    /// <summary>Whether this light is baked into the per-object lightmaps (its light on walls and props).</summary>
+    public bool OnObjects { get; set; } = true;
+
+    public bool IsSpot => Kind == 1;
+
+    public PointLight Clone() => (PointLight)MemberwiseClone();
+
+    /// <summary>Unit vector a spot shines along (from yaw/pitch). Meaningless for a point light.</summary>
+    public Vec3 Direction()
+    {
+        float yaw = SpotYawDeg * MathF.PI / 180f, pitch = SpotPitchDeg * MathF.PI / 180f;
+        float c = MathF.Cos(pitch);
+        return new Vec3(MathF.Sin(yaw) * c, MathF.Sin(pitch), MathF.Cos(yaw) * c);
+    }
+
+    /// <summary>
+    /// The cone term of a spot at a point, 0..1 (1 everywhere for a point light): 1 inside the inner cone, 0 outside
+    /// the outer one, a smooth ramp between - so a spot's edge on the ground is a soft ring, not a stencil.
+    /// </summary>
+    public float Cone(float wx, float wy, float wz)
+    {
+        if (!IsSpot) return 1f;
+        float dx = wx - Position.X, dy = wy - Position.Y, dz = wz - Position.Z;
+        float len = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1e-4f) return 1f;
+        var d = Direction();
+        float cosA = (dx * d.X + dy * d.Y + dz * d.Z) / len;
+        float outer = MathF.Cos(Math.Clamp(ConeDeg, 1f, 179f) * 0.5f * MathF.PI / 180f);
+        float inner = MathF.Cos(Math.Clamp(ConeDeg, 1f, 179f) * 0.5f * (1f - Math.Clamp(ConeSoft, 0f, 1f)) * MathF.PI / 180f);
+        if (cosA <= outer) return 0f;
+        if (cosA >= inner || inner <= outer) return 1f;
+        float t = (cosA - outer) / (inner - outer);
+        return t * t * (3f - 2f * t);
+    }
+
+    /// <summary>
+    /// How much this light delivers to a point, ignoring occlusion. Zero past the radius (and outside a spot's
+    /// cone), so the bake can skip whole regions cheaply.
     /// </summary>
     public float Attenuation(float wx, float wy, float wz)
     {
@@ -65,7 +136,40 @@ public sealed class PointLight
         float window = 1f - t * t;
         window *= window;
         float shape = MathF.Pow(1f - t, MathF.Max(Falloff, 0.1f));
-        return Intensity * shape * window;
+        float a = Intensity * shape * window;
+        return IsSpot ? a * Cone(wx, wy, wz) : a;
+    }
+}
+
+/// <summary>
+/// The lamps people actually place, as starting points. Each is a complete light; the user tunes from there.
+/// Colours are the ones the real fixtures have (sodium is orange, halide is cold, a fire is deep amber), because a
+/// night street lit by one uniform "warm white" is the first thing that looks like a game rather than a place.
+/// </summary>
+public sealed record LightPreset(string Name, float R, float G, float B, float Intensity, float Radius, float Falloff,
+                                 int Kind, float ConeDeg, float ConeSoft, float SourceSize, float GlowSize, float Height)
+{
+    public static readonly LightPreset StreetSodium = new("Street lamp - sodium", 1.00f, 0.72f, 0.36f, 1.4f, 26f, 1.6f, 1, 120f, 0.6f, 0.35f, 2.2f, 7f);
+    public static readonly LightPreset StreetWhite  = new("Street lamp - white",  0.95f, 0.95f, 1.00f, 1.3f, 26f, 1.6f, 1, 120f, 0.6f, 0.35f, 2.0f, 7f);
+    public static readonly LightPreset WallLamp     = new("Wall lamp",            1.00f, 0.84f, 0.60f, 0.9f, 12f, 1.8f, 0, 90f, 0.5f, 0.15f, 1.0f, 3f);
+    public static readonly LightPreset Floodlight   = new("Floodlight",           0.92f, 0.96f, 1.00f, 2.2f, 60f, 1.2f, 1, 50f, 0.35f, 0.5f, 2.5f, 8f);
+    public static readonly LightPreset Fire         = new("Fire / torch",         1.00f, 0.55f, 0.18f, 1.2f, 14f, 2.2f, 0, 90f, 0.5f, 0.8f, 1.6f, 1f);
+    public static readonly LightPreset WindowGlow   = new("Window glow",          1.00f, 0.88f, 0.62f, 0.5f, 9f, 2.4f, 1, 140f, 0.9f, 0.6f, 0f, 1.8f);
+    public static readonly LightPreset NeonRed      = new("Neon - red",           1.00f, 0.15f, 0.20f, 0.8f, 10f, 2.0f, 0, 90f, 0.5f, 0.3f, 1.2f, 3f);
+    public static readonly LightPreset NeonCyan     = new("Neon - cyan",          0.20f, 0.90f, 1.00f, 0.8f, 10f, 2.0f, 0, 90f, 0.5f, 0.3f, 1.2f, 3f);
+    public static readonly LightPreset Moonpool     = new("Cool fill",            0.55f, 0.65f, 1.00f, 0.4f, 40f, 1.2f, 0, 90f, 0.5f, 2.0f, 0f, 12f);
+
+    public static IReadOnlyList<LightPreset> All { get; } =
+        new[] { StreetSodium, StreetWhite, WallLamp, Floodlight, Fire, WindowGlow, NeonRed, NeonCyan, Moonpool };
+
+    /// <summary>Copy the preset's look onto a light, keeping its name and position.</summary>
+    public void ApplyTo(PointLight l)
+    {
+        l.ColorR = R; l.ColorG = G; l.ColorB = B;
+        l.Intensity = Intensity; l.Radius = Radius; l.Falloff = Falloff;
+        l.Kind = Kind; l.ConeDeg = ConeDeg; l.ConeSoft = ConeSoft; l.SpotPitchDeg = -90f;
+        l.SourceSize = SourceSize;
+        l.Glow = GlowSize > 0f; l.GlowSize = MathF.Max(GlowSize, 0.5f);
     }
 }
 

@@ -207,6 +207,38 @@ public static class TgaTexture
         return b;
     }
 
+    /// <summary>
+    /// A 24-bit truecolour TGA - the object-lightmap format that carries COLOUR.
+    ///
+    /// Measured off GC_Bespin_Night (the mod's Blender-baked night lightmaps): image type 2, 24 bpp, no colour map,
+    /// descriptor 0 (bottom-left origin), BGR texels - and Battlefield 1942 loads them with the lamp colour intact.
+    /// Its day maps are the usual 8-bit grey palette, so the two formats sit side by side in one game. BfVietnam's
+    /// shader reads only the blue channel of a lightmap, so a coloured map there is brightness-only; write
+    /// <see cref="EncodeGrayColormapped"/> for that game.
+    /// </summary>
+    public static byte[] EncodeRgb24(Texture2D t)
+    {
+        int w = t.Width, h = t.Height;
+        var buf = new byte[18 + w * h * 3];
+        buf[2] = 2;                                   // image type 2 = truecolour, uncompressed
+        buf[12] = (byte)(w & 0xFF); buf[13] = (byte)((w >> 8) & 0xFF);
+        buf[14] = (byte)(h & 0xFF); buf[15] = (byte)((h >> 8) & 0xFF);
+        buf[16] = 24;
+        buf[17] = 0;                                  // bottom-left origin, like every shipped lightmap
+        var px = t.Rgba;
+        int p = 18;
+        for (int y = 0; y < h; y++)
+        {
+            int srcRow = (h - 1 - y) * w;
+            for (int x = 0; x < w; x++)
+            {
+                int o = (srcRow + x) * 4;
+                buf[p++] = px[o + 2]; buf[p++] = px[o + 1]; buf[p++] = px[o];   // BGR
+            }
+        }
+        return buf;
+    }
+
     public static byte[] EncodeGrayColormapped(Texture2D t)
     {
         int w = t.Width, h = t.Height;
