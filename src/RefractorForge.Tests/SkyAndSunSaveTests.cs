@@ -322,6 +322,90 @@ public class CombatAreaMapScalingTests
         Assert.True(MeanB(t) > MeanR(t), $"a clamped window belongs in the blue quadrant (R {MeanR(t):0}, B {MeanB(t):0})");
     }
 
+    // A 10 m cube standing on the ground at world (500..510, 500..510) - one building, as two triangles per face is
+    // more than the footprint pass needs (it only ever looks straight down).
+    private static List<(System.Numerics.Vector3 A, System.Numerics.Vector3 B, System.Numerics.Vector3 C)> Building()
+    {
+        System.Numerics.Vector3 V(float x, float y, float z) => new(x, y, z);
+        return new()
+        {
+            (V(500, 10, 500), V(510, 10, 500), V(510, 10, 510)),
+            (V(500, 10, 500), V(510, 10, 510), V(500, 10, 510)),
+        };
+    }
+
+    [Fact]
+    public void Placed_objects_are_drawn_onto_the_map()
+    {
+        // A terrain-only render of a city is a brown smear; retail maps read as maps because you can see the
+        // buildings. The claim is narrow: the same window, rendered with and without the geometry, differs, and it
+        // differs WHERE the building stands and nowhere else.
+        var (hm, cfg, mat) = Landmark();
+        var area = new RefractorForge.Formats.Validation.CombatArea(0f, 0f, 1024f, 1024f);
+        var bare = Minimap.Render(128, hm, cfg, null, mat, true, area, 1);
+        var built = Minimap.Render(128, hm, cfg, null, mat, true, area, 1, Building());
+        Assert.NotEqual(bare.Rgba, built.Rgba);
+
+        // world (505, 505) -> u,v 0.493; north-up flips v, so the pixel is at (63, 64) of 128.
+        int px = (int)(505f / 1024f * 128), py = 127 - px;
+        Assert.NotEqual(0, Diff(bare, built, px, py));
+        Assert.Equal(0, Diff(bare, built, 8, 8));       // far corner untouched
+    }
+
+    [Fact]
+    public void Ground_clutter_is_not_drawn_as_a_building()
+    {
+        // Flat decals and debris lie ON the terrain. Drawing them would paint big meaningless slabs, so anything
+        // standing under a metre above the ground is dropped - here the same quad, laid at ground level.
+        var (hm, cfg, mat) = Landmark();
+        var area = new RefractorForge.Formats.Validation.CombatArea(0f, 0f, 1024f, 1024f);
+        var flat = Building().Select(t => (Lower(t.A), Lower(t.B), Lower(t.C))).ToList();
+        var bare = Minimap.Render(128, hm, cfg, null, mat, true, area, 1);
+        var laid = Minimap.Render(128, hm, cfg, null, mat, true, area, 1, flat);
+        Assert.Equal(bare.Rgba, laid.Rgba);
+
+        static System.Numerics.Vector3 Lower(System.Numerics.Vector3 v) => v with { Y = 0.2f };
+    }
+
+    [Fact]
+    public void Supersampling_keeps_the_frame_and_softens_the_aliasing()
+    {
+        // Same window, same content, so the image must still be the same picture - but averaging several terrain
+        // samples per output pixel is what stops a 5:1 downsample of the atlas from aliasing.
+        var (hm, cfg, mat) = Landmark();
+        var one = Minimap.Render(64, hm, cfg, null, mat, true, null, 1);
+        var three = Minimap.Render(64, hm, cfg, null, mat, true, null, 3);
+        Assert.Equal(one.Width, three.Width);
+        Assert.True(MeanR(three) > MeanR(one) * 0.8f && MeanR(three) < MeanR(one) * 1.25f,
+                    $"supersampling must not change the picture (R {MeanR(one):0} -> {MeanR(three):0})");
+    }
+
+    [Fact]
+    public void The_reference_grid_is_drawn_only_when_asked()
+    {
+        // Columns A.. across the top and rows 1.. down the left: how players call positions out to each other, and
+        // on every retail in-game map.
+        var (hm, cfg, mat) = Landmark();
+        var plain = Minimap.Render(256, hm, cfg, null, mat, true, null, 1);
+        var grid = Minimap.Render(256, hm, cfg, null, mat, true, null, 1, null, 8);
+        Assert.NotEqual(plain.Rgba, grid.Rgba);
+
+        // Every division line darkens its whole column; between them nothing moved.
+        for (int d = 1; d < 8; d++)
+        {
+            int x = d * 256 / 8;
+            Assert.True(Diff(plain, grid, x, 200) > 0, $"no grid line at column {x}");
+        }
+        Assert.Equal(0, Diff(plain, grid, 256 / 16, 200));   // mid-cell, below the labels
+    }
+
+    private static int Diff(Texture2D a, Texture2D b, int x, int y)
+    {
+        int i = (y * a.Width + x) * 4, d = 0;
+        for (int c = 0; c < 3; c++) d += System.Math.Abs(a.Rgba[i + c] - b.Rgba[i + c]);
+        return d;
+    }
+
     private static float MeanR(Texture2D t) => Channel(t, 0);
     private static float MeanB(Texture2D t) => Channel(t, 2);
 

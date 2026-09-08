@@ -5440,8 +5440,11 @@ List<(string Name, byte[] Bytes)> MapImagePieces(string baseRfa)
 void DoGenerateMinimap()
 {
     if (heightmap is null) return;
-    var ingame = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
-    var thumb = Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
+    // Supersampled, with the placed buildings drawn on top - a plain point-sampled terrain render of a city is a
+    // brown smear next to a retail map. Resolve the geometry once and share it between the two sizes.
+    var mapTris = LevelScene.ObjectTriangles(so, meshLib, solidOnly: true);
+    var ingame = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea, 3, mapTris, 8);
+    var thumb = Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea, 3, mapTris);
     string? a = null, b = null, c = null;
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
@@ -5887,36 +5890,8 @@ void InitTerrainShadowOnLoad()
 // nothing - the buildings that cast every real shadow were not in the calculation at all. So the objects go into a
 // MeshOccluder and every texel casts a ray at the sun through them. That is millions of ray/triangle tests, hence
 // the worker and the progress bar.
-List<(System.Numerics.Vector3 a, System.Numerics.Vector3 b, System.Numerics.Vector3 c)> ShadowCasterTriangles()
-{
-    var tris = new List<(System.Numerics.Vector3, System.Numerics.Vector3, System.Numerics.Vector3)>();
-    if (so is null || meshLib is null) return tris;
-    foreach (var o in so.Objects)
-    {
-        // The PRIMARY LOD only. Adding _m2 as well would double the triangle count for a silhouette that is,
-        // by definition, the same shape seen from further away.
-        var meshName = meshLib.LodGeometryNames(o.Template).FirstOrDefault();
-        if (meshName is null || !meshLib.TryGet(meshName, out var m)) continue;
-        var world = LevelScene.MeshWorld(o);
-        var pos = m.Positions;
-        foreach (var part in m.Parts)
-        {
-            // Skip foliage cards and anything alpha-blended: a tree billboard is a flat quad that would cast a
-            // hard rectangular slab of shadow, which is worse than casting none.
-            if (part.Foliage || part.Blend) continue;
-            var idx = part.Indices;
-            for (int t = 0; t + 2 < idx.Length; t += 3)
-            {
-                int a = idx[t], b = idx[t + 1], c = idx[t + 2];
-                if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
-                tris.Add((System.Numerics.Vector3.Transform(pos[a], world),
-                          System.Numerics.Vector3.Transform(pos[b], world),
-                          System.Numerics.Vector3.Transform(pos[c], world)));
-            }
-        }
-    }
-    return tris;
-}
+List<(System.Numerics.Vector3 A, System.Numerics.Vector3 B, System.Numerics.Vector3 C)> ShadowCasterTriangles()
+    => LevelScene.ObjectTriangles(so, meshLib);
 
 // Bake the terrain's sun cast-shadow and ARM IT FOR SAVING. Arming used to live only in the caller, so the
 // standalone "Bake Sun Shadows" lit the viewport and the save then wrote nothing - while the combined
@@ -15291,9 +15266,10 @@ bool BuildPackage()
         byte[]? mini = null, thumb = null;
         if (pkgMinimap)
         {
-            var m = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea);
+            var pkgTris = LevelScene.ObjectTriangles(so, meshLib, solidOnly: true);
+            var m = Minimap.Render(512, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea, 3, pkgTris, 8);
             mini = PngWriter.Encode(m);
-            thumb = PngWriter.Encode(Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea));
+            thumb = PngWriter.Encode(Minimap.Render(256, heightmap, cfg, terrainTex, materialMap, true, env.CombatArea, 3, pkgTris));
         }
 
         var inputs = new RefractorForge.Formats.Packaging.LevelPackager.Inputs

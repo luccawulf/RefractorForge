@@ -251,6 +251,50 @@ public sealed class LevelScene
              * Matrix4x4.CreateTranslation(o.Position.X, o.Position.Y, o.Position.Z);
     }
 
+    /// <summary>
+    /// Every placed object's primary-LOD geometry as world-space triangles. Shared by the sun-shadow bake (what
+    /// casts) and the in-game map render (what shows as a building), which want exactly the same set: the PRIMARY
+    /// LOD only - adding _m2 would double the triangle count for a silhouette that is by definition the same shape
+    /// seen from further away - and no foliage cards or alpha-blended parts, which are flat quads that would cast a
+    /// hard rectangular slab and print an equally hard rectangular block on the map.
+    /// <para>Resolve on the calling thread: the mesh library's cache is not thread-safe.</para>
+    /// </summary>
+    /// <param name="solidOnly">
+    /// Also drop every ALPHA-TESTED part, which the shadow bake keeps. `Foliage` alone is not enough to find the
+    /// vegetation: it is only set for a cutout material that names NO alphaTestRef, so a tree whose shader does
+    /// name one keeps all its leaf cards - and Saigon68 places about 700 of those. On the in-game map that prints
+    /// a canopy-sized white blob per bush, which is the difference between a map of a city and a map of a rash.
+    /// Cutout geometry is leaves, grass, fences and window frames; a building's walls are solid.
+    /// </param>
+    public static List<(Vector3 A, Vector3 B, Vector3 C)> ObjectTriangles(StaticObjectsFile? objs, MeshLibrary? meshes,
+                                                                          bool solidOnly = false)
+    {
+        var tris = new List<(Vector3, Vector3, Vector3)>();
+        if (objs is null || meshes is null) return tris;
+        foreach (var o in objs.Objects)
+        {
+            var meshName = meshes.LodGeometryNames(o.Template).FirstOrDefault();
+            if (meshName is null || !meshes.TryGet(meshName, out var m)) continue;
+            var world = MeshWorld(o);
+            var pos = m.Positions;
+            foreach (var part in m.Parts)
+            {
+                if (part.Foliage || part.Blend) continue;
+                if (solidOnly && part.AlphaTest) continue;
+                var idx = part.Indices;
+                for (int t = 0; t + 2 < idx.Length; t += 3)
+                {
+                    int a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                    if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
+                    tris.Add((Vector3.Transform(pos[a], world),
+                              Vector3.Transform(pos[b], world),
+                              Vector3.Transform(pos[c], world)));
+                }
+            }
+        }
+        return tris;
+    }
+
     /// <summary>Small ground marker (3 m cube) for mesh-less / invisible gameplay objects.</summary>
     private static Matrix4x4 MarkerWorld(StaticObject o)
     {
