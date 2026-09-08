@@ -1544,5 +1544,9 @@
  "{0} selected; {1} of {2} shown": "{0} 個を選択中；{2} 個中 {1} 個を表示",
  "{0} shader(s)": "{0} 個のシェーダー",
  "Sound rings": "サウンドの範囲リング",
- "How far each placed ambient sound carries, drawn on the ground: an inner ring at full\nvolume (its minDistance) and an outer one where it fades to silence. A sound is invisible\nand its reach is its whole behaviour, so this is the difference between placing one and\nguessing.": "配置した環境音がどこまで届くかを地面に描画します：内側のリングが最大音量の範囲\n（minDistance）、外側が無音になる距離です。音は目に見えず、その到達範囲が挙動の\nすべてなので、配置と当て推量の違いはここにあります。"
+ "How far each placed ambient sound carries, drawn on the ground: an inner ring at full\nvolume (its minDistance) and an outer one where it fades to silence. A sound is invisible\nand its reach is its whole behaviour, so this is the difference between placing one and\nguessing.": "配置した環境音がどこまで届くかを地面に描画します：内側のリングが最大音量の範囲\n（minDistance）、外側が無音になる距離です。音は目に見えず、その到達範囲が挙動の\nすべてなので、配置と当て推量の違いはここにあります。",
+ "Max distance (m)": "最大距離 (m)",
+ "The radius that stays at FULL volume. The inner ring in the viewport.": "最大音量が保たれる半径です。ビューポートの内側のリングにあたります。",
+ "Where it fades to silence - the outer ring. This is the second number of the script's\nDistance->Volume ramp, which is how every retail ambient shapes its falloff.": "無音になる距離 — 外側のリングです。スクリプトの Distance→Volume ランプの 2 番目の値で、\nリテールの環境音はすべてこの方法で減衰を作っています。",
+ "no distance ramp in this script - no max distance to set": "このスクリプトには距離ランプがありません — 設定できる最大距離はありません"
 }

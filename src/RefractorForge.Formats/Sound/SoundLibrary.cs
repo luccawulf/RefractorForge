@@ -37,6 +37,18 @@ public sealed class SoundLibrary
     public SoundEmitter? Get(string template) => template is not null && _byTemplate.TryGetValue(template, out var e) ? e : null;
     public bool AnyDirty => _byTemplate.Values.Any(e => e.Dirty);
 
+    /// <summary>
+    /// Add an emitter the level does not have on disk YET - one created this session, whose files are still queued
+    /// for the next save. Without this a sound you just placed is invisible to everything that asks the library
+    /// what makes a noise: no marker, no radius rings, and the Sounds layer toggle does nothing to it, which reads
+    /// as "the sound object did not work" long before you get as far as the game.
+    /// </summary>
+    public void Register(string template, string sscName, SoundScript? script)
+    {
+        if (string.IsNullOrWhiteSpace(template)) return;
+        _byTemplate[template] = new SoundEmitter { Template = template, SscName = sscName, Script = script };
+    }
+
     /// <summary>Build from already-read text: each Sounds/*.con body, plus a map of .ssc filename -&gt; bytes.
     /// Loader-agnostic so both the folder loader and the .rfa loader can use it.</summary>
     public static SoundLibrary FromTexts(IEnumerable<string> conTexts, IReadOnlyDictionary<string, byte[]> sscByName)

@@ -697,7 +697,6 @@ RefractorForge.Formats.Validation.IssueSeverity mapReportMin = RefractorForge.Fo
 Dictionary<uint, int[]> plLocs = new();
 int selLight = -1;              // index into lightRig.Lights, -1 = none
 bool showLightGizmos = true;
-bool showSoundRings = true;       // how far each placed ambient sound carries, drawn on the ground
 bool groundLightsLive = true;     // draw the placed lights on the terrain live; a ground bake turns this off (the pool is in the texture then)
 float groundBakeStrength = 1f;    // scales the pool a ground bake burns in
 bool showTunnels = false;         // the Tunnels (BFV 1.2) window
@@ -4231,17 +4230,6 @@ void DrawSounds()
         if (si.Near > 0.5f) Ring(si.Near, 0.55f * lit, 1f * lit, 0.72f * lit);       // full volume
         Ring(si.Far, 0.80f * lit, 0.42f * lit, 1f * lit);                            // silence
     }
-    if (pts.Count > 0)
-    {
-        var buf = new float[pts.Count * 3];
-        for (int i = 0; i < pts.Count; i++) { buf[i * 3] = pts[i].X; buf[i * 3 + 1] = pts[i].Y; buf[i * 3 + 2] = pts[i].Z; }
-        gl.UniformMatrix4(uMvpM, 1, false, vpFloats);
-        gl.BindVertexArray(gpVao);
-        gl.BindBuffer(BufferTargetARB.ArrayBuffer, gpVbo);
-        gl.BufferData<float>(BufferTargetARB.ArrayBuffer, buf, BufferUsageARB.DynamicDraw);
-        gl.Uniform3(uColor, 0.92f, 0.55f, 1f); gl.Uniform1(uSize, 11f);
-        gl.DrawArrays(PrimitiveType.Points, 0, (uint)pts.Count);
-    }
     gl.Enable(EnableCap.DepthTest);
 
     var dl = ImGui.GetBackgroundDrawList();   // world overlay: over the 3D scene but UNDER all UI chrome (panels/minimap/modals)
@@ -4258,6 +4246,9 @@ void DrawSounds()
         if (float.IsNaN(s.X) || s.X < vpMin.X || s.X > vpMax.X || s.Y < vpMin.Y || s.Y > vpMax.Y) continue;
         float d = Vector3.Distance(cam.Position, w);
         float vol = SoundVolumeAt(d, si.Near, si.Far, si.Volume);
+        // A MUSIC NOTE, not the generic marker diamond every other placed thing wears. A sound is the one object
+        // with nothing to look at, so the marker is all you have to find it by - it should say what it is.
+        DrawMusicNote(dl, s, 1f, ImGui.GetColorU32(new Vector4(0.92f, 0.55f, 1f, vol > 0.001f ? 1f : 0.55f)));
         // The label says what you would hear standing here: the level it has reached, or why it is silent.
         string what = !si.AutoPlay ? Loc.T("  (while looked at)")
                     : vol > 0.001f ? string.Format(Loc.T("  {0:0}%"), vol * 100f)
@@ -4273,6 +4264,52 @@ void DrawSounds()
         }
     }
     dl.PopClipRect();
+}
+
+// A quaver, drawn from primitives rather than a font glyph so it does not depend on the UI font carrying the
+// character (Segoe UI does; a fallback might not, and a missing glyph would leave a sound with no marker at all).
+// An outline in black goes down first so the note stays readable over bright ground.
+void DrawMusicNote(ImDrawListPtr dl, Vector2 at, float scale, uint col)
+{
+    float u = 7f * uiScale * scale;                       // the note's half-height unit
+    var head = new Vector2(at.X - u * 0.35f, at.Y + u * 0.75f);
+    float rx = u * 0.62f, ry = u * 0.45f;
+    uint edge = ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.8f));
+
+    // Head: an ellipse, tilted the way a printed note is. Drawn as a filled polygon - AddEllipseFilled is not in
+    // every ImGui.NET build, and a hand-built ring is one loop.
+    Span<Vector2> ring = stackalloc Vector2[16];
+    const float tilt = -0.35f;
+    for (int i = 0; i < 16; i++)
+    {
+        float a = i / 16f * MathF.PI * 2f;
+        float ex = MathF.Cos(a) * rx, ey = MathF.Sin(a) * ry;
+        ring[i] = new Vector2(head.X + ex * MathF.Cos(tilt) - ey * MathF.Sin(tilt),
+                              head.Y + ex * MathF.Sin(tilt) + ey * MathF.Cos(tilt));
+    }
+    for (int pass = 0; pass < 2; pass++)
+    {
+        uint c = pass == 0 ? edge : col;
+        float grow = pass == 0 ? 1.6f : 0f;
+        if (grow > 0f)
+        {
+            for (int i = 0; i < 16; i++)
+                dl.AddLine(ring[i], ring[(i + 1) % 16], c, 3.2f);
+        }
+        else
+        {
+            dl.PathClear();
+            for (int i = 0; i < 16; i++) dl.PathLineTo(ring[i]);
+            dl.PathFillConvex(c);
+        }
+    }
+    // Stem up the right of the head, and a single flag off its top.
+    var stemTop = new Vector2(head.X + rx * 0.92f, head.Y - u * 1.85f);
+    var stemBot = new Vector2(head.X + rx * 0.92f, head.Y - ry * 0.15f);
+    dl.AddLine(stemBot, stemTop, edge, 3.4f);
+    dl.AddLine(stemTop, new Vector2(stemTop.X + u * 0.75f, stemTop.Y + u * 0.85f), edge, 3.4f);
+    dl.AddLine(stemBot, stemTop, col, 1.9f);
+    dl.AddLine(stemTop, new Vector2(stemTop.X + u * 0.75f, stemTop.Y + u * 0.85f), col, 1.9f);
 }
 
 // Everything the editor knows about one template's sound: its full-volume radius, where it falls silent, whether it
@@ -9217,7 +9254,19 @@ void Inspector()
             float vol = sc.Volume;
             if (DrgF(Loc.TL("Volume"), ref vol, 0.01f, 0f, 4f)) { sc.SetVolume(MathF.Max(0f, vol)); em.Dirty = true; }
             float md = sc.MinDistance;
-            if (DrgF(Loc.TL("Min distance (m)"), ref md, 0.25f, 0f, 2000f)) { sc.SetMinDistance(MathF.Max(0f, md)); em.Dirty = true; }
+            if (DrgF(Loc.TL("Min distance (m)"), ref md, 0.25f, 0f, 2000f)) { sc.SetMinDistance(MathF.Max(0f, md)); em.Dirty = true; soundInfoCache.Clear(); }
+            Theme.Tip(Loc.T("The radius that stays at FULL volume. The inner ring in the viewport."));
+            // Max distance: the far end of the script's Distance->Volume ramp, i.e. where it reaches silence. Only
+            // a script that HAS that ramp has a far distance to move - retail's ambients all do, and so does every
+            // sound this editor writes - so the control says so rather than silently doing nothing.
+            if (sc.MaxDistance is { } far0)
+            {
+                float fd = far0;
+                if (DrgF(Loc.TL("Max distance (m)"), ref fd, 0.5f, 1f, 4000f))
+                { sc.SetMaxDistance(MathF.Max(md + 1f, fd)); em.Dirty = true; soundInfoCache.Clear(); }
+                Theme.Tip(Loc.T("Where it fades to silence - the outer ring. This is the second number of the script's\nDistance->Volume ramp, which is how every retail ambient shapes its falloff."));
+            }
+            else ImGui.TextDisabled(Loc.T("no distance ramp in this script - no max distance to set"));
             bool loop = sc.Loop;
             if (ImGui.Checkbox(Loc.TL("Loop"), ref loop)) { sc.SetLoop(loop); em.Dirty = true; }
             ImGui.SameLine();
@@ -9259,8 +9308,6 @@ void LayerMenu()
     ImGui.MenuItem(Loc.TL("Combat Area"), null, ref showCombatArea);
     ImGui.MenuItem(Loc.TL("Notes"), null, ref showNotes);
     ImGui.MenuItem(Loc.TL("Light markers"), null, ref showLightGizmos);
-    ImGui.MenuItem(Loc.TL("Sound rings"), null, ref showSoundRings);
-    Theme.Tip(Loc.T("How far each placed ambient sound carries, drawn on the ground: an inner ring at full\nvolume (its minDistance) and an outer one where it fades to silence. A sound is invisible\nand its reach is its whole behaviour, so this is the difference between placing one and\nguessing."));
     if (!gameIsBf1942)
     {
         ImGui.MenuItem(Loc.TL("Tunnel entry point rings + labels"), null, ref showTunnelEntries);
@@ -13357,7 +13404,6 @@ void BuildUi()
     BrightenDialog();
     PointToolOverlay();
     LightGizmos();
-    SoundGizmos();
     TunnelGizmos();
     CombatAreaOverlay();
     NotesOverlay();
@@ -14974,6 +15020,15 @@ bool ImportSoundObject()
         foreach (var f in built.Files) pendingLevelFiles.Add(f);
         BroadcastLevelFiles(built.Template, built.Files);
 
+        // Tell the sound library about it NOW. The library is built from the level's Sounds/*.con at load, so a
+        // sound made this session lives only in the save queue - invisible to the marker, the radius rings and the
+        // Sounds layer toggle until a reload, which reads as the sound object not having worked at all.
+        var sscFile = built.Files.FirstOrDefault(f => f.RelPath.EndsWith(".ssc", StringComparison.OrdinalIgnoreCase));
+        sounds.Register(built.Template, built.Template + ".ssc",
+                        sscFile.Bytes is null ? null : RefractorForge.Formats.Sound.SoundScript.Parse(sscFile.Bytes));
+        soundInfoCache.Clear();
+        showSounds = true;                       // and show it: you just placed something you cannot otherwise see
+
         // The level's sound layer has to run the new .con or the template never exists.
         string? envCon = PendingText("Sounds/Environment.con") ?? ReadLevelText("Sounds/Environment.con");
         pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Sounds/Environment.con", StringComparison.OrdinalIgnoreCase));
@@ -16004,65 +16059,6 @@ void BakeLightsToGround()
 // Draw a marker and a reach ring for every placed light, so a rig can be aimed rather than guessed at. Uses the
 // ImGui draw list rather than new GL buffers: these are a handful of circles, and the projection helper the
 // gizmos already use is enough.
-// How far a placed ambient sound carries, drawn on the ground as two rings.
-//
-// A sound is invisible, and its two distances are the whole of its behaviour: minDistance is the radius that stays
-// at FULL volume, and the script's Distance->Volume ramp carries it down to silence at maxDistance. Without a
-// picture you are placing something whose reach you cannot see, which is why "I placed a sound and heard nothing"
-// is so easy to arrive at - a 20 m ambient dropped in the middle of a 1024 m map is inaudible everywhere you
-// happen to stand.
-void SoundGizmos()
-{
-    if (!showSoundRings || so is null || sounds.Count == 0) return;
-    var fb = window.FramebufferSize;
-    var vp = cam.ViewProjection;
-    var dl = ImGui.GetBackgroundDrawList();
-
-    for (int i = 0; i < so.Objects.Count; i++)
-    {
-        var o = so.Objects[i];
-        if (!sounds.IsSound(o.Template)) continue;
-        var wpos = new Vector3(o.Position.X, o.Position.Y, o.Position.Z);
-        if (Vector3.Distance(wpos, cam.Position) > 3000f) continue;
-
-        var em = sounds.Get(o.Template);
-        float minD = em?.MinDistance ?? 10f;
-        float maxD = em?.Script?.MaxDistance ?? (minD * 3f);
-        bool sel = i == selected || multi.Contains(i);
-
-        // Drawn as a ring of world-space points projected individually, so it follows the terrain's perspective
-        // instead of being a flat screen circle that lies about where the sound reaches.
-        void Ring(float radius, uint col, float thick)
-        {
-            const int N = 48;
-            Vector2 first = default, prev = default;
-            bool have = false, started = false;
-            for (int k = 0; k <= N; k++)
-            {
-                float a = k / (float)N * MathF.PI * 2f;
-                float wx = o.Position.X + MathF.Cos(a) * radius, wz = o.Position.Z + MathF.Sin(a) * radius;
-                var p = Gizmo.Project(new Vector3(wx, GroundUnder(wx, wz) + 0.35f, wz), vp, fb.X, fb.Y);
-                if (float.IsNaN(p.X)) { have = false; continue; }      // behind the camera: break the line
-                if (!started) { first = p; started = true; }
-                if (have) dl.AddLine(prev, p, col, thick);
-                prev = p; have = true;
-            }
-            if (started && have) dl.AddLine(prev, first, col, thick);
-        }
-
-        // Inner ring = full volume, outer = where it fades to silence.
-        Ring(minD, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, sel ? 0.95f : 0.45f)), sel ? 2.5f : 1.5f);
-        Ring(maxD, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, sel ? 0.45f : 0.20f)), sel ? 2f : 1.2f);
-
-        var scr = Gizmo.Project(wpos, vp, fb.X, fb.Y);
-        if (float.IsNaN(scr.X)) continue;
-        dl.AddCircleFilled(scr, (sel ? 6f : 4f) * uiScale, ImGui.GetColorU32(new Vector4(0.35f, 0.85f, 1f, 0.95f)));
-        if (sel) dl.AddText(scr + new Vector2(9f * uiScale, -7f * uiScale),
-                            ImGui.GetColorU32(new Vector4(0.7f, 0.95f, 1f, 1f)),
-                            $"{o.Template}  {minD:0}m / {maxD:0}m");
-    }
-}
-
 void LightGizmos()
 {
     if (!showLightGizmos || lightRig.Lights.Count == 0) return;

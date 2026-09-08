@@ -107,6 +107,44 @@ public sealed class SoundScript
 
     public void SetVolume(float v) => SetScalar("volume", v);
     public void SetMinDistance(float d) => SetScalar("minDistance", d);
+
+    /// <summary>
+    /// Move where the sound reaches silence: the SECOND <c>param</c> of the Distance -&gt; Volume <c>Ramp</c>
+    /// effect, the mirror of <see cref="MaxDistance"/>. Only that effect's params are touched, so a script with
+    /// other effects keeps them; a script with no such ramp is left alone (there is no far distance to move, and
+    /// inventing one would change how the sound falls off rather than how far it carries).
+    /// </summary>
+    public void SetMaxDistance(float d)
+    {
+        d = System.MathF.Max(1f, d);
+        bool inEffect = false, toVolume = false, fromDistance = false;
+        int start = -1;
+        var paramLines = new List<int>();
+        for (int i = 0; i < _lines.Count; i++)
+        {
+            var k = KeyOf(_lines[i]);
+            if (k == "begineffect") { inEffect = true; toVolume = fromDistance = false; paramLines.Clear(); start = i; continue; }
+            if (!inEffect) continue;
+            if (k == "endeffect")
+            {
+                if (toVolume && fromDistance && paramLines.Count >= 2)
+                {
+                    int at = paramLines[1];
+                    var indent = _lines[at][..(_lines[at].Length - _lines[at].TrimStart().Length)];
+                    _lines[at] = indent + "param " + d.ToString("0.###", CultureInfo.InvariantCulture);
+                    return;
+                }
+                inEffect = false; start = -1; continue;
+            }
+            var t = Tokens(_lines[i]);
+            if (t.Length >= 2)
+            {
+                if (k == "controldestination") toVolume = t[1].Equals("Volume", System.StringComparison.OrdinalIgnoreCase);
+                else if (k == "controlsource") fromDistance = t[1].Equals("Distance", System.StringComparison.OrdinalIgnoreCase);
+            }
+            if (k == "param") paramLines.Add(i);
+        }
+    }
     public void SetLoop(bool on) => SetFlag("loop", on);
     public void SetStereo(bool on) => SetFlag("stereo", on);
 

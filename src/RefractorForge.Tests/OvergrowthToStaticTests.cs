@@ -306,3 +306,103 @@ public class RsStatementParsingTests
         Assert.Equal("texture/b", set.Materials["B"].Texture);
     }
 }
+
+/// <summary>
+/// A placed ambient's two distances: minDistance is the full-volume radius the engine rolls off from, and the far
+/// end of the script's Distance-&gt;Volume Ramp is where it reaches silence. Both are editable, and a sound created
+/// this session has to reach the sound library at once or the editor shows no marker, no rings and no response to
+/// the Sounds toggle - which reads as the sound object not having worked.
+/// </summary>
+public class SoundDistanceTests
+{
+    // The shape SoundObject writes, and the shape every retail ambient uses.
+    private static string Script(float near, float far) => string.Join("\r\n", new[]
+    {
+        "*** test ***",
+        "load @ROOT/Sound/@RTD/test.wav",
+        "loop",
+        "volume 0.6",
+        $"minDistance {near}",
+        "beginEffect",
+        "controlSource Distance",
+        "controlDestination Volume",
+        "effectType Ramp",
+        $"param {near}",
+        $"param {far}",
+        "param 1",
+        "param -1",
+        "endEffect",
+        "",
+    });
+
+    [Fact]
+    public void Both_distances_read_back()
+    {
+        var sc = RefractorForge.Formats.Sound.SoundScript.Parse(Script(20f, 120f));
+        Assert.Equal(20f, sc.MinDistance, 3);
+        Assert.Equal(120f, sc.MaxDistance!.Value, 3);
+    }
+
+    [Fact]
+    public void Setting_the_max_distance_moves_only_the_far_param()
+    {
+        var sc = RefractorForge.Formats.Sound.SoundScript.Parse(Script(20f, 120f));
+        sc.SetMaxDistance(300f);
+        Assert.Equal(300f, sc.MaxDistance!.Value, 3);
+        Assert.Equal(20f, sc.MinDistance, 3);                       // the near end is untouched
+        var text = sc.ToText();
+        Assert.Contains("param 20", text);                          // the ramp's first param still there
+        Assert.Contains("param 1", text);
+        Assert.Contains("param -1", text);
+        Assert.DoesNotContain("param 120", text);
+    }
+
+    [Fact]
+    public void The_two_distances_are_independent()
+    {
+        var sc = RefractorForge.Formats.Sound.SoundScript.Parse(Script(20f, 120f));
+        sc.SetMinDistance(35f);
+        Assert.Equal(35f, sc.MinDistance, 3);
+        Assert.Equal(120f, sc.MaxDistance!.Value, 3);
+    }
+
+    /// <summary>A script with no ramp has no far distance to move, and must not gain one by accident.</summary>
+    [Fact]
+    public void A_script_with_no_ramp_is_left_alone()
+    {
+        var sc = RefractorForge.Formats.Sound.SoundScript.Parse("*** x ***\r\nload a.wav\r\nminDistance 10\r\n");
+        var before = sc.ToText();
+        sc.SetMaxDistance(200f);
+        Assert.Null(sc.MaxDistance);
+        Assert.Equal(before, sc.ToText());
+    }
+
+    [Fact]
+    public void A_sound_created_this_session_joins_the_library()
+    {
+        var lib = new RefractorForge.Formats.Sound.SoundLibrary();
+        Assert.False(lib.IsSound("frogs"));
+        lib.Register("frogs", "frogs.ssc", RefractorForge.Formats.Sound.SoundScript.Parse(Script(15f, 90f)));
+        Assert.True(lib.IsSound("frogs"));
+        Assert.Equal(15f, lib.Get("frogs")!.MinDistance, 3);
+        Assert.Equal(90f, lib.Get("frogs")!.Script!.MaxDistance!.Value, 3);
+    }
+
+    /// <summary>The placeable shape is an AreaObject: a SimpleObject ties the sound to a DRAWN object, so the
+    /// engine culls it with the geometry and the sound is inaudible wherever the object is not on screen.</summary>
+    [Fact]
+    public void A_placed_sound_is_built_as_an_AreaObject()
+    {
+        var wav = new byte[512];
+        var built = RefractorForge.Formats.Sound.SoundObject.BuildArea("frogs", wav, 0.6f, 20f, 120f);
+        var con = System.Text.Encoding.Latin1.GetString(
+            built.Files.First(f => f.RelPath.EndsWith("frogs.con", StringComparison.OrdinalIgnoreCase)).Bytes);
+        Assert.Contains("ObjectTemplate.create AreaObject frogs", con);
+        Assert.Contains("ObjectTemplate.triggerRadius", con);
+        Assert.Contains("ObjectTemplate.addLinePoint", con);
+        Assert.DoesNotContain("SimpleObject", con);
+        // ...and both sample-rate folders, or the level is silent for players on the other sound setting.
+        Assert.Contains(built.Files, f => f.RelPath.Equals("Sound/22khz/frogs.wav", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(built.Files, f => f.RelPath.Equals("Sound/44kHz/frogs.wav", StringComparison.OrdinalIgnoreCase));
+    }
+}
