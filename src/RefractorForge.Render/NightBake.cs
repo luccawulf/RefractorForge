@@ -101,9 +101,11 @@ public static class NightBake
             if (a <= 0f) continue;
             var toL = new Vector3(l.Position.X - p.X, l.Position.Y - p.Y, l.Position.Z - p.Z);
             float len = toL.Length();
-            float ndl = len > 1e-4f ? MathF.Max(Vector3.Dot(n, toL / len), 0f) : 1f;
-            ndl = ndl * (1f - wrap) + wrap;
-            if (ndl <= 0f) continue;
+            float raw = len > 1e-4f ? Vector3.Dot(n, toL / len) : 1f;
+            // A lamp BEHIND a face never lights it - the wrap only softens the terminator on the lit side, it must
+            // not let a bulb under a roof brighten the roof's top.
+            if (raw <= 0f) continue;
+            float ndl = raw * (1f - wrap) + wrap;
             float vis = Visibility(s, p, n, l, cur, samples, seed);
             if (vis <= 0f) continue;
             float k = a * ndl * vis;

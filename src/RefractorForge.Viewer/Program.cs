@@ -1425,6 +1425,8 @@ System.Threading.Tasks.Task? nbTask = null; System.Threading.CancellationTokenSo
 Texture2D? nbGround = null;            // the ground stage's result, burned into the atlas on the render thread
 HashSet<string> glowTemplates = new(StringComparer.OrdinalIgnoreCase);   // glow objects built this session
 NightBake.Scene? lmNightScene = null; bool lmColour = false; int lmLampSamples = 1;   // what the object bake uses
+float nightMoonLevel = 0.25f;          // what a moonlit face is written as in a NIGHT lightmap bake (lamps go to 1.0)
+float lmMoonLevel = 1f;                // the sun level the running object bake writes; 1 for a day bake
 float brightenLevel = 0.65f;
 bool brightenUnlit = false;
 List<(string Rel, bool On)> brightenList = new();
@@ -7407,8 +7409,8 @@ void BakeObjectLightmaps()
     // running; otherwise it is built here, on this thread, from meshes that are already resolved.
     if (rigRef is not null && lmNightScene is null && so is not null && meshLib is not null)
         lmNightScene = NightBake.Build(heightmap, cfg, LevelScene.ObjectTriangles(so, meshLib));
-    if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); }
-    var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples;
+    if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); lmMoonLevel = 1f; }
+    var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples; float moonRef = lmMoonLevel;
     var worlds = new Matrix4x4[jobs.Count];
     var sizes = new int[jobs.Count];
     for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
@@ -7431,7 +7433,7 @@ void BakeObjectLightmaps()
                 // floor in as well lit everything twice.
                 results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
                     sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef,
-                    night: nightRef, colour: colourRef, lampSamples: lampRef);
+                    night: nightRef, colour: colourRef, lampSamples: lampRef, sunLevel: moonRef);
                 System.Threading.Interlocked.Increment(ref lmDone);
             });
         }
@@ -9987,6 +9989,9 @@ void NightLightingWindow()
     }
     else Theme.Muted(Loc.T("BfVietnam reads only the brightness of an object lightmap; the lamp colour lives in the ground."));
     ImGui.SetNextItemWidth(160f * uiScale);
+    SldF(Loc.TL("Moon in lightmaps"), ref nightMoonLevel, 0f, 1f, "%.2f");
+    Theme.Tip(Loc.T("What a moonlit face is written as in the object lightmaps; the lamps go in at 1.0. The engine draws a\nface as lightmap x moon colour x N.L, so at 1.0 a moonlit wall is already at the top of the range and no lamp\ncan add to it. The reference night maps average 0.05-0.13 - 0.25 keeps the moon readable and the lamps 4x brighter."));
+    ImGui.SetNextItemWidth(160f * uiScale);
     SldF(Loc.TL("Ground pool strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
     Theme.Tip(Loc.T("Scales the pools burned into the ground tiles. They go in as a RATIO to the level's night light, so\nbake with the night preset applied or the game will be brighter than the preview."));
     bool busy = nbStage != 0 || lmBaking || sbBaking;
@@ -10068,6 +10073,7 @@ void NightBakeProgress()
         {
             nbStage = 2;
             lmNightScene = nightScene; lmColour = gameIsBf1942 && nightColourLightmaps; lmLampSamples = NightLampSamples();
+            lmMoonLevel = nightMoonLevel;
             BakeObjectLightmaps();
             if (!lmBaking) { nbStage = 2; NightBakeContinue(); }   // nothing bakeable: go straight on
         }

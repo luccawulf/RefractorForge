@@ -1622,5 +1622,7 @@
  "No glows placed.": "配置されたグローはありません。",
  "{0} glow(s) removed.": "グローを {0} 個削除しました。",
  "This level has no Init.con to register the glow in.": "このレベルにはグローを登録する Init.con がありません。",
- "Glow object failed: ": "グローオブジェクトの作成に失敗: "
+ "Glow object failed: ": "グローオブジェクトの作成に失敗: ",
+ "Moon in lightmaps": "ライトマップの月の明るさ",
+ "What a moonlit face is written as in the object lightmaps; the lamps go in at 1.0. The engine draws a\nface as lightmap x moon colour x N.L, so at 1.0 a moonlit wall is already at the top of the range and no lamp\ncan add to it. The reference night maps average 0.05-0.13 - 0.25 keeps the moon readable and the lamps 4x brighter.": "月光が当たる面をオブジェクトのライトマップに書き込む値。ランプは 1.0 で書き込まれます。エンジンは面を\nライトマップ × 月の色 × N.L で描くため、1.0 では月光の壁がすでに上限に達し、ランプが何も足せません。\n参考の夜マップは平均 0.05〜0.13 — 0.25 なら月も読め、ランプはその 4 倍明るくなります。"
 }

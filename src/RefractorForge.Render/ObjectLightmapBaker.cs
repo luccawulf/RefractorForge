@@ -86,9 +86,16 @@ public static class ObjectLightmapBaker
     /// hue intact - GC_Bespin_Night ships exactly that). False folds them to brightness for BfVietnam, whose shader
     /// reads only the blue channel.</param>
     /// <param name="lampSamples">Shadow samples per lamp per texel; 1 is a hard shadow, 4-8 a penumbra.</param>
+    /// <param name="sunLevel">
+    /// What a face the sun reaches is written as. 1 for a day bake. For a NIGHT bake it must be well below 1: the
+    /// engine draws a face as <c>lightmap x sunColour x N.L</c>, so a moonlit wall written at 1.0 already sits at
+    /// the top of the range and no lamp can add to it - lamps would show only in the moon's shadow. The reference
+    /// night maps average 0.04-0.13 with their lamps up at 1.0 (Dystopia City, GC_Bespin_Night), which is what
+    /// makes a lamp-lit wall several times brighter than a moonlit one. 0.25 is a good night value.
+    /// </param>
     public static Texture2D? Bake(MeshLibrary.Mesh mesh, Matrix4x4 world, Heightmap hm, TerrainConfig cfg, Vec3 sunDir,
         int size = 256, float ambient = 0.4f, LightRig? rig = null, bool selfShadow = true, int samples = 2,
-        NightBake.Scene? night = null, bool colour = false, int lampSamples = 1)
+        NightBake.Scene? night = null, bool colour = false, int lampSamples = 1, float sunLevel = 1f)
     {
         var lm = mesh.LightmapUvs;
         if (lm is null || lm.Length == 0 || size < 4) return null;
@@ -158,7 +165,7 @@ public static class ObjectLightmapBaker
                     // direction, so a single-sided plane does not shadow itself.
                     bool lit = TerrainShadow.PointLit(wp.X, wp.Y, wp.Z, sunDir, hm, cfg, maxH)
                                && (occ is null || !occ.Occluded(wp, sun));
-                    float v = ambient + (1f - ambient) * (lit ? 1f : 0f);
+                    float v = ambient + (1f - ambient) * (lit ? sunLevel : 0f);
 
                     // Placed lights add on top of the sun. With a night scene they are shadowed by the whole level
                     // and softened over the lamp's size; without one, terrain-only occlusion as before. The colour

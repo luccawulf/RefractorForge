@@ -141,6 +141,12 @@ public class NightLightingTests
         int roof = (16 * 32 + 24) * 4;
         Assert.Equal(255, colour.Rgba[roof]);                       // the roof top sees the sun: full, white
         Assert.Equal(255, colour.Rgba[roof + 2]);
+
+        // A NIGHT bake writes the moonlit roof low so the lamp can stand above it: at 0.25 the roof is a quarter
+        // and the lamp-lit floor is brighter than the moonlit roof, the relationship every reference night map has.
+        var night = ObjectLightmapBaker.Bake(mesh, Matrix4x4.Identity, hm, cfg, sunOverhead, 32, ambient: 0f, rig: rig, night: scene, colour: true, sunLevel: 0.25f)!;
+        Assert.InRange(night.Rgba[roof], 60, 68);
+        Assert.True(night.Rgba[c] > night.Rgba[roof], $"lamp-lit floor {night.Rgba[c]} brighter than moonlit roof {night.Rgba[roof]}");
         Assert.True(colour.Rgba[c] > 100, $"red channel lit ({colour.Rgba[c]})");
         Assert.True(colour.Rgba[c] > colour.Rgba[c + 1] * 3, "a red lamp stays red in a 24-bit map");
         Assert.Equal(grey.Rgba[c], grey.Rgba[c + 1]);
