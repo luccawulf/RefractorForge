@@ -121,7 +121,9 @@ public class NightLightingTests
         var uv = new Vector2[8];
         var lm = new Vector2[] { new(0.02f, 0.02f), new(0.48f, 0.02f), new(0.48f, 0.98f), new(0.02f, 0.98f),
                                  new(0.52f, 0.02f), new(0.98f, 0.02f), new(0.98f, 0.98f), new(0.52f, 0.98f) };
-        int[] idx = { 0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6 };
+        // Direct3D clockwise winding, as every shipped .sm is: seen from above these run clockwise, so the
+        // baker's outward normal (-cross) is +Y.
+        int[] idx = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
         var part = new MeshLibrary.MaterialPart(idx, Vector3.One, null, false);
         return new MeshLibrary.Mesh(pos, uv, new[] { part }) { LightmapUvs = lm };
     }

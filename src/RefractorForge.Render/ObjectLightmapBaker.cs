@@ -147,7 +147,11 @@ public static class ObjectLightmapBaker
                 Vector3 wa = Vector3.Transform(pos[a], world), wb = Vector3.Transform(pos[b], world), wc = Vector3.Transform(pos[c], world);
                 Vector3 fn = Vector3.Cross(wb - wa, wc - wa);
                 if (fn.LengthSquared() < 1e-12f) continue;
-                fn = Vector3.Normalize(fn);
+                // Refractor meshes are Direct3D CLOCKWISE-front: cross(b-a, c-a) points INTO the object (measured on
+                // Saigon68's barrel: 0 of 48 triangles outward). The outward normal is the negation. With the sign
+                // wrong, a lamp on the lit side of a wall was rejected as "behind" it and the shadow ray started
+                // inside the wall - the lamp painted almost nothing on real buildings.
+                fn = -Vector3.Normalize(fn);
 
                 Vector2 ta = lm[a] * size, tb = lm[b] * size, tc = lm[c] * size;
                 // A vertex with a NaN in its second UV set (retail BfVietnam meshes carry a few) would turn the
