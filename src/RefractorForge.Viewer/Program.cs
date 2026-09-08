@@ -1295,6 +1295,7 @@ uint brushSquareVao = 0, brushSquareVbo = 0;  // square-brush radius outline (XZ
 uint brushDrapeVao = 0, brushDrapeVbo = 0;    // dynamic brush-cursor outline that drapes on the terrain
 uint gridVao = 0, gridVbo = 0; int gridVertCount = 0; float gridStep = 0f; bool gridDirty = true;  // draped world-grid overlay
 uint indicatorVao = 0; int indicatorCount = 0;  // small 3D diamond drawn at mesh-less objects so they're visible
+uint noteVao = 0; int noteCount = 0;            // 3D music note drawn at sound areas (they have no mesh at all)
 uint gpVao = 0, gpVbo = 0;             // gameplay markers (control points / vehicle spawns / soldier spawns)
 int terrainIndexCount = 0;
 
@@ -3195,6 +3196,16 @@ void OnLoad()
         indicatorCount = diaFaces.Length;
     }
 
+    // A 3D MUSIC NOTE for sound areas. A sound is the one placed thing with nothing to look at - an AreaObject is
+    // a pure trigger volume, no geometry by design - so its marker IS the object as far as the editor is concerned,
+    // and wearing the same amber "mesh not found" diamond as a genuinely broken template says the wrong thing.
+    // The shape is built (and its winding asserted) in Render/MarkerMeshes so it can be checked without a GPU.
+    {
+        var (nv, nf) = RefractorForge.Render.MarkerMeshes.MusicNote();
+        noteVao = MakeMesh(nv, nf, out _);
+        noteCount = nf.Length;
+    }
+
     // Dynamic point buffer for gameplay markers (re-uploaded per layer at draw time).
     gpVao = gl.GenVertexArray();
     gl.BindVertexArray(gpVao);
@@ -4213,8 +4224,8 @@ void DrawSounds()
     var vpFloats = ToFloats(cam.ViewProjection);
     gl.Disable(EnableCap.DepthTest);
 
-    // audible-radius rings (unit ring scaled to minDistance), and gather the emitter positions for the points
-    var pts = new System.Collections.Generic.List<Vector3>();
+    // audible-radius rings (unit ring scaled to minDistance), and gather the emitters for the note markers
+    var notes = new System.Collections.Generic.List<(Vector3 P, bool Audible)>();
     gl.UseProgram(markerProg);
     gl.BindVertexArray(brushRingVao);
     foreach (var ob in so.Objects)
@@ -4222,7 +4233,6 @@ void DrawSounds()
         if (SoundInfoOf(ob.Template) is not { } si) continue;
         var p = new Vector3(ob.Position.X, ob.Position.Y, ob.Position.Z);
         if (FogCulled(p)) continue;                          // skip the rings AND the marker once past the fog
-        pts.Add(p);
         // Two rings: inside the inner one the sound is at full volume, at the outer one it has faded to nothing.
         // They brighten while the camera is within earshot, so it is obvious where a sound starts and how it builds.
         float d = Vector3.Distance(cam.Position, p);
@@ -4238,6 +4248,39 @@ void DrawSounds()
         float lit = audible ? 1f : 0.45f;
         if (si.Near > 0.5f) Ring(si.Near, 0.55f * lit, 1f * lit, 0.72f * lit);       // full volume
         Ring(si.Far, 0.80f * lit, 0.42f * lit, 1f * lit);                            // silence
+        notes.Add((p, audible));
+    }
+
+    // The note itself, still with the depth test off so a sound inside a building is never lost - the same reason
+    // the rings are drawn that way. Yawed to face the camera (upright, never pitched): it is extruded geometry, so
+    // edge-on it would be a sliver. Lit by a FIXED light rather than the level's sun, so a marker stays readable
+    // on a night map. Note that disabling the depth test masks depth WRITES too, so this cannot occlude anything.
+    if (noteVao != 0 && notes.Count > 0)
+    {
+        var nl = Vector3.Normalize(new Vector3(-0.45f, 0.82f, 0.36f));
+        gl.UseProgram(objProg);
+        gl.Uniform3(uLightO, nl.X, nl.Y, nl.Z);
+        gl.Uniform1(uUseTexO, 0);
+        gl.Uniform1(uAlphaTestO, 0);
+        gl.Uniform3(uTintO, 1f, 1f, 1f);
+        gl.BindVertexArray(noteVao);
+        foreach (var (p, audible) in notes)
+        {
+            float k = audible ? 1f : 0.55f;
+            gl.Uniform3(uColorO, 0.92f * k, 0.55f * k, 1f * k);
+            float sc = Math.Clamp(Vector3.Distance(cam.Position, p) * 0.010f, 0.5f, 6f);   // ~constant on screen
+            float yaw = MathF.Atan2(cam.Position.X - p.X, cam.Position.Z - p.Z);
+            var world = Matrix4x4.CreateScale(sc) * Matrix4x4.CreateRotationY(yaw)
+                      * Matrix4x4.CreateTranslation(p.X, p.Y + sc * 1.3f, p.Z);
+            var mvpN = world * cam.ViewProjection; var modelN = world;
+            unsafe
+            {
+                gl.UniformMatrix4(uMvpO, 1, false, (float*)&mvpN);
+                gl.UniformMatrix4(uModelO, 1, false, (float*)&modelN);
+                gl.DrawElements(PrimitiveType.Triangles, (uint)noteCount, DrawElementsType.UnsignedInt, (void*)0);
+            }
+        }
+        gl.BindVertexArray(0);
     }
     gl.Enable(EnableCap.DepthTest);
 
@@ -4255,10 +4298,8 @@ void DrawSounds()
         if (float.IsNaN(s.X) || s.X < vpMin.X || s.X > vpMax.X || s.Y < vpMin.Y || s.Y > vpMax.Y) continue;
         float d = Vector3.Distance(cam.Position, w);
         float vol = SoundVolumeAt(d, si.Near, si.Far, si.Volume);
-        // A MUSIC NOTE, not the generic marker diamond every other placed thing wears. A sound is the one object
-        // with nothing to look at, so the marker is all you have to find it by - it should say what it is.
-        DrawMusicNote(dl, s, 1f, ImGui.GetColorU32(new Vector4(0.92f, 0.55f, 1f, vol > 0.001f ? 1f : 0.55f)));
         // The label says what you would hear standing here: the level it has reached, or why it is silent.
+        // (The marker itself is the 3D note drawn above, not a screen-space glyph.)
         string what = !si.AutoPlay ? Loc.T("  (while looked at)")
                     : vol > 0.001f ? string.Format(Loc.T("  {0:0}%"), vol * 100f)
                     : Loc.T("  (out of range)");
@@ -4273,52 +4314,6 @@ void DrawSounds()
         }
     }
     dl.PopClipRect();
-}
-
-// A quaver, drawn from primitives rather than a font glyph so it does not depend on the UI font carrying the
-// character (Segoe UI does; a fallback might not, and a missing glyph would leave a sound with no marker at all).
-// An outline in black goes down first so the note stays readable over bright ground.
-void DrawMusicNote(ImDrawListPtr dl, Vector2 at, float scale, uint col)
-{
-    float u = 7f * uiScale * scale;                       // the note's half-height unit
-    var head = new Vector2(at.X - u * 0.35f, at.Y + u * 0.75f);
-    float rx = u * 0.62f, ry = u * 0.45f;
-    uint edge = ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.8f));
-
-    // Head: an ellipse, tilted the way a printed note is. Drawn as a filled polygon - AddEllipseFilled is not in
-    // every ImGui.NET build, and a hand-built ring is one loop.
-    Span<Vector2> ring = stackalloc Vector2[16];
-    const float tilt = -0.35f;
-    for (int i = 0; i < 16; i++)
-    {
-        float a = i / 16f * MathF.PI * 2f;
-        float ex = MathF.Cos(a) * rx, ey = MathF.Sin(a) * ry;
-        ring[i] = new Vector2(head.X + ex * MathF.Cos(tilt) - ey * MathF.Sin(tilt),
-                              head.Y + ex * MathF.Sin(tilt) + ey * MathF.Cos(tilt));
-    }
-    for (int pass = 0; pass < 2; pass++)
-    {
-        uint c = pass == 0 ? edge : col;
-        float grow = pass == 0 ? 1.6f : 0f;
-        if (grow > 0f)
-        {
-            for (int i = 0; i < 16; i++)
-                dl.AddLine(ring[i], ring[(i + 1) % 16], c, 3.2f);
-        }
-        else
-        {
-            dl.PathClear();
-            for (int i = 0; i < 16; i++) dl.PathLineTo(ring[i]);
-            dl.PathFillConvex(c);
-        }
-    }
-    // Stem up the right of the head, and a single flag off its top.
-    var stemTop = new Vector2(head.X + rx * 0.92f, head.Y - u * 1.85f);
-    var stemBot = new Vector2(head.X + rx * 0.92f, head.Y - ry * 0.15f);
-    dl.AddLine(stemBot, stemTop, edge, 3.4f);
-    dl.AddLine(stemTop, new Vector2(stemTop.X + u * 0.75f, stemTop.Y + u * 0.85f), edge, 3.4f);
-    dl.AddLine(stemBot, stemTop, col, 1.9f);
-    dl.AddLine(stemTop, new Vector2(stemTop.X + u * 0.75f, stemTop.Y + u * 0.85f), col, 1.9f);
 }
 
 // Everything the editor knows about one template's sound: its full-volume radius, where it falls silent, whether it
@@ -9728,10 +9723,18 @@ void ApplyDecalBrightness()
 void BrightenDialog()
 {
     if (!showBrightenDialog) return;
-    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.FirstUseEver);
-    if (ImGui.Begin(Loc.TL("Brighten Decals") + "###brightendlg", ref showBrightenDialog, ImGuiWindowFlags.AlwaysAutoResize))
+    // Fixed default size and NOT AlwaysAutoResize. Three things in this dialog size themselves from the content
+    // width - the wrapped prose, the search field's negative width, and the width-0 list child - and each reports an
+    // extent of "content width plus padding", which an auto-resizing window then adopts as next frame's content
+    // width. That feedback loop is why it crept to the right a few pixels per frame. With a real size the user can
+    // drag, every one of those is measured against a width that does not move.
+    ImGui.SetNextWindowSize(new Vector2(480f * uiScale, 520f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(360f * uiScale, 280f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
+    if (ImGui.Begin(Loc.TL("Brighten Decals") + "###brightendlg", ref showBrightenDialog))
     {
+        ImGui.PushTextWrapPos(0f);   // safe here, and only here, because the window is no longer auto-resizing
         ImGui.TextWrapped(Loc.T("The game multiplies every surface by the light reaching it, so a decal in shade - a tunnel, an alley, a north-facing wall - goes dark and unreadable even though the picture is fine. This raises selfillum on the level's own shaders, which is the engine's floor under that shading."));
+        ImGui.PopTextWrapPos();
         ImGui.Spacing();
         ImGui.SetNextItemWidth(220f * uiScale);
         SldF(Loc.TL("Brightness in shade"), ref brightenLevel, 0f, 1f, "%.2f");
@@ -9759,7 +9762,7 @@ void BrightenDialog()
         ImGui.SameLine();
         if (ImGui.SmallButton(Loc.TL("None")))
             for (int i = 0; i < brightenList.Count; i++) if (Shown(brightenList[i].Rel)) brightenList[i] = (brightenList[i].Rel, false);
-        if (ImGui.BeginChild("###brightenlist", new Vector2(0f, Math.Min(260f, 24f * Math.Max(visible, 1) + 8f) * uiScale), ImGuiChildFlags.Border))
+        if (ImGui.BeginChild("###brightenlist", new Vector2(0f, -34f * uiScale), ImGuiChildFlags.Border))
         {
             if (visible == 0) ImGui.TextDisabled(Loc.T("Nothing matches that search."));
             for (int i = 0; i < brightenList.Count; i++)
