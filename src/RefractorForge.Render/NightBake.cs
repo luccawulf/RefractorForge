@@ -167,6 +167,68 @@ public static class NightBake
         return new Texture2D(size, size, rgba);
     }
 
+    /// <summary>
+    /// The ONE lighting value an object without a lightmap unwrap can carry, as colour.
+    /// <para>
+    /// Measured on the engine (BfVietnam_DEBUG.exe, StandardMesh::createLightSampling): the lightmap generator
+    /// reads a per-texel sample table from <c>StandardMesh/&lt;mesh&gt;.samples</c> that DICE's exporter wrote,
+    /// and gives up when it is missing - none ship, so there is no auto-unwrap to reproduce. At runtime such a
+    /// mesh's vertices all carry UV (0,0), so the whole object samples a single texel of its map (in every shipped
+    /// map for these meshes that texel is black: Hue's wall corners render at ambient only). A flat map therefore
+    /// lights the object uniformly, and the right uniform value is the area-weighted average of what its surface
+    /// would receive: the moon where the sun direction reaches it, plus every lamp with the level's shadows.
+    /// </para>
+    /// </summary>
+    /// <param name="sunLevel">What a moonlit face is worth in the map (see the object bake's parameter of the same name).</param>
+    /// <param name="maxTris">Triangles sampled (the largest by area); cheap next to a real bake.</param>
+    public static Vector3 AverageLamp(Scene s, MeshLibrary.Mesh mesh, Matrix4x4 world, LightRig? rig,
+                                      Vector3 sunDir, float sunLevel, int lampSamples, int maxTris = 400)
+    {
+        var pos = mesh.Positions;
+        var tris = new List<(Vector3 A, Vector3 B, Vector3 C, float Area)>();
+        foreach (var part in mesh.Parts)
+        {
+            var idx = part.Indices;
+            for (int t = 0; t + 2 < idx.Length; t += 3)
+            {
+                int a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
+                var wa = Vector3.Transform(pos[a], world); var wb = Vector3.Transform(pos[b], world); var wc = Vector3.Transform(pos[c], world);
+                float area = Vector3.Cross(wb - wa, wc - wa).Length() * 0.5f;
+                if (area > 1e-6f) tris.Add((wa, wb, wc, area));
+            }
+        }
+        if (tris.Count == 0) return Vector3.Zero;
+        tris.Sort((x, y) => y.Area.CompareTo(x.Area));
+        if (tris.Count > maxTris) tris.RemoveRange(maxTris, tris.Count - maxTris);
+
+        var cur = s.NewCursor();
+        var sun = Vector3.Normalize(sunDir);
+        var (_, maxH) = TerrainShadow.HeightSpan(s.Hm, s.Cfg);
+        var sunV = new RefractorForge.Formats.Geometry.Vec3(sun.X, sun.Y, sun.Z);
+        Vector3 sum = Vector3.Zero; float wsum = 0f;
+        int k = 0;
+        foreach (var (a, b, c, area) in tris)
+        {
+            var p = (a + b + c) / 3f;
+            // Direct3D clockwise winding: the outward normal is the negated cross product.
+            var n = -Vector3.Normalize(Vector3.Cross(b - a, c - a));
+            float ndl = Vector3.Dot(n, sun);
+            float moon = 0f;
+            if (ndl > 0f)
+            {
+                bool lit = TerrainShadow.PointLit(p.X, p.Y, p.Z, sunV, s.Hm, s.Cfg, maxH)
+                           && (s.Objects is null || cur is null || !s.Objects.Occluded(p + n * 0.03f, sun, cur));
+                moon = lit ? sunLevel : 0f;
+            }
+            var v = new Vector3(moon);
+            if (rig is not null && rig.Lights.Count > 0)
+                v += Lamp(s, p, n, rig, cur, lampSamples, ground: false, seed: (uint)(k * 2654435761u));
+            sum += v * area; wsum += area; k++;
+        }
+        return wsum > 0f ? Vector3.Min(sum / wsum, Vector3.One) : Vector3.Zero;
+    }
+
     // ---- helpers -------------------------------------------------------------------------------------------------
 
     /// <summary>March the heightmap between two points; true when the ground never rises above the segment.</summary>

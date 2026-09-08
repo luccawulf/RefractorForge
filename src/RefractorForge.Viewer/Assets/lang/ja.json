@@ -1624,5 +1624,7 @@
  "This level has no Init.con to register the glow in.": "このレベルにはグローを登録する Init.con がありません。",
  "Glow object failed: ": "グローオブジェクトの作成に失敗: ",
  "Moon in lightmaps": "ライトマップの月の明るさ",
- "What a moonlit face is written as in the object lightmaps; the lamps go in at 1.0. The engine draws a\nface as lightmap x moon colour x N.L, so at 1.0 a moonlit wall is already at the top of the range and no lamp\ncan add to it. The reference night maps average 0.05-0.13 - 0.25 keeps the moon readable and the lamps 4x brighter.": "月光が当たる面をオブジェクトのライトマップに書き込む値。ランプは 1.0 で書き込まれます。エンジンは面を\nライトマップ × 月の色 × N.L で描くため、1.0 では月光の壁がすでに上限に達し、ランプが何も足せません。\n参考の夜マップは平均 0.05〜0.13 — 0.25 なら月も読め、ランプはその 4 倍明るくなります。"
+ "What a moonlit face is written as in the object lightmaps; the lamps go in at 1.0. The engine draws a\nface as lightmap x moon colour x N.L, so at 1.0 a moonlit wall is already at the top of the range and no lamp\ncan add to it. The reference night maps average 0.05-0.13 - 0.25 keeps the moon readable and the lamps 4x brighter.": "月光が当たる面をオブジェクトのライトマップに書き込む値。ランプは 1.0 で書き込まれます。エンジンは面を\nライトマップ × 月の色 × N.L で描くため、1.0 では月光の壁がすでに上限に達し、ランプが何も足せません。\n参考の夜マップは平均 0.05〜0.13 — 0.25 なら月も読め、ランプはその 4 倍明るくなります。",
+ "Uniform lamp level on objects without an unwrap": "UV 展開のないオブジェクトに一様なランプ光",
+ "Most props and the o_cl_* city blocks have no lightmap unwrap: their vertices all read ONE texel\nof the map (measured on the engine - DICE's own maps for them are black at that texel). So they\nget a flat map holding the average lamp light on their surface, with shadows, as level and colour.": "小物の大半と o_cl_* の街区にはライトマップ UV がなく、全頂点がマップの 1 テクセルだけを読みます\n（エンジンで計測。DICE 自身のマップもそのテクセルは黒です）。そこで、表面が受けるランプ光の平均を\n影込みで求め、明るさと色を持つ一様なマップとして与えます。"
 }

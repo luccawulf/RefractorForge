@@ -157,6 +157,41 @@ public class NightLightingTests
     }
 
     [Fact]
+    public void An_object_without_an_unwrap_gets_one_value_that_averages_its_surface()
+    {
+        // The engine reads a single texel for such a mesh, so the bake reduces it to the area-weighted average of
+        // moon + lamps over its faces: a red lamp beside the floor gives a red-leaning value, a wall between them
+        // takes it away, and the moon term alone gives the moon level where the sun direction reaches.
+        var (hm, cfg) = Flat(32);
+        var mesh = RoofOverFloor();
+        var red = new PointLight { Position = new Vec3(4, 2, 4), Radius = 14f, Intensity = 1f, ColorR = 1f, ColorG = 0.1f, ColorB = 0.1f, SourceSize = 0f, CastsShadows = true };
+        var rig = new LightRig { Lights = { red } };
+        var sunOverhead = new Vector3(0, 1, 0);
+
+        var open = NightBake.AverageLamp(NightBake.Build(hm, cfg, null), mesh, Matrix4x4.Identity, rig, sunOverhead, 0.25f, 1);
+        // No occluders here, so the moon (0.25) reaches both quads and sits under every channel; the lamp's red
+        // excess rides on top of it.
+        Assert.True(open.X - open.Y > 0.15f, $"red lamp tints the average ({open})");
+        Assert.InRange(open.Y, 0.25f, 0.32f);
+
+        // Without lamps, only the moon: the roof sees it (0.25), the floor under the roof does not; the average
+        // is area-weighted, and both quads are the same size, so it lands halfway.
+        var moonOnly = NightBake.AverageLamp(NightBake.Build(hm, cfg, LevelScene_Tris(mesh)), mesh, Matrix4x4.Identity, null, sunOverhead, 0.25f, 1);
+        Assert.InRange(moonOnly.X, 0.10f, 0.15f);
+        Assert.Equal(moonOnly.X, moonOnly.Y, 3);
+    }
+
+    // The mesh's own triangles as scene occluders, world = identity.
+    private static System.Collections.Generic.List<(Vector3, Vector3, Vector3)> LevelScene_Tris(MeshLibrary.Mesh m)
+    {
+        var l = new System.Collections.Generic.List<(Vector3, Vector3, Vector3)>();
+        foreach (var part in m.Parts)
+            for (int t = 0; t + 2 < part.Indices.Length; t += 3)
+                l.Add((m.Positions[part.Indices[t]], m.Positions[part.Indices[t + 1]], m.Positions[part.Indices[t + 2]]));
+        return l;
+    }
+
+    [Fact]
     public void Glow_object_is_the_additive_recipe_with_a_stable_name()
     {
         var colour = new Vec3(1f, 0.72f, 0.36f);

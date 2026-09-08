@@ -1426,6 +1426,11 @@ Texture2D? nbGround = null;            // the ground stage's result, burned into
 HashSet<string> glowTemplates = new(StringComparer.OrdinalIgnoreCase);   // glow objects built this session
 NightBake.Scene? lmNightScene = null; bool lmColour = false; int lmLampSamples = 1;   // what the object bake uses
 float nightMoonLevel = 0.25f;          // what a moonlit face is written as in a NIGHT lightmap bake (lamps go to 1.0)
+// An object with no lightmap unwrap samples ONE texel of its map (its vertices all carry UV 0,0 - measured on the
+// engine, see NightBake.AverageLamp), so the most it can take is a uniform level and colour per instance. On by
+// default for the night bake: it is the only way a lamp reaches the o_cl_* city blocks, sandbags and cots at all.
+bool nightUniformUnwrapless = true;
+Vector3?[]? lmFallbackRgb = null;      // per job: the uniform value for a mesh the rasteriser could not unwrap
 float lmMoonLevel = 1f;                // the sun level the running object bake writes; 1 for a day bake
 float brightenLevel = 0.65f;
 bool brightenUnlit = false;
@@ -7411,6 +7416,8 @@ void BakeObjectLightmaps()
         lmNightScene = NightBake.Build(heightmap, cfg, LevelScene.ObjectTriangles(so, meshLib));
     if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); lmMoonLevel = 1f; }
     var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples; float moonRef = lmMoonLevel;
+    bool uniformRef = nightUniformUnwrapless && nbStage == 2;
+    var fallbackRgb = new Vector3?[jobs.Count]; lmFallbackRgb = fallbackRgb;
     var worlds = new Matrix4x4[jobs.Count];
     var sizes = new int[jobs.Count];
     for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
@@ -7434,6 +7441,10 @@ void BakeObjectLightmaps()
                 results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
                     sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef,
                     night: nightRef, colour: colourRef, lampSamples: lampRef, sunLevel: moonRef);
+                // No unwrap: the engine will read one texel, so give it the one value the surface averages to.
+                if (results[i] is null && uniformRef && nightRef is not null && rigRef is not null && jobMeshes[i].LightmapUvs is { Length: > 0 })
+                    fallbackRgb[i] = NightBake.AverageLamp(nightRef, jobMeshes[i], worlds[i], rigRef,
+                        new Vector3(sunV.X, sunV.Y, sunV.Z), moonRef, lampRef);
                 System.Threading.Interlocked.Increment(ref lmDone);
             });
         }
@@ -7449,7 +7460,7 @@ void FinishObjectLightmapBake()
     int noSlot = lmNoSlot;
     var olm = new ObjectLightmaps();
     bakedObjectLightmaps.Clear();
-    int baked = 0, noUnwrap = 0, lodMaps = 0;
+    int baked = 0, noUnwrap = 0, lodMaps = 0, uniform = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
         var (o, meshName, _, primary) = jobs[i];
@@ -7466,7 +7477,20 @@ void FinishObjectLightmapBake()
         // It is not. Supplying a flat white map to satisfy it sets Prelight to 1 over the whole object, and the
         // shader's saturate(2 * (Prelight * sun * N.L + LMambient)) then blows the entire scene out to solid
         // white. That is a real regression this code has already shipped once; absence is the correct answer.
-        if (results[i] is not { } tex) { if (primary) noUnwrap++; continue; }
+        if (results[i] is not { } tex)
+        {
+            // A mesh with the slot but no unwrap can still carry ONE value - the average of what its surface gets.
+            // Every texel is that value, so it reads the same whatever texel the (0,0) vertices land on.
+            if (lmFallbackRgb is { } fb && i < fb.Length && fb[i] is { } uni)
+            {
+                var flat = UniformLightmapTexture(uni, lmColour);
+                if (primary) { olm.AddBaked(o.Template, x, y, z, flat); uniform++; }
+                bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = lmColour ? TgaTexture.EncodeRgb24(flat) : TgaTexture.EncodeGrayColormapped(flat);
+                continue;
+            }
+            if (primary) noUnwrap++;
+            continue;
+        }
         if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
         // A 24-bit map keeps the lamps' colour (BF1942 reads it - GC_Bespin_Night ships exactly this); the grey
         // palette form is what BfVietnam's .b-only shader wants and what every retail map is.
@@ -7484,8 +7508,9 @@ void FinishObjectLightmapBake()
                       $"in {appClock - lmBakeStarted:0.0}s; {noUnwrap} mesh(es) have no lightmap unwrap and are left without a map " +
                       $"(the retail game lights those dynamically - writing a blank one turns the scene white), " +
                       $"{noSlot} object(s) have no lightmap slot at all and are sun-lit in the game.");
-    lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null;
+    lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null; lmFallbackRgb = null;
     lmCancel?.Dispose(); lmCancel = null; lmTask = null;
+    if (uniform > 0) Console.WriteLine($"   {uniform} object(s) without a lightmap unwrap got a UNIFORM lamp level (the engine reads one texel for those).");
     if (nbStage == 2) { NightBakeContinue(); return; }
     Toast(noUnwrap + noSlot > 0
         ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
@@ -7497,6 +7522,19 @@ void FinishObjectLightmapBake()
 // one 128px TGA. Used for meshes whose lightmap-UV slot carries no unwrap: they cannot hold a varying map, but
 // they can hold the level a real bake would have averaged (see ObjectLightmapBaker.AverageLit), which is what
 // stops them glowing beside the objects that could be unwrapped.
+// A flat map carrying one colour, for a mesh whose vertices all sample the same texel (no unwrap). 128px like
+// the grey one: a size every retail level already ships, so nothing new is asked of the engine.
+Texture2D UniformLightmapTexture(Vector3 c, bool colour)
+{
+    float luma = 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
+    byte r = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(colour ? c.X : luma, 0f, 1f) * 255f), 0, 255);
+    byte g = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(colour ? c.Y : luma, 0f, 1f) * 255f), 0, 255);
+    byte b = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(colour ? c.Z : luma, 0f, 1f) * 255f), 0, 255);
+    var px = new byte[128 * 128 * 4];
+    for (int i = 0; i < px.Length; i += 4) { px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255; }
+    return new Texture2D(128, 128, px);
+}
+
 byte[] UniformLightmap(float lit)
 {
     byte v = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(lit, 0f, 1f) * 255f), 0, 255);
@@ -9988,6 +10026,8 @@ void NightLightingWindow()
         Theme.Tip(Loc.T("Writes 24-bit lightmaps that keep each lamp's colour on walls and props - the format GC_Bespin_Night\nships. Off writes the usual grey maps (brightness only)."));
     }
     else Theme.Muted(Loc.T("BfVietnam reads only the brightness of an object lightmap; the lamp colour lives in the ground."));
+    ImGui.Checkbox(Loc.TL("Uniform lamp level on objects without an unwrap"), ref nightUniformUnwrapless);
+    Theme.Tip(Loc.T("Most props and the o_cl_* city blocks have no lightmap unwrap: their vertices all read ONE texel\nof the map (measured on the engine - DICE's own maps for them are black at that texel). So they\nget a flat map holding the average lamp light on their surface, with shadows, as level and colour."));
     ImGui.SetNextItemWidth(160f * uiScale);
     SldF(Loc.TL("Moon in lightmaps"), ref nightMoonLevel, 0f, 1f, "%.2f");
     Theme.Tip(Loc.T("What a moonlit face is written as in the object lightmaps; the lamps go in at 1.0. The engine draws a\nface as lightmap x moon colour x N.L, so at 1.0 a moonlit wall is already at the top of the range and no lamp\ncan add to it. The reference night maps average 0.05-0.13 - 0.25 keeps the moon readable and the lamps 4x brighter."));
