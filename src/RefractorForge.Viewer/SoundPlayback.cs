@@ -52,25 +52,27 @@ sealed class SoundPlayback : System.IDisposable
         else { Log("DISABLED"); StopAll(); }
     }
 
-    public void Update(Vector3 camPos, System.Collections.Generic.IEnumerable<(SoundEmitter Em, Vector3 Pos, float Radius)> placed, double dt)
+    public void Update(Vector3 camPos, System.Collections.Generic.IEnumerable<(SoundEmitter Em, Vector3 Pos, float Near, float Far)> placed, double dt)
     {
         if (!_enabled) return;
         try { UpdateCore(camPos, placed, dt); }
         catch (System.Exception ex) { Log($"update error (disabling): {ex.GetType().Name} {ex.Message}"); StopAll(); _enabled = false; }
     }
 
-    private void UpdateCore(Vector3 camPos, System.Collections.Generic.IEnumerable<(SoundEmitter Em, Vector3 Pos, float Radius)> placed, double dt)
+    private void UpdateCore(Vector3 camPos, System.Collections.Generic.IEnumerable<(SoundEmitter Em, Vector3 Pos, float Near, float Far)> placed, double dt)
     {
         _clock += dt;
 
-        // nearest placement (3D) per template within its ring
-        var nearest = new Dictionary<string, (float D, float Radius, SoundEmitter Em)>(System.StringComparer.OrdinalIgnoreCase);
-        foreach (var (em, pos, radius) in placed)
+        // Nearest placement (3D) per template, using the SAME pair of distances the editor draws as rings and reads for
+        // the volume bar: full inside Near, ramping to nothing at Far. Handing this one radius (minDistance) made the
+        // preview fall silent at the INNER ring while the bar still showed volume out to the outer one.
+        var nearest = new Dictionary<string, (float D, float Near, float Far, SoundEmitter Em)>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var (em, pos, near, far) in placed)
         {
-            if (em.Script is null || !em.Script.Loop || radius <= 0f) continue;
+            if (em.Script is null || !em.Script.Loop || far <= 0f) continue;
             float d = Vector3.Distance(camPos, pos);
-            if (d > radius) continue;
-            if (!nearest.TryGetValue(em.Template, out var cur) || d < cur.D) nearest[em.Template] = (d, radius, em);
+            if (d > far) continue;                       // FAR is where it falls silent
+            if (!nearest.TryGetValue(em.Template, out var cur) || d < cur.D) nearest[em.Template] = (d, near, far, em);
         }
 
         // choose up to MaxVoices, retaining already-playing in-range templates first (hysteresis -> no churn)
@@ -85,14 +87,16 @@ sealed class SoundPlayback : System.IDisposable
         var summary = dueSummary ? new System.Text.StringBuilder($"inRange(templates)={nearest.Count} chosen={chosen.Count} voices={_voices.Count} ") : null;
         foreach (var t in chosen)
         {
-            var (d, radius, em) = nearest[t];
-            float fade = System.Math.Clamp(1f - d / radius, 0f, 1f);
+            var (d, near, far, em) = nearest[t];
+            // The engine's own ramp, and the one the volume bar draws.
+            float fade = d <= near ? 1f
+                       : (far <= near ? 0f : System.Math.Clamp(1f - (d - near) / (far - near), 0f, 1f));
             float vol = (em.Script!.Volume <= 0f ? 1f : em.Script.Volume) * fade * MasterVolume;
 
             if (_voices.TryGetValue(t, out var v))
             {
                 if (v.Reader is not null) { try { v.Reader.Volume = vol; } catch { } }
-                summary?.Append($"| {t} d={d:0.0}/{radius:0} vol={vol:0.00} state={(v.Out?.PlaybackState.ToString() ?? "-")} ");
+                summary?.Append($"| {t} d={d:0.0} in {near:0}..{far:0} vol={vol:0.00} state={(v.Out?.PlaybackState.ToString() ?? "-")} ");
             }
             else if (started < MaxStartsPerFrame)
             {

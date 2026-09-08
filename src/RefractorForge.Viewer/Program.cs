@@ -1961,7 +1961,11 @@ void SyncMarkers()
     // get an indicator marker; anything that resolves to a mesh OR assembles (vehicle/weapon) renders for real.
     pointMarkers = meshLib is null
         ? markers
-        : so.Objects.Where(o => !meshLib.TryGet(o.Template, out _) && !meshLib.TryGetAssembledMesh(o.Template, out _))
+        // ...and a SOUND is excluded: it has no mesh by design (an AreaObject is pure trigger volume), and
+        // DrawSounds already marks it with a music note and its two radius rings. An amber "mesh not found"
+        // diamond on top of that says the wrong thing twice - nothing is missing, and the note is the marker.
+        : so.Objects.Where(o => !meshLib.TryGet(o.Template, out _) && !meshLib.TryGetAssembledMesh(o.Template, out _)
+                                && !sounds.IsSound(o.Template))
                     .Select(o => new Vector3(o.Position.X, o.Position.Y, o.Position.Z)).ToArray();
 }
 
@@ -4014,14 +4018,19 @@ byte[]? ResolveSoundWav(SoundEmitter em)
     return best;
 }
 
-// Placed sound emitters as (emitter, world pos, audible radius = the drawn minDistance ring) for the playback preview.
-IEnumerable<(SoundEmitter Em, Vector3 Pos, float Radius)> PlacedSounds()
+// Placed sound emitters for the playback preview, with BOTH distances - the same pair the rings are drawn at and
+// the same pair the volume bar reads. This used to hand over minDistance alone as "the audible radius", so the
+// preview faded to silence at the INNER ring while the bar (and the engine) hold full volume out to it and only
+// then ramp down to the outer one. The two disagreed everywhere in between, which is the "I can hear it when the
+// circle does not reach me" mismatch.
+IEnumerable<(SoundEmitter Em, Vector3 Pos, float Near, float Far)> PlacedSounds()
 {
     if (so is null) yield break;
     foreach (var o in so.Objects)
     {
+        if (SoundInfoOf(o.Template) is not { } si) continue;
         var em = sounds.Get(o.Template);
-        if (em is not null) yield return (em, new Vector3(o.Position.X, o.Position.Y, o.Position.Z), em.MinDistance);
+        if (em is not null) yield return (em, new Vector3(o.Position.X, o.Position.Y, o.Position.Z), si.Near, si.Far);
     }
 }
 
