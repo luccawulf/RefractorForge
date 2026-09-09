@@ -70,17 +70,28 @@ public static class NightBake
         return seen / (float)samples;
     }
 
+    /// <summary>
+    /// How close to the LIGHT a ray stops. A lamp is mounted in or on something - a ceiling rose, a lamp head, a
+    /// wall bracket - so the last half-metre before the bulb is nearly always inside that fixture or the surface
+    /// it hangs from. Stopping at the bulb makes such a lamp shadow itself completely: measured on Saigon68, a
+    /// lamp sitting 0.10 m under a 0.35 m ceiling slab had 0% of the room's rays reach it, and the room came out
+    /// flat ambient. With this allowance the same lamp reaches 95-98%.
+    /// </summary>
+    public const float FixtureRadius = 0.35f;
+
     /// <summary>Is the straight line from a surface point to a light position unobstructed?</summary>
-    public static bool Clear(Scene s, Vector3 p, Vector3 n, Vector3 lightPos, MeshOccluder.Cursor? cur)
+    public static bool Clear(Scene s, Vector3 p, Vector3 n, Vector3 lightPos, MeshOccluder.Cursor? cur,
+                             float fixtureRadius = FixtureRadius)
     {
         var d = lightPos - p;
         float len = d.Length();
         if (len < 1e-4f) return true;
         d /= len;
         // Start the ray a hair off the surface along its normal, so the surface never shadows itself and a lamp
-        // hung just under a ceiling still lights the floor beneath it.
+        // hung just under a ceiling still lights the floor beneath it; stop it short of the fixture at the far end.
         var o = p + n * 0.03f;
-        if (s.Objects is not null && cur is not null && s.Objects.Occluded(o, d, len - 0.05f, cur, 0.01f)) return false;
+        float reach = len - MathF.Max(0.05f, fixtureRadius);
+        if (reach > 0f && s.Objects is not null && cur is not null && s.Objects.Occluded(o, d, reach, cur, 0.01f)) return false;
         return TerrainClear(s.Hm, s.Cfg, o, lightPos);
     }
 

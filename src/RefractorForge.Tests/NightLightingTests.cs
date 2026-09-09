@@ -157,6 +157,39 @@ public class NightLightingTests
     }
 
     [Fact]
+    public void A_lamp_mounted_in_a_ceiling_still_lights_the_room()
+    {
+        // A ceiling slab at y = 6..6.4 with the lamp inside it at y = 6.2 - how a ceiling rose is actually placed.
+        // Stopping the shadow ray at the bulb makes the lamp shadow itself and the room goes flat; the fixture
+        // allowance is what fixes it. Measured on Saigon68: 0% of the room's rays reached such a lamp, now 95%+.
+        var (hm, cfg) = Flat(32);
+        var slab = new System.Collections.Generic.List<(Vector3, Vector3, Vector3)>();
+        foreach (float y in new[] { 6.0f, 6.4f })
+        {
+            Vector3 a = new(0, y, 0), b = new(16, y, 0), c = new(16, y, 16), e = new(0, y, 16);
+            slab.Add((a, b, c)); slab.Add((a, c, e)); slab.Add((a, c, b)); slab.Add((a, e, c));   // both windings
+        }
+        var scene = NightBake.Build(hm, cfg, slab);
+        var lamp = new Vector3(8, 6.2f, 8);
+        var floor = new Vector3(8, 1.5f, 8);
+        var up = Vector3.UnitY;
+        Assert.False(NightBake.Clear(scene, floor, up, lamp, scene.NewCursor(), fixtureRadius: 0.05f),
+                     "stopping at the bulb: the slab the lamp is mounted in blocks it");
+        Assert.True(NightBake.Clear(scene, floor, up, lamp, scene.NewCursor()),
+                    "with the fixture allowance the floor sees it");
+
+        // The allowance must not see THROUGH a real wall: a slab halfway between floor and lamp still blocks.
+        var wall = new System.Collections.Generic.List<(Vector3, Vector3, Vector3)>();
+        foreach (float y in new[] { 3.0f, 3.2f })
+        {
+            Vector3 a = new(0, y, 0), b = new(16, y, 0), c = new(16, y, 16), e = new(0, y, 16);
+            wall.Add((a, b, c)); wall.Add((a, c, e)); wall.Add((a, c, b)); wall.Add((a, e, c));
+        }
+        var blocked = NightBake.Build(hm, cfg, wall);
+        Assert.False(NightBake.Clear(blocked, floor, up, lamp, blocked.NewCursor()), "a wall in between still shadows");
+    }
+
+    [Fact]
     public void An_object_without_an_unwrap_gets_one_value_that_averages_its_surface()
     {
         // The engine reads a single texel for such a mesh, so the bake reduces it to the area-weighted average of
