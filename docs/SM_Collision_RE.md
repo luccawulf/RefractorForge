@@ -1,10 +1,16 @@
 # StandardMesh (.sm) collision section — reverse-engineering notes
 
-Status: **FULL STRUCTURE DECODED** (every field, from BfMeshView's own source `modStdMesh.bas`, confirmed by a
-byte-exact round-trip of all 1800 sections). Reading + a wireframe overlay shipped; a writer exists. The ONE thing
-still unknown is the **BSP node semantics** (`qdata`/`zdata`) — and BfMeshView doesn't know them either (it
-`Seek`s past the qblock; its col writer is marked "broken"). So we can write a col with an **empty BSP** and
-**test in-game** whether BFV rebuilds it.
+Status: **SOLVED (2026-09-10).** The BSP tail was the last unknown, and the Mod Development Toolkit's own MAXScript
+exporter (`functions/_SM_Export.ms`, `WriteSimpleBsp`) writes it: **one 32-byte node per face** - the face's plane
+normal, a zero, its three vertex indices and its material id - then the marker `"SimpleBSP tree method  "`, then an
+identity index list. Verified byte-for-byte against Saigon68's Desert Combat props (`DC_roadbarrier1_m1`, `VSS_Crate`)
+and three retail meshes (`O_HueHouse_B_no_fence_m2`, `O_Rubbish04_m1`, `ve_brdm_main_l1`), all of which the game loads
+with working collision; DICE's `DShape1VertexBuffer` sections carry the same per-face nodes. The "opaque colq" below was
+BfMeshView's guess at a field split that does not exist - see `docs/Max_Toolkit_Conventions.md` for the layout and
+`StandardMeshWriter.BuildCollisionSection` for the writer. Imported objects are solid now, with a named material.
+
+The vertex's fourth float (`w`) is X with its low 16 bits overwritten by the material id; the node normal is the
+left-hand normal of the clockwise face (outward). The historical notes follow.
 
 ### Field structure (authoritative — `stdmeshcol` in BfMeshView's modStdMesh.bas; matches our byte-exact decode)
 ```

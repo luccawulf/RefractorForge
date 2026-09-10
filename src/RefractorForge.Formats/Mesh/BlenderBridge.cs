@@ -31,10 +31,11 @@ public static class BlenderBridge
     public static bool NeedsBlender(string path) =>
         Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>The picker filter: everything the importer takes, Blender or not.</summary>
+    /// <summary>The picker filter: everything the importer takes - OBJ and .3ds read natively, the rest through
+    /// Blender.</summary>
     public const string PickerFilter =
-        "3D models|*.obj;*.fbx;*.glb;*.gltf;*.blend;*.stl;*.ply;*.usd;*.usda;*.usdc;*.usdz;*.abc;*.dae|" +
-        "Wavefront OBJ|*.obj|Autodesk FBX|*.fbx|glTF|*.glb;*.gltf|Blender|*.blend|All files|*.*";
+        "3D models|*.obj;*.3ds;*.fbx;*.glb;*.gltf;*.blend;*.stl;*.ply;*.usd;*.usda;*.usdc;*.usdz;*.abc;*.dae|" +
+        "Wavefront OBJ|*.obj|3D Studio (3ds Max, gmax)|*.3ds|Autodesk FBX|*.fbx|glTF|*.glb;*.gltf|Blender|*.blend|All files|*.*";
 
     /// <summary>Where blender.exe is, or null. <c>RF_BLENDER</c> overrides everything, for a portable install.</summary>
     public static string? FindBlender()

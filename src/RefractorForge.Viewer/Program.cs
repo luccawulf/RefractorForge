@@ -680,6 +680,13 @@ int miMaxTexIdx = 1;                         // 0 = 256, 1 = 512, 2 = 1024
 int miBudget = 2000, miExtraLods = 2;        // triangles for LOD 0 (0 = keep every one); coarser copies after it
 string? miObjPath = null;                    // the OBJ actually read: the file itself, or Blender's conversion of it
 bool miBusy = false; string miBlenderNote = "";
+// The model taken apart by the toolkit's naming convention (LOD01 / COL01 / COL02 / shadow / bbox - MeshParts),
+// the materials a .3ds carries inside itself, and the engine material its collision is made of.
+MeshParts? miParts = null;
+Dictionary<string, ObjMaterial>? miFileMaterials = null;
+string miPartsNote = "";
+int miColMat = RefractorForge.Formats.Rfa.StandardMeshWriter.DefaultCollisionMaterial;
+int miColMatIdx = RefractorForge.Formats.Con.CollisionMaterials.IndexOf(RefractorForge.Formats.Rfa.StandardMeshWriter.DefaultCollisionMaterial);
 System.Threading.Tasks.Task<BlenderBridge.Result>? miConvert = null;
 // Erosion + river.
 int erodeIterations = 40; float erodeTalus = 1.2f; bool erodeHydraulic = true; float erodeRadius = 60f;
@@ -1401,7 +1408,7 @@ List<string>? soundWavArchives = null;                       // cached .rfa(s) s
 // a freshly opened map reads as red until you unlock what you are working on - that IS the state, shown plainly
 // rather than inferred from a failed drag.
 bool showCollision = false;                                  // .sm collision-mesh wireframe overlay (off by default)
-bool expCollision = false;                                   // .obj export: include an experimental (empty-BSP) collision section
+bool expCollision = false;                                   // Export as .sm: include a SimpleBSP collision section (the toolkit exporter's own)
 bool showFoliage = false;                                    // overgrowth-trees overlay: instance the .wst geometry on the map (a VIEW; never saved)
 bool showAnimations = true;                                  // spin RotationalBundle parts (windmill blades, watermill wheel, mod rotors); view-only
 // The overgrowth patch grid, in metres, and the band it is allowed to live in. Below 7 m the instance count
@@ -6349,6 +6356,10 @@ void DoImportObj()
         var obj = ObjMesh.Load(path);
         if (obj.TotalFaces == 0) { Toast(Loc.T("That .obj has no triangles.")); return; }
         MeshFit.FlipV(obj);   // OBJ's picture origin is bottom-left, the engine's top-left: turned over once, here
+        // An OBJ winds its front faces counter-clockwise; the engine reads a triangle clockwise from outside (every
+        // retail mesh does). Turned over here, once, so the .sm this becomes is not back-facing in game. The editor
+        // draws both sides and never showed the difference, which is how it went unnoticed.
+        obj.ReverseWinding();
         string name = SanitizeTemplate(Path.GetFileNameWithoutExtension(path));
 
         // Per-material colours + textures from the .obj's .mtl (resolved relative to the .obj's folder).
@@ -7052,12 +7063,13 @@ void DoExportObjSm(string template)
         var con = Path.ChangeExtension(path, ".con");
         var stub = $"GeometryTemplate.create StandardMesh {template}\r\nGeometryTemplate.file {template}\r\n\r\n" +
                    $"ObjectTemplate.create SimpleObject {template}\r\nObjectTemplate.geometry {template}\r\n" +
-                   $"ObjectTemplate.hasCollisionPhysics 1\r\n" +
-                   "rem NOTE: in-game collision needs col data inside the .sm (a serialized DShape). Refractor has no\r\n" +
-                   "rem .con-level collision primitive for static objects -- author COL01/COL02 meshes + 3dsToSm, or wait\r\n" +
-                   "rem for a RefractorForge .sm col writer (see docs/SM_Collision_RE.md). Until then this object is solid-less.\r\n";
+                   $"ObjectTemplate.hasCollisionPhysics {(col is not null ? 1 : 0)}\r\n" +
+                   (col is null
+                       ? "rem No collision section was written: tick 'include collision' before exporting, or name a COL01\r\n" +
+                         "rem object and import through Tools > Import 3D Model (docs/Max_Toolkit_Conventions.md).\r\n"
+                       : "");
         File.WriteAllText(con, stub);
-        Toast($"Exported {Path.GetFileName(path)}{(wroteRs ? " + .rs" : "")}{(col is not null ? " + EXPERIMENTAL collision" : "")} + .con stub.");
+        Toast($"Exported {Path.GetFileName(path)}{(wroteRs ? " + .rs" : "")}{(col is not null ? " + collision" : "")} + .con stub.");
     }
     catch (Exception ex) { Toast(Loc.T("Export .sm failed: ") + ex.Message); }
 }
@@ -15792,13 +15804,23 @@ void BeginModelLoad()
 
 void LoadModelForImport()
 {
-    miMesh = null; miInfo = ""; miWarn = "";
+    miMesh = null; miInfo = ""; miWarn = ""; miParts = null; miPartsNote = ""; miFileMaterials = null;
     if (miObjPath is null || !File.Exists(miObjPath)) { miWarn = Loc.T("No such file."); return; }
     try
     {
-        var m = ObjMesh.Load(miObjPath);
+        var loaded = ModelFile.Load(miObjPath);
+        miFileMaterials = loaded.Materials;
+        if (loaded.ZUpMaxConvention) miUpAxis = 2;      // a .3ds is in Max's frame: the toolkit's own Y/Z swap lands it
+        miParts = MeshParts.Split(loaded.Mesh);
+        var m = miParts.Lods[0];
         if (m.TotalFaces == 0) { miWarn = Loc.T("That model has no triangles."); return; }
         miMesh = m;
+        if (miParts.UsedConvention)
+        {
+            miPartsNote = string.Format(Loc.T("Toolkit naming found: {0}."), miParts.Describe());
+            if (miParts.Unclassified.Count > 0)
+                miPartsNote += " " + string.Format(Loc.T("Folded into LOD01: {0}."), string.Join(", ", miParts.Unclassified));
+        }
         if (miName.Trim().Length == 0) miName = SanitizeTemplate(Path.GetFileNameWithoutExtension(miPath));
         float w = m.BoundingBox[3] - m.BoundingBox[0], h = m.BoundingBox[4] - m.BoundingBox[1], d = m.BoundingBox[5] - m.BoundingBox[2];
         miInfo = string.Format(Loc.T("{0} triangles, {1} vertices, {2} material(s). Authored size {3:0.##} x {4:0.##} x {5:0.##}."),
@@ -15815,6 +15837,9 @@ void LoadModelForImport()
 string ModelDetailNote()
 {
     if (miMesh is null) return "";
+    if (miParts is { Lods.Count: > 1 })
+        return string.Format(Loc.T("Writes the file's own {0} detail levels ({1} triangles); the extra-LOD setting is not used."),
+                             miParts.Lods.Count, string.Join(" / ", miParts.Lods.Select(l => l.TotalFaces.ToString("n0"))));
     int lod0 = miBudget > 0 ? Math.Min(miBudget, miMesh.TotalFaces) : miMesh.TotalFaces;
     var parts = new List<string> { $"LOD0 {lod0:n0}" };
     for (int i = 1; i <= miExtraLods; i++) { int t = Math.Max(12, lod0 >> i); if (t >= lod0) break; parts.Add($"LOD{i} {t:n0}"); }
@@ -15867,6 +15892,12 @@ void ModelImportDialog()
         if (miBusy) ImGui.TextColored(Theme.Accent, Loc.T("Converting with Blender... this takes a few seconds."));
         if (miBlenderNote.Length > 0) Theme.Muted(miBlenderNote);
         if (miInfo.Length > 0) ImGui.TextWrapped(miInfo);
+        if (miPartsNote.Length > 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, Theme.Accent);
+            ImGui.TextWrapped(miPartsNote);
+            ImGui.PopStyleColor();
+        }
         if (miWarn.Length > 0)
         {
             ImGui.PushStyleColor(ImGuiCol.Text, Theme.Warn);
@@ -15877,8 +15908,8 @@ void ModelImportDialog()
         ImGui.Separator();
         ImGui.TextUnformatted(Loc.T("Orientation and size"));
         ImGui.SetNextItemWidth(190f * uiScale);
-        CboZ(Loc.TL("Up axis"), ref miUpAxis, Loc.T("Y up (OBJ default)") + "\0" + Loc.T("Z up (Blender / FBX)") + "\0");
-        Theme.Tip(Loc.T("Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side."));
+        CboZ(Loc.TL("Up axis"), ref miUpAxis, Loc.T("Y up (OBJ default)") + "\0" + Loc.T("Z up (Blender / FBX)") + "\0" + Loc.T("Z up (3ds Max / .3ds)") + "\0");
+        Theme.Tip(Loc.T("Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side.\nA .3ds or a Max scene uses the toolkit's own Y/Z swap, so it faces the way its author saw it."));
         ImGui.SetNextItemWidth(190f * uiScale);
         CboZ(Loc.TL("Size"), ref miFitMode, Loc.T("Keep the file's units") + "\0" + Loc.T("Fit the height") + "\0" + Loc.T("Fit the longest side") + "\0");
         if (miFitMode == 0) { ImGui.SetNextItemWidth(120f * uiScale); DrgF(Loc.TL("Scale"), ref miScale, 0.01f, 0.001f, 1000f, "%.3f"); }
@@ -15893,8 +15924,25 @@ void ModelImportDialog()
         CboZ(Loc.TL("Max texture"), ref miMaxTexIdx, "256\0512\01024\0");
         ImGui.SameLine(); ImGui.Checkbox(Loc.TL("DXT5"), ref miDxt);
         Theme.Tip(Loc.T("DXT5 is a quarter the size and what retail ships.\nUncompressed is larger but exact - use it if a texture shows blocking."));
-        ImGui.Checkbox(Loc.TL("Solid (bake collision)"), ref miCollision);
-        if (miCollision) ImGui.TextColored(Theme.Warn, Loc.T("EXPERIMENTAL - the collision BSP is written empty; test in game."));
+        bool fileCol = miParts is not null && (miParts.CollisionSimple is not null || miParts.CollisionComplex is not null);
+        if (fileCol) Theme.Muted(Loc.T("Collision comes from the file's COL01 / COL02 objects."));
+        else ImGui.Checkbox(Loc.TL("Solid (bake collision)"), ref miCollision);
+        Theme.Tip(Loc.T("Writes the toolkit's SimpleBSP collision: one node per face, the same section Rexman's Max exporter\nwrites and Saigon68's props load with. Name an object COL01 (and COL02) in your modelling tool to author it."));
+        if (fileCol || miCollision)
+        {
+            ImGui.SetNextItemWidth(190f * uiScale);
+            int wasIdx = miColMatIdx;
+            CboZ(Loc.TL("Collision material"), ref miColMatIdx, RefractorForge.Formats.Con.CollisionMaterials.ComboZ);
+            if (miColMatIdx != wasIdx && RefractorForge.Formats.Con.CollisionMaterials.Choices[miColMatIdx].Id >= 0)
+                miColMat = RefractorForge.Formats.Con.CollisionMaterials.Choices[miColMatIdx].Id;
+            ImGui.SameLine(); ImGui.SetNextItemWidth(70f * uiScale);
+            if (InI(Loc.TL("id##colmat"), ref miColMat))
+            {
+                miColMat = Math.Clamp(miColMat, 0, 65535);
+                miColMatIdx = RefractorForge.Formats.Con.CollisionMaterials.IndexOf(miColMat);
+            }
+            Theme.Tip(Loc.T("The engine's numbered material (game/materialManagerdefine.con): what a bullet sounds like on it and how it\ntakes damage. The list is what retail collision meshes actually use; type any other id."));
+        }
         ImGui.SetNextItemWidth(120f * uiScale);
         DrgF(Loc.TL("Draw distance"), ref miDrawDist, 5f, 0f, 4000f, miDrawDist > 0f ? "%.0f m" : "default");
         Theme.Tip(Loc.T("How far away the object still draws. Default is what retail static objects use: 800 m, with the coarser LODs taking over at 50 and 100 m."));
@@ -15939,20 +15987,31 @@ bool CreateModelObject()
 
         // Re-read the source rather than fitting the copy the dialog is describing, so changing a setting and
         // pressing the button again starts from the authored geometry instead of compounding the last fit.
-        var mesh = ObjMesh.Load(miSource);
-        var fit = MeshFit.Apply(mesh, new MeshFitOptions {
-            Up = miUpAxis == 1 ? UpAxis.Z : UpAxis.Y,
+        var loaded = ModelFile.Load(miSource);
+        var parts = MeshParts.Split(loaded.Mesh);
+        var mesh = parts.Lods[0];
+        var fitOptions = new MeshFitOptions {
+            Up = miUpAxis == 2 ? UpAxis.ZSwap : miUpAxis == 1 ? UpAxis.Z : UpAxis.Y,
             Fit = miFitMode == 1 ? FitMode.Height : miFitMode == 2 ? FitMode.LongestSide : FitMode.AsAuthored,
             TargetMeters = miTarget,
             Scale = miFitMode == 0 ? miScale : 1f,
             Origin = miOrigin == 1 ? OriginMode.Center : miOrigin == 2 ? OriginMode.Keep : OriginMode.Base,
-        });
+        };
+        var fit = MeshFit.Apply(mesh, fitOptions);
+        // Every other part - the file's own LODs, its collision, its shadow, its box - gets the SAME scale and
+        // offset LOD01 got, never a fit of its own: a collision box fitted to its own height would come out a
+        // different size from the model it belongs to.
+        foreach (var part in parts.Lods.Skip(1).Concat(parts.CollisionMeshes))
+            MeshFit.ApplyLike(part, fitOptions, fit);
+        if (parts.Shadow is not null) MeshFit.ApplyLike(parts.Shadow, fitOptions, fit);
+        if (parts.Bounds is not null) MeshFit.ApplyLike(parts.Bounds, fitOptions, fit);
 
         // Materials + textures from the .obj's .mtl, resolved relative to the .obj. Each picture is forced to a
         // power of two (the texture manager silently DROPS anything else) and given a mip chain, or it shimmers at
         // distance. The texture name is prefixed with the template so two imports cannot fight over one file.
         var dir = Path.GetDirectoryName(miSource) ?? ".";
         var mtl = new Dictionary<string, ObjMaterial>(StringComparer.OrdinalIgnoreCase);
+        if (loaded.Materials is not null) foreach (var kv in loaded.Materials) mtl[kv.Key] = kv.Value;   // a .3ds keeps them inside
         foreach (var lib in mesh.MtlLibs)
         {
             var mp = Path.Combine(dir, lib);
@@ -15994,18 +16053,24 @@ bool CreateModelObject()
         // exactly as authored; nothing is invented either way, every surviving vertex is one the author placed.
         ObjMesh lod0 = miBudget > 0 && mesh.TotalFaces > miBudget ? MeshDecimator.Decimate(mesh, miBudget) : mesh;
         var extraLods = new List<ObjMesh>();
-        for (int i = 1; i <= miExtraLods; i++)
-        {
-            int target = Math.Max(12, lod0.TotalFaces >> i);
-            if (target >= lod0.TotalFaces) break;
-            extraLods.Add(MeshDecimator.Decimate(lod0, target));
-        }
+        if (parts.Lods.Count > 1) extraLods.AddRange(parts.Lods.Skip(1));      // the author's own LOD02.., as the toolkit did
+        else
+            for (int i = 1; i <= miExtraLods; i++)
+            {
+                int target = Math.Max(12, lod0.TotalFaces >> i);
+                if (target >= lod0.TotalFaces) break;
+                extraLods.Add(MeshDecimator.Decimate(lod0, target));
+            }
         // Build renames every material in place; remember what each section was called so the preview can find
         // its picture afterwards.
         var sourceNames = lod0.SubMeshes.Select(s => s.Material).ToList();
 
+        var fileCols = parts.CollisionMeshes.ToList();
         var built = RefractorForge.Formats.Con.ModelObject.Build(levelName, name, lod0, bindings, textures,
-                                                                 miCollision, baseSub, miDrawDist, extraLods);
+                                                                 miCollision, baseSub, miDrawDist, extraLods,
+                                                                 collisionMeshes: fileCols.Count > 0 ? fileCols : null,
+                                                                 collisionMaterial: miColMat,
+                                                                 shadow: parts.Shadow, bounds: parts.Bounds);
 
         // Queue every file for the save, then the two registration patches - both built on the newest queued copy,
         // so a second import adds to the first rather than replacing it.

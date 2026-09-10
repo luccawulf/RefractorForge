@@ -1699,5 +1699,15 @@
   "deathMaterial - OUT OF BOUNDS": "deathMaterial — エリア外",
   "Drawn {0:0} m around the camera, like the game.": "カメラ周囲 {0:0} m に描画（ゲームと同じ）。",
   "The undergrowth map's own cell size - 1 m on Ia Drang, 2 m on most maps.\nSmaller is thicker grass and more instances.": "下生えマップ自体のセルサイズ。Ia Drang は 1 m、多くのマップは 2 m。\n小さいほど草が密になり、インスタンス数も増えます。",
-  "Press Tab to show objects": "オブジェクトを表示するには Tab キー"
+  "Press Tab to show objects": "オブジェクトを表示するには Tab キー",
+  "Toolkit naming found: {0}.": "ツールキットの命名規則を検出: {0}。",
+  "Folded into LOD01: {0}.": "LOD01 に統合: {0}。",
+  "Writes the file's own {0} detail levels ({1} triangles); the extra-LOD setting is not used.": "ファイル自身の {0} 段階の LOD を書き出します（{1} 三角形）。追加 LOD の設定は使いません。",
+  "Z up (3ds Max / .3ds)": "Z が上 (3ds Max / .3ds)",
+  "Blender's OBJ exporter already writes Y up.\nAn FBX or .blend brought in another way is Z up and lands on its side.\nA .3ds or a Max scene uses the toolkit's own Y/Z swap, so it faces the way its author saw it.": "Blender の OBJ エクスポータは最初から Y が上です。\n別の経路で持ち込んだ FBX や .blend は Z が上で、横倒しになります。\n.3ds や Max のシーンはツールキット自身の Y/Z 入れ替えを使うので、作者が見た向きになります。",
+  "Collision comes from the file's COL01 / COL02 objects.": "コリジョンはファイルの COL01 / COL02 オブジェクトから取ります。",
+  "Writes the toolkit's SimpleBSP collision: one node per face, the same section Rexman's Max exporter\nwrites and Saigon68's props load with. Name an object COL01 (and COL02) in your modelling tool to author it.": "ツールキットの SimpleBSP コリジョンを書き出します。面ごとに 1 ノードで、Rexman の Max エクスポータが書き、\nSaigon68 の小物が読み込むものと同じセクションです。モデリングツールでオブジェクトを COL01（と COL02）と名付ければ自分で作れます。",
+  "Collision material": "コリジョン材質",
+  "id##colmat": "ID##colmat",
+  "The engine's numbered material (game/materialManagerdefine.con): what a bullet sounds like on it and how it\ntakes damage. The list is what retail collision meshes actually use; type any other id.": "エンジンの番号付き材質（game/materialManagerdefine.con）。弾が当たった音とダメージの受け方を決めます。\n一覧は製品版のコリジョンメッシュが実際に使っているもの。他の ID は直接入力できます。"
 }

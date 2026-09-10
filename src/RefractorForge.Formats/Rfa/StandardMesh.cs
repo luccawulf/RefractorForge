@@ -211,12 +211,66 @@ public sealed class StandardMesh
             lods.Add(mats);
         }
 
+        // What follows the LODs: the shadow block and the portal chunk. Grammar, from the toolkit's exporter and
+        // every retail mesh checked: u32 hasShadow; [u32 numLods=1; u32 numMaterials; material headers; data];
+        // u32 portalSize; portalSize bytes. `Consumed` stays the end of the LODs (every gate counts the 8 bytes of
+        // a shadow-less ending as the tail); the shadow is parsed on top, tolerantly - a mesh whose tail is not
+        // this shape simply has no shadow to report.
+        ShadowMesh? shadow = null;
+        int trailerLen = 0;
+        try
+        {
+            int q = p;
+            uint hasShadow = U32(buf, ref q);
+            if (hasShadow == 1)
+            {
+                int snl = (int)U32(buf, ref q); int snm = (int)U32(buf, ref q);
+                var shd = new (string name, uint vbs, int nv, int nfv)[snm];
+                for (int m = 0; m < snm; m++)
+                {
+                    int nlen = (int)U32(buf, ref q);
+                    string name = Encoding.Latin1.GetString(buf.Slice(q, nlen)); q += nlen;
+                    q += 12; _ = U32(buf, ref q); _ = U32(buf, ref q);
+                    uint vbs = U32(buf, ref q); int nv = (int)U32(buf, ref q); int nfv = (int)U32(buf, ref q); _ = U32(buf, ref q);
+                    shd[m] = (name, vbs, nv, nfv);
+                }
+                var sverts = new List<Vec3>(); var sfaces = new List<(int, int, int)>();
+                string sname = "";
+                foreach (var h in shd)
+                {
+                    int b = sverts.Count;
+                    if (sname.Length == 0) sname = h.name;
+                    for (int v = 0; v < h.nv; v++)
+                    {
+                        int at = q + v * (int)h.vbs;
+                        sverts.Add(new Vec3(F32(buf, ref at), F32(buf, ref at), F32(buf, ref at)));
+                    }
+                    q += h.nv * (int)h.vbs;
+                    for (int i = 0; i + 2 < h.nfv; i += 3)
+                        sfaces.Add((b + U16(buf, ref q), b + U16(buf, ref q), b + U16(buf, ref q)));
+                }
+                _ = snl;
+                shadow = new ShadowMesh(sname, sverts.ToArray(), sfaces.ToArray());
+            }
+            if (q + 4 <= buf.Length) { trailerLen = (int)U32(buf, ref q); }
+        }
+        catch { shadow = null; }
+
         return new StandardMesh
         {
             Version = version, BoundingBox = bbox, NumCollisionMeshes = numCol, CollisionSections = col,
-            NumLods = numLods, Lods = lods, Consumed = p, Total = buf.Length,
+            NumLods = numLods, Lods = lods, Consumed = p, Total = buf.Length, Shadow = shadow, TrailerLength = trailerLen,
         };
     }
+
+    /// <summary>The real-time shadow mesh a <c>.sm</c> can end with: positions and triangles only (its vertices carry
+    /// no normal or uv), in the file's own face order.</summary>
+    public sealed record ShadowMesh(string Name, Vec3[] Vertices, (int A, int B, int C)[] Faces);
+
+    /// <summary>The shadow mesh after the LODs, or null when the file declares none (or its tail is not readable).</summary>
+    public ShadowMesh? Shadow { get; private init; }
+    /// <summary>The size the file declares for its portal chunk after the shadow block (0 on nearly every mesh).</summary>
+    public int TrailerLength { get; private init; }
 
     /// <summary>
     /// Parse without throwing. Returns <c>false</c> for malformed input so a single bad asset

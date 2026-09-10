@@ -25,6 +25,11 @@ namespace RefractorForge.Formats.Con;
 ///
 /// The two <c>.con</c> patches (<see cref="DecalObject.PatchObjectsCon"/>, <see cref="DecalObject.PatchInitCon"/>)
 /// are shared verbatim — they are about the LEVEL, not about what kind of object you added.
+///
+/// A model that follows the Battlefield toolkit's naming convention (<see cref="MeshParts"/>: LOD01.., COL01,
+/// COL02, shadow, bbox) is written with everything it declares - its own detail levels instead of decimated
+/// copies, its own collision meshes with a named engine material, its shadow mesh, its bounding box. That is
+/// the same <c>.sm</c> the toolkit's own exporter would have produced from the same scene.
 /// </summary>
 public static class ModelObject
 {
@@ -44,8 +49,11 @@ public static class ModelObject
     /// or a folder write.</param>
     /// <param name="MaterialNames">The renamed materials in submesh order, so a caller can show what was bound.</param>
     /// <param name="LodCount">How many levels of detail the .sm carries (1 = just the model).</param>
+    /// <param name="HasShadow">Whether a shadow mesh was written after the LODs.</param>
+    /// <param name="CollisionCount">How many collision sections the .sm carries (0, 1 or 2).</param>
     public sealed record Built(string Template, List<(string RelPath, byte[] Bytes)> Files, string RunLine,
-                               ObjMesh Mesh, List<string> MaterialNames, bool HasCollision, int LodCount = 1);
+                               ObjMesh Mesh, List<string> MaterialNames, bool HasCollision, int LodCount = 1,
+                               bool HasShadow = false, int CollisionCount = 0);
 
     /// <param name="levelName">The level folder name, as it appears under &lt;baseSub&gt;/levels/.</param>
     /// <param name="name">Template name (letters, digits, underscore); sanitized.</param>
@@ -53,20 +61,30 @@ public static class ModelObject
     /// <c>&lt;Name&gt;_MaterialN</c> convention and oversized sections are split. Pass a copy if that matters.</param>
     /// <param name="baseSub">The game's archive mount root: "bf1942" or "BfVietnam". The two games share no
     /// namespace, so a BF1942 path resolves to nothing in Vietnam and the object silently gets no mesh.</param>
-    /// <param name="collision">Bake a collision section from the mesh so the object is solid. EXPERIMENTAL — the
-    /// section's BSP tail is written empty because its node format is still unsolved, and whether the engine
-    /// rebuilds it at load has to be confirmed in game (docs/SM_Collision_RE.md).</param>
+    /// <param name="collision">Bake a collision section from the model itself (the coarsest LOD that fits the
+    /// section's vertex limit) so the object is solid. Ignored when <paramref name="collisionMeshes"/> names the
+    /// collision explicitly.</param>
     /// <param name="maxDrawDistance">How far away the object still draws; 0 = retail's 800 m for a static object.</param>
     /// <param name="extraLods">Coarser copies of <paramref name="mesh"/>, coarsest last, sharing its materials by
-    /// source name (what <c>MeshDecimator</c> produces). Written into the same .sm after it and switched in by
-    /// distance. Mutated the same way the model is.</param>
+    /// source name (what <c>MeshDecimator</c> produces, or what the file's own LOD02.. objects hold). Written into
+    /// the same .sm after it and switched in by distance. Mutated the same way the model is.</param>
+    /// <param name="collisionMeshes">The model's own collision meshes - COL01 then COL02 - written as sections in
+    /// that order. One that is past the section's vertex limit is left out with a note in Objects.con.</param>
+    /// <param name="collisionMaterial">The engine material every collision face is made of; see
+    /// <see cref="CollisionMaterials"/>.</param>
+    /// <param name="shadow">The model's shadow mesh, or null for none.</param>
+    /// <param name="bounds">A geometric bounding-box object whose box replaces LOD 0's in the header, or null.</param>
     public static Built Build(string levelName, string name, ObjMesh mesh,
                               IEnumerable<Material>? materials = null,
                               IEnumerable<Texture>? textures = null,
                               bool collision = false,
                               string baseSub = "bf1942",
                               float maxDrawDistance = 0f,
-                              IReadOnlyList<ObjMesh>? extraLods = null)
+                              IReadOnlyList<ObjMesh>? extraLods = null,
+                              IReadOnlyList<ObjMesh>? collisionMeshes = null,
+                              int collisionMaterial = StandardMeshWriter.DefaultCollisionMaterial,
+                              ObjMesh? shadow = null,
+                              ObjMesh? bounds = null)
     {
         name = DecalObject.Sanitize(name);
         if (mesh.SubMeshes.Count == 0) throw new InvalidOperationException("The model has no geometry to write.");
@@ -110,14 +128,35 @@ public static class ModelObject
 
         var files = new List<(string, byte[])>();
         var crlf = new UTF8Encoding(false);
+        var notes = new List<string>();
 
-        // Collision from the model itself, or — past the section's 32,767-vertex limit — from the first coarser
-        // copy that fits. A LOD-1 collision on a dense model is a far better outcome than none.
-        byte[]? col = null;
-        if (collision)
+        // Collision. The model's own COL01/COL02 when it has them - that is what the toolkit's exporter wrote and
+        // what every retail object carries. Otherwise, on request, from the model itself: the coarsest LOD that
+        // fits the section's 32,767-vertex limit, a LOD-1 collision on a dense model being far better than none.
+        var cols = new List<byte[]>();
+        if (collisionMeshes is { Count: > 0 })
+        {
+            int k = 0;
+            foreach (var cm in collisionMeshes)
+            {
+                k++;
+                var sec = StandardMeshWriter.BuildObjCollision(cm, collisionMaterial);
+                if (sec is not null) cols.Add(sec);
+                else notes.Add($"rem COL{k:00} has {cm.TotalVertices} vertices, past the 32767 collision limit; it was left out.");
+            }
+        }
+        else if (collision)
+        {
             foreach (var lod in lods)
-                if ((col = StandardMeshWriter.BuildObjCollision(lod)) is not null) break;
-        files.Add(($"StandardMesh/{name}.sm", StandardMeshWriter.Write(lods, col)));
+            {
+                var sec = StandardMeshWriter.BuildObjCollision(lod, collisionMaterial);
+                if (sec is not null) { cols.Add(sec); break; }
+            }
+            if (cols.Count == 0) notes.Add("rem Collision was requested but the mesh is past the 32767-vertex collision limit; decimate it.");
+        }
+
+        var box = bounds is { TotalVertices: > 0 } ? bounds.BoundingBox : null;
+        files.Add(($"StandardMesh/{name}.sm", StandardMeshWriter.Write(lods, cols, shadow, $"{name}_", box)));
         files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(RsWriter.Write(shaders))));
 
         foreach (var t in textures ?? Enumerable.Empty<Texture>())
@@ -147,15 +186,14 @@ public static class ModelObject
         string obj =
             $"ObjectTemplate.create SimpleObject {name}\r\n" +
             $"ObjectTemplate.geometry {name}\r\n" +
-            $"ObjectTemplate.HasCollisionPhysics {(col is not null ? 1 : 0)}\r\n" +
-            (col is null && collision
-                ? "rem Collision was requested but the mesh is past the 32767-vertex collision limit; decimate it.\r\n"
-                : "") +
+            $"ObjectTemplate.HasCollisionPhysics {(cols.Count > 0 ? 1 : 0)}\r\n" +
+            string.Concat(notes.Select(n => n + "\r\n")) +
             "\r\n";
         files.Add(($"Objects/{name}/Objects.con", crlf.GetBytes(obj)));
 
         files.Add(($"Objects/{name}/{name}.con", crlf.GetBytes("run Objects\r\nrun Geometries\r\n")));
 
-        return new Built(name, files, $"run {name}/{name}", mesh, names, col is not null, lods.Count);
+        bool hasShadow = shadow is { TotalFaces: > 0 };
+        return new Built(name, files, $"run {name}/{name}", mesh, names, cols.Count > 0, lods.Count, hasShadow, cols.Count);
     }
 }

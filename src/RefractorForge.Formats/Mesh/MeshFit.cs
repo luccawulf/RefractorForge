@@ -11,6 +11,21 @@ public enum UpAxis
     Y,
     /// <summary>Blender's own world axes, which FBX / glTF / <c>.blend</c> imports arrive in. Rotated on import.</summary>
     Z,
+    /// <summary>3ds Max's axes, the way the Battlefield toolkit's own exporter and <c>3dsToSm.exe</c> read them: Y
+    /// and Z simply swapped, (x, y, z) -> (x, z, y). That is a reflection rather than a rotation, and it is what
+    /// every retail mesh went through, so a <c>.3ds</c> or a Max scene lands facing the way its author saw it.
+    /// The reflection also turns the triangles over, which is exactly what the engine wants - see
+    /// <see cref="MeshFitOptions.FrontFaces"/>.</summary>
+    ZSwap,
+}
+
+/// <summary>Which way round the source file winds a front face.</summary>
+public enum FaceWinding
+{
+    /// <summary>Counter-clockwise seen from outside - the OBJ, Blender, Max and <c>.3ds</c> convention.</summary>
+    CounterClockwise,
+    /// <summary>Clockwise seen from outside - Refractor's own convention (a mesh exported from a retail .sm).</summary>
+    Clockwise,
 }
 
 /// <summary>How to size the import.</summary>
@@ -47,6 +62,13 @@ public sealed class MeshFitOptions
     /// <summary>Extra uniform scale, applied in every mode. 1 = none.</summary>
     public float Scale = 1f;
     public OriginMode Origin = OriginMode.Base;
+    /// <summary>How the SOURCE winds its front faces. Refractor reads a triangle clockwise-from-outside - every
+    /// retail mesh does, measured across the corpus, and the object-lightmap baker relies on it. An OBJ, a
+    /// Blender export or a Max scene winds the other way, so the fit turns each triangle over (a,b,c) -> (a,c,b)
+    /// to land on the engine's convention; a reflection in the axis change (<see cref="UpAxis.ZSwap"/>) already
+    /// does that turn, and is not doubled. Before this, every imported model wrote back-facing triangles and was
+    /// invisible in game - the editor draws both sides and never showed it.</summary>
+    public FaceWinding FrontFaces = FaceWinding.CounterClockwise;
     /// <summary>Turn the texture space over: an OBJ's image origin is bottom-left (V grows up the picture), the
     /// engine's — and the editor's, which draws retail meshes correctly — is top-left. Without this every imported
     /// texture arrives upside down, in the editor and in the game alike. On by default; off only for a mesh that
@@ -71,19 +93,7 @@ public static class MeshFit
     public static Result Apply(ObjMesh mesh, MeshFitOptions o)
     {
         if (mesh.TotalVertices == 0) return default;
-
-        // 0. Texture space. See FlipV: the picture's origin moves from the bottom-left corner to the top-left.
-        if (o.FlipV) FlipV(mesh);
-
-        // 1. Axis. Blender is Z-up with -Y forward; Refractor is Y-up with -Z forward, so (x, y, z) -> (x, z, -y).
-        //    That is a proper rotation (determinant +1), so the triangle winding still means what it did and only
-        //    the positions and normals move.
-        if (o.Up == UpAxis.Z)
-            foreach (var s in mesh.SubMeshes)
-            {
-                for (int i = 0; i < s.Positions.Count; i++) s.Positions[i] = ZUpToYUp(s.Positions[i]);
-                for (int i = 0; i < s.Normals.Count; i++) s.Normals[i] = ZUpToYUp(s.Normals[i]);
-            }
+        Orient(mesh, o);
 
         var b = Bounds(mesh);
         float w = b.maxX - b.minX, h = b.maxY - b.minY, d = b.maxZ - b.minZ;
@@ -106,8 +116,51 @@ public static class MeshFit
             _ => Vec3.Zero,
         };
 
+        // Transform recomputes the box; when there is nothing to transform the box still has to follow the axis
+        // change above, or a Z-up model reports its old, sideways bounds.
         if (scale != 1f || offset != Vec3.Zero) mesh.Transform(scale, offset);
+        else mesh.RecomputeBounds();
         return new Result(scale, offset, w * scale, h * scale, d * scale);
+    }
+
+    /// <summary>The steps that do not depend on the mesh's size: texture space, axis, winding. Shared by
+    /// <see cref="Apply"/> and <see cref="ApplyLike"/> so every part of a model is turned the same way.</summary>
+    static void Orient(ObjMesh mesh, MeshFitOptions o)
+    {
+        // 0. Texture space. See FlipV: the picture's origin moves from the bottom-left corner to the top-left.
+        if (o.FlipV) FlipV(mesh);
+
+        // 1. Axis. Blender is Z-up with -Y forward; Refractor is Y-up with -Z forward, so (x, y, z) -> (x, z, -y).
+        //    That is a proper rotation (determinant +1), so the triangle winding still means what it did and only
+        //    the positions and normals move. ZSwap is the toolkit's own (x, y, z) -> (x, z, y): a reflection.
+        if (o.Up == UpAxis.Z)
+            foreach (var s in mesh.SubMeshes)
+            {
+                for (int i = 0; i < s.Positions.Count; i++) s.Positions[i] = ZUpToYUp(s.Positions[i]);
+                for (int i = 0; i < s.Normals.Count; i++) s.Normals[i] = ZUpToYUp(s.Normals[i]);
+            }
+        else if (o.Up == UpAxis.ZSwap)
+            foreach (var s in mesh.SubMeshes)
+            {
+                for (int i = 0; i < s.Positions.Count; i++) s.Positions[i] = SwapYZ(s.Positions[i]);
+                for (int i = 0; i < s.Normals.Count; i++) s.Normals[i] = SwapYZ(s.Normals[i]);
+            }
+
+        // 1b. Winding. The engine wants clockwise-from-outside; a counter-clockwise source is turned over unless
+        //     the reflection above has already done it (two turns would put it back).
+        bool reflected = o.Up == UpAxis.ZSwap;
+        if ((o.FrontFaces == FaceWinding.CounterClockwise) != reflected) mesh.ReverseWinding();
+    }
+
+    /// <summary>Give another part of the same model the fit its LOD 0 got: the same orientation, then the SAME
+    /// scale and offset. A collision box or a shadow mesh fitted on its own bounds would come out a different
+    /// size from the model it belongs to, which is exactly the wrong thing.</summary>
+    public static void ApplyLike(ObjMesh part, MeshFitOptions o, Result fit)
+    {
+        if (part.TotalVertices == 0) return;
+        Orient(part, o);
+        if (fit.Scale != 1f || fit.Offset != Vec3.Zero) part.Transform(fit.Scale, fit.Offset);
+        else part.RecomputeBounds();
     }
 
     /// <summary>V' = 1 - V on every vertex: the OBJ texture convention turned into the engine's. Its own inverse,
@@ -119,6 +172,7 @@ public static class MeshFit
     }
 
     private static Vec3 ZUpToYUp(Vec3 p) => new(p.X, p.Z, -p.Y);
+    private static Vec3 SwapYZ(Vec3 p) => new(p.X, p.Z, p.Y);
 
     private static (float minX, float minY, float minZ, float maxX, float maxY, float maxZ) Bounds(ObjMesh mesh)
     {
