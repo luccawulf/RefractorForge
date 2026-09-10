@@ -1369,9 +1369,11 @@ double gpLastClickTime = -1; GpKind gpLastClickKind = GpKind.ControlPoint; int g
 bool showHelp = false; string? helpText = null;             // Help > User Guide window (loads USER_GUIDE.md next to the exe)
 bool gpRotDragging = false; float gpRotStartYaw = 0f, gpRotStartMouseX = 0f;  // Rotate-tool yaw drag on a spawn
 bool showTerrain = true, showObjects = true, showVehicles = true, showControlPoints = true, showSpawns = true;
-// A paint mapper hides the objects so you can read the ground you are painting (Battlecraft did the same). Tab
-// brings them back for as long as you stay in that mapper; switching mapper hides them again, because that is the
-// state you want almost every time you go in to paint. The status line says so, so nobody has to guess.
+// Every mapper EXCEPT Object hides the objects, so you can read the ground you are working on (Battlecraft did
+// the same for its paint modes). Tab brings them back for as long as you stay in that mapper; switching mapper
+// hides them again, because that is the state you want almost every time you leave the Object mapper. A line at
+// the bottom of the viewport says which key does it, so nobody has to already know.
+const int ObjectMapper = 2;
 bool paintShowObjects = false;
 // LOCKED OBJECTS (Battlecraft's lock/unlock buttons): a locked object can still be selected and inspected, but not
 // moved, rotated, dropped or deleted - the guard against nudging a finished piece of a map while working around it.
@@ -7801,10 +7803,11 @@ void OnRender(double dt)
     // Sun/key-light direction: the manual azimuth/elevation control, else the level's SkyAndSun.con. Drives terrain +
     // object shading AND the real-time shadow map.
     var ld = EffectiveSun();
-    // A paint tool hides the objects, the markers and the foliage for a clear read of the ground - unless Tab has
-    // asked for the objects back (paintShowObjects), which survives until you leave the mapper.
+    // `painting` is about the FOLIAGE overlay, which would bury the growth map you are painting under its own
+    // trees. The objects follow the MAPPER instead: outside the Object mapper they are hidden until Tab asks for
+    // them, and that answer survives until you switch mapper.
     bool painting = toolNames[tool] == "Paint";
-    bool objectsOn = showObjects && (!painting || paintShowObjects);
+    bool objectsOn = showObjects && (mapper == ObjectMapper || paintShowObjects);
 
     if (terrainDirty) { RebuildTerrain(); terrainDirty = false; shadowMapDirty = true; }   // re-upload after this frame's sculpt dabs
 
@@ -9512,14 +9515,13 @@ void WindowMenu()
 bool UiPopupOpen() => imgui is not null
                    && ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel);
 
-// Tab, from anywhere. In a paint mapper it flips the per-visit override; everywhere else it flips the layer
+// Tab, from anywhere. Outside the Object mapper it flips the per-visit override; inside it flips the layer
 // itself. Asking for the objects also turns the layer on, because "show me the objects" cannot sensibly leave
 // them off.
 void ToggleObjectsVisible()
 {
-    bool inPaint = toolNames[tool] == "Paint";
     bool on;
-    if (inPaint) { paintShowObjects = !paintShowObjects; if (paintShowObjects) showObjects = true; on = paintShowObjects; }
+    if (mapper != ObjectMapper) { paintShowObjects = !paintShowObjects; if (paintShowObjects) showObjects = true; on = paintShowObjects; }
     else { showObjects = !showObjects; on = showObjects; }
     Toast(on ? Loc.T("Objects shown") : Loc.T("Objects hidden"));
 }
@@ -14426,9 +14428,9 @@ void BuildUi()
     }
     ImGui.End();
     ImGui.PopStyleColor();
-    // Objects are hidden because a paint mapper is active. Say so, and say what to press - otherwise the map
-    // looks empty and the hotkey is something you have to already know about.
-    if (toolNames[tool] == "Paint" && !(showObjects && paintShowObjects))
+    // Objects are hidden because this is not the Object mapper. Say what to press - otherwise the map looks
+    // empty and the hotkey is something you have to already know about.
+    if (mapper != ObjectMapper && !(showObjects && paintShowObjects))
     {
         string hint = Loc.T("Press Tab to show objects");
         var fgl = ImGui.GetForegroundDrawList();
