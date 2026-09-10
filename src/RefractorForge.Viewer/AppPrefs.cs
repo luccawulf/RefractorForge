@@ -33,11 +33,38 @@ public static class AppPrefs
     /// either way so the number is never a guess.</summary>
     public static int ObjectTextureCap { get; set; } = 0;
 
+    /// <summary>The always-on relay this editor connects to: address, port, display name and join password.
+    /// A central server is by definition the same one every time, so typing its address on every connect is
+    /// pure friction - and a password nobody can remember is a password everybody works around.
+    ///
+    /// The password is stored in the clear alongside the rest. It guards a map-editing session on someone's
+    /// hobby server, not an account, and the alternative in practice is that it gets pasted into a chat.
+    /// It is not reused anywhere and the field says so.</summary>
+    public static string CentralServerAddress { get; set; } = "";
+    public static int CentralServerPort { get; set; } = 7777;
+    public static string CentralServerPassword { get; set; } = "";
+    public static string CentralServerName { get; set; } = "";
+
+    /// <summary>Where a map downloaded from the relay is written. Empty means "beside the level archive that is
+    /// already open", which is the mod's own Levels folder in the normal case and therefore the right answer
+    /// without anybody configuring anything. It is a setting because the right answer is not always that: a
+    /// second mod, a different drive, or simply somewhere the game is not looking yet.</summary>
+    public static string MapDownloadDir { get; set; } = "";
+
+    /// <summary>A map to rejoin on the next start. Switching level restarts the editor, and being dropped back
+    /// at a disconnected desktop having to reconnect and pick the same map again is the friction that made
+    /// downloading one feel like three separate chores. Set just before the relaunch, consumed and cleared on
+    /// the way back up.</summary>
+    public static string PendingRejoinMap { get; set; } = "";
+
     private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge");
     private static string FilePath => Path.Combine(Dir, "prefs.json");
 
     private sealed record Data(bool? ResolveInheritedMods, bool? LayerBaseMap, bool? GroundCamera = null,
-                               int? ObjectTextureCap = null);
+                               int? ObjectTextureCap = null, string? CentralServerAddress = null,
+                               int? CentralServerPort = null, string? CentralServerPassword = null,
+                               string? CentralServerName = null, string? MapDownloadDir = null,
+                               string? PendingRejoinMap = null);
 
     /// <summary>Load persisted preferences. Call once at startup, BEFORE the level load block reads them.</summary>
     public static void Load()
@@ -50,6 +77,12 @@ public static class AppPrefs
             if (d.LayerBaseMap is bool b) LayerBaseMap = b;
             if (d.GroundCamera is bool c) GroundCamera = c;
             if (d.ObjectTextureCap is int t) ObjectTextureCap = t;
+            if (d.CentralServerAddress is string ca) CentralServerAddress = ca;
+            if (d.CentralServerPort is int cp && cp > 0 && cp <= 65535) CentralServerPort = cp;
+            if (d.CentralServerPassword is string cw) CentralServerPassword = cw;
+            if (d.CentralServerName is string cn) CentralServerName = cn;
+            if (d.MapDownloadDir is string md) MapDownloadDir = md;
+            if (d.PendingRejoinMap is string pr) PendingRejoinMap = pr;
         }
         catch { /* a corrupt prefs file must never stop the editor starting */ }
     }
@@ -59,7 +92,9 @@ public static class AppPrefs
         try
         {
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera, ObjectTextureCap),
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera, ObjectTextureCap,
+                    CentralServerAddress, CentralServerPort, CentralServerPassword, CentralServerName, MapDownloadDir,
+                    PendingRejoinMap),
                 new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }

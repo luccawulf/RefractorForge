@@ -21,17 +21,36 @@ Group=refractorforge
 WorkingDirectory=/opt/refractorforge-relay
 Environment=RF_PORT=7777
 Environment=RF_PASS=change-me
-ExecStart=/opt/refractorforge-relay/RefractorForge.Server ${RF_PORT} --save /var/lib/refractorforge/session --pass ${RF_PASS}
+# Backup cadence. A backup is only written when something changed in the interval, so an idle server writes
+# none and the snapshots kept are always that many distinct edited states. 15 min x 192 is roughly two days
+# of solid work, and far more of calendar time on a server people use at different hours - which is the point:
+# the window has to outlast the gap between one person breaking something and the next person noticing.
+Environment=RF_BACKUP_EVERY=15
+Environment=RF_KEEP_BACKUPS=192
+# A count is not a bound on disk: a session that has had terrain and material maps synced into it is
+# megabytes, not the couple of hundred KB an objects-only one is. The cap is what stops it filling the disk.
+Environment=RF_BACKUP_MAX_MB=2048
+# Where the level archives live, so a joiner who has never seen the map can be handed it. A level archive is
+# hundreds of MB: point this at the roomy disk, not the one the system is on.
+Environment=RF_BASE_STORE=/data/refractorforge/base
+# The session and its backups live beside the archives, on the disk with room. Keeping them on the system
+# disk capped the history at whatever that disk could spare, which on a box running game servers is not much.
+Environment=RF_STATE=/data/refractorforge/session
+# One folder per map under here. With it the relay hosts many maps behind this one port and each editor picks
+# which to work on; a name nobody has used yet creates that map.
+Environment=RF_MAPS=/data/refractorforge/maps
+# RF_PASS is read from the environment, not passed as --pass: systemd expands ${RF_PASS} before exec, so an
+# argument would put the join password into argv where `ps` shows it to everyone on the machine.
+ExecStart=/opt/refractorforge-relay/RefractorForge.Server ${RF_PORT} --save ${RF_STATE} --backup-every ${RF_BACKUP_EVERY} --keep-backups ${RF_KEEP_BACKUPS} --backup-max-mb ${RF_BACKUP_MAX_MB} --base-store ${RF_BASE_STORE} --maps ${RF_MAPS}
 # SIGTERM is what "systemctl stop" sends; the relay flushes its state on it before exiting.
 KillSignal=SIGTERM
 TimeoutStopSec=20
 Restart=on-failure
 RestartSec=5
-StateDirectory=refractorforge
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/refractorforge
+ReadWritePaths=/data/refractorforge
 
 [Install]
 WantedBy=multi-user.target

@@ -71,6 +71,13 @@ public sealed class GlObjects
     private readonly Dictionary<string, List<Matrix4x4>> _foliage = new(StringComparer.OrdinalIgnoreCase);
     public int FoliageInstanceCount { get; private set; }
 
+    /// <summary>Undergrowth is kept in its OWN bucket because it lives on a different clock: overgrowth covers the
+    /// whole map and is rebuilt only when you change it, while undergrowth is generated around the camera (the
+    /// engine does the same) and is therefore rebuilt as you move. Sharing one bucket meant every step re-scattered
+    /// tens of thousands of trees to move a few hundred blades of grass.</summary>
+    private readonly Dictionary<string, List<Matrix4x4>> _under = new(StringComparer.OrdinalIgnoreCase);
+    public int UndergrowthInstanceCount { get; private set; }
+
     // Per-instance baked object lightmaps: objIndex -> GL texture (the ObjectLightMaps/*.tga matched to that placement).
     // Sampled via the mesh's 2nd UV channel; bound per-instance in Draw when ShowLightmaps is on.
     private readonly Dictionary<int, uint> _instLightmap = new();
@@ -403,9 +410,17 @@ public sealed class GlObjects
     /// template not already on the GPU and skipping ones that don't resolve. Reuses the shared template cache, so
     /// a tree mesh shared with a placed object is uploaded once.</summary>
     public void SetFoliage(GL gl, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
+        => FoliageInstanceCount = Fill(gl, _foliage, instances, lib);
+
+    /// <summary>Replace the UNDERGROWTH bucket. Same contract as <see cref="SetFoliage"/>; called far more often,
+    /// because the near-field grass follows the camera.</summary>
+    public void SetUndergrowth(GL gl, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
+        => UndergrowthInstanceCount = Fill(gl, _under, instances, lib);
+
+    private int Fill(GL gl, Dictionary<string, List<Matrix4x4>> bucket, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
     {
-        _foliage.Clear();
-        FoliageInstanceCount = 0;
+        bucket.Clear();
+        int n = 0;
         foreach (var (tmpl, world) in instances)
         {
             if (!_templates.ContainsKey(tmpl))
@@ -413,27 +428,43 @@ public sealed class GlObjects
                 if ((!lib.TryGet(tmpl, out var mesh) || mesh is null) && (!lib.TryGetAssembledMesh(tmpl, out mesh) || mesh is null)) continue;
                 UploadMesh(gl, tmpl, mesh);
             }
-            if (!_foliage.TryGetValue(tmpl, out var lst)) { lst = new List<Matrix4x4>(); _foliage[tmpl] = lst; }
+            if (!bucket.TryGetValue(tmpl, out var lst)) { lst = new List<Matrix4x4>(); bucket[tmpl] = lst; }
             lst.Add(world);
-            FoliageInstanceCount++;
+            n++;
         }
+        return n;
     }
 
-    public void ClearFoliage() { _foliage.Clear(); FoliageInstanceCount = 0; }
+    public void ClearFoliage()
+    {
+        _foliage.Clear(); FoliageInstanceCount = 0;
+        _under.Clear(); UndergrowthInstanceCount = 0;
+    }
 
     /// <summary>Draw the foliage overlay with a hard distance cull (instances farther than <paramref name="cullDist"/>
     /// from the camera are skipped) so a dense map stays interactive. No selection/tint; per-template VAO binds once.
     /// (Phase 1: distance-culled per-instance draw — GPU instancing is a future optimisation.)</summary>
     public unsafe void DrawFoliage(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
                                    Matrix4x4 viewProj, Vector3 camPos, float cullDist)
+        => DrawBucket(_foliage, gl, prog, uMVP, uModel, uColor, uUseTex, uAlphaTest, uTint, viewProj, camPos, cullDist);
+
+    /// <summary>Draw the undergrowth bucket. It gets its OWN cull distance - the palette's, which is 35-60 m -
+    /// because drawing grass out to the overgrowth's 300+ m is neither what the game does nor affordable.</summary>
+    public unsafe void DrawUndergrowth(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
+                                       Matrix4x4 viewProj, Vector3 camPos, float cullDist)
+        => DrawBucket(_under, gl, prog, uMVP, uModel, uColor, uUseTex, uAlphaTest, uTint, viewProj, camPos, cullDist);
+
+    private unsafe void DrawBucket(Dictionary<string, List<Matrix4x4>> bucket,
+                                   GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
+                                   Matrix4x4 viewProj, Vector3 camPos, float cullDist)
     {
-        if (_foliage.Count == 0) return;
+        if (bucket.Count == 0) return;
         float cull2 = cullDist * cullDist;
         gl.UseProgram(prog);
         gl.ActiveTexture(TextureUnit.Texture0);
         { int u = gl.GetUniformLocation(prog, "uHasLightmap"); if (u >= 0) gl.Uniform1(u, 0); }   // foliage has no lightmap
         gl.Uniform3(uTint, 1f, 1f, 1f);
-        foreach (var (tmpl, worlds) in _foliage)
+        foreach (var (tmpl, worlds) in bucket)
         {
             if (!_templates.TryGetValue(tmpl, out var t)) continue;
             gl.BindVertexArray(t.Vao);

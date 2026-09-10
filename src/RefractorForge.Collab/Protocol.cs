@@ -18,7 +18,16 @@ namespace RefractorForge.Collab;
 /// totally-ordered stream, their documents are byte-identical by construction (last-writer-wins
 /// per field, with "last" defined by the relay's order — the same on every client).
 /// </summary>
-public enum MsgType { Join, SyncBegin, SyncObj, SyncEnd, Op, Presence, Leave, Error, SeedRequest, Auth }
+public enum MsgType
+{
+    Join, SyncBegin, SyncObj, SyncEnd, Op, Presence, Leave, Error, SeedRequest, Auth,
+    // The base level archive: the ground the ops are applied to. See the Base* factories below.
+    Base, BaseOk, BaseDiff, BaseNeed, BaseGet, BasePut, BaseData, BaseDone,
+    // Choosing which map to work on, when the relay hosts several. See the Map* factories below.
+    MapList, MapInfo, MapEnd, PickMap, MapOk,
+    // Pulling the CURRENT map back out as one archive. See the Export factories below.
+    Export, ExportReady, ExportFailed,
+}
 
 public readonly struct Message
 {
@@ -43,8 +52,11 @@ public readonly struct Message
     public static Message Op(long seq, string clientId, long localOpId, string editWire)
         => new() { Type = MsgType.Op, Args = new[] { seq.ToString(CultureInfo.InvariantCulture), clientId, localOpId.ToString(CultureInfo.InvariantCulture) }, Payload = editWire };
 
-    public static Message Presence(string clientId, string name, string selId, Vec3 cursor, float heading = 0f)
-        => new() { Type = MsgType.Presence, Args = new[] { clientId, name, selId, cursor.ToString(), heading.ToString("0.####", CultureInfo.InvariantCulture) }, Payload = "" };
+    /// <summary>Ephemeral presence: where a peer's camera is, and where it is pointing. Pitch is a SIXTH field
+    /// appended after heading, which older relays and clients simply ignore - a relay forwards the PRESENCE line
+    /// verbatim, and a client that only reads five fields still gets the position and the compass bearing.</summary>
+    public static Message Presence(string clientId, string name, string selId, Vec3 cursor, float heading = 0f, float pitch = 0f)
+        => new() { Type = MsgType.Presence, Args = new[] { clientId, name, selId, cursor.ToString(), heading.ToString("0.####", CultureInfo.InvariantCulture), pitch.ToString("0.####", CultureInfo.InvariantCulture) }, Payload = "" };
 
     public static Message Leave(string clientId)
         => new() { Type = MsgType.Leave, Args = new[] { clientId }, Payload = "" };
@@ -62,6 +74,119 @@ public readonly struct Message
     public static Message Auth(string password)
         => new() { Type = MsgType.Auth, Args = Array.Empty<string>(), Payload = password };
 
+    // ---------------------------------------------------------------------------------------------------
+    // The base level archive.
+    //
+    // Everything above this line syncs EDITS. None of it syncs the ground those edits land on - the level's
+    // own .rfa. Two people whose archives differ apply the identical ordered op stream to different worlds
+    // and neither is told, which is the one silent corruption this protocol had left. So a client announces
+    // what it is standing on the moment it joins, and the relay, which pins the session to one archive, either
+    // agrees, or says what it has and whether it can hand it over.
+    //
+    // The bytes travel in base64 chunks over this same line protocol rather than a second socket: it keeps the
+    // one outbound connection that makes the relay work behind home routers, and a chunk is small enough that
+    // an editing session carries on between them.
+    // ---------------------------------------------------------------------------------------------------
+
+    /// <summary>Client -> server, right after Join: "this is the archive I have open". A client with no level
+    /// open sends a fingerprint of "-".</summary>
+    public static Message Base(string fingerprint, long bytes, string levelName)
+        => new() { Type = MsgType.Base, Args = new[] { fingerprint, bytes.ToString(CultureInfo.InvariantCulture), levelName }, Payload = "" };
+
+    /// <summary>Server -> client: you are on the session's archive. Also the answer to the first client, whose
+    /// archive becomes the pin.</summary>
+    public static Message BaseOk(string fingerprint)
+        => new() { Type = MsgType.BaseOk, Args = new[] { fingerprint }, Payload = "" };
+
+    /// <summary>Server -> client: the session is pinned to a different archive. <paramref name="available"/> is
+    /// whether the relay actually holds the bytes and can serve them, because knowing you are wrong is only
+    /// half an answer.</summary>
+    public static Message BaseDiff(string fingerprint, long bytes, string levelName, bool available)
+        => new()
+        {
+            Type = MsgType.BaseDiff,
+            Args = new[] { fingerprint, bytes.ToString(CultureInfo.InvariantCulture), levelName, available ? "1" : "0" },
+            Payload = "",
+        };
+
+    /// <summary>Server -> client: you match the pin but the relay has no copy of it. Upload yours so the next
+    /// person to join can be given it.</summary>
+    public static Message BaseNeed(string fingerprint)
+        => new() { Type = MsgType.BaseNeed, Args = new[] { fingerprint }, Payload = "" };
+
+    /// <summary>Client -> server: send me the session's archive.</summary>
+    public static Message BaseGet(string fingerprint)
+        => new() { Type = MsgType.BaseGet, Args = new[] { fingerprint }, Payload = "" };
+
+    /// <summary>Client -> server: I am about to upload this archive.</summary>
+    public static Message BasePut(string fingerprint, long bytes, string levelName)
+        => new() { Type = MsgType.BasePut, Args = new[] { fingerprint, bytes.ToString(CultureInfo.InvariantCulture), levelName }, Payload = "" };
+
+    /// <summary>Either direction: one chunk of archive bytes, base64 in the payload. The index is there so a
+    /// receiver can reject an out-of-order stream instead of writing a corrupt file.</summary>
+    public static Message BaseData(string fingerprint, int index, string base64)
+        => new() { Type = MsgType.BaseData, Args = new[] { fingerprint, index.ToString(CultureInfo.InvariantCulture) }, Payload = base64 };
+
+    /// <summary>Either direction: that was the last chunk. The receiver verifies the fingerprint before it
+    /// accepts the file, so a truncated or corrupted transfer is discarded rather than installed.</summary>
+    public static Message BaseDone(string fingerprint)
+        => new() { Type = MsgType.BaseDone, Args = new[] { fingerprint }, Payload = "" };
+
+    // -----------------------------------------------------------------------------------------------------
+    // Choosing a map.
+    //
+    // A relay hosting several maps sends its list the moment a client is authenticated, and waits: the client is
+    // registered nowhere and sees no document until it has picked one. That ordering is the point. Registering
+    // first and switching later would mean streaming a whole level to somebody who is about to ask for a
+    // different one, and would give every client a window in which its edits could land in the wrong map.
+    // -----------------------------------------------------------------------------------------------------
+
+    /// <summary>Server -> client: here comes the list of maps on this relay.</summary>
+    public static Message MapList() => new() { Type = MsgType.MapList, Args = Array.Empty<string>(), Payload = "" };
+
+    /// <summary>Server -> client: one map. Objects and whether the relay holds its archive are there so a person
+    /// can tell an established map from an empty one before entering it.</summary>
+    public static Message MapInfo(string name, int objects, bool hasBase, long updatedUnix, int clients)
+        => new()
+        {
+            Type = MsgType.MapInfo,
+            Args = new[]
+            {
+                name,
+                objects.ToString(CultureInfo.InvariantCulture),
+                hasBase ? "1" : "0",
+                updatedUnix.ToString(CultureInfo.InvariantCulture),
+                clients.ToString(CultureInfo.InvariantCulture),
+            },
+            Payload = "",
+        };
+
+    /// <summary>Server -> client: that was the whole list.</summary>
+    public static Message MapEnd() => new() { Type = MsgType.MapEnd, Args = Array.Empty<string>(), Payload = "" };
+
+    /// <summary>Client -> server: put me in this map. A name the relay does not know creates it, which is how a
+    /// new map is started without touching the server.</summary>
+    public static Message PickMap(string name)
+        => new() { Type = MsgType.PickMap, Args = new[] { name }, Payload = "" };
+
+    /// <summary>Server -> client: you are in. The document follows immediately.</summary>
+    public static Message MapOk(string name)
+        => new() { Type = MsgType.MapOk, Args = new[] { name }, Payload = "" };
+
+    /// <summary>Client -> server: build the map as it stands now and send it to me as one archive. The relay
+    /// keeps a map as an immutable base plus a delta, which is right for editing and for history but no use to
+    /// somebody who just wants the level - opening it in the editor, or putting it on a game server, means one
+    /// file. This is how that file is produced, on demand, without the storage model changing.</summary>
+    public static Message Export() => new() { Type = MsgType.Export, Args = Array.Empty<string>(), Payload = "" };
+
+    /// <summary>Server -> client: built. The bytes follow as ordinary BASEDATA chunks under this fingerprint.</summary>
+    public static Message ExportReady(string fingerprint, long bytes, string mapName)
+        => new() { Type = MsgType.ExportReady, Args = new[] { fingerprint, bytes.ToString(CultureInfo.InvariantCulture), mapName }, Payload = "" };
+
+    /// <summary>Server -> client: could not build it, and why in words meant for a person.</summary>
+    public static Message ExportFailed(string reason)
+        => new() { Type = MsgType.ExportFailed, Args = Array.Empty<string>(), Payload = reason };
+
     public string Encode()
     {
         return Type switch
@@ -71,11 +196,27 @@ public readonly struct Message
             MsgType.SyncObj   => $"SYNCOBJ {Payload}",
             MsgType.SyncEnd   => "SYNCEND",
             MsgType.Op        => $"OP {Args[0]} {Args[1]} {Args[2]} {Payload}",
-            MsgType.Presence  => $"PRESENCE {Args[0]} {Args[1]} {Args[2]} {Args[3]} {Args[4]}",
+            MsgType.Presence  => $"PRESENCE {Args[0]} {Args[1]} {Args[2]} {Args[3]} {Args[4]} {(Args.Length > 5 ? Args[5] : "0")}",
             MsgType.Leave     => $"LEAVE {Args[0]}",
             MsgType.Error     => $"ERROR {Payload}",
             MsgType.SeedRequest => "SEEDREQ",
             MsgType.Auth      => $"AUTH {Payload}",
+            MsgType.Base      => $"BASE {Args[0]} {Args[1]} {Args[2]}",
+            MsgType.BaseOk    => $"BASEOK {Args[0]}",
+            MsgType.BaseDiff  => $"BASEDIFF {Args[0]} {Args[1]} {Args[2]} {Args[3]}",
+            MsgType.BaseNeed  => $"BASENEED {Args[0]}",
+            MsgType.BaseGet   => $"BASEGET {Args[0]}",
+            MsgType.BasePut   => $"BASEPUT {Args[0]} {Args[1]} {Args[2]}",
+            MsgType.BaseData  => $"BASEDATA {Args[0]} {Args[1]} {Payload}",
+            MsgType.BaseDone  => $"BASEDONE {Args[0]}",
+            MsgType.MapList   => "MAPLIST",
+            MsgType.MapInfo   => $"MAPINFO {Args[0]} {Args[1]} {Args[2]} {Args[3]} {Args[4]}",
+            MsgType.MapEnd    => "MAPEND",
+            MsgType.PickMap   => $"PICKMAP {Args[0]}",
+            MsgType.MapOk     => $"MAPOK {Args[0]}",
+            MsgType.Export       => "EXPORT",
+            MsgType.ExportReady  => $"EXPORTREADY {Args[0]} {Args[1]} {Args[2]}",
+            MsgType.ExportFailed => $"EXPORTFAILED {Payload}",
             _ => throw new InvalidOperationException(),
         };
     }
@@ -106,14 +247,57 @@ public readonly struct Message
             }
             case "PRESENCE":
             {
-                var p = rest.Split(' ', 5);
+                var p = rest.Split(' ', 6);
                 float heading = p.Length > 4 && float.TryParse(p[4], NumberStyles.Float, CultureInfo.InvariantCulture, out var h) ? h : 0f;
-                return Presence(p[0], p[1], p[2], Vec3.Parse(p[3]), heading);
+                float pitch = p.Length > 5 && float.TryParse(p[5], NumberStyles.Float, CultureInfo.InvariantCulture, out var pi) ? pi : 0f;
+                return Presence(p[0], p[1], p[2], Vec3.Parse(p[3]), heading, pitch);
             }
             case "LEAVE":  return Leave(rest);
             case "ERROR":  return Error(rest);
             case "SEEDREQ": return SeedRequest();
             case "AUTH":   return Auth(rest);
+            case "BASE":
+            {
+                var p = rest.Split(' ', 3);
+                return Base(p[0], long.Parse(p[1], CultureInfo.InvariantCulture), p.Length > 2 ? p[2] : "level");
+            }
+            case "BASEOK":   return BaseOk(rest.Trim());
+            case "BASEDIFF":
+            {
+                var p = rest.Split(' ', 4);
+                return BaseDiff(p[0], long.Parse(p[1], CultureInfo.InvariantCulture), p[2], p.Length > 3 && p[3] == "1");
+            }
+            case "BASENEED": return BaseNeed(rest.Trim());
+            case "BASEGET":  return BaseGet(rest.Trim());
+            case "BASEPUT":
+            {
+                var p = rest.Split(' ', 3);
+                return BasePut(p[0], long.Parse(p[1], CultureInfo.InvariantCulture), p.Length > 2 ? p[2] : "level");
+            }
+            case "BASEDATA":
+            {
+                var p = rest.Split(' ', 3);
+                return BaseData(p[0], int.Parse(p[1], CultureInfo.InvariantCulture), p.Length > 2 ? p[2] : "");
+            }
+            case "BASEDONE": return BaseDone(rest.Trim());
+            case "MAPLIST":  return MapList();
+            case "MAPINFO":
+            {
+                var p = rest.Split(' ', 5);
+                return MapInfo(p[0], int.Parse(p[1], CultureInfo.InvariantCulture), p[2] == "1",
+                               long.Parse(p[3], CultureInfo.InvariantCulture),
+                               p.Length > 4 ? int.Parse(p[4], CultureInfo.InvariantCulture) : 0);
+            }
+            case "MAPEND":   return MapEnd();
+            case "PICKMAP":  return PickMap(rest.Trim());
+            case "MAPOK":    return MapOk(rest.Trim());
+            case "EXPORT":   return Export();
+            case "EXPORTREADY":
+            {
+                var p = rest.Split(' ', 3);
+                return ExportReady(p[0], long.Parse(p[1], CultureInfo.InvariantCulture), p.Length > 2 ? p[2] : "map");
+            }
+            case "EXPORTFAILED": return ExportFailed(rest);
             default: throw new FormatException($"Unknown message '{type}'");
         }
     }

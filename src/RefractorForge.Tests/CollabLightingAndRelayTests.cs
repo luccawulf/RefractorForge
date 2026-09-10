@@ -112,6 +112,119 @@ public class CollabLightingAndRelayTests
     }
 
     [Fact]
+    public void RF_PASS_supplies_the_password_when_no_flag_is_given()
+    {
+        // systemd expands ${RF_PASS} in ExecStart before exec, so a --pass in the unit still lands in argv and
+        // `ps` shows the join password to every user on the box. Reading the environment is what avoids that.
+        var prev = Environment.GetEnvironmentVariable("RF_PASS");
+        try
+        {
+            Environment.SetEnvironmentVariable("RF_PASS", "from-the-unit-file");
+            var o = RelayOptions.Parse(Array.Empty<string>(), out var err);
+            Assert.Null(err);
+            Assert.Equal("from-the-unit-file", o.Password);
+
+            // An explicit flag still wins, so every command line that worked before behaves the same.
+            var f = RelayOptions.Parse(new[] { "--pass", "typed-here" }, out _);
+            Assert.Equal("typed-here", f.Password);
+
+            Environment.SetEnvironmentVariable("RF_PASS", "");
+            Assert.Null(RelayOptions.Parse(Array.Empty<string>(), out _).Password);
+        }
+        finally { Environment.SetEnvironmentVariable("RF_PASS", prev); }
+    }
+
+    [Fact]
+    public void Backup_cadence_has_defaults_and_is_settable()
+    {
+        var d = RelayOptions.Parse(Array.Empty<string>(), out _);
+        Assert.Equal(5, d.BackupMinutes);
+        Assert.Equal(12, d.KeepBackups);
+
+        // A team spread across timezones wants days of history, not an hour: 30 min x 336 is a week of activity.
+        var o = RelayOptions.Parse(new[] { "--backup-every", "30", "--keep-backups", "336" }, out var err);
+        Assert.Null(err);
+        Assert.Equal(30, o.BackupMinutes);
+        Assert.Equal(336, o.KeepBackups);
+    }
+
+    [Theory]
+    [InlineData("--backup-every 0")]        // an interval of zero would back up on every tick
+    [InlineData("--backup-every 4000")]     // longer than a day is a typo, not an intention
+    [InlineData("--backup-every soon")]
+    [InlineData("--keep-backups 0")]        // keeping none would delete the snapshot it just took
+    [InlineData("--keep-backups lots")]
+    public void Nonsense_backup_settings_are_errors(string line)
+    {
+        RelayOptions.Parse(line.Split(' '), out var err);
+        Assert.NotNull(err);
+    }
+
+    [Fact]
+    public void Backups_also_prune_on_total_size_and_never_drop_the_last_one()
+    {
+        // The count alone is not a bound on disk. A session holding only objects is a couple of hundred KB; one
+        // that has had terrain and material maps synced in is megabytes, and the same retention is then GB.
+        string dir = Path.Combine(Path.GetTempPath(), "rf_backup_size_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllBytes(Path.Combine(dir, "Heightmap.raw"), new byte[400 * 1024]);
+            var backups = Path.Combine(dir, "_backups");
+            Directory.CreateDirectory(backups);
+            for (int i = 1; i <= 5; i++)
+            {
+                var b = Path.Combine(backups, $"20260101_00000{i}");
+                Directory.CreateDirectory(b);
+                File.WriteAllBytes(Path.Combine(b, "Heightmap.raw"), new byte[400 * 1024]);
+            }
+
+            // Six snapshots of 400 KB is ~2.4 MB; a 1 MB budget must cut it down, though the count allows 50.
+            RelayHost.BackupState(dir, keep: 50, maxMb: 1);
+
+            var left = Directory.EnumerateDirectories(backups).ToList();
+            long total = left.Sum(d => new DirectoryInfo(d).EnumerateFiles().Sum(f => f.Length));
+            Assert.True(total <= 1024 * 1024, $"backups still {total} bytes");
+            Assert.NotEmpty(left);
+
+            // A budget smaller than ONE snapshot still leaves exactly one standing: no backup at all is worse
+            // than being over budget. Grow the state past the cap so the snapshot it is about to take exceeds it.
+            File.WriteAllBytes(Path.Combine(dir, "Heightmap.raw"), new byte[2 * 1024 * 1024]);
+            RelayHost.BackupState(dir, keep: 50, maxMb: 1);
+            Assert.Single(Directory.EnumerateDirectories(backups));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public void Backups_prune_to_the_retention_and_keep_the_newest()
+    {
+        // BackupState stamps folders yyyyMMdd_HHmmss and prunes by ordinal sort, so what survives must be the
+        // most recent ones. Pre-made stamps stand in for real runs, which would need a clock to separate.
+        string dir = Path.Combine(Path.GetTempPath(), "rf_backup_prune_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "StaticObjects.con"), "rem state");
+            var backups = Path.Combine(dir, "_backups");
+            Directory.CreateDirectory(backups);
+            for (int i = 1; i <= 6; i++) Directory.CreateDirectory(Path.Combine(backups, $"20260101_00000{i}"));
+
+            RelayHost.BackupState(dir, keep: 3);
+
+            var left = Directory.EnumerateDirectories(backups).Select(Path.GetFileName)
+                                .OrderBy(x => x, StringComparer.Ordinal).ToList();
+            Assert.Equal(3, left.Count);
+            Assert.Contains("20260101_000006", left);           // newest of the pre-made ones survives
+            Assert.DoesNotContain("20260101_000001", left);     // oldest is gone
+            // The snapshot just taken is one of the three, and it carries the state file.
+            var newest = Path.Combine(backups, left[^1]);
+            Assert.True(File.Exists(Path.Combine(newest, "StaticObjects.con")));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public void The_editors_old_relay_form_still_parses()
     {
         // RefractorForge.exe --relay 7800 D:\Levels\Hue --save C:\state --pass hunter2  - what the docs have said.

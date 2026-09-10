@@ -25,6 +25,11 @@ public sealed class MeshLibrary
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByTail2 = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _treeByName = new(StringComparer.OrdinalIgnoreCase);   // BF1942 .tm tree meshes (basename, no ext)
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByName = new(StringComparer.OrdinalIgnoreCase);
+    // animations.rfa: the skin that binds a mesh's vertices to bones, and the skeletons those bones live in. A
+    // skinned mesh's .sm holds the BIND pose, which is not the shape the engine draws - see RestPosed.
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _sknByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _skeByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Mesh?> _restCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _rsOverrideFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Mesh?> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<RefractorFlatArchiveEntry> _vehicleCons = new();                  // .con files under .../Vehicles/
@@ -277,6 +282,8 @@ public sealed class MeshLibrary
                     if (tail2 is not null) _ = lib._byTail2.TryAdd(tail2, e);
                 }
                 else if (baseName.EndsWith(".tm", StringComparison.OrdinalIgnoreCase)) _ = lib._treeByName.TryAdd(baseName[..^3], e);   // BF1942 tree mesh (treeMesh.rfa)
+                else if (baseName.EndsWith(".skn", StringComparison.OrdinalIgnoreCase)) _ = lib._sknByName.TryAdd(baseName[..^4], e);
+                else if (baseName.EndsWith(".ske", StringComparison.OrdinalIgnoreCase)) _ = lib._skeByName.TryAdd(baseName[..^4], e);
                 else if (baseName.EndsWith(".rs", StringComparison.OrdinalIgnoreCase))
                 {
                     _ = lib._rsByName.TryAdd(baseName, e);
@@ -466,9 +473,29 @@ public sealed class MeshLibrary
         // and AssembleTemplate includes the root's own geometry plus each LodObject's first alternative, so plain
         // buildings and LOD objects are unchanged; only multi-part Bundles gain their missing pieces.
         if (TryGetStaticAssembled(template, out var c) && c is not null) { mesh = c; return true; }
+        // A skinned bundle placed on its own (a flag, a banner) never reaches the hierarchy walk, so give it the
+        // same rest-pose correction here - otherwise the map shows the bind pose, upside down.
+        if (TryGetSkinnedRest(template, out var sk) && sk is not null) { mesh = sk; return true; }
         if (TryGet(template, out var b) && b is not null) { mesh = b; return true; }
         mesh = null!;
         return false;
+    }
+
+    /// <summary>A template that declares both a geometry and a <c>createSkeleton</c>, resolved to its skeleton's
+    /// REST pose rather than the .sm's bind pose. False for everything else, which is nearly everything.</summary>
+    public bool TryGetSkinnedRest(string template, out Mesh mesh)
+    {
+        mesh = null!;
+        EnsureAllTemplates();
+        if (_allTemplates is null || !_allTemplates.TryGetValue(template, out var tpl)) return false;
+        if (tpl.Skeleton is null || tpl.Geometry is not { Length: > 0 } g) return false;
+        EnsureObjectGeometry();
+        string meshName = _geomFile is not null && _geomFile.TryGetValue(g, out var f) ? f : g;
+        if (!TryGet(meshName, out var raw) && !TryGet(g, out raw)) return false;
+        var posed = RestPosed(raw, meshName, tpl.Skeleton) ?? RestPosed(raw, g, tpl.Skeleton);
+        if (posed is null) return false;
+        mesh = posed;
+        return true;
     }
 
     /// <summary>One geometry of an assembled vehicle: a resolved mesh and its transform relative to the
@@ -907,6 +934,7 @@ public sealed class MeshLibrary
         public bool IsBelowGround;                             // isBelowGround 1: lives under the terrain, culled with it
         public bool IsEntryPoint;                              // isEntryPoint 1: soldiers may pass the terrain near it
         public bool HasMap;                                    // hasMap 1: an underground minimap is bound to it
+        public string? Skeleton;                               // createSkeleton animations/<name>.ske (an AnimatedBundle)
         public string? SoundScript;                            // loadSoundScript <file>.ssc
         public bool AutoPlaySound;                             // autoPlaySound 1: an ambient, heard by distance
         public bool LevelLocal;                                // declared under levels/<Map>/objects: the map's own
@@ -1041,6 +1069,7 @@ public sealed class MeshLibrary
             else if (cmd.Equals("isBelowGround", StringComparison.OrdinalIgnoreCase)) cur.IsBelowGround = arg.StartsWith("1");
             else if (cmd.Equals("isEntryPoint", StringComparison.OrdinalIgnoreCase)) cur.IsEntryPoint = arg.StartsWith("1");
             else if (cmd.Equals("hasMap", StringComparison.OrdinalIgnoreCase)) cur.HasMap = arg.StartsWith("1");
+            else if (cmd.Equals("createSkeleton", StringComparison.OrdinalIgnoreCase)) cur.Skeleton = arg.Trim();
             else if (cmd.Equals("loadSoundScript", StringComparison.OrdinalIgnoreCase)) cur.SoundScript = arg.Trim();
             else if (cmd.Equals("autoPlaySound", StringComparison.OrdinalIgnoreCase)) cur.AutoPlaySound = arg.StartsWith("1");
             else if (cmd.Equals("setPivotPosition", StringComparison.OrdinalIgnoreCase)) cur.Pivot = ParseVec(arg);
@@ -1128,7 +1157,7 @@ public sealed class MeshLibrary
                 // Resolve the geometry: first as a GeometryTemplate alias -> .sm file, else by the name itself.
                 string meshName = geoFiles.TryGetValue(g, out var file) ? file : g;
                 if ((TryGet(meshName, out var m) || TryGet(g, out m)) && m is not null)
-                    acc.Add(new VehiclePart(m, parent));
+                    acc.Add(new VehiclePart(RestPosed(m, meshName, tpl.Skeleton) ?? RestPosed(m, g, tpl.Skeleton) ?? m, parent));
             }
 
             var children = tpl.Children;
@@ -1155,6 +1184,82 @@ public sealed class MeshLibrary
     }
 
     private static float Rad(float deg) => deg * MathF.PI / 180f;
+
+    private static string LeafStem(string path)
+    {
+        var n = path.Replace((char)92, '/');
+        n = n[(n.LastIndexOf('/') + 1)..];
+        int dot = n.LastIndexOf('.');
+        return dot > 0 ? n[..dot] : n;
+    }
+
+    /// <summary>
+    /// The shape a SKINNED mesh actually has when nothing is animating it: its skeleton's rest pose.
+    /// <para>
+    /// An <c>AnimatedMesh</c>'s <c>.sm</c> stores the BIND pose, which is the modeller's T-pose in the skin's own
+    /// space and NOT what the engine draws - the engine puts every vertex through its bones. Drawing the raw .sm
+    /// therefore gets both the orientation and the anchor wrong. The Tango's US flag is the clean example: its bind
+    /// pose is upside down (the texture's top edge sits at the mesh's bottom) and straddles its attach point, so the
+    /// boat flew an inverted flag centred on its mast. Posed, the cloth hangs the right way up from a hoist edge at
+    /// the origin, which is why the .con can anchor it at the top of the staff with a plain setPosition.
+    /// </para><para>
+    /// <c>worldPos = sum(weight * boneWorld * bindLocal)</c>, exactly the runtime's skinning with the identity clip.
+    /// The .sm splits vertices at UV and normal seams so it has MORE of them than the .skn, which is welded; each is
+    /// matched to its skin vertex by EXACT bind position, the same weld the ReplayViewer's soldier rig verified at
+    /// 740/740 vertices. A mesh with no skin, no skeleton, or no matches keeps its bind pose - this only ever adds
+    /// correctness where the data is there to add it.
+    /// </para></summary>
+    private Mesh? RestPosed(Mesh mesh, string? meshName, string? skeletonPath)
+    {
+        if (mesh.Positions.Length == 0 || string.IsNullOrWhiteSpace(meshName) || string.IsNullOrWhiteSpace(skeletonPath)) return null;
+        string skn = LeafStem(meshName!), ske = LeafStem(skeletonPath!);
+        if (!_sknByName.TryGetValue(skn, out var sknEntry) || !_skeByName.TryGetValue(ske, out var skeEntry)) return null;
+        string key = skn + "|" + ske;
+        if (_restCache.TryGetValue(key, out var cached)) return cached;
+        Mesh? built = null;
+        try { built = BuildRestPose(mesh, sknEntry, skeEntry); } catch { built = null; }
+        _restCache[key] = built;
+        return built;
+    }
+
+    private Mesh? BuildRestPose(Mesh mesh, RefractorFlatArchiveEntry sknEntry, RefractorFlatArchiveEntry skeEntry)
+    {
+        var skin = RefractorForge.Formats.Animation.Skin.Load(OwningArchive(sknEntry).Read(sknEntry));
+        var skel = RefractorForge.Formats.Animation.Skeleton.Load(OwningArchive(skeEntry).Read(skeEntry));
+        if (skin.Vertices.Count == 0 || skel.Bones.Count == 0) return null;
+        var bone = skin.MapToSkeleton(skel);
+        var world = skel.ComputeWorld();                       // column-major float[16] per bone, world = parent * local
+
+        var posed = new Dictionary<(float, float, float), Vector3>(skin.Vertices.Count);
+        foreach (var v in skin.Vertices)
+        {
+            var acc = Vector3.Zero;
+            foreach (var inf in v.Influences)
+            {
+                int bi = inf.LocalBoneIndex >= 0 && inf.LocalBoneIndex < bone.Length ? bone[inf.LocalBoneIndex] : -1;
+                if (bi < 0 || bi >= world.Length) continue;
+                var m = world[bi];
+                acc += inf.Weight * new Vector3(
+                    m[0] * inf.BindX + m[4] * inf.BindY + m[8] * inf.BindZ + m[12],
+                    m[1] * inf.BindX + m[5] * inf.BindY + m[9] * inf.BindZ + m[13],
+                    m[2] * inf.BindX + m[6] * inf.BindY + m[10] * inf.BindZ + m[14]);
+            }
+            posed[(v.X, v.Y, v.Z)] = acc;
+        }
+
+        var pos = new Vector3[mesh.Positions.Length];
+        int hit = 0;
+        for (int i = 0; i < pos.Length; i++)
+        {
+            var p = mesh.Positions[i];
+            if (posed.TryGetValue((p.X, p.Y, p.Z), out var w)) { pos[i] = w; hit++; }
+            else pos[i] = p;
+        }
+        // A partial weld means the .skn belongs to some other mesh of the same name; leave the bind pose alone
+        // rather than tear half the geometry off its neighbours.
+        if (hit < pos.Length) return null;
+        return mesh with { Positions = pos };
+    }
 
     /// <summary>
     /// Resolve a vehicle's main BODY mesh from its spawn name (e.g. "sheridan", "t54", "f4phantom").

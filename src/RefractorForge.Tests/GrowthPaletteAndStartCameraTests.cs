@@ -62,6 +62,20 @@ public class GrowthPaletteTests
         Assert.Equal("dryGrass", pal.SlotForIndex(2)!.Name);
     }
 
+    /// <summary>Growth value 7 is the engine's deathMaterial - the ground <c>Game::isOutsideWorld</c> reads as
+    /// being outside the world. A palette that does not declare it must answer "nothing grows here", NOT the eighth
+    /// slot in the file. This palette's eighth slot is <c>mud</c>, so counting made the editor call the
+    /// out-of-bounds material "mud" and grow mud's trees on ground a player cannot stand on.</summary>
+    [Fact]
+    public void The_out_of_bounds_material_never_borrows_another_slots_name()
+    {
+        var pal = FoliagePalette.Parse(MisNested);
+        Assert.Equal("mud", pal.Materials[7].Name);            // what counting down the list would have found
+        Assert.Null(pal.SlotForIndex(7));
+        // Every other index keeps the positional fallback, which is what a .wst with invented names needs.
+        Assert.Equal("mud", pal.SlotForIndex(6)!.Name);
+    }
+
     [Fact]
     public void An_element_name_that_is_not_a_legal_xml_name_is_accepted()
     {

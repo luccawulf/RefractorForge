@@ -1,4 +1,5 @@
 using RefractorForge.Formats.Con;
+using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Editing;
 using RefractorForge.Formats.Geometry;
 
@@ -12,6 +13,7 @@ public sealed class Peer
     public string SelectionId = "-";
     public Vec3 Cursor = Vec3.Zero;
     public float Heading = 0f;   // camera yaw (radians, 0 = +Z) so the diamond can show which way they're looking
+    public float Pitch = 0f;     // camera pitch (radians, + is up); the pointer line needs it or looking down reads as looking north
 }
 
 /// <summary>
@@ -90,15 +92,73 @@ public sealed class CollabClient
     /// terrain or gameplay has to hold its own state and feed it from here.</summary>
     public Action<string>? OnWorldOp;
 
+    // ---- the base level archive ---------------------------------------------------------------------
+    // The relay syncs edits, not the ground they land on. These are how a consumer finds out that the map it
+    // has open is not the map the session is built on, and gets the right one.
+
+    /// <summary>Raised when the session's archive is not the one this client has open. The argument carries
+    /// what the session is pinned to and whether the relay can hand it over; until it is resolved, edits made
+    /// here are being applied to different ground from everyone else's.</summary>
+    public Action<LevelBase.Id, bool>? OnBaseMismatch;
+
+    /// <summary>Raised when this client is the one that can fill the relay's empty store. Call
+    /// <see cref="UploadBase"/> to do it.</summary>
+    public Action<LevelBase.Id>? OnBaseWanted;
+
+    /// <summary>Bytes received (or sent) so far, and the total expected. Raised often enough to drive a bar.</summary>
+    public Action<long, long>? OnBaseProgress;
+
+    /// <summary>Raised once a download has verified and been written. The argument is the path it landed at.</summary>
+    public Action<string>? OnBaseDownloaded;
+
+    /// <summary>Raised when a transfer failed. The argument says why, in words meant for a person.</summary>
+    public Action<string>? OnBaseFailed;
+
+    /// <summary>What this client told the relay it is standing on, if anything.</summary>
+    public LevelBase.Id? MyBase => _base.Mine;
+
+    /// <summary>What the session is pinned to, once the relay has said.</summary>
+    public LevelBase.Id? SessionBase => _base.Session;
+
+    /// <summary>True once the relay has confirmed this client is on the session's archive.</summary>
+    public bool BaseAgreed => _base.Agreed;
+
+    // The transfer itself lives in BaseSync, shared with the editor's own session so the two clients cannot
+    // drift apart on a protocol whose whole purpose is to stop two people drifting apart.
+    private readonly BaseSync _base;
+
     public CollabClient(string clientId, string name, IServerEndpoint server)
     {
         ClientId = clientId;
         Name = name;
         _server = server;
+        _base = new BaseSync(line => _server.Receive(ClientId, line));
+        _base.OnMismatch += (pin, avail) => OnBaseMismatch?.Invoke(pin, avail);
+        _base.OnWanted += pin => OnBaseWanted?.Invoke(pin);
+        _base.OnProgress += (a, b) => OnBaseProgress?.Invoke(a, b);
+        _base.OnDownloaded += path => OnBaseDownloaded?.Invoke(path);
+        _base.OnFailed += why => OnBaseFailed?.Invoke(why);
     }
 
     /// <summary>Announce presence (sends display name). Call after the transport is attached.</summary>
     public void Join() => _server.Receive(ClientId, Message.Join(ClientId, Name).Encode());
+
+    /// <summary>Tell the relay which level archive this client has open, so a mismatch is caught before any
+    /// edit is made rather than never. Pass null when no level is open. Fingerprinting reads the whole file,
+    /// so call it off the UI thread for a large archive.</summary>
+    public void AnnounceBase(string? archivePath) => _base.Announce(archivePath);
+
+    /// <summary>Ask the relay for the session's archive, writing it to <paramref name="destinationPath"/>.</summary>
+    public void DownloadBase(string destinationPath) => _base.Download(destinationPath);
+
+    /// <summary>Send this client's archive up so the relay can serve it to the next joiner. Blocking.</summary>
+    public void UploadBase(string archivePath) => _base.Upload(archivePath);
+
+    /// <summary>Abandon a transfer in flight, leaving nothing half-written.</summary>
+    public void CancelBaseTransfer() => _base.Cancel();
+
+    /// <summary>Bytes moved and expected, for a progress bar.</summary>
+    public (long Done, long Total) BaseMoved => _base.Moved;
 
     // ---- Local edit API: predict immediately, then send upstream. ----
 
@@ -148,6 +208,10 @@ public sealed class CollabClient
         Message m;
         try { m = Message.Decode(line); }
         catch { return; }
+
+        // The base archive is not document state and its transfer does its own locking, so it is handled here
+        // rather than under _gate: a 300 MB download must not hold the lock every edit needs.
+        if (_base.Handle(m)) return;
 
         // Decided under the lock, raised after it — see _gate.
         string? worldOp = null;
@@ -213,12 +277,14 @@ public sealed class CollabClient
                     p.SelectionId = m.Args[2];
                     p.Cursor = Vec3.Parse(m.Args[3]);
                     if (m.Args.Length > 4 && float.TryParse(m.Args[4], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var hd)) p.Heading = hd;
+                    if (m.Args.Length > 5 && float.TryParse(m.Args[5], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pt)) p.Pitch = pt;
                     break;
                 }
 
                 case MsgType.Leave:
                     _peers.Remove(m.Args[0]);
                     break;
+
             }
         }
 

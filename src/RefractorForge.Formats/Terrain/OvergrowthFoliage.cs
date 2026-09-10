@@ -42,15 +42,45 @@ public static class OvergrowthFoliage
     public const float VegOverPatchMeters = 12.5f;
     public const float VegUnderPatchMeters = 17.5f;
 
-    /// <summary>Patch grid size in metres for a build + this level's own palette.</summary>
-    public static float PatchMetersFor(VegetationBuild build, FoliagePalette? pal, bool over)
+    /// <summary>Placement grid in metres: the growth map's OWN cell size, <c>worldSize / materialMapSideSize</c>.
+    ///
+    /// This used to be derived from the palette's viewDistance (the exe's <c>arg/(COUNT/2-1)</c>), which put trees
+    /// 37 to 137 metres apart depending on the map and left every level looking bare. Measuring the maps settled
+    /// it: the growth index map is a 4 m grid, retail levels paint 26,000-34,000 tree-bearing cells per square
+    /// kilometre, and that density is near identical from map to map - Ho Chi Minh Trail 30,398, Ia Drang 33,620,
+    /// Khe Sanh 33,552. The view-distance model predicted those three would differ by an order of magnitude. They
+    /// do not, in the editor or in the game, so the placement grid is the painted map itself.
+    ///
+    /// The per-type <c>probability</c> values corroborate it: within a material they sum to about 1.0, so they are
+    /// a roulette between types for a cell that is getting something, not a chance of the cell staying empty. And
+    /// <c>minRadiusDistToEquals</c> / <c>minRadiusDistToOthers</c> are 0.2 to 2 metres, so the engine is quite
+    /// happy to stand two trees a metre apart - which no 112-metre patch model can produce.</summary>
+    public static float PatchMetersFor(FoliagePalette? pal, float worldSize, bool over = true)
     {
-        float fallback = over ? VegOverPatchMeters : VegUnderPatchMeters;
-        if (build != VegetationBuild.Stock) return fallback;
-        float vd = pal?.ViewDistance ?? 0f;
-        if (vd <= 0f) return fallback;                       // no viewdistance declared: nothing to derive from
-        return vd / (StockPatchCount / 2 - 1);               // the stock exe's own formula
+        int side = pal?.MaterialMapSideSize ?? 0;
+        if (side <= 0 || worldSize <= 0f) return over ? VegOverPatchMeters : VegUnderPatchMeters;
+        return worldSize / side;
     }
+
+    // How far undergrowth reaches. Retail declares 35 to 61 metres (Khe Sanh declares nothing at all), which is why
+    // it is a carpet you walk through rather than scenery you look at - and why generating it for the WHOLE map is
+    // both wrong and impossible: Ia Drang paints 86% of a 2048-cell, one-metre map, which is two million clumps.
+    public const float DefaultUnderView = 50f;
+    public const float UnderViewMin = 20f, UnderViewMax = 120f;
+
+    /// <summary>How far from the camera a layer is worth generating and drawing. Undergrowth answers with the
+    /// palette's own (short) view distance, clamped to the band retail actually uses; overgrowth answers 0, meaning
+    /// "the whole map" - the caller culls it against fog or the world size.</summary>
+    public static float ViewMetersFor(FoliagePalette? pal, bool over)
+    {
+        float vd = pal?.ViewDistance ?? 0f;
+        if (over) return vd > 0f ? vd : 0f;
+        return Math.Clamp(vd > 0f ? vd : DefaultUnderView, UnderViewMin, UnderViewMax);
+    }
+
+    /// <summary>Kept for callers that still name a build; the placement grid no longer depends on one.</summary>
+    public static float PatchMetersFor(VegetationBuild build, FoliagePalette? pal, bool over) =>
+        over ? VegOverPatchMeters : VegUnderPatchMeters;
 
     /// <summary>The fraction of instances a build keeps. Low/Medium/High subsample; Stock and Ultra keep all.</summary>
     public static float KeepFractionFor(VegetationBuild build) => build switch
@@ -61,26 +91,43 @@ public static class OvergrowthFoliage
         _ => 1f,
     };
 
-    // Trees-per-occupied-patch distribution captured from the running game (19,179 trees / 9,091 patches, avg 2.11).
-    // Cumulative: 1:0.292  2:0.680  3:0.924  4:0.994  5:0.9996  6:1.0.
-    static int CountForPatch(ref uint s)
-    {
-        float r = NextF(ref s);
-        if (r < 0.292f) return 1;
-        if (r < 0.680f) return 2;
-        if (r < 0.924f) return 3;
-        if (r < 0.994f) return 4;
-        if (r < 0.9996f) return 5;
-        return 6;
-    }
+    /// <summary>Instances per painted cell, MEASURED against a capture of the running game.
+    ///
+    /// Operation Flaming Dart, read out of the engine's own patch grid: 41,559 instances against 81,474 painted
+    /// cells on the 4 m growth map, so 0.510 per cell. Broken down by material it is 0.509 on juicyGrass (whose
+    /// type probabilities sum to 1.0) and 0.480 on wetDirt (0.8) - near enough identical, so the rate is a
+    /// constant and <c>probability</c> only chooses BETWEEN types, which is what the roulette already does with
+    /// it. 0.26% of instances landed on a material that grows nothing, matching the jitter carrying a few over a
+    /// cell boundary.
+    ///
+    /// This is the number the whole preview hangs on: one per cell drew five times what the game does, and the
+    /// old viewDistance patch grid drew a fraction of a percent of it.</summary>
+    /// <para>
+    /// UNDERGROWTH uses the same rate against ITS own map, which is a 1-2 m grid rather than a 4 m one, so the same
+    /// number comes out roughly four times denser per square metre - a clump every metre and a half on Ia Drang.
+    /// That is what the layer looks like in game, and it is what the palette expects: undergrowth
+    /// <c>minRadiusDistToEquals</c> runs 0.2-1 m. It is NOT separately measured - no capture of the undergrowth
+    /// exists - but applying the measured rule to the layer's own painted map is the only reading the data supports,
+    /// and it replaces a patch model that drew a few hundred clumps where the game draws thousands.
+    /// </para></summary>
+    public const float CellOccupancy = 0.51f;
 
-    /// <summary>Scatter from the over- (default) or under-growth layer. <paramref name="patchMeters"/> is the patch
-    /// grid size (the game uses ~12.5 m); <paramref name="densityScale"/> multiplies the per-patch tree count
-    /// (1.0 = game-matched). Empty material slots (default / water) yield nothing. Deterministic.</summary>
+    /// <summary>Scatter from the over- (default) or under-growth layer. <paramref name="patchMeters"/> is the
+    /// placement grid (the growth map's own cell size); <paramref name="densityScale"/> multiplies the per-cell rate
+    /// (1.0 = game-matched). Empty material slots (default / water) yield nothing. Deterministic: the seed comes from
+    /// the cell coordinate, so a windowed scatter places its plants in exactly the spots a whole-map one would.</summary>
     /// <param name="keepFraction">The Low/Medium/High builds hash each patch and keep only a quarter, a half or
     /// three quarters of them. 1 = keep everything (Stock and Ultra).</param>
+    /// <param name="radius">When positive, generate ONLY within this many metres of
+    /// (<paramref name="centreX"/>, <paramref name="centreZ"/>) - the engine's own behaviour, which keeps a grid of
+    /// patches around the camera rather than the whole world. Undergrowth needs it: at a 1 m grid a whole map is
+    /// millions of clumps, and none of them beyond its 50 m view distance is ever drawn.</param>
+    /// <param name="maxInstances">A hard ceiling, so a pathological palette or a hand-typed grid size cannot lock
+    /// the editor up. Generation stops there rather than thinning, so what you get is the near field, complete.</param>
     public static List<FoliageInstance> Scatter(GrowthMaps growth, TerrainConfig cfg, float patchMeters, float densityScale = 1f, bool over = true,
-                                                float keepFraction = 1f)
+                                                float keepFraction = 1f,
+                                                float centreX = 0f, float centreZ = 0f, float radius = 0f,
+                                                int maxInstances = int.MaxValue)
     {
         var list = new List<FoliageInstance>();
         var map = over ? growth.Over : growth.Under;
@@ -94,9 +141,28 @@ public static class OvergrowthFoliage
         float ps = ws / grid;                                                         // actual patch size
         densityScale = Math.Clamp(densityScale, 0.05f, 8f);
 
-        for (int cy = 0; cy < grid; cy++)
-            for (int cx = 0; cx < grid; cx++)
+        // The camera window, as whole cells, so the same cell always carries the same seed however you got to it.
+        int cx0 = 0, cx1 = grid - 1, cy0 = 0, cy1 = grid - 1;
+        float reach2 = 0f;
+        if (radius > 0f)
+        {
+            cx0 = Math.Max(0, (int)MathF.Floor((centreX - radius) / ps));
+            cx1 = Math.Min(grid - 1, (int)MathF.Ceiling((centreX + radius) / ps));
+            cy0 = Math.Max(0, (int)MathF.Floor((centreZ - radius) / ps));
+            cy1 = Math.Min(grid - 1, (int)MathF.Ceiling((centreZ + radius) / ps));
+            float reach = radius + ps;
+            reach2 = reach * reach;
+        }
+
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++)
             {
+                if (list.Count >= maxInstances) return list;
+                if (reach2 > 0f)
+                {
+                    float dx = (cx + 0.5f) * ps - centreX, dz = (cy + 0.5f) * ps - centreZ;
+                    if (dx * dx + dz * dz > reach2) continue;
+                }
                 // Cheap occupancy reject: if the patch centre's material grows nothing, skip the whole patch.
                 int mcx0 = Math.Clamp((int)((cx + 0.5f) * ps / ws * side), 0, side - 1);
                 int mcy0 = Math.Clamp((int)((cy + 0.5f) * ps / ws * side), 0, side - 1);
@@ -108,7 +174,11 @@ public static class OvergrowthFoliage
                 if (keepFraction < 1f && PatchHash01(cx, cy) >= keepFraction) continue;
 
                 uint state = (uint)((cy * 4711 + cx * 13 + 23) & 0x7fffffff);          // engine per-patch seed
-                int count = Math.Max(0, (int)MathF.Round(CountForPatch(ref state) * densityScale));
+                // One candidate per cell of the painted map, at the rate measured against the running game. Both
+                // layers use it: the difference between a forest and a lawn is the grid the layer paints on (4 m
+                // for overgrowth, 1-2 m for undergrowth), not a different rule.
+                float accept = Math.Clamp(CellOccupancy * densityScale, 0f, 8f);
+                int count = (int)accept + (NextF(ref state) < (accept - (int)accept) ? 1 : 0);
                 for (int k = 0; k < count; k++)
                 {
                     float wx = cx * ps + NextF(ref state) * ps;

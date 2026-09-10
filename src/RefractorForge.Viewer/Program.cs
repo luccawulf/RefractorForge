@@ -1369,6 +1369,10 @@ double gpLastClickTime = -1; GpKind gpLastClickKind = GpKind.ControlPoint; int g
 bool showHelp = false; string? helpText = null;             // Help > User Guide window (loads USER_GUIDE.md next to the exe)
 bool gpRotDragging = false; float gpRotStartYaw = 0f, gpRotStartMouseX = 0f;  // Rotate-tool yaw drag on a spawn
 bool showTerrain = true, showObjects = true, showVehicles = true, showControlPoints = true, showSpawns = true;
+// A paint mapper hides the objects so you can read the ground you are painting (Battlecraft did the same). Tab
+// brings them back for as long as you stay in that mapper; switching mapper hides them again, because that is the
+// state you want almost every time you go in to paint. The status line says so, so nobody has to guess.
+bool paintShowObjects = false;
 // LOCKED OBJECTS (Battlecraft's lock/unlock buttons): a locked object can still be selected and inspected, but not
 // moved, rotated, dropped or deleted - the guard against nudging a finished piece of a map while working around it.
 // Keyed by the object's stable Id, so locks survive undo/redo, re-sorts and marker rebuilds (indices do not).
@@ -1398,12 +1402,30 @@ bool showCollision = false;                                  // .sm collision-me
 bool expCollision = false;                                   // .obj export: include an experimental (empty-BSP) collision section
 bool showFoliage = false;                                    // overgrowth-trees overlay: instance the .wst geometry on the map (a VIEW; never saved)
 bool showAnimations = true;                                  // spin RotationalBundle parts (windmill blades, watermill wheel, mod rotors); view-only
-float foliageSpacing = 12.5f;                                // patch grid size (m) -- the game uses ~12.5 m; drives the game-matched density
+// The overgrowth patch grid, in metres, and the band it is allowed to live in. Below 7 m the instance count
+// runs away - a 2048 m map on the growth map's own 4 m cells is a third of a MILLION trees, which is more than
+// the game will carry - and past 27 m the forest reads as scattered individuals instead of jungle. The map's own
+// derived spacing is clamped into this band, so "Map defaults" can never hand back a number that would crash.
+const float OverPatchMin = 7f, OverPatchMax = 27f;
+float foliageSpacing = 12.5f;                                // patch grid size (m); drives the game-matched density
 float foliageDensity = 1f;                                   // density multiplier on the per-patch tree count (1.0 = game-matched)
 bool foliageDirty = true;                                    // rebuild the foliage overlay (toggled on / params changed / level loaded)
 bool showUnderFoliage = false;                               // undergrowth overlay (underGrowth.wst grass/bushes), the same model as the trees
-float underSpacing = 17.5f;                                  // BfVietnam.exe spaces under-growth patches 17.5 m (over-growth 12.5 m)
+// Which executable the preview should model. The generator keeps a COUNT x COUNT grid of patches around the
+// camera: stock BfVietnam.exe uses 10 x 10 at viewDistance/4 metres, the Veg_* builds 80 x 80 (over) / 34 x 34
+// (under) at ~12.5 / 17.5 m. That is roughly 64x the patches for the same ground, which is the entire difference
+// between a bare hillside and a forest. Previewing stock while PLAYING a Veg build is why the trees casting the
+// baked shadows were not on screen, so this is a setting rather than an assumption.
+int vegBuildIdx = 0;   // 0 Stock, 1 Low, 2 Medium, 3 High, 4 Ultra
+// Undergrowth sits on ITS OWN painted grid - 1 m on Ia Drang, 2 m on Con Thien - which is what makes it a carpet
+// rather than scenery. A whole map of it is millions of clumps, so like the engine we only ever generate the ring
+// around the camera and rebuild it when the camera has moved a useful fraction of that ring.
+const float UnderPatchMin = 0.5f, UnderPatchMax = 16f;
+float underSpacing = 2f;                                     // placement grid (m): the undergrowth map's own cell
 float underDensity = 1f;
+bool underDirty = true;                                      // rebuild the near-field undergrowth
+Vector3 underAnchor = new(float.MinValue, 0f, float.MinValue);   // where the camera was when it was last built
+const int UnderMaxInstances = 60000;                         // a ceiling, so a 0.5 m grid cannot lock the editor
 // Which BfVietnam build the overgrowth preview should look like. The stock exe and the Veg_* builds do not plant
 // remotely the same amount: stock keeps a 10x10 patch window spaced viewDistance/4 apart, the Veg builds an 80x80
 // one at a hardcoded 12.5 m. On Saigon68 (viewdistance 450) that is 112.5 m vs 12.5 m - the editor was showing
@@ -1506,7 +1528,7 @@ int stampRot = 0;                // quarter turns
 float stampScale = 1f, stampOpacity = 1f, stampFeather = 0.08f;
 uint stampGlTex = 0;             // inspector thumbnail (0 = none)
 // Surface names for the bundled Default ("GRASSY") texture set, straight from its index.dat (texture order 0..15).
-string[] surfNames = { "Default", "Water", "Dry Grass", "Wet Grass", "Dry Dirt", "Damp Dirt", "Mud", "Outside Map",
+string[] surfNames = { "Default", "Water", "Dry Grass", "Wet Grass", "Dry Dirt", "Damp Dirt", "Mud", "Out of Bounds",
                        "Gravel", "Frozen Ground", "Dry Sand", "Wet Sand", "Rock Surface", "Sand Road", "Dirt Road", "Paved Road" };
 // ---- Texture Library + Editor42-style Layer Tool (paint imported tileable textures; height/slope/noise blend) ----
 // A folder of user textures shipped beside the exe (TerrainTextures\<Category>\*) that users drop their own into.
@@ -1564,6 +1586,17 @@ string[] matNames =
 };
 // material index (matNames order) -> surface slot (surfNames order), matched by name, for the surface-atlas bake.
 int[] matToSurf = { 0, 2, 3, 4, 5, 6, 10, 11, 8, 12, 14, 13, 15, 15, 9, 1 };
+
+// What to CALL a material index. Index 7 is not a surface at all: the engine's own table names it deathMaterial
+// and Game::isOutsideWorld reads it as being outside the world, so naming it after the texture slot it happens to
+// point at ("Wet Sand") describes the paint and hides the only thing about it that matters. Everywhere a material
+// index is named - the panel header, the swatch tips, the label under the brush, the pick toast - goes through here.
+string MatLabel(int mat)
+{
+    if ((mat & 15) == RefractorForge.Formats.Terrain.DeathMaterial.Index) return Loc.T("Out of Bounds (deathMaterial)");
+    int slot = matToSurf[mat & 15] & 15;
+    return slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?";
+}
 
 // terrain sculpting state
 TerrainStroke? stroke = null;          // active sculpt drag (mouse-down..up), coalesced into one undo
@@ -1911,6 +1944,18 @@ string collabName = Environment.UserName;
 int collabPort = 7777;
 string collabHostAddr = "127.0.0.1";
 string collabPass = "";              // optional shared password for Host/Join (blank = open)
+// The always-on relay, remembered between runs: a central server is by definition the same one every time,
+// so its address is a setting rather than something to retype. Declared here, with the other collab state,
+// because they are assigned in straight-line startup code and this file binds as one unit.
+string centralAddr = AppPrefs.CentralServerAddress;
+int centralPort = AppPrefs.CentralServerPort;
+string centralPass = AppPrefs.CentralServerPassword;
+string mapPickerNew = "";
+// The map to walk back into after a level switch, and whether that has been attempted yet. Read once
+// at startup so a relaunch caused by downloading a map lands back in that map, connected.
+string rejoinMap = AppPrefs.PendingRejoinMap;
+bool rejoinTried = false;   // the new-map name in the picker; declared here, not beside the modal, because
+                            // this file binds as one unit and a local assigned in straight-line code must come first
 string collabError = "";
 double collabPresenceTimer = 0;                        // throttles presence broadcasts
 Vector3[] peerColors = { new(0.95f, 0.45f, 0.25f), new(0.35f, 0.80f, 0.45f), new(0.45f, 0.60f, 1f), new(0.95f, 0.80f, 0.30f), new(0.85f, 0.45f, 0.85f) };
@@ -3444,7 +3489,7 @@ void OnUpdate(double dt)
             collabPresenceTimer = 0;
             string selId = (so is not null && selected >= 0 && selected < so.Objects.Count) ? so.Objects[selected].Id : "-";
             var cp = cam.Position;
-            collab.SendPresence(selId, new Vec3(cp.X, cp.Y, cp.Z), cam.Yaw);   // heading so peers' diamonds show our look direction
+            collab.SendPresence(selId, new Vec3(cp.X, cp.Y, cp.Z), cam.Yaw, cam.Pitch);   // heading + pitch so peers see where we are actually looking
         }
     }
 
@@ -3468,6 +3513,20 @@ void OnUpdate(double dt)
 
 void OnKeyDown(IKeyboard k, Key key, int _)
 {
+    // TAB is the objects toggle and nothing else. Dear ImGui also tabs between input widgets - and that is NOT
+    // switchable, its own source says the tabbing request runs "regardless of ImGuiConfigFlags_NavEnableKeyboard" -
+    // so the first Tab after touching a panel jumped focus into a text box, and from then on WantCaptureKeyboard
+    // swallowed every later press. Handled here, ABOVE that guard so it always fires, and clearing the focused
+    // window (which is what ImGui tabs WITHIN) stops the jump: the request bails when there is no nav window. This
+    // runs from Silk's key event, before the frame's NewFrame, so the clear lands in time.
+    // Not inside a dialog, though: a modal's own fields are exactly where tabbing between boxes is what you want,
+    // and dropping the focused window there would close the dialog (ImGui's focus clear closes every open popup).
+    if (key == Key.Tab && !UiPopupOpen())
+    {
+        if (imgui is not null) ImGui.SetWindowFocus(null);
+        ToggleObjectsVisible();
+        return;
+    }
     if (imgui is not null && ImGui.GetIO().WantCaptureKeyboard) return;   // don't fire shortcuts while typing in a field
     bool ctrl = k.IsKeyPressed(Key.ControlLeft) || k.IsKeyPressed(Key.ControlRight);
     // Mapper hotkeys (F1-F6) + Save (Ctrl+S) work even before a level's objects are loaded.
@@ -3488,7 +3547,6 @@ void OnKeyDown(IKeyboard k, Key key, int _)
         case Key.J: if (ctrl) break; terrainView = 1; Toast(Loc.T("Terrain: wireframe")); return;
         case Key.K: if (ctrl) break; terrainView = 0; Toast(Loc.T("Terrain: textured")); return;
         // TAB hides the objects so you can see the ground you are painting, exactly as Battlecraft does.
-        case Key.Tab: showObjects = !showObjects; Toast(showObjects ? Loc.T("Objects shown") : Loc.T("Objects hidden")); return;
         case Key.S: if (ctrl) { DoSave(); return; } break;
         case Key.L:
             if (ctrl) { DoTestLevel(); return; }
@@ -3988,8 +4046,9 @@ void DrawGridLabels()
                 // The material map indexes the level's TEXTURE SET (0-15), so label with the texture-set names
                 // (index.dat order) -- NOT the old matNames guess, which was a different, wrong order (it showed
                 // jungle grass as "Wet Sand"). Name only (no leading index number).
-                string name = mi < surfNames.Length ? surfNames[mi] : mi.ToString();
-                if (mi == RefractorForge.Formats.Terrain.DeathMaterial.Index) name += " DEATH";   // out of the world, in the engine's eyes
+                string name = mi == RefractorForge.Formats.Terrain.DeathMaterial.Index
+                            ? Loc.T("Out of Bounds") + " DEATH"                                   // out of the world, in the engine's eyes
+                            : mi < surfNames.Length ? surfNames[mi] : mi.ToString();
                 var at = s - ImGui.CalcTextSize(name) * 0.5f;   // centre the name in the cell
                 dl.AddText(at + new Vector2(1f, 1f), 0xCC000000, name);
                 dl.AddText(at, col, name);
@@ -6440,7 +6499,7 @@ void EyedropAt(float wx, float wz)
         int gx = Math.Clamp((int)(wx / ws * side), 0, side - 1);
         int gy = Math.Clamp((int)(wz / ws * side), 0, side - 1);
         byte v = map[gx, gy];
-        if (paintLayer == 0) { activeMaterial = v; int es = v < matToSurf.Length ? (matToSurf[v] & 15) : (v & 15); Toast($"Picked material #{v} ({(es < surfNames.Length ? surfNames[es] : "?")})"); }
+        if (paintLayer == 0) { activeMaterial = v; Toast($"Picked material #{v} ({MatLabel(v)})"); }
         else { activeFoliage = v; Toast($"Picked foliage #{v}"); }
     }
 }
@@ -7742,7 +7801,10 @@ void OnRender(double dt)
     // Sun/key-light direction: the manual azimuth/elevation control, else the level's SkyAndSun.con. Drives terrain +
     // object shading AND the real-time shadow map.
     var ld = EffectiveSun();
-    bool painting = toolNames[tool] == "Paint";   // hide objects/markers for a clear terrain view while painting (Battlecraft-style)
+    // A paint tool hides the objects, the markers and the foliage for a clear read of the ground - unless Tab has
+    // asked for the objects back (paintShowObjects), which survives until you leave the mapper.
+    bool painting = toolNames[tool] == "Paint";
+    bool objectsOn = showObjects && (!painting || paintShowObjects);
 
     if (terrainDirty) { RebuildTerrain(); terrainDirty = false; shadowMapDirty = true; }   // re-upload after this frame's sculpt dabs
 
@@ -7810,7 +7872,7 @@ void OnRender(double dt)
 
     // Real object geometry (GPU). Selected object is tinted via the highlight colour.
     Stage("objects");
-    if (glObjects is not null && showObjects && !painting)
+    if (glObjects is not null && objectsOn)
     {
         gl.UseProgram(objProg);
         gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
@@ -7951,7 +8013,17 @@ void OnRender(double dt)
     if (glObjects is not null && (showFoliage || showUnderFoliage) && !painting)
     {
         if (foliageDirty) BuildOvergrowthFoliage();
-        if (glObjects.FoliageInstanceCount > 0)
+        // The grass follows the camera. Rebuild once it has walked a third of the ring - far enough that this is
+        // rare while panning, close enough that the ring's edge never comes into view.
+        if (showUnderFoliage)
+        {
+            float ring = UnderViewMeters();
+            var here = cam.Position; here.Y = 0f;
+            var was = underAnchor; was.Y = 0f;
+            if (underDirty || Vector3.Distance(here, was) > ring * 0.33f) BuildUndergrowthFoliage(cam.Position);
+        }
+        else if (glObjects.UndergrowthInstanceCount > 0) BuildUndergrowthFoliage(cam.Position);   // turned off: drop it
+        if (glObjects.FoliageInstanceCount > 0 || glObjects.UndergrowthInstanceCount > 0)
         {
             gl.UseProgram(objProg);
             gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
@@ -7961,6 +8033,10 @@ void OnRender(double dt)
             cull = Math.Clamp(cull, 100f, (float)cfg.WorldSize);
             glObjects.DrawFoliage(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
                                   cam.ViewProjection, cam.Position, cull);
+            // Undergrowth gets its OWN, much shorter cull - the palette's 35-60 m. Drawing grass out to the
+            // overgrowth's 300+ m is neither what the game does nor something the frame rate would survive.
+            glObjects.DrawUndergrowth(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                      cam.ViewProjection, cam.Position, UnderViewMeters());
         }
     }
 
@@ -8047,7 +8123,7 @@ void OnRender(double dt)
 
     // Markers: mesh-less objects (sound/effect emitters, logical points) get a visible 3D indicator
     // diamond so their location is clear. When no mesh library is loaded, every object is a point.
-    if (pointMarkers.Length > 0 && showObjects && !painting)
+    if (pointMarkers.Length > 0 && objectsOn)
     {
         if (glObjects is not null && indicatorVao != 0)
         {
@@ -8099,7 +8175,7 @@ void OnRender(double dt)
         gl.BindVertexArray(indicatorVao);
         int pidx = 0;
         // Collect each peer's diamond centre + heading so we can draw the look-direction pointers in one line pass after.
-        var pointers = new System.Collections.Generic.List<(Vector3 At, float Heading, Vector3 Col, float Scale)>();
+        var pointers = new System.Collections.Generic.List<(Vector3 At, float Heading, float Pitch, Vector3 Col, float Scale)>();
         foreach (var peer in collab.Peers.Values)
         {
             var col = peerColors[pidx++ % peerColors.Length];
@@ -8118,7 +8194,7 @@ void OnRender(double dt)
             var cur = new Vector3(peer.Cursor.X, peer.Cursor.Y, peer.Cursor.Z);
             float ds = Math.Clamp(Vector3.Distance(cam.Position, cur) * 0.012f, 1.5f, 14f);
             PeerDiamond(cur, ds, peer.Heading);
-            pointers.Add((cur, peer.Heading, col, ds));
+            pointers.Add((cur, peer.Heading, peer.Pitch, col, ds));
             // The marker over the object they have selected - same screen-constant sizing as the person, 20% bigger.
             if (peer.SelectionId != "-" && so is not null && so.FindById(peer.SelectionId) is { } po)
             {
@@ -8127,21 +8203,25 @@ void OnRender(double dt)
             }
         }
 
-        // Look-direction pointer: a short coloured line from each peer's diamond along their heading, so the way
-        // they're facing reads unambiguously (the rotated diamond alone is near-symmetric front/back).
+        // Look-direction pointer: ONE coloured line from each peer's diamond along the way they are actually
+        // looking - the full 3D camera forward, pitch included, so someone studying the ground or the treetops
+        // reads as such instead of as someone staring at the horizon. (A dimmed horizon reference line was tried
+        // alongside it and removed: it never moves, so it reads as a stuck second pointer.)
         if (pointers.Count > 0)
         {
             gl.UseProgram(markerProg);
             gl.UniformMatrix4(uMvpM, 1, false, ToFloats(cam.ViewProjection));
             gl.BindVertexArray(gizmoVao);
-            foreach (var (at, heading, col, scale) in pointers)
+            gl.Uniform1(uSize, 1f);
+            gl.BindBuffer(BufferTargetARB.ArrayBuffer, gizmoVbo);
+            foreach (var (at, heading, pitch, col, scale) in pointers)
             {
-                var dir = new Vector3(MathF.Sin(heading), 0f, MathF.Cos(heading));
-                var tip = at + dir * (scale * 3.0f);
+                float cp2 = MathF.Cos(pitch);
+                var dir = new Vector3(cp2 * MathF.Sin(heading), MathF.Sin(pitch), cp2 * MathF.Cos(heading));   // Camera.Forward
+                var tip = at + dir * (scale * 3.4f);
                 float[] line = { at.X, at.Y, at.Z, tip.X, tip.Y, tip.Z };
-                gl.BindBuffer(BufferTargetARB.ArrayBuffer, gizmoVbo);
                 gl.BufferData<float>(BufferTargetARB.ArrayBuffer, line, BufferUsageARB.DynamicDraw);
-                gl.Uniform3(uColor, col.X, col.Y, col.Z); gl.Uniform1(uSize, 1f);
+                gl.Uniform3(uColor, col.X, col.Y, col.Z);
                 gl.DrawArrays(PrimitiveType.Lines, 0, 2);
             }
         }
@@ -8214,7 +8294,7 @@ void OnRender(double dt)
                            : captureMode ? $"Capture {captureMeters:0} m"
                            : $"{(activeTexture < surfNames.Length ? surfNames[activeTexture] : "?")}  #{activeTexture}")
                         : paintLayer == 0
-                            ? $"{(mslot < surfNames.Length ? surfNames[mslot] : "?")}  #{activeMaterial}"
+                            ? $"{MatLabel(activeMaterial)}  #{activeMaterial}"
                             : $"{(paintLayer == 1 ? "Undergrowth" : "Overgrowth")}  #{activeFoliage}{(activeFoliage == 0 ? " (clear)" : "")}";
                     var sw = paintLayer == 3 ? texSwatch[activeTexture & 15]
                            : paintLayer == 0 ? texSwatch[mslot] : matPalette[activeFoliage & 15];
@@ -8551,6 +8631,7 @@ void SetMapper(int m)
 {
     mapper = m;
     roadMode = false; measureMode = false;
+    paintShowObjects = false;              // every visit to a paint mapper starts with a clear view of the ground
     switch (m)
     {
         case 0: tool = Array.IndexOf(toolNames, "Sculpt"); break;                                                  // Terrain
@@ -8935,8 +9016,7 @@ void Inspector()
                 // Each material INDEX maps to a surface (matToSurf -> texPalette). Show the swatch as the ACTUAL
                 // surface colour + the surface name (in the editor's surfNames order) so the grid matches the ground
                 // and the on-map labels - the old matNames order was wrong (it mislabelled jungle grass as Wet Sand).
-                int hSlot = activeMaterial < matToSurf.Length ? (matToSurf[activeMaterial] & 15) : (activeMaterial & 15);
-                ImGui.Text($"Material #{activeMaterial}  {(hSlot < surfNames.Length ? surfNames[hSlot] : "")}");
+                ImGui.Text($"Material #{activeMaterial}  {MatLabel(activeMaterial)}");
                 if (activeMaterial == RefractorForge.Formats.Terrain.DeathMaterial.Index)
                     ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f), Loc.T("deathMaterial: the game treats this as OUTSIDE THE WORLD - anything on it is out of bounds."));
                 // 16-swatch material palette (8 per row); click selects the active material index.
@@ -8948,7 +9028,7 @@ void Inspector()
                     if (ImGui.ColorButton($"mat{i}", texSwatch[slot], ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker, new Vector2(20, 20)))
                         activeMaterial = (byte)i;
                     if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
-                    Theme.Tip($"#{i}  {(slot < surfNames.Length ? Loc.T(surfNames[slot]) : "?")}"
+                    Theme.Tip($"#{i}  {MatLabel(i)}"
                             + (i == RefractorForge.Formats.Terrain.DeathMaterial.Index ? "\n" + Loc.T("deathMaterial - OUT OF BOUNDS. The engine kills on this, whatever the combat area says.") : ""));
                     if (i % 8 != 7 && i != 15) ImGui.SameLine();
                 }
@@ -8976,6 +9056,8 @@ void Inspector()
             string slotName = folSlot?.Name ?? (activeFoliage < RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames.Length
                                              ? RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames[activeFoliage] : "?");
             ImGui.Text($"Value #{activeFoliage}  -  {slotName}{(activeFoliage == 0 ? "  (clear)" : "")}");
+            if (activeFoliage == RefractorForge.Formats.Terrain.DeathMaterial.Index)
+                ImGui.TextColored(new Vector4(1f, 0.35f, 0.3f, 1f), Loc.T("Value 7 is deathMaterial - the engine treats this ground as OUTSIDE THE WORLD."));
             if (activeFoliage != 0)
             {
                 if (folSlot is null || folSlot.Types.Count == 0)
@@ -8998,6 +9080,9 @@ void Inspector()
                 if (sel) { ImGui.PopStyleVar(); ImGui.PopStyleColor(); }
                 string iName = iSlot?.Name ?? (i < RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames.Length
                                                ? RefractorForge.Formats.Terrain.FoliagePalette.MaterialNames[i] : "?");
+                // Index 7 is the engine's deathMaterial whatever a .wst calls it, and that is the one thing worth
+                // knowing before you paint on it.
+                if (i == RefractorForge.Formats.Terrain.DeathMaterial.Index) iName = Loc.T("deathMaterial - OUT OF BOUNDS");
                 Theme.Tip(i == 0 ? $"#0  {iName}\n" + Loc.T("Clears the cell.")
                                  : $"#{i}  {iName}\n" + (grows
                                      ? string.Join("\n", iSlot!.Types.Select(t => $"   {t.GeometryName}  p {t.Probability:0.##}"))
@@ -9391,7 +9476,7 @@ void LayerMenu()
     if (!gameIsBf1942 && growth?.Over is not null && growth.OverPalette is not null)
         if (ImGui.MenuItem(Loc.TL("Overgrowth Trees"), null, ref showFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
     if (!gameIsBf1942 && growth?.Under is not null && growth.UnderPalette is not null)
-        if (ImGui.MenuItem(Loc.TL("Undergrowth"), null, ref showUnderFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
+        if (ImGui.MenuItem(Loc.TL("Undergrowth"), null, ref showUnderFoliage)) { underDirty = true; BroadcastOvergrowth(); }
     ImGui.MenuItem(Loc.TL("Effects"), null, ref showEffects);
     ImGui.MenuItem(Loc.TL("Weather"), null, ref showWeather);
     ImGui.MenuItem(Loc.TL("Animations"), null, ref showAnimations);
@@ -9423,6 +9508,22 @@ void WindowMenu()
     ImGui.EndMenu();
 }
 
+// Is any popup or modal open? Tab is theirs while one is up.
+bool UiPopupOpen() => imgui is not null
+                   && ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel);
+
+// Tab, from anywhere. In a paint mapper it flips the per-visit override; everywhere else it flips the layer
+// itself. Asking for the objects also turns the layer on, because "show me the objects" cannot sensibly leave
+// them off.
+void ToggleObjectsVisible()
+{
+    bool inPaint = toolNames[tool] == "Paint";
+    bool on;
+    if (inPaint) { paintShowObjects = !paintShowObjects; if (paintShowObjects) showObjects = true; on = paintShowObjects; }
+    else { showObjects = !showObjects; on = showObjects; }
+    Toast(on ? Loc.T("Objects shown") : Loc.T("Objects hidden"));
+}
+
 // Layer visibility toggles - always shown at the bottom of the Inspector panel.
 // The resolved overgrowth scatter: the .wst geometry scattered per cell (OvergrowthFoliage.Scatter), each dropped
 // to ground height (skipping underwater) and kept only if its mesh resolves in the loaded library. SHARED by the
@@ -9431,7 +9532,8 @@ List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterOv
 {
     var outp = new List<(string, float, float, float, float, float)>();
     if (meshLib is null || growth?.Over is null || growth.OverPalette is null || terrainPick is null) return outp;
-    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, foliageSpacing, foliageDensity, over: true))
+    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, foliageSpacing, foliageDensity, over: true,
+                 keepFraction: RefractorForge.Formats.Terrain.OvergrowthFoliage.KeepFractionFor(VegBuild())))
     {
         if (!meshLib.TryGet(fi.Geometry, out _)) continue;             // skip geometries with no mesh in the library
         float y = terrainPick.HeightAt(fi.WorldX, fi.WorldZ);
@@ -9441,13 +9543,24 @@ List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterOv
     return outp;
 }
 
-// The undergrowth (grass, bushes, small plants from underGrowth.wst) scattered the same way, from its own map and
-// palette, at the game's wider patch spacing.
-List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterUndergrowthResolved()
+// How far undergrowth reaches on THIS map: the palette's own view distance (35-61 m across retail), clamped to
+// the band the shipped maps use. It is both the generation radius and the draw cull.
+float UnderViewMeters() => RefractorForge.Formats.Terrain.OvergrowthFoliage.ViewMetersFor(growth?.UnderPalette, over: false);
+
+// The undergrowth (grass, bushes, small plants from underGrowth.wst) scattered from its own map and palette, on
+// its own 1-2 m grid - but ONLY around the camera, which is what the engine does and the only way the layer can be
+// shown at its real density: Ia Drang paints 86% of a 2048-cell map, which is over two million clumps map-wide and
+// none of them past 53 m is ever drawn. The seed is per-cell, so a clump stands in the same place however you
+// walked up to it.
+List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterUndergrowthResolved(Vector3 around)
 {
     var outp = new List<(string, float, float, float, float, float)>();
     if (meshLib is null || growth?.Under is null || growth.UnderPalette is null || terrainPick is null) return outp;
-    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, underSpacing, underDensity, over: false))
+    // A margin past the cull, so walking up to the rebuild threshold does not uncover a bare rim.
+    float reach = UnderViewMeters() * 1.35f;
+    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, underSpacing, underDensity, over: false,
+                 keepFraction: RefractorForge.Formats.Terrain.OvergrowthFoliage.KeepFractionFor(VegBuild()),
+                 centreX: around.X, centreZ: around.Z, radius: reach, maxInstances: UnderMaxInstances))
     {
         if (!meshLib.TryGet(fi.Geometry, out _)) continue;
         float y = terrainPick.HeightAt(fi.WorldX, fi.WorldZ);
@@ -9457,22 +9570,37 @@ List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterUn
     return outp;
 }
 
-// Rebuild the foliage overlay (a VIEW only - never saved as part of the level): the overgrowth trees and the
-// undergrowth, each from its own scatter, in one instance list for GlObjects.
+static Matrix4x4 FoliageWorld(float x, float y, float z, float yaw, float scale)
+    => Matrix4x4.CreateScale(scale) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z);
+
+// Rebuild the foliage overlay (a VIEW only - never saved as part of the level). The two layers are rebuilt on
+// different clocks - the trees cover the whole map and only change when you change them, the grass follows the
+// camera - so they are two passes over two GL buckets, not one.
 void BuildOvergrowthFoliage()
 {
     foliageDirty = false;
-    foliageCount = 0; underFoliageCount = 0;
+    foliageCount = 0;
     if (glObjects is null) return;
     var inst = showFoliage ? ScatterOvergrowthResolved() : new();
-    var under = showUnderFoliage ? ScatterUndergrowthResolved() : new();
-    var gi = new List<(string, Matrix4x4)>(inst.Count + under.Count);
-    foreach (var (t, x, y, z, yaw, s) in inst)
-        gi.Add((t, Matrix4x4.CreateScale(s) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z)));
-    foreach (var (t, x, y, z, yaw, s) in under)
-        gi.Add((t, Matrix4x4.CreateScale(s) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z)));
+    var gi = new List<(string, Matrix4x4)>(inst.Count);
+    foreach (var (t, x, y, z, yaw, s) in inst) gi.Add((t, FoliageWorld(x, y, z, yaw, s)));
     glObjects.SetFoliage(gl, gi, meshLib!);
-    foliageCount = inst.Count; underFoliageCount = under.Count;
+    foliageCount = inst.Count;
+    underDirty = true;                                       // a level load / palette edit invalidates both
+}
+
+// The near-field undergrowth, regenerated around wherever the camera is now.
+void BuildUndergrowthFoliage(Vector3 around)
+{
+    underDirty = false;
+    underAnchor = around;
+    underFoliageCount = 0;
+    if (glObjects is null) return;
+    var under = showUnderFoliage ? ScatterUndergrowthResolved(around) : new();
+    var gi = new List<(string, Matrix4x4)>(under.Count);
+    foreach (var (t, x, y, z, yaw, s) in under) gi.Add((t, FoliageWorld(x, y, z, yaw, s)));
+    glObjects.SetUndergrowth(gl, gi, meshLib!);
+    underFoliageCount = under.Count;
 }
 
 // Per-map overlay settings (spacing + on/off): a tiny JSON sidecar beside the level (in the folder, or next to the
@@ -9494,21 +9622,40 @@ string? OvergrowthSettingsPath()
 // this level's own .wst viewdistance (viewDistance / (COUNT/2 - 1), COUNT 10), so Saigon68's 450 gives 112.5 m.
 // There is no build selector any more: matching a BfVietnam_Veg_* build was never a shippable answer, because a
 // player would have to install that .exe. Converting the overgrowth to STATIC OBJECTS is - see Tools > Overgrowth.
-float VegPatchMeters(bool over) => RefractorForge.Formats.Terrain.OvergrowthFoliage.PatchMetersFor(
-    RefractorForge.Formats.Terrain.VegetationBuild.Stock,
-    over ? growth?.OverPalette : growth?.UnderPalette, over);
+RefractorForge.Formats.Terrain.VegetationBuild VegBuild() => vegBuildIdx switch
+{
+    1 => RefractorForge.Formats.Terrain.VegetationBuild.VegLow,
+    2 => RefractorForge.Formats.Terrain.VegetationBuild.VegMedium,
+    3 => RefractorForge.Formats.Terrain.VegetationBuild.VegHigh,
+    4 => RefractorForge.Formats.Terrain.VegetationBuild.VegUltra,
+    _ => RefractorForge.Formats.Terrain.VegetationBuild.Stock,
+};
+
+// Overgrowth is placed on the growth map's OWN grid (worldSize / materialMapSideSize, so 4 m on retail maps),
+// because that is what the painted data says: levels paint 24,000-48,000 tree cells per square kilometre and the
+// figure barely moves from map to map. The old viewDistance/4 model put trees 37-137 m apart depending on the
+// level and drew a few hundred where the game draws tens of thousands. Undergrowth keeps the patch model - its
+// index map is 1-2 m and one per cell would be millions.
+float VegPatchMeters(bool over)
+{
+    float m = RefractorForge.Formats.Terrain.OvergrowthFoliage.PatchMetersFor(
+        over ? growth?.OverPalette : growth?.UnderPalette, cfg?.WorldSize ?? 0f, over);
+    // The growth map's own cell is 4 m on a 1024 m level and 8 m on a 2048 m one, and 4 m plants a third of a
+    // million trees - past what the game can draw. Clamp each layer's default into its own slider's band.
+    return over ? Math.Clamp(m, OverPatchMin, OverPatchMax) : Math.Clamp(m, UnderPatchMin, UnderPatchMax);
+}
 
 void ResetGrowthSettingsToMap()
 {
     foliageDensity = 1f; underDensity = 1f;
     foliageSpacing = VegPatchMeters(over: true);
     underSpacing = VegPatchMeters(over: false);
-    // SHOW what the map declares. These overlays used to open OFF, so a map with a full overgrowth palette looked
-    // bare until you found two checkboxes - and you could not judge a baked sun shadow against ground that was
-    // missing every tree casting into it. On when the level actually paints growth AND names something to grow
-    // there; still off for a map with an empty palette or an unpainted map, where there is nothing to show.
-    showFoliage = GrowthHasContent(over: true);
-    showUnderFoliage = GrowthHasContent(over: false);
+    underDirty = true;
+    // Both overlays open OFF. They are the two most expensive things the editor draws - tens of thousands of tree
+    // instances, and a grass carpet that regenerates as the camera moves - and a level opens fastest and reads
+    // most clearly without them. The Layers panel lists both with their instance counts, one click away.
+    showFoliage = false;
+    showUnderFoliage = false;
     foliageDirty = true;
 }
 
@@ -9536,7 +9683,8 @@ void SaveOvergrowthSettings()
     try
     {
         File.WriteAllText(p, System.Text.Json.JsonSerializer.Serialize(new { show = showFoliage, spacing = foliageSpacing, density = foliageDensity,
-                                                                           underShow = showUnderFoliage, underSpacing = underSpacing, underDensity = underDensity }));
+                                                                           underShow = showUnderFoliage, underSpacing = underSpacing, underDensity = underDensity,
+                                                                           vegBuild = vegBuildIdx }));
         Toast($"Saved overgrowth settings -> {Path.GetFileName(p)}");
     }
     catch (Exception ex) { Toast(Loc.T("Save overgrowth settings failed: ") + ex.Message); }
@@ -9550,10 +9698,11 @@ void LoadOvergrowthSettings()
     {
         using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(p));
         var root = doc.RootElement;
-        if (root.TryGetProperty("spacing", out var sp) && sp.TryGetSingle(out var spv)) foliageSpacing = Math.Clamp(spv, 6f, 32f);
+        if (root.TryGetProperty("spacing", out var sp) && sp.TryGetSingle(out var spv)) foliageSpacing = Math.Clamp(spv, OverPatchMin, OverPatchMax);
         if (root.TryGetProperty("density", out var dn) && dn.TryGetSingle(out var dnv)) foliageDensity = Math.Clamp(dnv, 0.25f, 1.5f);
         if (root.TryGetProperty("show", out var sh)) showFoliage = sh.GetBoolean();
-        if (root.TryGetProperty("underSpacing", out var usp) && usp.TryGetSingle(out var uspv)) underSpacing = Math.Clamp(uspv, 6f, 40f);
+        if (root.TryGetProperty("underSpacing", out var usp) && usp.TryGetSingle(out var uspv)) underSpacing = Math.Clamp(uspv, UnderPatchMin, UnderPatchMax);
+        if (root.TryGetProperty("vegBuild", out var vb) && vb.TryGetInt32(out var vbi)) vegBuildIdx = Math.Clamp(vbi, 0, 4);
         if (root.TryGetProperty("underDensity", out var udn) && udn.TryGetSingle(out var udnv)) underDensity = Math.Clamp(udnv, 0.25f, 1.5f);
         if (root.TryGetProperty("underShow", out var ush)) showUnderFoliage = ush.GetBoolean();
         foliageDirty = true;
@@ -10444,10 +10593,17 @@ void LayersPanel()
         {
             // Patch size + density use the game's patch model (default 12.5 m / x1.0 = the density BfVietnam generates).
             ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Patch size (m)"), ref foliageSpacing, 6f, 200f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            // Down to 1 m: the real value is the growth map's cell size, 4 m on every retail level, and a 6 m
+            // floor silently clamped it to something 2-3x too sparse.
+            if (SldF(Loc.TL("Patch size (m)"), ref foliageSpacing, OverPatchMin, OverPatchMax, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
             ImGui.SetNextItemWidth(150f);
-            // Density tops out at 1.5x: x1.0 is already the game-matched density, so the useful range is a small over/under.
-            if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            // x1.0 is the density measured against a capture of the running game (0.51 instances per painted
+            // cell of the growth map, matching Operation Flaming Dart to 0.16%). The range runs far below that
+            // because whether the rate is the same on a map that paints most of its ground is NOT settled -
+            // Ia Drang paints 78% where Flaming Dart paints 31% - so this has to be able to reach the answer.
+            if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.02f, 2f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            Theme.Muted(string.Format(Loc.T("= {0:0.000} trees per painted cell of the growth map"),
+                                      RefractorForge.Formats.Terrain.OvergrowthFoliage.CellOccupancy * foliageDensity));
             if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = VegPatchMeters(over: true); foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
             Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
             GrowthDefinitionTree(growth.OverPalette, "overdef");
@@ -10455,14 +10611,16 @@ void LayersPanel()
     }
     if (!gameIsBf1942 && growth?.Under is not null && growth.UnderPalette is not null)
     {
-        if (ImGui.Checkbox($"Undergrowth ({underFoliageCount})###underLayer", ref showUnderFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
+        if (ImGui.Checkbox($"Undergrowth ({underFoliageCount})###underLayer", ref showUnderFoliage)) { underDirty = true; BroadcastOvergrowth(); }
         if (showUnderFoliage)
         {
+            Theme.Muted(string.Format(Loc.T("Drawn {0:0} m around the camera, like the game."), UnderViewMeters()));
             ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, 6f, 120f, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
+            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, UnderPatchMin, UnderPatchMax, "%.1f")) { underDirty = true; BroadcastOvergrowth(); }
+            Theme.Tip(Loc.T("The undergrowth map's own cell size - 1 m on Ia Drang, 2 m on most maps.\nSmaller is thicker grass and more instances."));
             ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = VegPatchMeters(over: false); underDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
+            if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { underDirty = true; BroadcastOvergrowth(); }
+            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = VegPatchMeters(over: false); underDensity = 1f; underDirty = true; BroadcastOvergrowth(); }
             Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
             GrowthDefinitionTree(growth.UnderPalette, "underdef");
         }
@@ -12841,6 +12999,9 @@ void CollabDrain()
     {
         Message m;
         try { m = Message.Decode(line); } catch { continue; }
+        // The base level archive - what map everyone is standing on - is not document state, and a transfer of
+        // it is hundreds of MB that must not touch the undo stack or the object list. CollabSession owns it.
+        if (collab.HandleBaseMessage(m)) continue;
         switch (m.Type)
         {
             case MsgType.SyncBegin:
@@ -12880,10 +13041,10 @@ void CollabDrain()
                     try
                     {
                         var rcmd = EditWire.Parse(payload);
-                        // A live OP is an edit somebody made, so it belongs on the undo stack - that is what lets
-                        // Ctrl+Z take back what the AI bridge (or another mapper) just did. A SYNCOBJ is the
-                        // initial adoption of the host's document, not an edit, and must NOT be undoable.
-                        if (m.Type == MsgType.Op && hist is not null) remoteEdits.Add(rcmd);
+                        // A live OP is an edit somebody made; how it lands is decided below (the AI bridge's edits
+                        // are undoable, a peer's are not). A SYNCOBJ is the initial adoption of the host's document,
+                        // not an edit, and is never undoable.
+                        if (m.Type == MsgType.Op) remoteEdits.Add(rcmd);
                         else { rcmd.Apply(so); if (m.Type == MsgType.SyncObj && pverb == "ADD") syncAdds++; }
                         changed = true;
                     }
@@ -12927,16 +13088,28 @@ void CollabDrain()
                     if (!collab.Peers.TryGetValue(m.Args[0], out var p)) { p = new Peer { ClientId = m.Args[0] }; collab.Peers[m.Args[0]] = p; }
                     p.Name = m.Args[1]; p.SelectionId = m.Args[2]; p.Cursor = Vec3.Parse(m.Args[3]);
                     if (m.Args.Length > 4 && float.TryParse(m.Args[4], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var hd)) p.Heading = hd;
+                    if (m.Args.Length > 5 && float.TryParse(m.Args[5], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pt)) p.Pitch = pt;
                 }
                 break;
             case MsgType.Leave: collab.Peers.Remove(m.Args[0]); break;
             case MsgType.Error: collab.Stop(); collab = null; changed = true; break;          // socket dropped
         }
     }
-    if (remoteEdits.Count > 0 && hist is not null)
+    if (remoteEdits.Count > 0 && so is not null)
     {
+        var rc = remoteEdits.Count == 1 ? remoteEdits[0] : new CompositeCommand(remoteEdits);
         applyingRemote = true;
-        try { hist.Do(remoteEdits.Count == 1 ? remoteEdits[0] : new CompositeCommand(remoteEdits)); }
+        // A PEER'S edit does not belong on your undo stack. It used to go through hist.Do, which meant Ctrl+Z took
+        // back whatever the other mapper had just done instead of your own last move - and, because committing an
+        // edit CLEARS the redo stack, every op that arrived while you worked destroyed your redo outright. That is
+        // what "undo and redo do not work when collaborating" was: not a design, a bug.
+        // The AI bridge is the exception. It is this editor's own loopback relay with an assistant on the far end
+        // acting for you, and taking back what it just placed with Ctrl+Z is the point of it.
+        try
+        {
+            if (hist is not null && collab is not null && collab.LocalOnly) hist.Do(rc);
+            else { rc.Apply(so); sessionDirty = true; }
+        }
         finally { applyingRemote = false; }
     }
     if (changed && so is not null)
@@ -12971,6 +13144,7 @@ void DoCollabHost()
         if (so is null) { collabError = Loc.T("Load a level first."); return; }
         collab = CollabSession.StartHost(so, collabPort, string.IsNullOrWhiteSpace(collabName) ? "Host" : collabName.Trim(),
                                          string.IsNullOrEmpty(collabPass) ? null : collabPass, BuildHostWorld());
+        collab.AnnounceBase(OpenLevelArchive());
         Console.WriteLine(collab.Status);
         ImGui.CloseCurrentPopup();
     }
@@ -13005,10 +13179,335 @@ void DoCollabJoin()
         if (so is null) { collabError = Loc.T("Load a level first."); return; }
         collab = CollabSession.StartJoin(collabHostAddr.Trim(), collabPort, string.IsNullOrWhiteSpace(collabName) ? "Guest" : collabName.Trim(),
                                          string.IsNullOrEmpty(collabPass) ? null : collabPass);
+        collab.AnnounceBase(OpenLevelArchive());
         Console.WriteLine(collab.Status);
         ImGui.CloseCurrentPopup();
     }
     catch (Exception ex) { collabError = ex.Message; }
+}
+
+// A level archive is hundreds of MB, so moving one is not something to leave the user guessing about. The
+// editor stays fully usable while it runs - the transfer is on a worker for an upload and on the inbound queue
+// for a download - so this is a small window rather than a modal, and it can be cancelled.
+void BaseTransferProgress()
+{
+    if (collab is null || collab.BaseTransfer == CollabSession.Transfer.None) return;
+    var p = collab.BaseProgress;
+    if (p is null) return;
+
+    bool up = collab.BaseTransfer == CollabSession.Transfer.Upload;
+    var fbT = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbT.X * 0.5f, fbT.Y - 120f * uiScale), ImGuiCond.Always, new Vector2(0.5f, 1f));
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.Always);
+    if (ImGui.Begin("###basetransfer", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                    | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking))
+    {
+        Theme.Heading(Loc.T(up ? "Uploading the map to the session" : "Downloading the session's map"));
+
+        double doneMb = p.Value.Done / 1048576.0, totalMb = p.Value.Total / 1048576.0;
+        // Total comes from the other end, so treat it as a hint: a bar that reads 140% because the size was
+        // stale is worse than one that just fills. Clamped, and shown as an indeterminate sweep when unknown.
+        float frac = p.Value.Total > 0 ? Math.Clamp((float)(p.Value.Done / (double)p.Value.Total), 0f, 1f) : 0f;
+        string label = p.Value.Total > 0
+            ? string.Format(Loc.T("{0:0.#} / {1:0.#} MB"), doneMb, totalMb)
+            : string.Format(Loc.T("{0:0.#} MB"), doneMb);
+        if (p.Value.Total > 0) ImGui.ProgressBar(frac, new Vector2(-1f, 0f), label);
+        else ImGui.ProgressBar(-1f * (float)appClock, new Vector2(-1f, 0f), label);
+
+        double rate = collab.BaseRate;
+        var eta = collab.BaseEta;
+        Theme.Muted(rate > 1
+            ? (eta is not null
+                ? string.Format(Loc.T("{0:0.#} MB/s, about {1:0} s left"), rate / 1048576.0, eta.Value)
+                : string.Format(Loc.T("{0:0.#} MB/s"), rate / 1048576.0))
+            : string.Format(Loc.T("{0:0} s elapsed"), collab.BaseElapsed));
+
+        Theme.Muted(Loc.T("The editor stays usable. Nothing is written over your open map:\na download lands beside it and only after its contents check out."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Cancel##basetransfer"), new Vector2(120f * uiScale, 0f))) collab.CancelBaseTransfer();
+    }
+    ImGui.End();
+}
+
+// Picking a map from the server's list IS the decision to work on it. Making the user then find a menu item to
+// fetch it was the gap in the first test: they clicked the map, nothing visible happened, and the editor sat on
+// the wrong level. So the fetch follows from the choice. It is not silent - the transfer window appears with a
+// progress bar and a Cancel - and it only ever starts when the relay actually holds the archive.
+void CollabAutoFetchMap()
+{
+    // Coming back from a level switch that was caused by downloading a map: reconnect and walk into it, so the
+    // whole thing reads as one action instead of three. Tried once - a server that is down or a map that has
+    // gone should leave the editor usable, not retrying every frame.
+    if (!rejoinTried && !string.IsNullOrEmpty(rejoinMap))
+    {
+        rejoinTried = true;
+        AppPrefs.PendingRejoinMap = "";
+        AppPrefs.Save();
+        if (collab is null && so is not null && !string.IsNullOrWhiteSpace(centralAddr))
+        {
+            try
+            {
+                collab = CollabSession.StartJoin(centralAddr.Trim(), centralPort,
+                                                 string.IsNullOrWhiteSpace(collabName) ? Environment.UserName : collabName.Trim(),
+                                                 string.IsNullOrEmpty(centralPass) ? null : centralPass);
+                collab.AnnounceBase(OpenLevelArchive());
+                Toast(string.Format(Loc.T("Reconnected - entering {0}"), rejoinMap));
+            }
+            catch (Exception ex) { Toast(Loc.T("Could not reconnect to the server: ") + ex.Message); }
+        }
+    }
+
+    // The picker is skipped when we already know which map we came back for - whether the reconnect above did
+    // it or the user did it by hand, which is the more likely case and the one that must not cost a second
+    // choice. Bounded to the first couple of minutes: a name remembered across a whole session could otherwise
+    // be applied to a different server later, where an unknown name CREATES a map rather than entering one.
+    if (collab is not null && collab.AwaitingMapChoice && !string.IsNullOrEmpty(rejoinMap))
+    {
+        if (appClock > 180d) { rejoinMap = ""; return; }
+        var want = rejoinMap;
+        rejoinMap = "";
+        collab.PickMap(want);
+        Toast(string.Format(Loc.T("Back in {0}"), want));
+        return;
+    }
+
+    if (collab is null || !collab.AutoDownloadPending) return;
+    if (collab.BaseBusy || collab.BaseMismatch is null || !collab.BaseAvailable) { collab.ClearAutoDownload(); return; }
+    collab.ClearAutoDownload();
+    DownloadSessionBase();
+}
+
+// Where a map from the server is written. The default is the folder the open level archive came from, which
+// in the normal case IS the mod's Levels folder, so the file lands where both the game and the editor already
+// look and nobody has to configure anything. It is overridable because that is not always right: a second mod,
+// another drive, or somewhere the game is not looking yet.
+string MapDownloadDir()
+{
+    if (!string.IsNullOrWhiteSpace(AppPrefs.MapDownloadDir) && Directory.Exists(AppPrefs.MapDownloadDir))
+        return AppPrefs.MapDownloadDir;
+    if (OpenLevelArchive() is string cur && Path.GetDirectoryName(cur) is string d && Directory.Exists(d)) return d;
+    return AppContext.BaseDirectory;
+}
+
+// The map keeps its own name, because a level archive is found by name - by the game, by the editor's mod
+// scan, and by the person looking in the folder. A file already sitting there under that name is moved aside
+// rather than overwritten: it may be a map they have and we have no business destroying it.
+string MapDownloadPath(string mapName)
+{
+    string dir = MapDownloadDir();
+    Directory.CreateDirectory(dir);
+    string dest = Path.Combine(dir, mapName + ".rfa");
+    if (File.Exists(dest))
+    {
+        try
+        {
+            string bak = dest + ".before-download";
+            if (File.Exists(bak)) File.Delete(bak);
+            File.Move(dest, bak);
+            Toast(string.Format(Loc.T("Kept your existing {0}.rfa as .before-download"), mapName));
+        }
+        catch { dest = Path.Combine(dir, mapName + ".from-server.rfa"); }
+    }
+    return dest;
+}
+
+// Fetch the archive this session is built on.
+void DownloadSessionBase()
+{
+    if (collab?.BaseMismatch is null) return;
+    collab.DownloadBase(MapDownloadPath(collab.BaseMismatch.LevelName));
+}
+
+// The .rfa the user actually opened, which is what a collaboration session is pinned to. It is NOT simply
+// rfaList[0]: an add-on map that ships no terrain gets a base-game archive layered underneath it, and that
+// borrowed archive sits at index 0 while being nobody's idea of "the level".
+string? OpenLevelArchive()
+{
+    foreach (var r in rfaList)
+    {
+        if (layeredTerrainRfa is not null
+            && Path.GetFullPath(r).Equals(Path.GetFullPath(layeredTerrainRfa), StringComparison.OrdinalIgnoreCase))
+            continue;
+        if (File.Exists(r)) return r;
+    }
+    return null;
+}
+
+// A central relay hosts several maps and registers a client nowhere until it names one, so between connecting
+// and choosing there is a real lobby. This is that choice. It is modal on purpose: nothing else about the
+// session means anything yet, and an editor that looked connected while it was not would be worse than a wait.
+void MapPickerModal()
+{
+    if (collab is null || !collab.AwaitingMapChoice) return;
+    if (!ImGui.IsPopupOpen(Loc.TL("Choose a map"))) ImGui.OpenPopup(Loc.TL("Choose a map"));
+
+    var fbm = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbm.X * 0.5f, fbm.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(520f * uiScale, 0f), ImGuiCond.Appearing);
+    bool openM = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Choose a map"), ref openM,
+                               ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize)) return;
+
+    var maps = collab.Maps;
+    ImGui.TextDisabled(maps.Count == 0
+        ? Loc.T("This server has no maps yet. Name one below to start it.")
+        : string.Format(Loc.T("{0} map(s) on this server. Your edits are saved there, not here."), maps.Count));
+    ImGui.Spacing();
+
+    if (maps.Count > 0 && ImGui.BeginTable("##maplist", 4,
+            ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.ScrollY,
+            new Vector2(0f, Math.Min(260f, 30f + maps.Count * 26f) * uiScale)))
+    {
+        ImGui.TableSetupColumn(Loc.TL("Map"));
+        ImGui.TableSetupColumn(Loc.TL("Objects"));
+        ImGui.TableSetupColumn(Loc.TL("Archive"));
+        ImGui.TableSetupColumn(Loc.TL("Here now"));
+        ImGui.TableHeadersRow();
+        foreach (var e in maps)
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            if (ImGui.Selectable(e.Name + "##map", false, ImGuiSelectableFlags.SpanAllColumns))
+            {
+                collab.PickMap(e.Name);
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.TableNextColumn(); ImGui.Text(e.Objects.ToString());
+            // Whether the relay holds this map's archive is the difference between a friend being able to join
+            // it and being told to go and find the file themselves, so it belongs in the list, not behind a click.
+            ImGui.TableNextColumn();
+            if (e.HasBase) ImGui.TextColored(new Vector4(0.55f, 0.85f, 0.55f, 1f), Loc.T("on server"));
+            else ImGui.TextColored(new Vector4(1f, 0.72f, 0.30f, 1f), Loc.T("not held"));
+            ImGui.TableNextColumn(); ImGui.Text(e.Clients.ToString());
+        }
+        ImGui.EndTable();
+    }
+
+    ImGui.Separator();
+    Theme.Heading(Loc.T("Start a new map"));
+    InT(Loc.TL("Name##newmap"), ref mapPickerNew, 64);
+    ImGui.TextDisabled(Loc.T("Letters, digits, - _ . only. It is created on the server the moment you enter it."));
+    bool nameOk = mapPickerNew.Trim().Length > 0
+                  && RefractorForge.Collab.MapLibrary.IsValidName(mapPickerNew.Trim());
+    ImGui.BeginDisabled(!nameOk);
+    if (Theme.AccentButton(Loc.TL("Create and enter"), new Vector2(180, 0)))
+    {
+        collab.PickMap(mapPickerNew.Trim());
+        mapPickerNew = "";
+        ImGui.CloseCurrentPopup();
+    }
+    ImGui.EndDisabled();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Disconnect##mappick"), new Vector2(140, 0)))
+    {
+        collab.Stop(); collab = null;
+        ImGui.CloseCurrentPopup();
+    }
+    ImGui.EndPopup();
+}
+
+// A finished download is only half of what the user asked for. They picked a map from the server, so the point
+// was to WORK on that map - leaving the archive sitting in a folder and the wrong level open is the thing that
+// made the first test confusing. This offers the swap the moment the file is complete and verified.
+void DownloadedMapModal()
+{
+    if (collab?.DownloadedPath is not string got) return;
+
+    // The map was fetched because it was chosen, so opening it is the expected end of that one action rather
+    // than a second decision. MayLeave still stands in the way when there is unsaved work, so nothing is lost.
+    if (collab.OpenWhenDownloaded)
+    {
+        collab.OpenWhenDownloaded = false;
+        collab.ClearDownloaded();
+        OpenDownloadedMap(got);
+        return;
+    }
+
+    if (!ImGui.IsPopupOpen(Loc.TL("Map downloaded"))) ImGui.OpenPopup(Loc.TL("Map downloaded"));
+
+    var fbd = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbd.X * 0.5f, fbd.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    bool openD = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Map downloaded"), ref openD,
+                               ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize)) return;
+
+    Theme.Heading(string.Format(Loc.T("{0} is ready"), Path.GetFileName(got)));
+    ImGui.TextDisabled(Loc.T("Until you open it, the session is on a different map from the one you have open,"));
+    ImGui.TextDisabled(Loc.T("so nothing from the server is being applied here."));
+    ImGui.Spacing();
+    ImGui.TextDisabled(Loc.T("Opening a level restarts the editor. Reconnect afterwards and pick the same map."));
+    ImGui.Spacing();
+    if (Theme.AccentButton(Loc.TL("Open it now"), new Vector2(160, 0)))
+    {
+        var path = got;
+        collab.ClearDownloaded();
+        ImGui.CloseCurrentPopup();
+        OpenDownloadedMap(path);
+    }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Later"), new Vector2(120, 0)))
+    {
+        collab.ClearDownloaded();
+        ImGui.CloseCurrentPopup();
+    }
+    ImGui.EndPopup();
+}
+
+// Open an archive the server just handed us. Switching level means a relaunch - the level is chosen once, at
+// startup, and half the editor is built around what it found - so this is the same path File > Open Level takes:
+// point the saved settings at the new archive, keep the mesh and texture archives already configured, restart.
+// MayLeave still guards it, so unsaved work prompts first rather than vanishing.
+void OpenDownloadedMap(string rfaPath)
+{
+    try
+    {
+        var saved = Settings.Load();
+        Settings.Save(new LevelPaths(rfaPath, null, null, saved?.Textures, saved?.MeshArchives, new[] { rfaPath }));
+        ActiveProject.Clear();
+        // Come back into the same map on the other side of the restart, rather than at a disconnected desktop.
+        AppPrefs.PendingRejoinMap = collab?.CurrentMap ?? "";
+        AppPrefs.Save();
+        Console.WriteLine($"Opening the downloaded map {rfaPath} - restarting...");
+        RelaunchAndExit();
+    }
+    catch (Exception ex) { Toast(Loc.T("Could not open the downloaded map: ") + ex.Message); }
+}
+
+// Pull the whole map down as one archive, edits and all. It lands beside the level archive already open, or
+// beside the editor when none is; never over the open one, which is mounted while the editor holds it.
+void DownloadCurrentMapArchive()
+{
+    if (collab is null) return;
+    string name = string.IsNullOrEmpty(collab.CurrentMap) ? "map" : collab.CurrentMap;
+    collab.DownloadCurrentMap(MapDownloadPath(name));
+}
+
+// Connect to the always-on relay. Same wire as Join - the difference is only that this one is remembered, and
+// that a central server is the arrangement that actually suits people working at different hours.
+void DoCollabCentral()
+{
+    try
+    {
+        if (so is null) { collabError = Loc.T("Load a level first."); return; }
+        if (string.IsNullOrWhiteSpace(centralAddr)) { collabError = Loc.T("Enter the server's address."); return; }
+        SaveCentralServer();
+        collab = CollabSession.StartJoin(centralAddr.Trim(), centralPort,
+                                         string.IsNullOrWhiteSpace(collabName) ? Environment.UserName : collabName.Trim(),
+                                         string.IsNullOrEmpty(centralPass) ? null : centralPass);
+        collab.AnnounceBase(OpenLevelArchive());
+        Console.WriteLine(collab.Status);
+        ImGui.CloseCurrentPopup();
+    }
+    catch (Exception ex) { collabError = ex.Message; }
+}
+
+void SaveCentralServer()
+{
+    AppPrefs.CentralServerAddress = centralAddr.Trim();
+    AppPrefs.CentralServerPort = centralPort;
+    AppPrefs.CentralServerPassword = centralPass;
+    AppPrefs.CentralServerName = collabName;
+    AppPrefs.Save();
 }
 
 void CollabModal()
@@ -13023,6 +13522,51 @@ void CollabModal()
     FitLabel(Loc.TL("Password (optional)"));
     InT(Loc.TL("Password (optional)"), ref collabPass, 64, ImGuiInputTextFlags.Password);
     ImGui.Spacing();
+
+    // The recommended way in, so it comes first. A central relay is always up and owns the map, which is what
+    // makes editing together at different hours work at all: nobody has to be online for anyone else to work,
+    // and no one person's copy is the master. Its address is remembered because it never changes.
+    Theme.Heading(Loc.T("Connect to central server"));
+    InT(Loc.TL("Server address"), ref centralAddr, 64);
+    InI(Loc.TL("Port##central"), ref centralPort);
+    FitLabel(Loc.TL("Server password"));
+    InT(Loc.TL("Server password"), ref centralPass, 64, ImGuiInputTextFlags.Password);
+    bool haveCentral = !string.IsNullOrWhiteSpace(centralAddr);
+    ImGui.BeginDisabled(!haveCentral);
+    if (Theme.AccentButton(Loc.TL("Connect"), new Vector2(160, 0))) DoCollabCentral();
+    ImGui.EndDisabled();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Forget##central"), new Vector2(110, 0)))
+    {
+        centralAddr = ""; centralPass = ""; centralPort = 7777;
+        SaveCentralServer();
+    }
+    ImGui.TextDisabled(haveCentral
+        ? Loc.T("Remembered on this PC, so you only type it once.")
+        : Loc.T("Enter the relay's address once and it is remembered."));
+    ImGui.TextDisabled(Loc.T("The server holds the map and keeps every change, so nobody has to be online"));
+    ImGui.TextDisabled(Loc.T("at the same time and no one PC is the master copy."));
+
+    ImGui.Spacing();
+    string dlDir = MapDownloadDir();
+    ImGui.TextDisabled(Loc.T("Maps you download are saved to:"));
+    ImGui.TextWrapped(dlDir);
+    if (ImGui.Button(Loc.TL("Change folder..."), new Vector2(150, 0)))
+    {
+        var picked = Picker.Folder(Loc.T("Where should maps downloaded from the server be saved?"), dlDir);
+        if (picked is not null) { AppPrefs.MapDownloadDir = picked; AppPrefs.Save(); }
+    }
+    if (!string.IsNullOrWhiteSpace(AppPrefs.MapDownloadDir))
+    {
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Use the level folder"), new Vector2(170, 0)))
+        {
+            AppPrefs.MapDownloadDir = "";
+            AppPrefs.Save();
+        }
+    }
+
+    ImGui.Separator();
     Theme.Heading(Loc.T("Host a session"));
     InI(Loc.TL("Port##host"), ref collabPort);
     if (Theme.AccentButton(Loc.TL("Host"), new Vector2(160, 0))) DoCollabHost();
@@ -13034,8 +13578,8 @@ void CollabModal()
 
     if (!string.IsNullOrEmpty(collabError)) ImGui.TextColored(new Vector4(1f, 0.45f, 0.45f, 1f), collabError);
     ImGui.Separator();
-    Theme.Heading(Loc.T("Central server (no host clobbering)"));
-    ImGui.TextDisabled(Loc.T("Run an always-on relay everyone Joins (nobody 'hosts'):"));
+    Theme.Heading(Loc.T("Running your own central server"));
+    ImGui.TextDisabled(Loc.T("An always-on relay everyone connects to (nobody 'hosts'):"));
     ImGui.TextDisabled(Loc.T("   RefractorForge.exe --relay 7777 [levelFolder]"));
     ImGui.TextDisabled(Loc.T("   add  --save serverState  to persist EVERYTHING across restarts"));
     ImGui.TextDisabled(Loc.T("   (objects + terrain + material + gameplay/vehicles)"));
@@ -13631,6 +14175,65 @@ void BuildUi()
                     if (!string.IsNullOrEmpty(collab.LocalIp)) ImGui.MenuItem(string.Format(Loc.T("LAN: {0}:{1}"), collab.LocalIp, collab.Port), null, false, false);
                     ImGui.MenuItem(string.Format(Loc.T("Internet: {0}:{1} (forward port)"), collab.PublicIp, collab.Port), null, false, false);
                 }
+                // The map everyone is standing on. Edits are meaningless if two people are not on the same
+                // archive, and until this existed nothing said so - the ops applied cleanly to the wrong world.
+                // The agreed case is worth stating too: "we are all on the same map" is what people want to see.
+                if (!string.IsNullOrEmpty(collab.BaseStatus) || !string.IsNullOrEmpty(collab.BaseLevel))
+                {
+                    ImGui.Separator();
+
+                    if (!string.IsNullOrEmpty(collab.BaseLevel))
+                        ImGui.MenuItem(string.Format(Loc.T("Session map: {0}"), collab.BaseLevel), null, false, false);
+
+                    if (!string.IsNullOrEmpty(collab.BaseStatus))
+                    {
+                        bool bad = collab.BaseMismatch is not null;
+                        // Amber for a mismatch, green once it is settled: the state is worth reading at a glance,
+                        // because working on the wrong map costs a session and never announces itself.
+                        ImGui.PushStyleColor(ImGuiCol.Text, bad ? new Vector4(1f, 0.72f, 0.30f, 1f)
+                                             : collab.BaseAgreed ? new Vector4(0.55f, 0.85f, 0.55f, 1f)
+                                             : new Vector4(0.75f, 0.75f, 0.75f, 1f));
+                        ImGui.MenuItem(collab.BaseStatus, null, false, false);
+                        ImGui.PopStyleColor();
+                    }
+
+                    // The map as it stands, edits included, as ONE file. The relay stores a map as an immutable
+                    // base plus a small delta, which is right for editing and for history, but a delta is no use
+                    // to somebody who just wants the level: opening it here, or putting it on a game server,
+                    // means one archive. The server builds it on demand - a repack measures at about a second.
+                    if (!collab.BaseBusy && !string.IsNullOrEmpty(collab.CurrentMap)
+                        && ImGui.MenuItem(Loc.TL("Download the current map as one .rfa")))
+                        DownloadCurrentMapArchive();
+
+                    if (collab.BaseMismatch is not null)
+                        ImGui.MenuItem(Loc.T("Nothing from the session is being applied to this level."), null, false, false);
+
+                    if (collab.BaseAgreed)
+                        ImGui.MenuItem(collab.BaseStored
+                            ? Loc.T("The relay is holding this map for whoever joins next.")
+                            : Loc.T("The relay has no copy: nobody new can be given this map yet."), null, false, false);
+
+                    var bp = collab.BaseProgress;
+                    if (bp is not null && bp.Value.Total > 0)
+                        ImGui.MenuItem(string.Format(Loc.T("  {0:0.#} of {1:0.#} MB"),
+                                                     bp.Value.Done / 1048576.0, bp.Value.Total / 1048576.0), null, false, false);
+
+                    if (collab.BaseMismatch is not null && collab.BaseAvailable && !collab.BaseBusy
+                        && ImGui.MenuItem(Loc.TL("Download this session's map")))
+                        DownloadSessionBase();
+
+                    if (!collab.BaseBusy && !collab.BaseStored && collab.BaseMismatch is null
+                        && OpenLevelArchive() is not null
+                        && ImGui.MenuItem(Loc.TL("Upload my map so others can get it")))
+                        collab.UploadBase(OpenLevelArchive()!);
+                }
+
+                // What the session itself is carrying, so it is obvious whether the relay actually has the level
+                // or is holding an empty document that will hand a joiner nothing.
+                ImGui.Separator();
+                ImGui.MenuItem(string.Format(Loc.T("{0} objects in the session"), so?.Objects.Count ?? 0), null, false, false);
+                if (!collab.IsHost) ImGui.MenuItem(Loc.T("Edits are saved on the server, not here."), null, false, false);
+
                 ImGui.Separator();
                 ImGui.MenuItem(string.Format(Loc.T("{0} peer(s) connected"), collab.Peers.Count), null, false, false);
                 int pmi = 0;
@@ -13823,6 +14426,19 @@ void BuildUi()
     }
     ImGui.End();
     ImGui.PopStyleColor();
+    // Objects are hidden because a paint mapper is active. Say so, and say what to press - otherwise the map
+    // looks empty and the hotkey is something you have to already know about.
+    if (toolNames[tool] == "Paint" && !(showObjects && paintShowObjects))
+    {
+        string hint = Loc.T("Press Tab to show objects");
+        var fgl = ImGui.GetForegroundDrawList();
+        ImGui.PushFont(Theme.FontSmall);
+        var sz = ImGui.CalcTextSize(hint);
+        var at = new Vector2(leftW + (W - rightW - leftW - sz.X) * 0.5f, H - statusH - sz.Y - 10f * uiScale);
+        fgl.AddText(at + new Vector2(1f, 1f), 0xC0000000, hint);
+        fgl.AddText(at, ImGui.GetColorU32(Theme.Accent), hint);
+        ImGui.PopFont();
+    }
     Theme.DrawToasts(new Vector2(leftW, top), new Vector2(W - rightW, H - statusH));
 
     // Complete a drag-and-drop from the Object Library: when the dragged item is released over the 3D
@@ -13908,6 +14524,10 @@ void BuildUi()
     BrightenDialog();
     NightLightingWindow();
     NightBakeProgress();
+    CollabAutoFetchMap();
+    BaseTransferProgress();
+    MapPickerModal();
+    DownloadedMapModal();
     PointToolOverlay();
     LightGizmos();
     TunnelGizmos();

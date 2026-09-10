@@ -85,15 +85,29 @@ public sealed class FoliagePalette
     /// <summary>Which slot a growth-map cell value selects. Matched by NAME rather than by position, because
     /// Khe_Sahn and Lang_Vei duplicate their <c>dryDirt</c> block - a 17th slot that shifts every material after it,
     /// so counting down the list would grow the wrong species from index 6 on. Falls back to position for a palette
-    /// whose names are not the engine's (Operation_Flaming_Dart renames slot 0).</summary>
+    /// whose names are not the engine's (Operation_Flaming_Dart renames slot 0).
+    /// <para>
+    /// Index 7 is <c>deathMaterial</c> - the void the engine kills you on - and it never falls back by position. A
+    /// .wst that omits a material slides every later slot up one (Ia Drang's undergrowth has no <c>wetDirt</c>), so
+    /// counting hands index 7 whatever sits eighth in the file, which is usually <c>mud</c>: the editor then both
+    /// LABELS the out-of-bounds material "mud" and grows mud's plants on ground nothing can stand on. A palette that
+    /// does not declare deathMaterial grows nothing there, which is also what the engine does. The fallback is left
+    /// in place for every other index because a .wst is free to invent its own names (Operation Flaming Dart renames
+    /// slot 0) and position is then the only thing left to go on.
+    /// </para></summary>
     public FoliageMaterialSlot? SlotForIndex(int index)
     {
         if (index < 0) return null;
         if (index < MaterialNames.Length)
             foreach (var m in Materials)
                 if (string.Equals(m.Name, MaterialNames[index], StringComparison.OrdinalIgnoreCase)) return m;
+        if (index == DeathMaterialIndex) return null;
         return index < Materials.Count ? Materials[index] : null;
     }
+
+    /// <summary>The growth-map value that names the engine's <c>deathMaterial</c> - the same index
+    /// <c>Game::isOutsideWorld</c> reads out of the material map.</summary>
+    public const int DeathMaterialIndex = 7;
 
     public static FoliagePalette Parse(string xml)
     {
