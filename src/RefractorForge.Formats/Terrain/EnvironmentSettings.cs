@@ -620,8 +620,17 @@ public sealed class EnvironmentSettings
             else outLines.Add(rawLine);
             if (key.StartsWith("renderer.", StringComparison.Ordinal)) lastRenderer = outLines.Count - 1;
         }
-        var missing = wanted.Where(x => x.Want && !seen.Contains(x.Key)).Select(x => x.Line).ToList();
-        if (missing.Count > 0) outLines.InsertRange(lastRenderer >= 0 ? lastRenderer + 1 : 0, missing);
+        // A setting that was not already in the file has to be ADDED, and where it is added matters for exactly
+        // one family: water. See WaterInsertIndex - a water.* line above `run Init/Terrain` kills the dedicated
+        // server. Everything else is order-free and goes with the renderer block as before.
+        var missing = wanted.Where(x => x.Want && !seen.Contains(x.Key)).ToList();
+        var addWater = missing.Where(x => IsWaterKey(x.Key)).Select(x => x.Line).ToList();
+        var addOther = missing.Where(x => !IsWaterKey(x.Key)).Select(x => x.Line).ToList();
+        if (addOther.Count > 0) outLines.InsertRange(lastRenderer >= 0 ? lastRenderer + 1 : 0, addOther);
+        // Any water line the file ALREADY had in the wrong place is moved down too, so re-saving a map that is
+        // broken this way repairs it instead of preserving it. Only when we are writing water at all.
+        if (WriteWater) MoveWaterBelowTerrainRun(outLines);
+        if (addWater.Count > 0) outLines.InsertRange(WaterInsertIndex(outLines), addWater);
         if (WriteStartCamera) PatchStartCamera(outLines);
         if (WriteTunnel && IsTunnelMap && ObjectMaps.Count > 0)
         {
@@ -655,6 +664,59 @@ public sealed class EnvironmentSettings
             }
         }
         return outLines;
+    }
+
+    private static bool IsWaterKey(string key) => key.StartsWith("water.", StringComparison.Ordinal);
+
+    /// <summary>Is this line the one that loads the terrain - <c>run Init/Terrain</c>?</summary>
+    private static bool IsTerrainRun(string line)
+    {
+        var t = line.TrimStart();
+        if (!t.StartsWith("run ", StringComparison.OrdinalIgnoreCase)) return false;
+        var target = t.Substring(4).Trim().Trim('"').Replace('\\', '/');
+        if (target.EndsWith(".con", StringComparison.OrdinalIgnoreCase)) target = target[..^4];
+        return target.EndsWith("Terrain", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Where a <c>water.*</c> line may safely go.
+    /// <para>
+    /// The water object does not exist until <c>run Init/Terrain</c> has run - the terrain is what creates it - so
+    /// a water setting placed ABOVE that line is applied to nothing and **kills the dedicated server during load**.
+    /// Measured on BfVietnam 1.21: al_vietnas had one stray <c>water.color</c> at Init.con line 31 with the terrain
+    /// run at line 97, and bfvietnam_w32ded.exe exited 1.5 s in, before it logged GameStart. Moving that single
+    /// line below the terrain run fixed it; the value never mattered (three different colours all crashed).
+    /// </para><para>
+    /// Retail agrees: Fall_of_Saigon runs the terrain at line 97 and sets every water key at 99-103, and every
+    /// other shipped level does the same. So: after the last water line that is itself safely placed, else
+    /// straight after the terrain run, else at the end of the file.
+    /// </para></summary>
+    private static int WaterInsertIndex(List<string> lines)
+    {
+        int lastWater = -1, terrainRun = -1;
+        for (int i = 0; i < lines.Count; i++)
+        {
+            var t = lines[i].TrimStart();
+            if (t.StartsWith("water.", StringComparison.OrdinalIgnoreCase)) lastWater = i;
+            else if (IsTerrainRun(lines[i])) terrainRun = i;
+        }
+        if (lastWater >= 0 && lastWater > terrainRun) return lastWater + 1;   // beside its siblings
+        if (terrainRun >= 0) return terrainRun + 1;                           // first safe spot
+        return lines.Count;                                                   // no terrain run: the end is safe
+    }
+
+    /// <summary>Relocate any <c>water.*</c> line sitting above <c>run Init/Terrain</c> to just below it, keeping
+    /// their order. That shape crashes a dedicated server, so re-saving a map that has it should repair it rather
+    /// than write it out again.</summary>
+    private static void MoveWaterBelowTerrainRun(List<string> lines)
+    {
+        int terrainRun = lines.FindIndex(IsTerrainRun);
+        if (terrainRun < 0) return;
+        var stray = new List<string>();
+        for (int i = terrainRun - 1; i >= 0; i--)
+            if (lines[i].TrimStart().StartsWith("water.", StringComparison.OrdinalIgnoreCase))
+            { stray.Insert(0, lines[i]); lines.RemoveAt(i); }
+        if (stray.Count > 0) lines.InsertRange(WaterInsertIndex(lines), stray);
     }
 
     // Rewrite the pre-spawn camera lines in place, one per team, and append any team that had none. Existing rem'd

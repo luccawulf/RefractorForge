@@ -263,3 +263,19 @@ loading default shader instead`.
 Retail is inconsistent with itself and all of it works: `Saigon68/ObjectLightmaps`,
 `Operation_Irving/objectlightmaps`. Case is not the cause of a missing lightmap — look for the name or the folder
 escape instead.
+
+## Init.con: `water.*` must come AFTER `run Init/Terrain`
+
+The terrain is what creates the water object, so a `water.*` line above `run Init/Terrain` applies to nothing and
+**kills the dedicated server during load** — it exits before it logs `GameStart`. Measured on BfVietnam 1.21: one
+stray `water.color` at line 31 with the terrain run at line 97 killed `bfvietnam_w32ded.exe` 1.5 s in; moving that
+single line below the terrain run fixed it, and the value was irrelevant (three different colours crashed alike).
+Retail agrees — `Fall_of_Saigon` runs the terrain at 97 and sets water at 99–103.
+
+`EnvironmentSettings.PatchInitConLines` used to add any missing setting straight after the last `renderer.*` line,
+which wrote exactly this defect into every map that had no water block yet. Now water keys go below the terrain
+run, and a stray one already too high is moved down. Gate: `src/RefractorForge.Tests/InitConWaterOrderTests.cs`.
+
+**How to prove a server-side fault at all: `docs/Dedicated_Server_Debugging.md`.** `bfvietnam_w32ded.exe` is
+headless and answers in ~25 s, which beats reading the map — five rounds of static auditing missed this because a
+static audit cannot see ordering.
