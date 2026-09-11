@@ -201,7 +201,7 @@ public sealed class RelayServer
                     string verb = pv < 0 ? payload : payload[..pv];
                     try
                     {
-                        if (verb is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL") EditWire.Parse(payload).Apply(_doc);
+                        if (verb is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL") EditWire.Parse(payload).Apply(_doc);
                         else _world?.ApplyOp(payload);
                     }
                     catch { /* malformed op: drop, do not advance state */ }

@@ -65,6 +65,47 @@ public class PickingTests
         }
     }
 
+    /// <summary>
+    /// Placing on top of an object: the pick buffer's depth under the cursor, turned back into a world point, has to
+    /// BE the point that was drawn there - or a crate meant for a rooftop floats above it or sinks into it. GL writes
+    /// depth = (NDC z + 1) / 2 with the default depth range; this does the same to a projected point and demands it
+    /// back, at every screen size and with the mirrored view on and off.
+    ///
+    /// Back to within 3 cm, not a millimetre: with the camera's 1 m near plane and 60 km far plane the depth values
+    /// crowd against 1.0, where one float step - and one step of the GPU's 24-bit depth buffer, which is the real
+    /// source - is about a centimetre at these distances. The control below shows the test still tells a right
+    /// mapping from a wrong one by metres.
+    /// </summary>
+    [Theory]
+    [InlineData(1280, 800)]
+    [InlineData(1920, 1080)]
+    [InlineData(3840, 2224)]
+    public void A_depth_read_under_the_cursor_unprojects_to_the_surface_drawn_there(int w, int h)
+    {
+        foreach (bool mirror in new[] { false, true })
+        {
+            var cam = Cam(w, h, mirror);
+            float worst = 0f, wrongBest = float.MaxValue;
+            for (int gz = 0; gz < 5; gz++)
+                for (int gx = 0; gx < 5; gx++)
+                {
+                    var p = new Vector3(470f - 120f + gx * 60f, 12f + gx * 3f, 180f + gz * 45f);   // rooftops at varied heights
+                    var clip = Vector4.Transform(new Vector4(p, 1f), cam.ViewProjection);
+                    if (clip.W <= 0f) continue;
+                    var px = Drawn(p, cam, w, h);
+                    if (float.IsNaN(px.X) || px.X < 0 || px.X >= w || px.Y < 0 || px.Y >= h) continue;
+                    float depth = (clip.Z / clip.W + 1f) * 0.5f;                                   // what GL stores
+                    var back = Picking.UnprojectDepth(cam.ViewProjection, px.X, px.Y, w, h, depth);
+                    worst = MathF.Max(worst, Vector3.Distance(p, back));
+                    // Control: reading the depth as if it were NDC z already (the easy mistake) must miss badly.
+                    var wrong = Picking.UnprojectDepth(cam.ViewProjection, px.X, px.Y, w, h, (depth + 1f) * 0.5f);
+                    wrongBest = MathF.Min(wrongBest, Vector3.Distance(p, wrong));
+                }
+            Assert.True(worst < 0.03f, $"{w}x{h} mirror={mirror}: depth unprojects {worst * 100f:0.##} cm off the surface");
+            Assert.True(wrongBest > 1f, $"{w}x{h} mirror={mirror}: the wrong depth mapping came within {wrongBest:0.###} m - the test cannot tell them apart");
+        }
+    }
+
     static GlObjects.PickBox Box(int index, Vector3 at, Vector3 half, float scale = 1f, float yawDeg = 0f) =>
         new(Matrix4x4.CreateScale(scale)
             * Matrix4x4.CreateFromYawPitchRoll(yawDeg * MathF.PI / 180f, 0f, 0f)

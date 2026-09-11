@@ -119,6 +119,52 @@ void main(){
         int pw = x1 - x0 + 1, ph = y1 - y0 + 1;
         if (pw <= 0 || ph <= 0) return -1;
 
+        var buf = new byte[pw * ph * 4];
+        RenderPatch(gl, objects, viewProj, fbW, fbH, x0, y0, pw, ph, buf, null);
+
+        // Nearest covered pixel to the cursor wins. Reading a patch rather than one pixel is what gives the click
+        // a tolerance, and because it is measured on the drawn image it needs no per-object fudge factor.
+        int best = -1; long bestD2 = long.MaxValue;
+        int curPx = cx - x0, curPy = glyTop - y0;
+        for (int y = 0; y < ph; y++)
+            for (int x = 0; x < pw; x++)
+            {
+                int o = (y * pw + x) * 4;
+                int code = buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16);
+                if (code == 0) continue;
+                long dx = x - curPx, dy = y - curPy;
+                long d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) { bestD2 = d2; best = code - 1; }
+            }
+        return best;
+    }
+
+    /// <summary>
+    /// The object drawn EXACTLY under the cursor, and the depth-buffer value of its surface there (0..1, window
+    /// depth), or false when no object covers that pixel. Placement uses it to set a new object down on top of the
+    /// one you are pointing at: the depth, unprojected, is the visible surface itself - no tolerance, no proxy box.
+    /// </summary>
+    public bool PickSurface(GL gl, GlObjects objects, Matrix4x4 viewProj, Vector2 cursorPx, int fbW, int fbH,
+                            out int id, out float depth)
+    {
+        id = -1; depth = 1f;
+        if (!Ensure(gl, fbW, fbH)) return false;
+        int cx = (int)MathF.Round(cursorPx.X), cy = (int)MathF.Round(cursorPx.Y);
+        if (cx < 0 || cy < 0 || cx >= fbW || cy >= fbH) return false;
+        var buf = new byte[4];
+        var dep = new float[1];
+        RenderPatch(gl, objects, viewProj, fbW, fbH, cx, fbH - 1 - cy, 1, 1, buf, dep);
+        int code = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+        if (code == 0) return false;
+        id = code - 1; depth = dep[0];
+        return true;
+    }
+
+    // Draw every object's id into the patch (x0, y0, pw, ph) - GL coordinates, bottom-left origin - and read the ids
+    // back, and the depth too when asked.
+    private unsafe void RenderPatch(GL gl, GlObjects objects, Matrix4x4 viewProj, int fbW, int fbH,
+                                    int x0, int y0, int pw, int ph, byte[] colors, float[]? depths)
+    {
         // This runs from the mouse handler, OUTSIDE the render loop, so every piece of state it touches has to go
         // back exactly as it was. Leaving the scissor on or the draw framebuffer bound would blank the viewport.
         Span<int> prevViewport = stackalloc int[4];
@@ -153,10 +199,12 @@ void main(){
 
         objects.DrawIds(gl, _prog, _uMvp, _uId, _uUseTex, _uAlphaRef, viewProj);
 
-        var buf = new byte[pw * ph * 4];
         gl.PixelStore(PixelStoreParameter.PackAlignment, 1);
-        fixed (byte* p = buf)
+        fixed (byte* p = colors)
             gl.ReadPixels(x0, y0, (uint)pw, (uint)ph, PixelFormat.Rgba, PixelType.UnsignedByte, p);
+        if (depths is not null)
+            fixed (float* d = depths)
+                gl.ReadPixels(x0, y0, (uint)pw, (uint)ph, PixelFormat.DepthComponent, PixelType.Float, d);
 
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)prevFbo);
         gl.Viewport(prevViewport[0], prevViewport[1], (uint)prevViewport[2], (uint)prevViewport[3]);
@@ -171,22 +219,6 @@ void main(){
         gl.UseProgram((uint)prevProg);
         gl.BindVertexArray((uint)prevVao);
         gl.BindTexture(TextureTarget.Texture2D, (uint)prevTex);
-
-        // Nearest covered pixel to the cursor wins. Reading a patch rather than one pixel is what gives the click
-        // a tolerance, and because it is measured on the drawn image it needs no per-object fudge factor.
-        int best = -1; long bestD2 = long.MaxValue;
-        int curPx = cx - x0, curPy = glyTop - y0;
-        for (int y = 0; y < ph; y++)
-            for (int x = 0; x < pw; x++)
-            {
-                int o = (y * pw + x) * 4;
-                int code = buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16);
-                if (code == 0) continue;
-                long dx = x - curPx, dy = y - curPy;
-                long d2 = dx * dx + dy * dy;
-                if (d2 < bestD2) { bestD2 = d2; best = code - 1; }
-            }
-        return best;
     }
 
     public void Dispose() { }   // GL objects die with the context; the editor holds one for its lifetime

@@ -32,6 +32,10 @@ public static class LevelValidator
         /// <summary>Whether a template can be resolved at all (mesh library or game objects).</summary>
         public Func<string, bool>? TemplateExists { get; init; }
 
+        /// <summary>Each game mode's soldier spawn templates, read for the below-ground flag (see
+        /// <see cref="SpawnBelowGround"/>). Without them an underground spawn is simply reported as buried.</summary>
+        public IReadOnlyList<(string Mode, SpawnBelowGround.Flags Flags)>? SpawnBelowGroundByMode { get; init; }
+
         /// <summary>How far above the ground an object's bottom may sit before it counts as floating.</summary>
         public float FloatTolerance { get; init; } = 0.75f;
         /// <summary>How far below the ground an object's bottom may sink before it counts as buried.</summary>
@@ -146,7 +150,7 @@ public static class LevelValidator
             if (ca is { } a && !a.Contains(s.Position.X, s.Position.Z))
                 r.Add(IssueSeverity.Error, "Soldier spawn",
                     $"'{s.Name}' is outside the combat area - spawning there is a death", s.Position);
-            CheckAboveGround(inp, r, "Soldier spawn", s.Name, s.Position);
+            CheckSoldierSpawnHeight(inp, r, s.Name, s.Position);
         }
 
         // Vehicle spawners: nothing to spawn, or nobody to spawn it for.
@@ -208,6 +212,30 @@ public static class LevelValidator
             r.Add(IssueSeverity.Warning, cat,
                 $"{death} of the {total} material cells inside the combat area are deathMaterial ({100f * death / total:0}%) - " +
                 "players there are out of bounds. Combat Area panel > Repaint deathMaterial inside area fixes it.");
+    }
+
+    // A soldier spawn under the terrain is a tunnel spawn if its template says so, and a spawn the game quietly lifts
+    // to the surface if it does not - per game mode, since each mode has its own templates file.
+    private static void CheckSoldierSpawnHeight(Inputs inp, LevelReport r, string name, Vec3 pos)
+    {
+        var g = GroundAt(inp, pos.X, pos.Z);
+        if (g is null || inp.SpawnBelowGroundByMode is not { Count: > 0 } modes || pos.Y - g.Value >= -1.0f)
+        {
+            CheckAboveGround(inp, r, "Soldier spawn", name, pos);
+            return;
+        }
+        float depth = g.Value - pos.Y;
+        foreach (var (mode, flags) in modes)
+        {
+            if (!flags.Defined.Contains(name)) continue;         // not in this mode
+            if (flags.Allowed.Contains(name)) continue;          // a real tunnel spawn - the game keeps it there
+            if (flags.Misspelled.TryGetValue(name, out var typo))
+                r.Add(IssueSeverity.Error, "Soldier spawn",
+                    $"'{name}' is {depth:0.0} m under the ground and its {mode} template says '{typo}', which the game does not know - so it lifts the spawn to the surface. The command is {SpawnBelowGround.Command}.", pos);
+            else
+                r.Add(IssueSeverity.Error, "Soldier spawn",
+                    $"'{name}' is {depth:0.0} m under the ground; the game lifts it to the surface unless its {mode} template sets {SpawnBelowGround.Command} 1", pos);
+        }
     }
 
     private static void CheckAboveGround(Inputs inp, LevelReport r, string cat, string name, Vec3 pos)

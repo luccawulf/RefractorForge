@@ -93,8 +93,9 @@ public class GroundShadowMergeTests
         Assert.InRange(shadowed, 98, 102);
     }
 
-    /// <summary>Baking twice compounds - which is exactly why the editor runs it as an undoable atlas edit and
-    /// says so. Pinning it here so nobody "fixes" the doubling by making the merge silently idempotent.</summary>
+    /// <summary>The raw multiply compounds - it has no idea what the ground already carries, and this pins that it
+    /// stays a plain multiply. Stacking is prevented one level up, and explicitly: the editor keeps the factor map of
+    /// the merge it made and divides it back out before the next one (see <see cref="GroundShadowRecordTests"/>).</summary>
     [Fact]
     public void Merging_twice_compounds_by_design()
     {

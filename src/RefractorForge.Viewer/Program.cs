@@ -764,6 +764,20 @@ RefractorForge.Viewer.GpuLightmapShader? gpuLm = null;
 System.Threading.Tasks.Task<(RefractorForge.Render.LightmapGpuSelfTest.Comparison Cmp, double CpuS, double GpuS)>? gpuTestTask = null;
 string gpuTestResult = "";
 bool gpuTestPassed = false;   // the checkbox can only switch the GPU on once the self-test has passed on this card
+// Lightmap-ready objects: give placed objects whose meshes carry no lightmap unwrap a level-local COPY on a patched
+// mesh, so a bake can reach them. The scan and the patching run on workers; the mesh library is read here first.
+bool showLmReady = false;
+bool lmReadyShowFoliage = false, lmReadyShowEffects = false, lmReadyOnlySelected = false;
+System.Threading.Tasks.Task<(List<RefractorForge.Render.LightmapReadyPlanner.Row> Rows, int Undefined)>? lmReadyScan = null;
+System.Threading.Tasks.Task<(RefractorForge.Formats.Con.LightmapReady.Output Out, Dictionary<string, RefractorForge.Formats.Con.LightmapReady.PatchedMesh> Patches, List<string> Failures, List<string> Chosen)>? lmReadyApply = null;
+List<RefractorForge.Render.LightmapReadyPlanner.Row>? lmReadyRows = null;
+HashSet<string> lmReadyChosen = new(StringComparer.OrdinalIgnoreCase);
+RefractorForge.Formats.Con.TemplateScripts? lmReadyScripts = null;
+RefractorForge.Formats.Con.LightmapReady.Manifest lmReadyManifest = RefractorForge.Formats.Con.LightmapReady.Manifest.Empty;
+Dictionary<string, RefractorForge.Render.LightmapReadyPlanner.MeshSource?>? lmReadyMeshes = null;
+string lmReadyStatus = "";
+int lmReadyUndefined = 0;
+(int Maps, long Bytes) lmReadyExisting = (0, 0);
 // A preview bake covers only the SELECTED objects. Judging a lighting setting should not cost a whole map: at
 // Ultra a full bake is tens of minutes, and nobody tunes a slider on an hour-long feedback loop. A preview must
 // therefore also never DISCARD the maps a full bake already produced - it adds to them.
@@ -806,6 +820,8 @@ bool sbThenObjects = false;             // "Bake Both": run the object lightmaps
 // LightBake.MultiplyShadowIntoAtlas), and a .lsb on its own changes nothing on screen, proven with a 50%
 // checkerboard .lsb that rendered identically in game.
 bool sbMergeToGround = true;
+Texture2D? groundMerge = null;       // the factor map the ground currently carries (see CurrentGroundMerge)
+bool groundMergeLoaded = false;      // read lazily from the level; reset whenever a level is opened
 float sbShadowLevel = 0.5f;             // what fully shadowed ground keeps; 0.5 matches retail
 HashSet<string>? lmExisting = null;      // lightmap files the level already ships, snapshotted when a bake starts
 Dictionary<byte, byte[]> uniformLightmapCache = new();   // flat fallback lightmaps, cached by their grey value
@@ -1344,6 +1360,9 @@ IKeyboard? kb = null;
 
 uint terrainProg = 0, markerProg = 0, terrainVao = 0, terrainVbo = 0, markerVao = 0, markerVbo = 0;
 uint previewVao = 0, previewVbo = 0;   // single point showing where a placement will land
+// The preview's last landing spot, re-picked only when the cursor or the camera has moved (PlacementPreviewHit).
+Vector2 placePrevMouse = new(-1f, -1f); Matrix4x4 placePrevVp = default; long placePrevTick = 0;
+bool placePrevOk = false; Vector3 placePrevHit = default;
 uint gizmoVao = 0, gizmoVbo = 0;       // 3 axis handles (drawn as GL_LINES via the marker shader)
 uint collisionVao = 0, collisionVbo = 0; int collisionLineCount = 0; bool collisionDirty = true;  // .sm collision wireframe overlay (RE'd DShape)
 // Battlecraft's object view modes (guide figure 17): 0 = textured (this editor's normal view), 1 = flat colour
@@ -1816,6 +1835,7 @@ bool lightPreview = true;      // shade the editor with the level's light colour
 bool lightingDirty = false;    // user touched the lighting -> patch Init.con on save
 // Editable fog state (seeded from the level's Init.con; tweaked live in the Environment panel).
 bool fogEnabled = false; Vector3 fogColor = new(0.72f, 0.83f, 0.83f); float fogStart = 100f, fogEnd = 450f;
+float viewDistance = 550f;   // Game.ViewDistance: how far the game draws at all - separate from the fog, edited beside it
 // Fog the editor changed to match a swapped skybox, and what it was before, so it can be put straight back.
 bool fogChangedBySky = false;
 (bool On, Vector3 Col, float Start, float End) fogSkyPrev;
@@ -2744,9 +2764,10 @@ void OnLoad()
                 return;
             }
 
-            // Place tool: drop the Object-Library selection onto the terrain under the cursor.
+            // Place tool: drop the Object-Library selection under the cursor - on the terrain, or on top of the static
+            // object drawn there (PlacementHit).
             if (toolNames[tool] == "Place" && browserTemplate is not null && terrainPick is not null
-                && so is not null && hist is not null && terrainPick.Raycast(ray, out var hitPos))
+                && so is not null && hist is not null && PlacementHit(ray, out var hitPos))
             {
                 var id = Guid.NewGuid().ToString("N");
                 var ppos = SnapXZ(new Vec3(hitPos.X, hitPos.Y, hitPos.Z));
@@ -3078,6 +3099,7 @@ void OnLoad()
         fogEnabled = env.FogEnabled;
         fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
         fogStart = env.FogStart; fogEnd = env.FogEnd;
+        viewDistance = env.ViewDistance;
         lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
         lightAmb = new Vector3(env.AmbientColor.X, env.AmbientColor.Y, env.AmbientColor.Z);
         lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
@@ -3689,6 +3711,45 @@ int PickObject(Ray ray)
         catch (Exception ex) { Console.WriteLine("Object pick fell back to the box test: " + ex.Message); }
     }
     return glObjects?.Raycast(ray.Origin, ray.Dir) ?? -1;
+}
+
+// Where a dropped static object lands: the terrain under the cursor, as it always was - unless a static object is
+// DRAWN there, nearer the camera, in which case the new one goes on top of it. A crate on a rooftop, a lamp on a
+// table, sandbags on a bunker. The point comes from the pick buffer's depth under the cursor, unprojected, so it is
+// the surface you can see, to the pixel - no collision mesh, no bounding box.
+bool PlacementHit(Ray ray, out Vector3 hit)
+{
+    hit = default;
+    bool onTerrain = false;
+    if (terrainPick is not null && terrainPick.Raycast(ray, out var th)) { hit = th; onTerrain = true; }
+    if (glObjects is null) return onTerrain;
+    try
+    {
+        var fbp = window.FramebufferSize;
+        if (glPick.PickSurface(gl, glObjects, cam.ViewProjection, lastMouse, fbp.X, fbp.Y, out _, out float depth) && depth < 1f)
+        {
+            var onObject = Picking.UnprojectDepth(cam.ViewProjection, lastMouse.X, lastMouse.Y, fbp.X, fbp.Y, depth);
+            if (!onTerrain || Vector3.Distance(ray.Origin, onObject) < Vector3.Distance(ray.Origin, hit)) { hit = onObject; return true; }
+        }
+    }
+    catch (Exception ex) { Console.WriteLine("Placement fell back to the terrain: " + ex.Message); }
+    return onTerrain;
+}
+
+// The same, for the green preview marker drawn every frame. Picking costs a redraw of the objects into the pick
+// buffer, so it is re-done only when the cursor or the camera has actually moved, and not more than ~20 times a
+// second while they do; between times the marker keeps its last answer.
+bool PlacementPreviewHit(Ray ray, out Vector3 hit)
+{
+    long now = Environment.TickCount64;
+    bool moved = lastMouse != placePrevMouse || cam.ViewProjection != placePrevVp;
+    if (moved && now - placePrevTick >= 50)
+    {
+        placePrevOk = PlacementHit(ray, out placePrevHit);
+        placePrevMouse = lastMouse; placePrevVp = cam.ViewProjection; placePrevTick = now;
+    }
+    hit = placePrevHit;
+    return placePrevOk;
 }
 
 // How forgiving a click is, in framebuffer pixels. Every hit-test radius in the editor was written as a raw pixel
@@ -5156,7 +5217,7 @@ void AutoBackup()
         {
             Directory.CreateDirectory(backupRoot);
             var dst = Path.Combine(backupRoot, $"{Path.GetFileNameWithoutExtension(levelDir)}_{stamp}{Path.GetExtension(levelDir)}");
-            if (!File.Exists(dst)) File.Copy(levelDir, dst);
+            if (!File.Exists(dst)) RefractorForge.Formats.DurableFile.Copy(levelDir, dst);   // flushed: see DurableFile
             Console.WriteLine($"Auto-backup -> {dst}");
             Toast($"Backed up {Path.GetFileName(levelDir)}");
         }
@@ -5172,7 +5233,7 @@ void AutoBackup()
                 var rel = Path.GetRelativePath(levelDir, src);
                 var dst = Path.Combine(bdir, rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                File.Copy(src, dst, true); n++;
+                RefractorForge.Formats.DurableFile.Copy(src, dst, overwrite: true); n++;
             }
             if (n > 0) { Console.WriteLine($"Auto-backup: {n} level file(s) -> {bdir}"); Toast($"Backed up {n} level file(s)"); }
         }
@@ -6122,8 +6183,18 @@ void FinishShadowBake()
     // in game, while retail's own tiles are ~x0.5 darker exactly where its .lsb flags shadow.
     if (sbMergeToGround && atlasCpu is not null)
     {
-        AtlasFullEdit(() => LightBake.MultiplyShadowIntoAtlas(atlasCpu!, shadow, sbShadowLevel));
-        Console.WriteLine($"   Merged the shadow into the ground texture at {sbShadowLevel:0.00} (Z undoes it; save re-encodes the tiles as DXT1).");
+        // REPLACE whatever an earlier bake merged, never stack on it: divide the old factor map out, multiply the
+        // new one in, and keep the new one so the next bake - this session or after a reopen - can do the same.
+        var previous = CurrentGroundMerge();
+        var factor = LightBake.ShadowFactorMap(shadow, sbShadowLevel);
+        AtlasFullEdit(() =>
+        {
+            if (previous is not null) LightBake.DivideFactorOutOfAtlas(atlasCpu!, previous);
+            LightBake.MultiplyFactorIntoAtlas(atlasCpu!, factor);
+        }, onApply: () => SetGroundMerge(factor), onUndo: () => SetGroundMerge(previous));
+        Console.WriteLine($"   Merged the shadow into the ground texture at {sbShadowLevel:0.00}"
+                          + (previous is not null ? ", replacing the previous bake's shadow" : "")
+                          + " (Z undoes it; save re-encodes the tiles as DXT1).");
     }
     else if (sbMergeToGround)
         Console.WriteLine("   No terrain texture atlas on this level, so the shadow could not be merged into the ground - the .lsb alone will not be visible in game.");
@@ -6812,16 +6883,52 @@ Texture2D? SurfPaintTex() => (paintFromLib && libTex is not null) ? libTex : (ac
 float SurfPaintTile() => paintFromLib ? libTileMeters : texTileMeters;
 
 // Run a whole-atlas mutation (Fill / Layer bake) as one undoable edit, then re-upload + flag for save.
-void AtlasFullEdit(Action mutate)
+void AtlasFullEdit(Action mutate, Action? onApply = null, Action? onUndo = null)
 {
     if (atlasCpu is null) { Toast(Loc.T("This level has no terrain texture atlas.")); return; }
     var before = (byte[])atlasCpu.Rgba.Clone();
     mutate();
     var after = (byte[])atlasCpu.Rgba.Clone();
-    var cmd = new AtlasStrokeCommand(atlasCpu, 0, 0, atlasCpu.Width, atlasCpu.Height, before, after, UploadAtlasRectMips);
+    var cmd = new AtlasStrokeCommand(atlasCpu, 0, 0, atlasCpu.Width, atlasCpu.Height, before, after, UploadAtlasRectMips, onApply, onUndo);
     atlasPainted = true;
     if (hist is not null) hist.Do(cmd);
-    else UploadAtlasRectMips(0, 0, atlasCpu.Width, atlasCpu.Height);
+    else { UploadAtlasRectMips(0, 0, atlasCpu.Width, atlasCpu.Height); onApply?.Invoke(); }
+}
+
+// ---- What the editor has multiplied into the ground --------------------------------------------------------------
+// A shadow merge darkens the ground tiles, and the tiles are the only copy of the ground art - so on its own a second
+// bake multiplied on top of the first (x0.5, then x0.25), a new sun left the old sun's shadows painted in beside the
+// new ones, and an unbake could not take any of it off again. The merge's FACTOR MAP is therefore kept with the level
+// (Textures/RF_GroundShadowMerge.tga, which the game never reads) and every bake divides the previous one back out
+// before applying its own. The record rides the same undo step as the ground edit it describes.
+const string GroundMergePath = "Textures/RF_GroundShadowMerge.tga";
+
+Texture2D? CurrentGroundMerge()
+{
+    if (!groundMergeLoaded)
+    {
+        groundMergeLoaded = true;
+        groundMerge = null;
+        try
+        {
+            var pending = pendingLevelFiles.LastOrDefault(f => f.RelPath.Equals(GroundMergePath, StringComparison.OrdinalIgnoreCase)).Bytes;
+            var bytes = pending ?? (ReadLevelText(GroundMergePath) is { } t ? System.Text.Encoding.Latin1.GetBytes(t) : null);
+            if (bytes is not null) groundMerge = TgaTexture.Decode(bytes);
+        }
+        catch { groundMerge = null; }
+    }
+    return LightBake.IsNeutralFactor(groundMerge) ? null : groundMerge;
+}
+
+// Point the record at what the ground now carries. A level that has a saved record gets a neutral one written over
+// it when the merge comes off (an archive entry cannot be deleted); one that never had a record just drops the queue.
+void SetGroundMerge(Texture2D? factor)
+{
+    groundMerge = factor; groundMergeLoaded = true;
+    if (factor is not null) { QueueLevelFile(GroundMergePath, TgaTexture.EncodeGrayColormapped(factor)); return; }
+    pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(GroundMergePath, StringComparison.OrdinalIgnoreCase));
+    if (ReadLevelText(GroundMergePath) is not null)
+        QueueLevelFile(GroundMergePath, TgaTexture.EncodeGrayColormapped(new Texture2D(1, 1, new byte[] { 255, 255, 255, 255 })));
 }
 
 void FillTerrainWith(Texture2D tex, float tile)
@@ -7418,11 +7525,20 @@ int LightmapSizeFor(MeshLibrary.Mesh mesh)
         maxX = MathF.Max(maxX, p.X); maxY = MathF.Max(maxY, p.Y); maxZ = MathF.Max(maxZ, p.Z);
     }
     if (minX > maxX) return 256;
-    float ext = MathF.Max(maxX - minX, MathF.Max(maxY - minY, maxZ - minZ));
-    int want = (int)MathF.Round(ext * lmTexelsPerMetre);
-    int p2 = 64;
-    while (p2 < want && p2 < lmBakeMaxSize) p2 <<= 1;
-    return Math.Clamp(p2, 64, lmBakeMaxSize);
+    return LightmapPxFor(MathF.Max(maxX - minX, MathF.Max(maxY - minY, maxZ - minZ)), 0);
+}
+
+// A lightmap-ready copy's mesh was unwrapped HERE, packed with 4-texel gutters at a particular size: never bake it
+// smaller than that. DICE's unwraps are not on that grid, and are not in the copies list either.
+int LightmapSizeForJob(string meshName, MeshLibrary.Mesh mesh, HashSet<string> lmReadyCopies)
+{
+    int size = LightmapSizeFor(mesh);
+    string leaf = meshName.Replace('\\', '/');
+    leaf = leaf[(leaf.LastIndexOf('/') + 1)..];
+    if (lmReadyCopies.Contains(leaf)
+        && RefractorForge.Formats.Mesh.LightmapUnwrapper.RecoverMinBakeSize(mesh.LightmapUvs) is int floor)
+        size = Math.Clamp(Math.Max(size, floor), 64, lmBakeMaxSize);
+    return size;
 }
 
 // The three quality settings, as one choice. Sub-samples per texel AXIS smooth the shadow edges; texels per
@@ -7585,7 +7701,8 @@ void BakeObjectLightmaps()
     var fallbackRgb = new Vector3?[jobs.Count]; lmFallbackRgb = fallbackRgb;
     var worlds = new Matrix4x4[jobs.Count];
     var sizes = new int[jobs.Count];
-    for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
+    var lmReadyCopies = ReadLmReadyManifest().Geometries.Values.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeForJob(jobs[i].MeshName, jobs[i].Mesh, lmReadyCopies); }
     lmWorkDone = 0; lmWorkTotal = 0;
     foreach (var sz in sizes) lmWorkTotal += (long)sz * sz;
 
@@ -8341,12 +8458,14 @@ void OnRender(double dt)
         }
     }
 
-    // Placement preview: a bright marker on the terrain under the cursor while Place is armed.
+    // Placement preview: a bright marker where the object will land while Place is armed - the terrain, or the top of
+    // the static object under the cursor. Prefabs stamp onto the terrain, so theirs stays there.
     if (terrainPick is not null && toolNames[tool] == "Place" && browserTemplate is not null && !UiWantsMouse())
     {
         var fbp = window.FramebufferSize;
         var pray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbp.X, fbp.Y);
-        if (terrainPick.Raycast(pray, out var pp))
+        Vector3 pp;
+        if (IsPrefab(browserTemplate) ? terrainPick.Raycast(pray, out pp) : PlacementPreviewHit(pray, out pp))
         {
             float[] one = { pp.X, pp.Y, pp.Z };
             gl.BindVertexArray(previewVao);
@@ -10133,12 +10252,15 @@ void NightLightingWindow()
     float el = sunElevationDeg;
     if (SldF(Loc.TL("Moon height (deg)"), ref el, 5f, 89f, "%.0f")) { sunOverride = true; sunElevationDeg = el; shadowMapDirty = true; BroadcastLight(); }
     ImGui.SetNextItemWidth(180f * uiScale);
-    var fc = fogColor; if (Col3(Loc.TL("Fog colour"), ref fc)) { fogColor = fc; fogEnabled = true; if (env is not null) { env.FogColor = new Vec3(fc.X, fc.Y, fc.Z); env.WriteFog = true; } BroadcastLight(); }
+    // These write straight into the level, so each one also marks Init.con for the next save - the fog lines were
+    // being set on the level without that, and a fog edited here alone never reached the file.
+    var fc = fogColor; if (Col3(Loc.TL("Fog colour"), ref fc)) { fogColor = fc; fogEnabled = true; if (env is not null) { env.FogColor = new Vec3(fc.X, fc.Y, fc.Z); env.WriteFog = true; lightingDirty = true; } BroadcastLight(); }
     ImGui.SetNextItemWidth(180f * uiScale);
     float fs = fogStart, fe = fogEnd;
-    if (SldF(Loc.TL("Fog start (m)"), ref fs, 10f, 2000f, "%.0f")) { fogStart = MathF.Min(fs, fogEnd - 5f); if (env is not null) { env.FogStart = fogStart; env.WriteFog = true; } }
+    if (SldF(Loc.TL("Fog start (m)"), ref fs, 10f, 2000f, "%.0f")) { fogStart = MathF.Min(fs, fogEnd - 5f); if (env is not null) { env.FogStart = fogStart; env.WriteFog = true; lightingDirty = true; } }
     ImGui.SetNextItemWidth(180f * uiScale);
-    if (SldF(Loc.TL("Fog end (m)"), ref fe, 20f, 4000f, "%.0f")) { fogEnd = MathF.Max(fe, fogStart + 5f); if (env is not null) { env.FogEnd = fogEnd; env.WriteFog = true; } }
+    if (SldF(Loc.TL("Fog end (m)"), ref fe, 20f, 4000f, "%.0f")) { fogEnd = MathF.Max(fe, fogStart + 5f); if (env is not null) { env.FogEnd = fogEnd; env.WriteFog = true; lightingDirty = true; } }
+    ViewDistanceSlider(writeToLevel: true);
     ImGui.SetNextItemWidth(180f * uiScale);
     float night = lightRig.NightAmount;
     if (SldF(Loc.TL("Preview darkness"), ref night, 0f, 1f, "%.2f")) lightRig.NightAmount = night;
@@ -10486,69 +10608,371 @@ string? EnsureGlowTemplate(Vec3 colour, float size, float brightness)
     catch (Exception ex) { Toast(Loc.T("Glow object failed: ") + ex.Message); return null; }
 }
 
-// Give the SELECTED object a lightmap-capable copy of its mesh, shipped inside this level.
-//
-// This is the whole of Part 2 in one button: unwrap the mesh, widen its vertex from 32 to 40 bytes so it has
-// somewhere to put a second UV set, write the patched .sm into the level's own archive, and point the object at
-// it by path. Roughly two thirds of BfVietnam's meshes and ninety percent of BF1942's have no lightmap channel
-// at all, so without this a bake can never reach them - and the engine has no way to make one either, since its
-// own generator needs exporter .samples files that ship in no archive.
-//
-// Deliberately ONE object at a time. Whether the engine actually draws a mesh whose vertex declaration we changed
-// is not established - both games ship meshes at exactly this declaration with real unwraps, which is why it is
-// the shape chosen, but that is not the same as "it will load THIS mesh after I rewrote it". Get one object
-// rendering in game before doing this to a map full of them.
-void PatchSelectedForLightmapping()
+// ---- Lightmap-ready objects -------------------------------------------------------------------------------------
+// Most placed objects cannot take a lightmap: their meshes have no lightmap channel, or ship it empty (on al_vietnas,
+// 1,877 of 2,006 objects). The engine cannot make one - its generator needs exporter .samples files that ship in no
+// archive - so the unwrap is made here, and each object TYPE gets a level-local COPY of its whole definition on the
+// patched mesh (Formats/Cons/LightmapReady). Copied line for line, so an ammo box keeps its supply depots and a
+// medic box keeps healing; a rebuild as a plain prop would silently switch them off.
+
+string LmReadyManifestPath() => $"Objects/{RefractorForge.Formats.Con.LightmapReady.Folder}/Objects.con";
+
+RefractorForge.Formats.Con.LightmapReady.Manifest ReadLmReadyManifest()
 {
-    if (so is null || meshLib is null || levelDir is null) { Toast(Loc.T("Open a level first.")); return; }
-    if (selected < 0 || selected >= so.Objects.Count) { Toast(Loc.T("Select an object first.")); return; }
-    var obj = so.Objects[selected];
+    string path = LmReadyManifestPath();
+    return RefractorForge.Formats.Con.LightmapReady.ReadManifest(PendingText(path) ?? ReadLevelText(path));
+}
 
-    string? meshName = meshLib.LodGeometryNames(obj.Template).FirstOrDefault();
-    if (meshName is null || !meshLib.TryGetMeshBytes(meshName, out _, out var smBytes))
-    { Toast(string.Format(Loc.T("Could not find the mesh file for {0}."), obj.Template)); return; }
+// The size the bake gives a lightmap: the mesh's largest side at the tier's texels per metre, as a power of two, and
+// never below the size an unwrap made HERE was packed for - its 4-texel gutters shrink with the map, and under the
+// baker's 3-texel dilation a thinner one lets one chart's light bleed into the next.
+int LightmapPxFor(float extent, int floor)
+{
+    int want = (int)MathF.Round(extent * lmTexelsPerMetre);
+    int p2 = 64;
+    while (p2 < want && p2 < lmBakeMaxSize) p2 <<= 1;
+    return Math.Clamp(Math.Max(p2, floor), 64, lmBakeMaxSize);
+}
 
-    if (RefractorForge.Formats.Con.LightmapMeshPatch.AlreadyPatched(meshName, pendingLevelFiles.Select(f => f.RelPath)))
-    { Toast(Loc.T("This level already has a lightmap-ready copy of that mesh.")); return; }
-
-    try
+// Object lightmaps the level carries on disk now, for the dialog's "this map already has" line.
+(int Maps, long Bytes) CountObjectLightmaps()
+{
+    var seen = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    foreach (var rfa in rfaList.Where(LevelArchive.IsRfa))
     {
-        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
-        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the object in.")); return; }
-        var (baseSub, levelName) = LevelIdentity();
-        meshLib.TryGetRsText(meshName, out _, out var rsText);
-
-        var built = RefractorForge.Formats.Con.LightmapMeshPatch.Build(
-            levelName, meshName, smBytes, rsText, baseSub, out var status);
-        if (built is null)
+        try
         {
-            Toast(string.Format(Loc.T("{0} cannot be unwrapped ({1}) - nothing was written."), meshName, status.ToString()));
-            return;
+            foreach (var e in new RefractorFlatArchive(rfa).Entries)
+                if (e.Name.Replace('\\', '/').Contains("/ObjectLightMaps/", StringComparison.OrdinalIgnoreCase)
+                    && e.Name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase))
+                    seen[System.IO.Path.GetFileName(e.Name)] = e.UncompressedSize;
         }
-
-        foreach (var f in built.Files) QueueLevelFile(f.RelPath, f.Bytes);
-        BroadcastLevelFiles(built.Template, built.Files);
-
-        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
-        QueueLevelFile("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
-            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine)));
-        QueueLevelFile("Init.con", System.Text.Encoding.Latin1.GetBytes(
-            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub)));
-
-        // Show it straight away, with its new UVs - otherwise the object would keep drawing the unpatched mesh
-        // until the map was saved and reopened, and a bake done in between would be of the wrong geometry.
-        var sm = built.Files.First(f => f.RelPath.EndsWith(".sm", StringComparison.OrdinalIgnoreCase)).Bytes;
-        if (meshLib.TryBuildMeshFromSm(sm, rsText, out var newMesh)) meshLib.AddMesh(built.Template, newMesh);
-
-        obj.Template = built.Template;
-        SyncMarkers(); RebuildObjects(); UploadMarkers(); RebuildCatalog();
-
-        var d = built.Diagnostics;
-        Toast(string.Format(
-            Loc.T("{0} is now lightmap-ready as {1}: {2} charts, {3} to {4} vertices, bake at {5}px or larger. Save writes it into the level."),
-            meshName, built.Template, d.Charts, d.VerticesIn, d.VerticesOut, d.MinBakeSize));
+        catch { }
     }
-    catch (Exception ex) { Toast(Loc.T("Lightmap patch failed: ") + ex.Message); }
+    return (seen.Count, seen.Values.Sum());
+}
+
+void OpenLmReady()
+{
+    showLmReady = true;
+    lmReadyOnlySelected = multi.Count > 0;
+    StartLmReadyScan();
+}
+
+void StartLmReadyScan()
+{
+    if (so is null || meshLib is null || levelDir is null) { lmReadyStatus = Loc.T("Open a level first."); return; }
+    if (lmReadyScan is not null || lmReadyApply is not null) return;
+    // Everything that touches the mesh library happens here, on the render thread: it is not thread-safe. What the
+    // worker gets is plain bytes and text.
+    var ts = RefractorForge.Formats.Con.TemplateScripts.Parse(meshLib.ConScripts());
+    foreach (var f in pendingLevelFiles.Where(f => f.RelPath.EndsWith(".con", StringComparison.OrdinalIgnoreCase)).ToList())
+        ts.Add(f.RelPath, System.Text.Encoding.Latin1.GetString(f.Bytes));
+    var manifest = ReadLmReadyManifest();
+    var placed = so.Objects.GroupBy(o => o.Template, StringComparer.OrdinalIgnoreCase).Select(g => (g.Key, g.Count())).ToList();
+    var meshes = new Dictionary<string, RefractorForge.Render.LightmapReadyPlanner.MeshSource?>(StringComparer.OrdinalIgnoreCase);
+    foreach (var f in RefractorForge.Render.LightmapReadyPlanner.FilesNeeded(placed.Select(p => p.Key), ts, manifest))
+    {
+        if (!meshLib.TryGetMeshBytes(f, out _, out var sm)) { meshes[f] = null; continue; }
+        meshLib.TryGetRsText(f, out _, out var rs);
+        meshes[f] = new RefractorForge.Render.LightmapReadyPlanner.MeshSource(sm, rs.Length > 0 ? rs : null);
+    }
+    lmReadyScripts = ts; lmReadyManifest = manifest; lmReadyMeshes = meshes;
+    lmReadyExisting = CountObjectLightmaps();
+    lmReadyStatus = Loc.T("Scanning the map's objects...");
+    float tpm = lmTexelsPerMetre; int maxPx = lmBakeMaxSize;
+    int Px(float ext, int floor)
+    {
+        int p2 = 64, want = (int)MathF.Round(ext * tpm);
+        while (p2 < want && p2 < maxPx) p2 <<= 1;
+        return Math.Clamp(Math.Max(p2, floor), 64, maxPx);
+    }
+    lmReadyScan = System.Threading.Tasks.Task.Run(() =>
+    {
+        var rows = RefractorForge.Render.LightmapReadyPlanner.Plan(placed, ts, manifest, meshes, Px, out int undef);
+        return (rows, undef);
+    });
+}
+
+void StartLmReadyApply(IReadOnlyCollection<string> templates)
+{
+    if (lmReadyScripts is null || lmReadyMeshes is null || lmReadyApply is not null || templates.Count == 0) return;
+    var ts = lmReadyScripts; var meshes = lmReadyMeshes; var manifest = lmReadyManifest;
+    var (baseSub, levelName) = LevelIdentity();
+    var chosen = templates.ToList();
+    lmReadyStatus = string.Format(Loc.T("Unwrapping the meshes of {0} object type(s)..."), chosen.Count);
+    lmReadyApply = System.Threading.Tasks.Task.Run(() =>
+    {
+        var patches = RefractorForge.Render.LightmapReadyPlanner.BuildPatches(chosen, ts, manifest, meshes, out var failures);
+        // The copies' scripts are written whole each time, so an earlier run's types go in again with the new ones.
+        var output = RefractorForge.Formats.Con.LightmapReady.Emit(ts, chosen.Concat(manifest.Placed.Keys), patches,
+                                                                  levelName, baseSub, manifest);
+        return (output, patches, failures, chosen);
+    });
+}
+
+void FinishLmReadyApply(RefractorForge.Formats.Con.LightmapReady.Output output,
+                        Dictionary<string, RefractorForge.Formats.Con.LightmapReady.PatchedMesh> patches, List<string> failures,
+                        List<string> chosen)
+{
+    if (so is null || meshLib is null) return;
+    var sent = new List<(string RelPath, byte[] Bytes)>(output.Files);
+    foreach (var (rel, bytes) in output.Files) QueueLevelFile(rel, bytes);
+
+    string? oc = PendingText("Objects/Objects.con") ?? ReadLevelText("Objects/Objects.con");
+    var ocBytes = System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Con.LightmapReady.PatchObjectsCon(oc));
+    QueueLevelFile("Objects/Objects.con", ocBytes); sent.Add(("Objects/Objects.con", ocBytes));
+    if ((PendingText("Init.con") ?? ReadLevelText("Init.con")) is { } init)
+    {
+        var patched = RefractorForge.Formats.Con.LightmapReady.PatchInitCon(init);
+        if (patched != init)
+        {
+            var ib = System.Text.Encoding.Latin1.GetBytes(patched);
+            QueueLevelFile("Init.con", ib); sent.Add(("Init.con", ib));
+        }
+    }
+
+    RegisterLmReadyWithLibrary();
+
+    // Point the placements of the types chosen THIS time at their copies - one undo step, broadcast to collaborators
+    // as TPL ops. An earlier run's types are in the scripts again (they are written whole), but a type that was
+    // pointed back at its original stays there until it is chosen again.
+    var want = chosen.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var cmds = so.Objects.Where(o => want.Contains(o.Template) && output.Placed.TryGetValue(o.Template, out var to)
+                                     && !o.Template.Equals(to, StringComparison.Ordinal))
+                         .Select(o => (IEditCommand)new RetemplateObject(o.Id, output.Placed[o.Template])).ToList();
+    if (cmds.Count > 0)
+    {
+        if (hist is not null) hist.Do(new CompositeCommand(cmds));
+        else foreach (var c in cmds) c.Apply(so);
+    }
+    BroadcastLevelFiles(RefractorForge.Formats.Con.LightmapReady.Folder, sent);
+    SyncMarkers(); RebuildObjects(); UploadMarkers(); RebuildCatalog();
+    RebindObjectMaps();   // a tunnel's underground map goes with its placements to the copy
+
+    string msg = string.Format(Loc.T("{0} object(s) of {1} type(s) are now lightmap-ready, on {2} patched mesh(es). Bake the object lightmaps to light them; Save writes the copies into the level."),
+                               cmds.Count, output.Placed.Count, patches.Count);
+    foreach (var s in output.Skipped) Console.WriteLine("   Lightmap-ready: skipped " + s);
+    foreach (var f in failures) Console.WriteLine("   Lightmap-ready: could not patch " + f);
+    if (output.Skipped.Count + failures.Count > 0)
+        msg += " " + string.Format(Loc.T("{0} could not be done - see the log."), output.Skipped.Count + failures.Count);
+    Console.WriteLine(msg);
+    Toast(msg);
+    lmReadyStatus = msg;
+    StartLmReadyScan();   // show the new state
+}
+
+// Make the copies visible to the mesh library before anything is saved: the viewport draws them on their patched
+// meshes, and the bake resolves them to the geometry names the game will look their lightmaps up by. Also used when
+// a collaborator's copies arrive, and harmless to repeat.
+void RegisterLmReadyWithLibrary()
+{
+    if (meshLib is null) return;
+    string dir = $"Objects/{RefractorForge.Formats.Con.LightmapReady.Folder}/";
+    foreach (var name in new[] { "Geometries.con", "Objects.con" })
+        if (PendingText(dir + name) is { } text) meshLib.AddScripts(dir + name, text);
+    var manifest = ReadLmReadyManifest();
+    foreach (var copy in manifest.Geometries.Values)
+    {
+        var sm = pendingLevelFiles.LastOrDefault(f => f.RelPath.Equals($"StandardMesh/{copy}.sm", StringComparison.OrdinalIgnoreCase)).Bytes;
+        if (sm is null) continue;
+        meshLib.AddMeshFile(copy, sm, PendingText($"StandardMesh/{copy}.rs"));
+    }
+}
+
+// Point every copy's placements back at the original. The copies stay defined in the level, unused - so an undo of
+// this, or making them lightmap-ready again, finds them exactly where they were.
+void RevertLmReady()
+{
+    if (so is null) return;
+    var manifest = ReadLmReadyManifest();
+    var back = so.Objects.Where(o => manifest.OriginalOf(o.Template) is not null)
+                         .Select(o => (IEditCommand)new RetemplateObject(o.Id, manifest.OriginalOf(o.Template)!)).ToList();
+    if (back.Count == 0) { lmReadyStatus = Loc.T("No objects point at lightmap-ready copies."); return; }
+    if (hist is not null) hist.Do(new CompositeCommand(back));
+    else foreach (var c in back) c.Apply(so);
+    SyncMarkers(); RebuildObjects(); UploadMarkers(); RebuildCatalog();
+    RebindObjectMaps();
+    lmReadyStatus = string.Format(Loc.T("Pointed {0} object(s) back at their original templates. The copies stay in the level, unused."), back.Count);
+    Toast(lmReadyStatus);
+    StartLmReadyScan();
+}
+
+void LmReadyPoll()
+{
+    if (lmReadyScan is { IsCompleted: true } scan)
+    {
+        lmReadyScan = null;
+        if (scan.IsFaulted) lmReadyStatus = Loc.T("Scan failed: ") + scan.Exception?.GetBaseException().Message;
+        else
+        {
+            var (rows, undef) = scan.Result;
+            bool first = lmReadyRows is null;
+            lmReadyRows = rows; lmReadyUndefined = undef;
+            // Keep the user's ticks across a rescan; start from the defaults the first time.
+            if (first) lmReadyChosen = rows.Where(r => r.DefaultOn).Select(r => r.Template).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            else lmReadyChosen.RemoveWhere(t => !rows.Any(r => r.Selectable && r.Template.Equals(t, StringComparison.OrdinalIgnoreCase)));
+            if (lmReadyStatus == Loc.T("Scanning the map's objects...")) lmReadyStatus = "";
+        }
+    }
+    if (lmReadyApply is { IsCompleted: true } apply)
+    {
+        lmReadyApply = null;
+        if (apply.IsFaulted) { lmReadyStatus = Loc.T("Lightmap patch failed: ") + apply.Exception?.GetBaseException().Message; Toast(lmReadyStatus); }
+        else { var (o, p, f, c) = apply.Result; FinishLmReadyApply(o, p, f, c); }
+    }
+}
+
+string LmReadyBytes(long b) => b < 1024 * 1024 ? $"{b / 1024.0:0} KB" : $"{b / (1024.0 * 1024.0):0.0} MB";
+
+string LmReadyKind(RefractorForge.Render.LightmapReadyPlanner.Kind k) => k switch
+{
+    RefractorForge.Render.LightmapReadyPlanner.Kind.Foliage => Loc.T("Foliage"),
+    RefractorForge.Render.LightmapReadyPlanner.Kind.Effect => Loc.T("Effect / decal"),
+    _ => Loc.T("Structure / prop"),
+};
+
+string LmReadyChange(RefractorForge.Render.LightmapReadyPlanner.Row r)
+{
+    if (r.DoneAs is not null) return Loc.T("done");
+    if (r.Problem is not null) return Loc.T("can't - see tooltip");
+    int n = r.Geometries.Count(g => g.Patch);
+    string what = r.Geometries.Any(g => g.Patch && g.State == "partial") ? Loc.T("re-unwrap")
+                : r.Widens ? Loc.T("widen to 40 B") : Loc.T("fill empty slot");
+    return n > 1 ? $"{what} ({string.Format(Loc.T("{0} LODs"), n)})" : what;
+}
+
+string LmReadyDetail(RefractorForge.Render.LightmapReadyPlanner.Row r)
+{
+    var sb = new System.Text.StringBuilder();
+    if (r.DoneAs is not null) sb.AppendLine(string.Format(Loc.T("Placements point at the copy {0}."), r.DoneAs));
+    if (r.Problem is not null) sb.AppendLine(r.Problem);
+    foreach (var g in r.Geometries)
+    {
+        string state = g.State switch
+        {
+            "full" => Loc.T("already unwrapped"),
+            "slot-zeroed" => Loc.T("lightmap slot present but empty"),
+            "no-slot" => Loc.T("no lightmap slot"),
+            "partial" => Loc.T("some materials unwrapped"),
+            _ => g.State,
+        };
+        sb.Append(g.Geometry).Append(": ").Append(state);
+        if (g.Problem is not null) sb.Append(" - ").Append(g.Problem);
+        else if (g.Diag is { } d) sb.Append(string.Format(Loc.T(" - {0} charts, {1} to {2} vertices, bakes at {3} px"), d.Charts, d.VerticesIn, d.VerticesOut, g.MapPx));
+        sb.AppendLine();
+    }
+    return sb.ToString().TrimEnd();
+}
+
+void LmReadyWindow()
+{
+    if (!showLmReady) return;
+    // A real size, not AlwaysAutoResize: the prose wraps and the table fills the height, and both size themselves
+    // from the window - an auto-resizing one would adopt that as its next width and creep.
+    ImGui.SetNextWindowSize(new Vector2(840f * uiScale, 620f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(560f * uiScale, 380f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
+    if (!ImGui.Begin(Loc.TL("Lightmap-Ready Objects") + "###lmready", ref showLmReady)) { ImGui.End(); return; }
+    ImGui.PushTextWrapPos(0f);
+    Theme.Muted(Loc.T("Most objects cannot take a lightmap: their meshes have no lightmap channel, or ship it empty, and the game cannot make one. For each type you tick, this makes a copy inside this level - its own definition line for line, on a mesh unwrapped here - and points its placements at the copy. Then bake the object lightmaps as usual. Nothing outside this map changes, and an ammo box stays an ammo box."));
+    ImGui.PopTextWrapPos();
+    bool busy = lmReadyScan is not null || lmReadyApply is not null;
+    if (lmReadyRows is null)
+    {
+        if (busy) Theme.Muted(lmReadyStatus);
+        else if (ImGui.Button(Loc.TL("Scan this map"))) StartLmReadyScan();
+        ImGui.End();
+        return;
+    }
+
+    ImGui.Checkbox(Loc.TL("Show foliage"), ref lmReadyShowFoliage);
+    Theme.Tip(Loc.T("Trees, palms, bushes, grass and rice - read from their shaders, not their names. Off by default: they are\nhundreds of placements, and a tree's leaf cards need a large map to unwrap into."));
+    ImGui.SameLine();
+    ImGui.Checkbox(Loc.TL("Show effects and decals"), ref lmReadyShowEffects);
+    ImGui.SameLine();
+    bool hasSel = multi.Count > 0 && so is not null;
+    if (!hasSel) lmReadyOnlySelected = false;
+    ImGui.BeginDisabled(!hasSel);
+    ImGui.Checkbox(Loc.TL("Only the selected objects' types"), ref lmReadyOnlySelected);
+    ImGui.EndDisabled();
+
+    var selTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (lmReadyOnlySelected && so is not null)
+        foreach (var i in multi)
+            if (i >= 0 && i < so.Objects.Count) { var t = so.Objects[i].Template; selTypes.Add(lmReadyManifest.OriginalOf(t) ?? t); }
+    var visible = lmReadyRows.Where(r => (r.Kind != RefractorForge.Render.LightmapReadyPlanner.Kind.Foliage || lmReadyShowFoliage)
+                                         && (r.Kind != RefractorForge.Render.LightmapReadyPlanner.Kind.Effect || lmReadyShowEffects)
+                                         && (!lmReadyOnlySelected || selTypes.Contains(r.Template))).ToList();
+
+    if (ImGui.SmallButton(Loc.TL("Tick all shown"))) foreach (var r in visible.Where(r => r.Selectable)) lmReadyChosen.Add(r.Template);
+    ImGui.SameLine();
+    if (ImGui.SmallButton(Loc.TL("Untick all shown"))) foreach (var r in visible) lmReadyChosen.Remove(r.Template);
+    ImGui.SameLine();
+    ImGui.BeginDisabled(busy);
+    if (ImGui.SmallButton(Loc.TL("Rescan"))) StartLmReadyScan();
+    ImGui.EndDisabled();
+
+    float footer = ImGui.GetFrameHeightWithSpacing() * 2f + ImGui.GetTextLineHeightWithSpacing() * 4f;
+    if (ImGui.BeginTable("##lmready", 7, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV,
+                         new Vector2(0f, -footer)))
+    {
+        ImGui.TableSetupScrollFreeze(0, 1);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 26f * uiScale);
+        ImGui.TableSetupColumn(Loc.T("Object"), ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn(Loc.T("Placed"), ImGuiTableColumnFlags.WidthFixed, 56f * uiScale);
+        ImGui.TableSetupColumn(Loc.T("Kind"), ImGuiTableColumnFlags.WidthFixed, 116f * uiScale);
+        ImGui.TableSetupColumn(Loc.T("Change"), ImGuiTableColumnFlags.WidthFixed, 170f * uiScale);
+        ImGui.TableSetupColumn(Loc.T("Map"), ImGuiTableColumnFlags.WidthFixed, 64f * uiScale);
+        ImGui.TableSetupColumn(Loc.T("Disk"), ImGuiTableColumnFlags.WidthFixed, 70f * uiScale);
+        ImGui.TableHeadersRow();
+        foreach (var r in visible)
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            if (r.Selectable)
+            {
+                bool on = lmReadyChosen.Contains(r.Template);
+                if (ImGui.Checkbox("##lmr_" + r.Template, ref on))
+                {
+                    if (on) lmReadyChosen.Add(r.Template); else lmReadyChosen.Remove(r.Template);
+                }
+            }
+            string detail = LmReadyDetail(r);
+            ImGui.TableNextColumn(); ImGui.TextUnformatted(r.Template); Theme.Tip(detail);
+            ImGui.TableNextColumn(); ImGui.TextUnformatted(r.Placed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            ImGui.TableNextColumn(); ImGui.TextUnformatted(LmReadyKind(r.Kind));
+            ImGui.TableNextColumn();
+            if (r.Problem is not null && r.DoneAs is null) Theme.Muted(LmReadyChange(r)); else ImGui.TextUnformatted(LmReadyChange(r));
+            Theme.Tip(detail);
+            ImGui.TableNextColumn();
+            int px = r.Geometries.Where(g => g.Patch).Select(g => g.MapPx).DefaultIfEmpty(0).Max();
+            ImGui.TextUnformatted(px > 0 && r.DoneAs is null && r.Problem is null ? $"{px} px" : "");
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(r.Selectable ? LmReadyBytes(r.BytesPerObject * r.Placed) : "");
+        }
+        ImGui.EndTable();
+    }
+
+    var chosenRows = visible.Where(r => r.Selectable && lmReadyChosen.Contains(r.Template)).ToList();
+    ImGui.PushTextWrapPos(0f);
+    Theme.Muted(string.Format(Loc.T("Ticked: {0} type(s), {1} object(s), {2} new lightmap(s), about {3}. This map carries {4} object lightmap(s) now ({5})."),
+        chosenRows.Count, chosenRows.Sum(r => r.Placed), chosenRows.Sum(r => r.MapsPerObject * r.Placed),
+        LmReadyBytes(chosenRows.Sum(r => r.BytesPerObject * r.Placed)), lmReadyExisting.Maps, LmReadyBytes(lmReadyExisting.Bytes)));
+    if (chosenRows.Any(r => r.Widens))
+        Theme.Muted(Loc.T("'Widen' grows the vertex from 32 to 40 bytes - the layout both games' own lightmapped meshes use, and one BfVietnam's dedicated server loads. Check the first ones draw lit in game."));
+    if (lmReadyStatus.Length > 0) Theme.Muted(lmReadyStatus);
+    ImGui.PopTextWrapPos();
+
+    ImGui.BeginDisabled(busy || chosenRows.Count == 0);
+    if (ImGui.Button(string.Format(Loc.T("Make {0} type(s) lightmap-ready"), chosenRows.Count) + "###lmrgo"))
+        StartLmReadyApply(chosenRows.Select(r => r.Template).ToList());
+    ImGui.EndDisabled();
+    ImGui.SameLine();
+    ImGui.BeginDisabled(busy || !lmReadyRows.Any(r => r.DoneAs is not null));
+    if (ImGui.Button(Loc.TL("Point all back at the originals"))) RevertLmReady();
+    ImGui.EndDisabled();
+    Theme.Tip(Loc.T("Undoes it for every type at once (Ctrl+Z undoes the last change too). The copies stay in the level unused,\nso making a type lightmap-ready again reuses them."));
+    ImGui.End();
 }
 
 // Bake a small fixed scene on the CPU and on the GPU and measure how far apart they are. The kernel's data handling
@@ -11250,6 +11674,29 @@ Vector3? SkyHorizonColour(string meshName)
     catch { return null; }
 }
 
+// Game.ViewDistance, edited beside the fog because the two are set together - but it is its own setting: the fog
+// shades what is inside it, the view distance is where the game stops drawing at all. With the fog ending past it,
+// the world ends in a hard line before the fog has hidden it. writeToLevel = the Lighting window, whose sliders go
+// straight into the level; the Environment panel previews until "Save fog to level".
+void ViewDistanceSlider(bool writeToLevel = false)
+{
+    float vd = viewDistance;
+    ImGui.SetNextItemWidth(writeToLevel ? 180f * uiScale : -1f);
+    if (SldF(Loc.TL("View distance (m)"), ref vd, 50f, Math.Max(2000f, cfg.WorldSize * 2f), "%.0f"))
+    {
+        viewDistance = vd;
+        if (writeToLevel && env is not null) { env.ViewDistance = vd; env.WriteViewDistance = true; lightingDirty = true; }
+    }
+    Theme.Tip(Loc.T("Game.ViewDistance: how far the game draws the world at all, separate from the fog.\nRetail maps use 250-900 m. Keep the fog end at or inside it, or the far edge of the\nmap shows as a hard line where the drawing stops."));
+    if (env is not null && !env.HasViewDistance)
+    {
+        ImGui.SameLine();
+        ImGui.TextDisabled(Loc.T("(level sets none)"));
+    }
+    if (fogEnabled && fogEnd > viewDistance + 1f)
+        ImGui.TextColored(Theme.Warn, string.Format(Loc.T("Fog ends at {0:0} m, past the view distance - the game cuts the world off at {1:0} m."), fogEnd, viewDistance));
+}
+
 /// Write the fog the editor is showing into the level, so the game gets it too. Until this is pressed the fog
 /// sliders are a PREVIEW: nothing in the Environment panel reached Init.con before, which is why a fog you liked
 /// never survived the trip into the game.
@@ -11260,9 +11707,10 @@ void SaveFog()
     env.FogColor = new Vec3(fogColor.X, fogColor.Y, fogColor.Z);
     env.FogStart = fogStart; env.FogEnd = fogEnd;
     env.WriteFog = true;
+    env.ViewDistance = viewDistance; env.WriteViewDistance = true;
     lightingDirty = true;              // Init.con is patched on the next save
     fogChangedBySky = false;           // this IS the level's fog now
-    Toast(Loc.T("Fog saved to the level - Ctrl+S writes it to Init.con."));
+    Toast(Loc.T("Fog and view distance saved to the level - Ctrl+S writes them to Init.con."));
 }
 
 // The level's own skybox as a cube map the WATER can mirror. Both .rcm files the game ships name the same generic
@@ -11566,8 +12014,19 @@ void UnbakeTerrainShadow()
     bakedShadowLsb = null;                      // drop any baked map so the save cannot prefer it over the unbake
     showShadows = false; shadowMapDirty = true;
     showBakedShadow = false;
+    // Take the editor's own merge back off the ground too - fully lit means the ground as well as the .lsb. Only the
+    // shadow this editor merged can come off; shadows a map SHIPPED with are part of its ground art.
+    bool groundToo = false;
+    if (CurrentGroundMerge() is { } merged && atlasCpu is not null)
+    {
+        AtlasFullEdit(() => LightBake.DivideFactorOutOfAtlas(atlasCpu!, merged),
+                      onApply: () => SetGroundMerge(null), onUndo: () => SetGroundMerge(merged));
+        groundToo = true;
+    }
     BroadcastLightBake();
-    Toast(Loc.T("Sun shadows unbaked: Save writes a fully lit LightmapShadowBits.lsb. Object lightmaps are untouched."));
+    Toast(groundToo
+        ? Loc.T("Sun shadows unbaked: the baked shadow is off the ground texture, and Save writes a fully lit LightmapShadowBits.lsb. Object lightmaps are untouched.")
+        : Loc.T("Sun shadows unbaked: Save writes a fully lit LightmapShadowBits.lsb. Object lightmaps are untouched."));
 }
 
 // Both at once - the old single command, for a map that wants to go all the way back to unlit.
@@ -11577,7 +12036,7 @@ void UnbakeLighting()
     UnbakeTerrainShadow();
     if (so is not null && meshLib is not null) UnbakeObjectLightmaps();
     bakedGround = false;
-    Toast(Loc.T("Lighting unbaked: terrain shadow and object lightmaps, written on Save. The ground-texture bake is separate - undo that with Z."));
+    Toast(Loc.T("Lighting unbaked: terrain shadow, its merge into the ground, and object lightmaps, written on Save. Placed lights burned into the ground are separate - undo those with Z."));
 }
 
 // The slider is a viewport OFFSET on top of whatever the level declared; saving folds the two into one angle and
@@ -11596,6 +12055,7 @@ void SaveSkyRotation()
 
 void SaveLightingFolder()
 {
+    RebindObjectMaps();
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
     SaveLightingToEnv();
     if (levelDir is not null) { lightRig.Save(levelDir); objGroups.Save(levelDir); notes.Save(levelDir); }   // sidecars, never packed
@@ -11615,6 +12075,7 @@ void SaveLightingFolder()
 // per game mode); the shallowest one is the level's own.
 (string Name, byte[] Bytes)? LightingRfaExtra(string baseRfa)
 {
+    RebindObjectMaps();
     if (!lightingDirty || env is null) return null;
     SaveLightingToEnv();
     if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
@@ -11930,17 +12391,19 @@ void EnvironmentPanel()
         SldF(Loc.TL("Fog end (m)"), ref fogEnd, fogStart + 1f, Math.Max(4000f, cfg.WorldSize * 2f), "%.0f");
         if (fogStart > fogEnd - 1f) fogStart = fogEnd - 1f;
     }
+    ViewDistanceSlider();
     if (ImGui.Button(Loc.TL("Reset to level default")) && env is not null)
     {
         fogEnabled = env.FogEnabled;
         fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
         fogStart = env.FogStart; fogEnd = env.FogEnd;
+        viewDistance = env.ViewDistance;
         fogChangedBySky = false;
     }
-    Theme.Tip(Loc.T("Back to the fog the level shipped."));
+    Theme.Tip(Loc.T("Back to the fog and view distance the level shipped."));
     ImGui.SameLine();
     if (Theme.AccentButton(Loc.TL("Save fog to level")) && env is not null) SaveFog();
-    Theme.Tip(Loc.T("Writes the fog above into the level's Init.con (renderer.vertexFogEnable, fogColorVec,\nfogstart, fogend) on the next Ctrl+S. Until you press this the sliders are only a\npreview here, and the game keeps whatever the level shipped."));
+    Theme.Tip(Loc.T("Writes the fog and view distance above into the level's Init.con (renderer.vertexFogEnable,\nfogColorVec, fogstart, fogend, Game.ViewDistance) on the next Ctrl+S. Until you press this the\nsliders are only a preview here, and the game keeps whatever the level shipped."));
     if (fogChangedBySky)
     {
         ImGui.TextColored(Theme.Warn, Loc.T("fog colour matched to the skybox"));
@@ -12748,7 +13211,7 @@ void OnLocalEdit(IEditCommand cmd)
     {
         int sp = part.IndexOf(' ');
         var t = sp < 0 ? part : part[..sp];
-        if (t is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL") collab.SendOp(part);
+        if (t is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL") collab.SendOp(part);
     }
 }
 
@@ -12770,7 +13233,7 @@ void OnUndoRedo(IEditCommand cmd)
     foreach (var part in wire.Split(" ; "))
     {
         var toks = part.Split(' ');
-        if (toks.Length >= 2 && toks[0] is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL")
+        if (toks.Length >= 2 && toks[0] is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL")
             BroadcastObjectState(toks[1]);
     }
 }
@@ -12784,6 +13247,9 @@ void BroadcastObjectState(string id)
     var o = so.FindById(id);
     if (o is null) { collab.SendOp($"DEL {id}"); return; }
     collab.SendOp(new AddObject(o.Id, o.Template, o.Position, o.Rotation).ToWire());
+    // ADD is a no-op on an object the peer still has, so the template has to travel on its own to converge after
+    // an undo of a lightmap-ready re-point.
+    collab.SendOp(new RetemplateObject(o.Id, o.Template).ToWire());
     collab.SendOp(new MoveObject(o.Id, o.Position).ToWire());
     collab.SendOp(new RotateObject(o.Id, o.Rotation).ToWire());
     collab.SendOp(new ScaleObject(o.Id, o.Scale ?? 1f).ToWire());
@@ -13159,6 +13625,9 @@ void ApplyRemoteLevelFiles(string payload)
         pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(rel, StringComparison.OrdinalIgnoreCase));
         pendingLevelFiles.Add((rel, bytes));
     }
+    // A peer's lightmap-ready copies: register them so this viewport draws the placements that now point at them.
+    if (p[1].Equals(RefractorForge.Formats.Con.LightmapReady.Folder, StringComparison.OrdinalIgnoreCase))
+    { RegisterLmReadyWithLibrary(); RebuildObjects(); }
     Toast(string.Format(Loc.T("Received {0} file(s) for '{1}' from a peer."), n, p[1]));
 }
 void ApplyRemoteObjMesh(string payload)
@@ -14265,6 +14734,7 @@ void BuildUi()
                 // under one heading touches the other's files. The combined commands sit last, named as both.
                 ImGui.TextDisabled(Loc.T("OBJECT LIGHTMAPS"));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
+                if (ImGui.MenuItem(Loc.TL("Lightmap-Ready Objects..."), null, false, so is not null && meshLib is not null)) OpenLmReady();
                 Theme.Tip(Loc.T("Each placed object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor.\nWrites lightmaps only - the terrain shadow below is a separate bake."));
                 // The quality choice belongs beside the button that uses it. It also lives in the Lights panel,
                 // but that is not where anyone goes to start a bake.
@@ -14697,6 +15167,10 @@ void BuildUi()
             if (terrainPick.Raycast(ray, out var hit))
             {
                 var dhit = SnapXZ(new Vec3(hit.X, hit.Y, hit.Z));
+                // A static object dropped over another one goes on top of it; gameplay handles and prefabs keep to
+                // the terrain, which is what their layouts are measured from.
+                if (GpKindForDrag(dragTemplate) is null && !IsPrefab(dragTemplate) && PlacementHit(ray, out var shit))
+                { hit = shit; dhit = SnapXZ(new Vec3(shit.X, shit.Y, shit.Z)); }
                 if (GpKindForDrag(dragTemplate) is GpKind pk)
                 {
                     // Gameplay drop: create a control point / vehicle / soldier spawn at the drop point.
@@ -14766,6 +15240,8 @@ void BuildUi()
     // drawing. A no-op when nothing is queued.
     gpuLm?.Pump(12.0);
     GpuSelfTestPoll();
+    LmReadyPoll();
+    LmReadyWindow();
     LightmapBakeProgress();
     ShadowBakeProgress();
     BrightenDialog();
@@ -14980,6 +15456,22 @@ void MarkTunnelEdited()
     env.WriteTunnel = true;
     lightingDirty = true;      // the Init.con patcher writes the tunnel lines together with the renderer ones
     terrainDirty = true;       // holes appear or disappear with the switch
+}
+
+// An underground map is bound to a template by NAME, so it has to follow the placements when they move between a
+// tunnel and its lightmap-ready copy (LightmapReady.RebindObjectMaps). Run before every save and after the tool
+// re-points placements, so an undo, a revert or a collaborator's TPL op all end up bound to what is placed.
+void RebindObjectMaps()
+{
+    if (env is null || so is null || env.ObjectMaps.Count == 0) return;
+    var placed = so.Objects.Select(o => o.Template).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var maps = RefractorForge.Formats.Con.LightmapReady.RebindObjectMaps(env.ObjectMaps, placed, ReadLmReadyManifest(), out bool changed);
+    if (!changed) return;
+    env.ObjectMaps.Clear();
+    env.ObjectMaps.AddRange(maps);
+    env.WriteTunnel = true;
+    lightingDirty = true;
+    foreach (var m in maps) Console.WriteLine("   Underground map bound to the placed template: " + m.ToConLine());
 }
 
 // A hole lives on a terrain VERTEX: the sample at (x, z) = (i*spacing, j*spacing), whose incident triangles
@@ -16898,6 +17390,7 @@ void ApplyTimeOfDay(RefractorForge.Formats.Terrain.TimeOfDayPreset p)
     fogEnabled = p.Fog;
     fogColor = new Vector3(p.FogColor.X, p.FogColor.Y, p.FogColor.Z);
     fogStart = p.FogStart; fogEnd = p.FogEnd;
+    viewDistance = p.ViewDistance;
     cloudColor = new Vector3(p.SkyTint.X, p.SkyTint.Y, p.SkyTint.Z);
     cloudsDirty = true;
     lightRig.NightAmount = p.NightAmount;
@@ -17131,6 +17624,21 @@ bool TemplateExistsAnywhere(string tmpl) =>
     (meshLib is not null && (meshLib.TryGet(tmpl, out _) || meshLib.TryAssembleVehicle(tmpl, out _)))
     || importedObjs.ContainsKey(tmpl);
 
+// Every game mode's soldier spawn templates, for the map check's tunnel-spawn test (SpawnBelowGround): each mode
+// keeps its own file, and al_vietnas had the flag misspelled in both.
+List<(string Mode, RefractorForge.Formats.Validation.SpawnBelowGround.Flags Flags)> SpawnBelowGroundByMode()
+{
+    var list = new List<(string, RefractorForge.Formats.Validation.SpawnBelowGround.Flags)>();
+    var modes = gameplayModes.Modes.Count > 0 ? gameplayModes.Modes : new[] { "Conquest" };
+    foreach (var mode in modes)
+    {
+        string rel = mode + "/SoldierSpawnTemplates.con";
+        if ((PendingText(rel) ?? ReadLevelText(rel)) is not { } text) continue;
+        list.Add((mode, RefractorForge.Formats.Validation.SpawnBelowGround.Parse(text.Replace("\r\n", "\n").Split('\n'))));
+    }
+    return list;
+}
+
 void RunMapValidation()
 {
     if (so is null) return;
@@ -17142,6 +17650,7 @@ void RunMapValidation()
         Bounds = TemplateBoundsOf,
         // An ammo spawner, an effect or a sound has no mesh but the game creates it; only a name nothing declares is missing.
         TemplateExists = meshLib is null ? null : (t => TemplateExistsAnywhere(t) || meshLib.KnowsTemplate(t)),
+        SpawnBelowGroundByMode = SpawnBelowGroundByMode(),
     });
     AddMissingTemplateAdvice(r);
     ShowReport(r);
@@ -17632,19 +18141,19 @@ void LightsPanel()
     if (ImGui.Button(Loc.TL("Bake Object Lightmaps")) && so is not null && meshLib is not null && heightmap is not null) BakeObjectLightmaps();
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Unbake lightmaps")) && so is not null && meshLib is not null) UnbakeObjectLightmaps();
+    Theme.Tip(Loc.T("Bake writes a lightmap per placed object (with these lights); Unbake queues fully lit ones\ninstead. Either way Save writes them, and the terrain shadow is left alone."));
     if (ImGui.Button(Loc.TL("Bake selected only (preview)")) && so is not null && meshLib is not null && heightmap is not null)
     { lmSelectedOnly = true; BakeObjectLightmaps(); lmSelectedOnly = false; }
     Theme.Tip(Loc.T("Bakes ONLY the objects you have selected, so a lighting setting can be judged in seconds instead of\nwaiting out a whole map. It ADDS to the lightmaps the level already has - it never clears them - so a\npreview is safe to run as often as you like. Bake the whole map once the settings look right."));
-    if (ImGui.Button(Loc.TL("Make selected object lightmap-ready"))) PatchSelectedForLightmapping();
-    Theme.Tip(Loc.T("Most meshes in both games have no lightmap channel at all, so a bake can never reach them.\nThis unwraps the selected object's mesh, widens its vertex to hold the second UV set, and ships\nthe patched copy inside THIS level - nothing outside the map changes. Do one object and look at\nit in game before doing a whole map: a changed vertex declaration is not proven to load."));
-    Theme.Tip(Loc.T("Bake writes a lightmap per placed object (with these lights); Unbake queues fully lit ones\ninstead. Either way Save writes them, and the terrain shadow is left alone."));
+    if (ImGui.Button(Loc.TL("Lightmap-ready objects...")) && so is not null && meshLib is not null) OpenLmReady();
+    Theme.Tip(Loc.T("Most objects have no lightmap channel, so a bake cannot reach them - props, sandbags, wire and the\nclutter inside buildings. This lists them by type and gives the ones you tick a level-local copy on a\nmesh unwrapped here, so the next bake lights them. Nothing outside this map changes."));
 
     // ---- Sun shadows + terrain: the other process ----------------------------------------------------------------
     ImGui.Separator();
     Theme.Section(Loc.T("SUN SHADOWS + TERRAIN"));
     Theme.Tip(Loc.T("The terrain's own light: the sun cast-shadow the game reads from LightmapShadowBits.lsb,\nand the placed lights' colour burned into the ground texture tiles. Separate from the object\nlightmaps above - baking or unbaking one never touches the other."));
     ImGui.Checkbox(Loc.TL("Merge into ground texture"), ref sbMergeToGround);
-    Theme.Tip(Loc.T("THIS is what makes a sun shadow visible in game. The engine does not draw the .lsb on the ground -\na deliberately unmissable checkerboard .lsb rendered no differently in game - it is painted into the\nterrain tiles, exactly as retail does (Fall_of_Saigon's tiles are about half as bright where its own\n.lsb flags shadow). Destructive to the ground art and it COMPOUNDS if you bake twice, so undo with Z\nbefore re-baking."));
+    Theme.Tip(Loc.T("THIS is what makes a sun shadow visible in game. The engine does not draw the .lsb on the ground -\na deliberately unmissable checkerboard .lsb rendered no differently in game - it is painted into the\nterrain tiles, exactly as retail does (every retail map's tiles are darker where its own .lsb flags\nshadow). The level keeps a record of what this editor painted in, so baking again REPLACES that shadow\nand Unbake takes it off. Shadows a map SHIPPED with are part of its ground art and are not touched."));
     ImGui.SameLine();
     ImGui.SetNextItemWidth(120f * uiScale);
     SldF(Loc.TL("Shadow darkness"), ref sbShadowLevel, 0.15f, 1f, "%.2f");

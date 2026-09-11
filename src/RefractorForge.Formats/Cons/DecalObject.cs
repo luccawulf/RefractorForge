@@ -131,7 +131,9 @@ public static class DecalObject
         string obj =
             $"ObjectTemplate.create SimpleObject {name}\r\n" +
             $"ObjectTemplate.geometry {name}\r\n" +
-            "ObjectTemplate.setHasCollisionPhysics 0\r\n" +
+            // hasCollisionPhysics - the only spelling in BfVietnam.exe's command table. "setHasCollisionPhysics", which
+            // this wrote before, is not a command at all: the engine skipped the line and the decal kept its default.
+            "ObjectTemplate.hasCollisionPhysics 0\r\n" +
             sound + "\r\n";
         files.Add(($"Objects/{name}/Objects.con", crlf.GetBytes(obj)));
 

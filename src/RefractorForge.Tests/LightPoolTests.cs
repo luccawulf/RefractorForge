@@ -163,7 +163,7 @@ public class LightPoolTests
         Assert.Contains("texture \"texture/lightpool_lightpool1\";", rs);
 
         // It must never be something you can walk into or shoot.
-        Assert.Contains("ObjectTemplate.setHasCollisionPhysics 0", Text(built, "Objects/lightpool1/Objects.con"));
+        Assert.Contains("ObjectTemplate.hasCollisionPhysics 0", Text(built, "Objects/lightpool1/Objects.con"));
 
         // The mesh path has to point at THIS game's mount root; a bf1942 path resolves to nothing in Vietnam.
         Assert.Contains("../BfVietnam/levels/Saigon68/StandardMesh/lightpool1", Text(built, "Objects/lightpool1/Geometries.con"));

@@ -322,9 +322,13 @@ sealed class AtlasStrokeCommand : IEditCommand
     private readonly int _x0, _y0, _w, _h;
     private readonly byte[] _before, _after;
     private readonly Action<int, int, int, int> _reupload;
+    // Editor state that belongs to this ground edit and has to travel with it through undo and redo - a shadow
+    // merge's record, which says what the ground currently has multiplied into it.
+    private readonly Action? _onApply, _onUndo;
 
-    public AtlasStrokeCommand(Texture2D atlas, int x0, int y0, int w, int h, byte[] before, byte[] after, Action<int, int, int, int> reupload)
-    { _atlas = atlas; _x0 = x0; _y0 = y0; _w = w; _h = h; _before = before; _after = after; _reupload = reupload; }
+    public AtlasStrokeCommand(Texture2D atlas, int x0, int y0, int w, int h, byte[] before, byte[] after, Action<int, int, int, int> reupload,
+                              Action? onApply = null, Action? onUndo = null)
+    { _atlas = atlas; _x0 = x0; _y0 = y0; _w = w; _h = h; _before = before; _after = after; _reupload = reupload; _onApply = onApply; _onUndo = onUndo; }
 
     private void Blit(byte[] src)
     {
@@ -337,8 +341,8 @@ sealed class AtlasStrokeCommand : IEditCommand
             }
     }
 
-    public void Apply(StaticObjectsFile _) { Blit(_after); _reupload(_x0, _y0, _w, _h); }
-    public void Undo(StaticObjectsFile _) { Blit(_before); _reupload(_x0, _y0, _w, _h); }
+    public void Apply(StaticObjectsFile _) { Blit(_after); _reupload(_x0, _y0, _w, _h); _onApply?.Invoke(); }
+    public void Undo(StaticObjectsFile _) { Blit(_before); _reupload(_x0, _y0, _w, _h); _onUndo?.Invoke(); }
     public string ToWire() => $"ATLAS {_x0} {_y0} {_w} {_h}";   // not collab-synced (atlas is editor-side)
 }
 

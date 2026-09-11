@@ -405,6 +405,7 @@ public sealed class RefractorFlatArchive
             i => entries[i].Name,
             i => { var d = entries[i].Data; return (BuildRegion(d, compress), d.Length); },
             compress, xPackId);
+        fs.Flush(flushToDisk: true);                      // see DurableFile
     }
 
     /// <summary>Stream a repack straight to a file (low memory, no array-size ceiling).
@@ -461,6 +462,9 @@ public sealed class RefractorFlatArchive
                     i => i < ents.Count && original._entryTrailers is { } t && t.TryGetValue(ents[i].Name, out var tr) ? tr : null,
                     original._tocTail
                 );
+            // On the DISK before it takes the level's name. Without this a crash shortly after a save left the
+            // rename in place and the data - the table of contents last of all - never written (DurableFile).
+            DurableFile.FlushToDisk(tmp);
             File.Move(tmp, path, overwrite: true);
         }
         catch

@@ -295,6 +295,37 @@ public static class LightmapUnwrapper
         return new UnwrapResult(UnwrapStatus.Ok, diag2, plans);
     }
 
+    /// <summary>
+    /// The atlas size an unwrap from this class was packed for, read back out of the UVs themselves - or null for an
+    /// unwrap it did not make.
+    ///
+    /// <para>Charts are packed with a gutter of <see cref="UnwrapOptions.GutterCells"/> texels AT THAT SIZE. Bake the map
+    /// smaller and the gutter shrinks with it; at half size it is two texels, the baker's three-texel dilation reaches
+    /// across it, and one chart's light bleeds into the next. So a patched mesh must never bake below this. Every UV
+    /// is written as a whole number of texels over the chosen size (<c>round(px) / R</c>), which makes the smallest R
+    /// that turns them all into integers that size. DICE's own unwraps land on no such grid and return null, and
+    /// keep the sizing they always had.</para>
+    /// </summary>
+    public static int? RecoverMinBakeSize(IReadOnlyList<Vector2>? uvs)
+    {
+        if (uvs is null || uvs.Count == 0) return null;
+        bool any = false;
+        foreach (int r in new[] { 64, 128, 256, 512, 1024 })
+        {
+            bool fits = true;
+            foreach (var uv in uvs)
+            {
+                if (uv.X == 0f && uv.Y == 0f) continue;       // a section with no unwrap of its own
+                any = true;
+                float x = uv.X * r, y = uv.Y * r;
+                if (MathF.Abs(x - MathF.Round(x)) > 1e-3f || MathF.Abs(y - MathF.Round(y)) > 1e-3f) { fits = false; break; }
+            }
+            if (!any) return null;
+            if (fits) return r;
+        }
+        return null;
+    }
+
     private static Vector3 V(Geometry.Vec3 v) => new(v.X, v.Y, v.Z);
     private static bool IsFinite(Vector3 v) => float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z);
 

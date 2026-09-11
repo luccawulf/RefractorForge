@@ -162,6 +162,9 @@ public static class ObjectLightmapBaker
             var tris = new List<(Vector3, Vector3, Vector3)>();
             foreach (var part in mesh.Parts)
             {
+                // The same rule the level's scene uses. A building's portal planes - the black quads across its
+                // windows - counted here as walls, which is why O_BuildMedDemo01 baked with no light inside at all.
+                if (!LevelScene.CastsShadow(part)) continue;
                 var idx = part.Indices;
                 for (int t = 0; t + 2 < idx.Length; t += 3)
                 {

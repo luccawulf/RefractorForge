@@ -265,6 +265,65 @@ public static class LightBake
     private static byte Scale(byte v, float k) => (byte)Math.Clamp((int)(v * k + 0.5f), 0, 255);
 
     /// <summary>
+    /// The per-texel multiplier a shadow merge applies, as a grey map: 255 = untouched, <paramref name="shadowLevel"/>
+    /// x 255 = fully shadowed. Keeping THIS - rather than only the ground it produced - is what makes a merge
+    /// reversible: the next bake divides it back out before applying its own, so baking twice replaces the shadow
+    /// instead of stacking a second one on top (x0.5 then x0.25), and an unbake can take it off the ground again.
+    /// </summary>
+    public static Texture2D ShadowFactorMap(Texture2D shadowVis, float shadowLevel = 0.5f)
+    {
+        shadowLevel = Math.Clamp(shadowLevel, 0f, 1f);
+        var rgba = new byte[shadowVis.Width * shadowVis.Height * 4];
+        var sp = shadowVis.Rgba;
+        for (int i = 0; i < shadowVis.Width * shadowVis.Height; i++)
+        {
+            float k = shadowLevel + (1f - shadowLevel) * (sp[i * 4] / 255f);
+            byte b = (byte)Math.Clamp((int)(k * 255f + 0.5f), 0, 255);
+            rgba[i * 4] = b; rgba[i * 4 + 1] = b; rgba[i * 4 + 2] = b; rgba[i * 4 + 3] = 255;
+        }
+        return new Texture2D(shadowVis.Width, shadowVis.Height, rgba);
+    }
+
+    /// <summary>Multiply the ground by a factor map from <see cref="ShadowFactorMap"/>, sampled by normalised position.</summary>
+    public static void MultiplyFactorIntoAtlas(Texture2D atlas, Texture2D factor) => ApplyFactor(atlas, factor, divide: false);
+
+    /// <summary>
+    /// Undo <see cref="MultiplyFactorIntoAtlas"/> with the same map: the factors are sampled identically, so this
+    /// inverts it to within rounding (a texel darkened to x0.5 comes back within a level or two of where it was).
+    /// </summary>
+    public static void DivideFactorOutOfAtlas(Texture2D atlas, Texture2D factor) => ApplyFactor(atlas, factor, divide: true);
+
+    private static void ApplyFactor(Texture2D atlas, Texture2D factor, bool divide)
+    {
+        int aw = atlas.Width, ah = atlas.Height, fw = factor.Width, fh = factor.Height;
+        var ap = atlas.Rgba; var fp = factor.Rgba;
+        System.Threading.Tasks.Parallel.For(0, ah, y =>
+        {
+            float v = (y + 0.5f) / ah;
+            for (int x = 0; x < aw; x++)
+            {
+                var (k, _, _) = Bilinear(fp, fw, fh, (x + 0.5f) / aw, v);
+                if (k >= 0.999f) continue;
+                k = MathF.Max(k, 0.05f);                          // never divide by nothing
+                float m = divide ? 1f / k : k;
+                int ao = (y * aw + x) * 4;
+                ap[ao + 0] = Scale(ap[ao + 0], m);
+                ap[ao + 1] = Scale(ap[ao + 1], m);
+                ap[ao + 2] = Scale(ap[ao + 2], m);
+            }
+        });
+    }
+
+    /// <summary>True when a factor map changes nothing (every texel 255) - the record an unbake leaves behind.</summary>
+    public static bool IsNeutralFactor(Texture2D? factor)
+    {
+        if (factor is null) return true;
+        var p = factor.Rgba;
+        for (int i = 0; i < factor.Width * factor.Height; i++) if (p[i * 4] < 254) return false;
+        return true;
+    }
+
+    /// <summary>
     /// Burn a ground light map into the terrain atlas.
     ///
     /// The pool is ADDED rather than multiplied: light adds to what a surface already reflects, and multiplying

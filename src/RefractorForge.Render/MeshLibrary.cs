@@ -75,6 +75,75 @@ public sealed class MeshLibrary
     /// resolves it exactly like an archive mesh — the editor can then render + place it without repacking.</summary>
     public void AddMesh(string template, Mesh mesh) => _cache[template] = mesh;
 
+    // Meshes and scripts this session produced that are in no archive yet - a level's lightmap-ready copies, queued
+    // for the next save. They are consulted BEFORE the archives, so the viewport, the LOD resolver and the bake all see
+    // new content immediately, exactly as they will after a save and reopen.
+    private readonly Dictionary<string, (byte[] Sm, string? Rs)> _memMeshes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<(string Source, string Text)> _memScripts = new();
+
+    private static string Leaf(string name)
+    {
+        name = (name ?? "").Replace('\\', '/');
+        int s = name.LastIndexOf('/'); if (s >= 0) name = name[(s + 1)..];
+        if (name.EndsWith(".sm", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".rs", StringComparison.OrdinalIgnoreCase)) name = name[..^3];
+        return name;
+    }
+
+    /// <summary>Make an unsaved <c>.sm</c> (and its <c>.rs</c>) resolvable by its file name, as if it were in an archive.</summary>
+    public void AddMeshFile(string name, byte[] sm, string? rs)
+    {
+        string leaf = Leaf(name);
+        _memMeshes[leaf] = (sm, rs);
+        foreach (var k in _cache.Keys.Where(k => Leaf(k).Equals(leaf, StringComparison.OrdinalIgnoreCase)).ToList()) _cache.Remove(k);
+    }
+
+    /// <summary>Layer an unsaved script's templates and geometries over the archives' (replacing one of the same
+    /// name). Re-adding a script from the same source replaces the earlier text.</summary>
+    public void AddScripts(string source, string text)
+    {
+        EnsureObjectGeometry();
+        EnsureAllTemplates();
+        _memScripts.RemoveAll(s => s.Source.Equals(source, StringComparison.OrdinalIgnoreCase));
+        _memScripts.Add((source, text));
+        foreach (var t in ParseConTemplates(text))
+        {
+            if (t.Name.Length == 0) continue;
+            t.LevelLocal = true;
+            _allTemplates![t.Name] = t;
+            if (t.Geometry is { Length: > 0 } g) _objGeom![t.Name] = g;
+            _cache.Remove(t.Name);
+        }
+        foreach (var kv in ParseGeometryFiles(text)) _geomFile![kv.Key] = kv.Value;
+    }
+
+    /// <summary>Every <c>.con</c> script the library can see, archives first in the order they were opened, then
+    /// any added with <see cref="AddScripts"/>.</summary>
+    public IEnumerable<(string Source, string Text)> ConScripts()
+    {
+        foreach (var e in _conEntries)
+        {
+            string text;
+            try { text = System.Text.Encoding.Latin1.GetString(OwningArchive(e).Read(e)); } catch { continue; }
+            yield return (e.Name, text);
+        }
+        foreach (var s in _memScripts.ToList()) yield return s;
+    }
+
+    private (byte[] Sm, string? Rs)? MemFor(string template)
+    {
+        if (_memMeshes.Count == 0 || string.IsNullOrEmpty(template)) return null;
+        if (_memMeshes.TryGetValue(Leaf(template), out var m)) return m;
+        EnsureObjectGeometry();
+        if (_objGeom!.TryGetValue(template, out var g))
+        {
+            string file = _geomFile!.TryGetValue(g, out var f) ? f : g;
+            if (_memMeshes.TryGetValue(Leaf(file), out m)) return m;
+            if (_memMeshes.TryGetValue(Leaf(g), out m)) return m;
+        }
+        if (_geomFile!.TryGetValue(template, out var direct) && _memMeshes.TryGetValue(Leaf(direct), out m)) return m;
+        return null;
+    }
+
     /// <summary>Flatten an imported OBJ into a render-ready <see cref="Mesh"/>: one combined vertex array plus one
     /// material part per OBJ material. <paramref name="resolve"/> supplies each material's colour + optional texture
     /// (from its .mtl); without it, parts get a neutral tint so the mesh still reads against the terrain.</summary>
@@ -1458,6 +1527,7 @@ public sealed class MeshLibrary
 
     private Mesh? Build(string template)
     {
+        if (MemFor(template) is { } mem) return TryBuildMeshFromSm(mem.Sm, mem.Rs, out var mm) ? mm : null;
         var entry = Resolve(template);
         if (entry is not null) return BuildFromEntry(entry);
         // No .sm: try a BF1942 TreeMesh (.tm) — trees/bushes use a separate format the .sm resolver never finds.
@@ -1787,6 +1857,7 @@ public sealed class MeshLibrary
     public bool TryGetMeshBytes(string nameOrTemplate, out string entryName, out byte[] bytes)
     {
         entryName = ""; bytes = Array.Empty<byte>();
+        if (MemFor(nameOrTemplate) is { } mem) { entryName = Leaf(nameOrTemplate) + ".sm"; bytes = mem.Sm; return true; }
         var entry = Resolve(nameOrTemplate) ?? (LodStem(nameOrTemplate) is { } stem ? Resolve(stem) : null);
         if (entry is null) return false;
         try { bytes = OwningArchive(entry).Read(entry); entryName = entry.Name; return true; }
@@ -1796,7 +1867,12 @@ public sealed class MeshLibrary
     public bool TryGetRsText(string meshName, out string entryName, out string text)
     {
         entryName = ""; text = "";
-        string rsName = meshName.EndsWith(".rs", StringComparison.OrdinalIgnoreCase) ? meshName : meshName + ".rs";
+        if (_memMeshes.TryGetValue(Leaf(meshName), out var mem) && mem.Rs is { Length: > 0 } memRs)
+        { entryName = Leaf(meshName) + ".rs"; text = memRs; return true; }
+        // A GeometryTemplate.file value is often a PATH ("../standardMesh/stecrate1_M1"), but shaders are indexed by
+        // leaf. Looked up with the path, a level-local prop's shader was simply not found.
+        meshName = Leaf(meshName);
+        string rsName = meshName + ".rs";
         try
         {
             if (_rsOverrideFiles.TryGetValue(rsName, out var file))

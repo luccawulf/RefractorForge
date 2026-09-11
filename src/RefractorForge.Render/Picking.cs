@@ -27,6 +27,21 @@ public static class Picking
         return new Ray(near, Vector3.Normalize(far - near));
     }
 
+    /// <summary>
+    /// The world point drawn at pixel (px, py) whose depth-buffer value is <paramref name="depth"/> (0..1). The
+    /// projection puts z in 0..1 and GL maps its NDC -1..1 onto the depth buffer, so NDC z = 2d - 1 is exactly the
+    /// value the matrix produced; the rest is the same inverse <see cref="ScreenToRay"/> uses. Placement reads the
+    /// pick buffer's depth under the cursor and turns it back into the surface point with this.
+    /// </summary>
+    public static Vector3 UnprojectDepth(Matrix4x4 viewProj, float px, float py, int width, int height, float depth)
+    {
+        Matrix4x4.Invert(viewProj, out var inv);
+        float ndcX = 2f * px / width - 1f;
+        float ndcY = 1f - 2f * py / height;
+        var p = Vector4.Transform(new Vector4(ndcX, ndcY, 2f * depth - 1f, 1f), inv);
+        return new Vector3(p.X, p.Y, p.Z) / p.W;
+    }
+
     /// <summary>Index of the nearest object whose pick-sphere the ray hits, or -1.</summary>
     public static int PickNearest(Ray ray, IReadOnlyList<Vector3> points, float radius)
     {

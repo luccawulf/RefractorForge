@@ -76,6 +76,22 @@ public sealed class DeleteObject : IEditCommand
     public string ToWire() => $"DEL {Id}";
 }
 
+/// <summary>
+/// Point a placed object at a different template and change NOTHING else - its position and rotation keep their
+/// original source text, and its layer, scale and extra lines stay put. A delete-and-add would rewrite every number
+/// in the object and drop the rest, which is why this is its own command. Used to point placements at their
+/// lightmap-ready copies and back.
+/// </summary>
+public sealed class RetemplateObject : IEditCommand
+{
+    public string Id; public string To;
+    private string? _from;
+    public RetemplateObject(string id, string to) { Id = id; To = to; }
+    public void Apply(StaticObjectsFile f) { var o = f.FindById(Id); if (o is null) return; _from ??= o.Template; o.Template = To; }
+    public void Undo(StaticObjectsFile f) { var o = f.FindById(Id); if (o is not null && _from is not null) o.Template = _from; }
+    public string ToWire() => $"TPL {Id} {To}";
+}
+
 /// <summary>Groups several edits into one reversible unit — a multi-select move/rotate/delete becomes a
 /// single undo step. Apply runs them in order; Undo reverses in the opposite order.</summary>
 public sealed class CompositeCommand : IEditCommand
@@ -268,6 +284,7 @@ public static class EditWire
             "SCALE" => new ScaleObject(p[1], float.Parse(p[2], NumberStyles.Float, CultureInfo.InvariantCulture)),
             "ADD"   => new AddObject(p[1], p[2], Vec3.Parse(p[3]), Vec3.Parse(p[4])),
             "DEL"   => new DeleteObject(p[1]),
+            "TPL"   => new RetemplateObject(p[1], p[2]),
             _ => throw new FormatException($"Unknown command '{p[0]}'"),
         };
     }
@@ -284,6 +301,6 @@ public static class EditWire
         if (string.IsNullOrEmpty(line)) return false;
         int sp = line.IndexOf(' ');
         var verb = sp < 0 ? line : line[..sp];
-        return verb is "MOVE" or "ROT" or "SCALE" or "ADD" or "DEL";
+        return verb is "MOVE" or "ROT" or "SCALE" or "ADD" or "DEL" or "TPL";
     }
 }

@@ -88,7 +88,8 @@ public class DecalObjectTests : IDisposable
             var obj = Text(b, "Objects/poster/Objects.con");
             Assert.Contains("ObjectTemplate.create SimpleObject poster", obj);
             Assert.Contains("ObjectTemplate.geometry poster", obj);
-            Assert.Contains("ObjectTemplate.setHasCollisionPhysics 0", obj);
+            Assert.Contains("ObjectTemplate.hasCollisionPhysics 0", obj);
+            Assert.DoesNotContain("setHasCollisionPhysics", obj);   // not in the engine's command table: silently skipped
 
             Assert.Equal("run Objects\r\nrun Geometries\r\n", Text(b, "Objects/poster/poster.con"));
 

@@ -252,6 +252,23 @@ public sealed class LevelScene
     }
 
     /// <summary>
+    /// Whether a material part stops light in a bake. Two kinds of part do not, and both are REAL geometry in the
+    /// mesh:
+    /// <list type="bullet">
+    /// <item><b>Portal planes.</b> BfVietnam's buildings stretch a black quad across every window and door -
+    /// <c>O_BuildMedDemo01_m1</c>'s third material is <c>texture "texture/portal_black"</c> with <c>texturefade
+    /// true</c> - so an opening reads as a dark interior from a distance and fades away as the player walks up.
+    /// A render trick, not a wall: counted as solid it shuts every window and the whole inside of the building
+    /// bakes black. The mesh library files a texture-fade material under <see cref="MeshLibrary.MaterialPart.Foliage"/>
+    /// (a cutout with no alpha reference), which is what excludes it here.</item>
+    /// <item><b>Blended glass</b> - <c>transparent true</c> - which lets the light through in the game.</item>
+    /// </list>
+    /// One rule for the level's scene AND each object's view of itself: they used to differ, so a building's portals
+    /// were skipped when it shaded its neighbours and counted when it shaded its own interior.
+    /// </summary>
+    public static bool CastsShadow(MeshLibrary.MaterialPart part) => !part.Foliage && !part.Blend;
+
+    /// <summary>
     /// Every placed object's primary-LOD geometry as world-space triangles. Shared by the sun-shadow bake (what
     /// casts) and the in-game map render (what shows as a building), which want exactly the same set: the PRIMARY
     /// LOD only - adding _m2 would double the triangle count for a silhouette that is by definition the same shape
@@ -279,7 +296,7 @@ public sealed class LevelScene
             var pos = m.Positions;
             foreach (var part in m.Parts)
             {
-                if (part.Foliage || part.Blend) continue;
+                if (!CastsShadow(part)) continue;
                 if (solidOnly && part.AlphaTest) continue;
                 var idx = part.Indices;
                 for (int t = 0; t + 2 < idx.Length; t += 3)
@@ -324,7 +341,7 @@ public sealed class LevelScene
             var pos = m.Positions;
             foreach (var part in m.Parts)
             {
-                if (part.Foliage || part.Blend) continue;
+                if (!CastsShadow(part)) continue;
                 if (solidOnly && part.AlphaTest) continue;
                 if (!meanCache.TryGetValue(part, out var col)) meanCache[part] = col = MeanAlbedo(part);
                 var idx = part.Indices;

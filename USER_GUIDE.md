@@ -83,7 +83,11 @@ first, and an object that is not yet selected becomes the selection with the sam
   15° steps). Hold **Ctrl** to pitch or **Alt** to roll with an up/down drag; the **X / Y / Z** buttons give
   Battlecraft's per-axis up/down rotation. The rings remain for fine work.
 - **Scale tool** — click any object and drag away from its centre to grow it, toward it to shrink it.
-- **Place tool** — with a template chosen in the Object Library, click the terrain to drop a copy.
+- **Place tool** — with a template chosen in the Object Library, click to drop a copy: on the terrain, or **on top
+  of the static object under the cursor** — a crate on a rooftop, a lamp on a table, sandbags on a bunker. The
+  green marker shows where it will land. Dragging a template out of the library does the same. (The point on the
+  object is read from the picture itself, so it is the surface you can see; prefabs and gameplay markers still
+  go onto the terrain.)
 - **Nudge tool** — like Move but gentler, and it keeps the object's own height (Ctrl = finer).
 - Locked objects (everything a level ships is locked) select but do not move: **Object ▸ Unlock**.
 - The Inspector shows **Position / Rotation / Scale** for the selection — drag, or **right-click a
@@ -246,7 +250,11 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
   `SkyAndSun.con`** — so the game's own lighting agrees with the shadows you baked. The panel says so once you have
   moved it; **Reset sun to level** hands the direction back to the level and stops the editor writing it.
   **Sun Shadows (real-time)** in Layers toggles the display.
-- **Fog** — colour, start / end distance.
+- **Fog** — colour, start / end distance, and the **view distance** (`Game.ViewDistance`): how far the game draws
+  the world at all, a separate setting from the fog, which only shades what is inside it. Retail maps use
+  250–900 m. Keep the fog end at or inside the view distance — past it, the map ends in a hard line where the
+  drawing stops, and the panel says so. **Save fog to level** writes both into Init.con, keeping whichever
+  spelling the level already uses.
 - **Sky** — use the level's cubemap, set sky rotation, or **Import skybox…** (6 faces named `…_01`–`_06`).
 - **Animated Clouds** — coverage, scale, drift X/Y, colour; import a cloud texture or mesh.
 - **Lighting bakes** (Tools ▸ Lighting — everything the game reads for light):
@@ -283,12 +291,23 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
     no way to make one: its generator needs exporter `.samples` files that ship in no archive. The bake skips
     them and says how many: they stay sun-lit in the editor and in the game, and a placed light cannot reach them.
     Buildings, huts, bunkers, the big walls and the tunnel meshes carry real unwraps and take the lights.
-  - **Make selected object lightmap-ready** gives the selected object one: it unwraps the mesh (filling an empty
-    slot where there is one, otherwise widening the vertex to the 40-byte layout that both games' own lightmapped
-    meshes use) and writes the copy into *this level's* archive - `O_Sandbags_m1` becomes
-    `StandardMesh/O_Sandbags_lm_m1.sm` - with a new template pointing at it, so nothing outside the map changes.
-    **Not yet confirmed in game** - do it to one object, save, and check it draws and takes its bake before doing
-    it to many.
+  - **Lightmap-ready objects…** (Lighting panel, or Tools ▸ Lightmap-Ready Objects…) fixes that for the whole map.
+    It lists every object type whose meshes have no usable unwrap - count, kind, what it would change, the map size
+    and disk cost - and for each type you tick it makes a **copy inside this level**:
+    - the mesh is unwrapped here: an empty slot is filled in place (the 64-byte layout BfVietnam's own lit buildings
+      use), otherwise the vertex is widened to the 40-byte layout both games' lightmapped meshes use;
+    - the object's definition is copied **line for line** - an ammo box keeps its supply depots, a medic box keeps
+      healing - with only the mesh names changed, down through every LOD mesh; parts placed at an offset are left
+      alone, as the bake leaves them;
+    - every placement of that type is pointed at the copy (one undo step). Then **Bake Object Lightmaps** as usual.
+    
+    Everything goes into this level's archive (`Objects/RF_LightmapReady/`, `StandardMesh/<mesh>_lm_m1.sm`);
+    nothing outside the map changes, and **Point all back at the originals** undoes it for every type. Foliage and
+    effect quads start unticked - trees are read from their shaders (every BfVietnam vegetation material has
+    `alphatestref` and `selfillum`) and run to hundreds of placements. A type defined twice with different contents
+    (retail's rope bridge), a mesh with no shader, or one that will not unwrap is listed with the reason and never
+    written. On al_vietnas: 85 structure types, 819 objects - including the clutter inside buildings - and BfVietnam's
+    dedicated server loads the result. Whether the widened ones draw lit is the in-game check.
   - A light placed *after* a bake still shows on a lightmapped object in the viewport (combined by maximum with
     the map, so a light that is already baked is not doubled); bake again to ship it.
   - The files go out the way the game files them: one map per **LOD mesh** (`O_HueHouse_B_M1_<x>-<y>-<z>.tga`
@@ -338,7 +357,12 @@ How the game does it (all four parts are needed):
    their shafts up with the tunnel's.
 4. **The underground map**: `mapManager.addObjectMap <template> <MapName> x/z/w/h` binds `Textures/<MapName>.dds`
    as the minimap while the player is inside that object. **Generate underground map(s)** renders each tunnel
-   object top-down (floors light, walls dark, north up) and writes the line for it.
+   object top-down (floors light, walls dark, north up) and writes the line for it. The binding is by template
+   NAME, so it follows the tunnel when **Lightmap-ready objects** points it at a level copy (and back again), and
+   the line is written after the level's own `run objects/...`, where such a copy exists.
+5. **Spawns in the tunnel** need `ObjectTemplate.allowSpawningBelowGround 1` on their template, spelled exactly:
+   the game lifts every other spawn below the terrain up to the surface. **Check Map** names each underground
+   spawn that is missing it — and a misspelling of it, which the game ignores without a word.
 
 **Tunnel water.** The terrain owns *two* water bodies. `PatchTerrain::getWaterLevel` uses the second one —
 `GeometryTemplate.waterBelowLevel` — for any point below the surface or on a hole, but only when
@@ -391,7 +415,8 @@ tick **Playable** to seed Conquest flags, spawns and kits. **Create** restarts t
 - **Save** (Ctrl+S) — **writes the level itself.** A folder level goes back to its folder; a level opened from
   a `.rfa` is written back into *that* `.rfa`. The archive is replaced through a temp file and every entry of the
   result is decoded again before the save reports success, and **File ▸ Auto-backup on save** keeps a timestamped
-  copy under `%AppData%\RefractorForge\Backups` first.
+  copy under `%AppData%\RefractorForge\Backups` first. Both are flushed to the disk before the map is replaced, so
+  a PC that goes down moments after a save can no longer leave the level with its data missing.
   - One thing to watch: a `<Level>_NNN.rfa` sitting beside your map is mounted *over* it by the engine, so its
     copy of a file wins over what you just saved. Save names any it finds in the log — delete or rename them and
     your edits appear.

@@ -116,7 +116,7 @@ public static class LightmapMeshPatch
         string obj =
             $"ObjectTemplate.create SimpleObject {name}\r\n" +
             $"ObjectTemplate.geometry {name}\r\n" +
-            "ObjectTemplate.setHasCollisionPhysics 1\r\n\r\n";
+            "ObjectTemplate.hasCollisionPhysics 1\r\n\r\n";      // not "setHas...": that is no command, and was skipped
         files.Add(($"Objects/{name}/Objects.con", crlf.GetBytes(obj)));
         files.Add(($"Objects/{name}/{name}.con", crlf.GetBytes("run Objects\r\nrun Geometries\r\n")));
 

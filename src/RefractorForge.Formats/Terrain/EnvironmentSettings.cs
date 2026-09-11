@@ -82,8 +82,12 @@ public sealed class EnvironmentSettings
     public float FogStart { get; set; } = 100f;
     /// <summary>World distance where fog reaches full density (renderer.fogend), metres.</summary>
     public float FogEnd { get; set; } = 450f;
-    /// <summary>Game.ViewDistance (far clip-ish), metres; informational.</summary>
+    /// <summary><c>Game.ViewDistance</c>: how far the game draws the world at all, metres - separate from the fog, which
+    /// only shades what is inside it. All 83 retail BfVietnam levels declare it (never as <c>setViewDistance</c>, which
+    /// the console also takes).</summary>
     public float ViewDistance { get; set; } = 550f;
+    /// <summary>Whether the level declared a view distance, or <see cref="ViewDistance"/> is only the default.</summary>
+    public bool HasViewDistance { get; set; }
 
     /// <summary><c>game.setActiveCombatArea</c>, when the level declares one. Offsets then sizes - see
     /// <see cref="Validation.CombatArea"/> for why the order matters.</summary>
@@ -327,7 +331,7 @@ public sealed class EnvironmentSettings
                     case "renderer.fogstart": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fs)) e.FogStart = fs; break;
                     case "renderer.fogend": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fe)) e.FogEnd = fe; break;
                     case "game.viewdistance":
-                    case "game.setviewdistance": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var vd)) e.ViewDistance = vd; break;
+                    case "game.setviewdistance": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var vd)) { e.ViewDistance = vd; e.HasViewDistance = true; } break;
                     case "game.setactivecombatarea": if (Validation.CombatArea.TryParse(line, out var caA)) e.CombatArea = caA; break;
                     case "game.istunnelmap": e.IsTunnelMap = val.StartsWith("1"); break;
                     case "game.usebelowgroundculling": e.UseBelowGroundCulling = val.StartsWith("1"); break;
@@ -591,7 +595,8 @@ public sealed class EnvironmentSettings
             ("renderer.fogcolorvec",        $"renderer.fogColorVec {V(FogColor)}",                  WriteFog),
             ("renderer.fogstart",           $"renderer.fogstart {F(FogStart)}",                     WriteFog),
             ("renderer.fogend",             $"renderer.fogend {F(FogEnd)}",                         WriteFog),
-            ("game.setviewdistance",        $"Game.setViewDistance {F(ViewDistance)}",              WriteViewDistance),
+            // Retail's spelling for a line the level never had; one it already has keeps its own (see the loop).
+            ("game.viewdistance",           $"Game.ViewDistance {F(ViewDistance)}",                 WriteViewDistance),
             ("water.color",                 $"water.color {V(WaterColor)}",                         WriteWater),
             ("water.shallowcolor",          $"water.shallowColor {V(ShallowColor)}",                WriteWater),
             ("water.deepcolor",             $"water.deepColor {V(DeepColor)}",                      WriteWater),
@@ -614,6 +619,15 @@ public sealed class EnvironmentSettings
             if (WriteTunnel && key == "mapmanager.addobjectmap") continue;
             if (RemoveCombatArea && key == "game.setactivecombatarea") continue;   // asked for explicitly, see above
             if (WriteTunnel && !IsTunnelMap && key == "game.entrypointradius") continue;   // meaningless with the system off
+            // Game.ViewDistance and Game.setViewDistance are ONE setting to the console. The level's line is rewritten
+            // in the level's own spelling - writing the other one beside it would leave two, and whichever the file
+            // reads last (al_vietnas's own, below the renderer block) would quietly win.
+            if (WriteViewDistance && key is "game.viewdistance" or "game.setviewdistance")
+            {
+                outLines.Add($"{(sp < 0 ? t : t[..sp])} {F(ViewDistance)}");
+                seen.Add("game.viewdistance");
+                continue;
+            }
             int w = Array.FindIndex(wanted, x => x.Key == key);
             // A rem'd line reads as key "rem", so a commented-out setting is left exactly as it is.
             if (w >= 0 && wanted[w].Want) { outLines.Add(wanted[w].Line); seen.Add(key); }
@@ -634,9 +648,15 @@ public sealed class EnvironmentSettings
         if (WriteStartCamera) PatchStartCamera(outLines);
         if (WriteTunnel && IsTunnelMap && ObjectMaps.Count > 0)
         {
-            // Directly after the isTunnelMap line, wherever that ended up, so the block reads as one setting.
+            // After the level's own object scripts when it runs any: a map can name a template the LEVEL defines - a
+            // lightmap-ready copy of a tunnel, a custom tunnel piece - and that template only exists once
+            // `run objects/...` has run. Nothing earlier needs the binding; the engine creates the placed objects
+            // from StaticObjects.con after Init.con has finished. Without level objects, directly after the
+            // isTunnelMap line, so the block reads as one setting.
+            int objectsRun = outLines.FindLastIndex(IsLevelObjectsRun);
             tunnelAt = outLines.FindIndex(l => l.TrimStart().StartsWith("Game.isTunnelMap", StringComparison.OrdinalIgnoreCase));
-            outLines.InsertRange(tunnelAt >= 0 ? tunnelAt + 1 : outLines.Count, ObjectMaps.Select(m => m.ToConLine()));
+            int at = objectsRun >= 0 ? objectsRun + 1 : tunnelAt >= 0 ? tunnelAt + 1 : outLines.Count;
+            outLines.InsertRange(at, ObjectMaps.Select(m => m.ToConLine()));
         }
         if (WriteWaterBelow)
         {
@@ -667,6 +687,14 @@ public sealed class EnvironmentSettings
     }
 
     private static bool IsWaterKey(string key) => key.StartsWith("water.", StringComparison.Ordinal);
+
+    /// <summary><c>run objects/Objects</c>, in any case - the line that defines the level's own templates.</summary>
+    private static bool IsLevelObjectsRun(string line)
+    {
+        var t = line.Trim();
+        return t.StartsWith("run ", StringComparison.OrdinalIgnoreCase)
+               && t[4..].TrimStart().StartsWith("objects/", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>Is this line the one that loads the terrain - <c>run Init/Terrain</c>?</summary>
     private static bool IsTerrainRun(string line)
