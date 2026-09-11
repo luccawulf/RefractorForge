@@ -15,11 +15,16 @@ namespace RefractorForge.Formats.Con;
 public sealed class StaticObject
 {
     /// <summary>
-    /// Stable per-session identity for editing/selection/collaboration. NOT written to the
-    /// .con file (the format has no id field) — assigned fresh on load, and shared between
-    /// collaborators when a session's state is synced.
+    /// Identity for editing/selection/collaboration. The .con format has no id field, so a level that has never
+    /// been synced gets one on load (<see cref="StaticObjectsFile.AssignStableIds"/> makes it the same on every
+    /// machine for the same file). A synced level carries it as a <c>rem rfid:&lt;id&gt;</c> line - a comment
+    /// to the game - which is what lets two people's copies of one map say "the same object" across saves.
     /// </summary>
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
+    /// <summary>True when <see cref="Id"/> came from a <c>rem rfid:</c> line in the file rather than being made
+    /// up on load - an id a sync can rely on.</summary>
+    public bool IdFromFile { get; set; }
 
     public string Template { get; set; }
 
@@ -65,7 +70,7 @@ public sealed class StaticObject
     /// <summary>Deep copy, preserving Id and original source text (for collaboration state sync).</summary>
     public StaticObject Clone()
     {
-        var c = new StaticObject(Template) { Id = Id, Layer = Layer };
+        var c = new StaticObject(Template) { Id = Id, IdFromFile = IdFromFile, Layer = Layer };
         c.InitPosition(Position, PositionSource ?? Position.ToString());
         c.InitRotation(Rotation, RotationSource ?? Rotation.ToString());
         if (Scale is float s) c.InitScale(s, ScaleSource ?? s.ToString(System.Globalization.CultureInfo.InvariantCulture));

@@ -73,6 +73,15 @@ public sealed class BaseSync
         _send(Message.Base(id.Fingerprint, id.Bytes, id.LevelName).Encode());
     }
 
+    /// <summary>Announce an archive this client is DERIVED from rather than the bytes it has: a copy of a server
+    /// map that has been saved since it was synced no longer hashes to the map's archive, but its record says which
+    /// archive it grew from, and that is what it is let in on.</summary>
+    public void AnnounceAs(LevelBase.Id id)
+    {
+        Mine = id;
+        _send(Message.Base(id.Fingerprint, id.Bytes, id.LevelName).Encode());
+    }
+
     /// <summary>Ask the server to build the map as it stands now and send it as one archive. Same transfer as
     /// a base download; the difference is that what arrives includes everyone's edits, so it is the file you
     /// open in the editor or drop on a game server.</summary>

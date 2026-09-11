@@ -281,7 +281,7 @@ public static class LevelSaver
 
     /// <summary>The edited StaticObjects.con as bytes (CRLF), for packing into a .rfa.</summary>
     public static byte[] SerializeStaticObjects(StaticObjectsFile so)
-        => Latin1(string.Join("\r\n", so.Write()) + "\r\n");
+        => Latin1(string.Join("\r\n", so.Write(so.PersistIds)) + "\r\n");
 
     /// <summary>Editor-side files that must NEVER be packed into a game archive: project manifests, sidecars,
     /// backups, temp/lock leftovers and OS litter. Packing these shipped junk into the level (and a stale

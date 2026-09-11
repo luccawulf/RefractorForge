@@ -262,9 +262,15 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
     (`LightmapShadowBits.lsb`), every object's lightmap (`ObjectLightMaps/*.tga` — sun, terrain shadow *and*
     your placed lights) and the placed lights' colour in the ground texture. All of it shows in the viewport at
     once, before anything is saved; **Save** then writes it all. Set the sun and the lights first.
-  - The parts on their own: **Bake Sun Shadows (terrain)**, **Bake Object Lightmaps**, **Bake Placed Lights
-    into Ground Texture**. **Show the level's baked terrain shadow (.lsb)** displays the shadow the level
-    already ships.
+  - The parts on their own: **Bake Sun Shadows**, **Bake Object Lightmaps**, **Bake Placed Lights into Ground
+    Texture**.
+  - **Sun shadows** are bake, then save — nothing else to switch on. The bake casts the terrain and every placed
+    object and darkens the shadow **into the ground texture**, which is where the game draws a sun shadow (the
+    `.lsb` it also writes changes nothing you can see on the ground). The viewport then shows the ground exactly as
+    the game will. **Shadow darkness** is how much darker shadowed ground gets: 0.50 matches retail maps, 0 is none;
+    moving it after a bake re-darkens the baked shadow at once, without baking again. The Lighting panel says what
+    shadow the ground carries, and so does the log on every save. **Unbake sun shadows** takes it back off — a map
+    saved after an Unbake has no sun shadow in game, and the save says so.
   - What an object lightmap *is*, from the game's own shader (`effects/RaShaderPPLSTs1DifLmp.fx`): a **sun-visibility
     mask**. The game draws `texture × saturate(2 × (mask × sunColour × N·L + LMambientColor))`, so the map only says
     where the sun reaches; the sun's angle is applied live, and `renderer.LMambientColor` (0.2–0.35 in every
@@ -440,6 +446,43 @@ tick **Playable** to seed Conquest flags, spawns and kits. **Create** restarts t
 
 Host or join a live session to edit the same map with others in real time. Edits broadcast to all
 peers; connected peers are listed with a "jump to" link to their camera. **Collab ▸ Disconnect** ends it.
+
+### Working on one map at different times (central server, Map sync)
+
+A **central server** (Collab ▸ Collaborate… ▸ Connect to central server) holds the map, so people do not have
+to be online together: work offline in your own `.rfa`, connect later, and the editor sorts out what changed
+where. Your map stays one packed `.rfa` the whole time.
+
+- **On connecting**, the editor does not replace your map with the server's. It compares both against the
+  version your `.rfa` last agreed with the server (a small record, `RF_Sync.txt`, that it keeps inside the `.rfa`;
+  the game ignores it) and opens **Map sync**:
+  - **New on the server** — who changed what since you last had it, and when ("Bob: 30 changes — objects,
+    terrain — 2 h ago").
+  - **Your changes not on the server** — what you did offline.
+  - **Changed on both sides** — the same object, terrain area or file changed differently by you and by someone
+    else. Choose **Keep the server's** or **Keep mine**.
+- **Download changes** takes the server's changes into your map and saves them straight into your `.rfa`. Your own
+  changes stay.
+- **Upload my changes** sends yours. If the server has anything you have not taken yet, it is downloaded first,
+  so nothing of anyone else's is written over.
+- Once both are done the map is **in step**, and it works like a live session: your edits go straight to the
+  server and everyone else's come in as they make them. Collab ▸ shows where you stand; if something of yours has
+  not reached the server, **Upload my changes** is offered again.
+- **What is compared:** objects one by one, the terrain and material/foliage maps in 32×32-cell areas, the gameplay
+  layer, water, lighting and placed lights, notes, imported objects — and **every other file the editor writes into
+  the `.rfa`**: ground-texture tiles, lighting bakes (object lightmaps, `.lsb`), sounds, decals, `Init.con` (fog,
+  view distance, tunnel and start-camera settings), sky and cloud settings, AI navmaps. Those files reach the
+  server when you save; a settings file that arrives reloads the fog, lighting and water panels.
+- **Objects keep an id** inside the `.rfa` from the first sync on (a `rem rfid:` comment line per object — the game
+  ignores it). An ordinary save of a map that has never been synced is unchanged.
+- **A copy saved before this existed** has no record, so the server cannot tell it is the same map. Map sync asks:
+  **Compare my copy with the server's map** (your objects are lined up with the server's by what they are, and
+  the comparison is made against the map as it started on the server), or **Replace mine with the server's map**
+  (yours is kept as `.before-download`).
+- **Download the current map as one .rfa** (Collab menu) gives the server's map with everything in it — every file,
+  and the record — so whoever opens it is already in step.
+- The server needs to be the version that shipped with this editor: an older one still works live, but cannot
+  say what changed while you were away, so every difference is shown as a choice.
 
 ---
 

@@ -27,6 +27,9 @@ public enum MsgType
     MapList, MapInfo, MapEnd, PickMap, MapOk,
     // Pulling the CURRENT map back out as one archive. See the Export factories below.
     Export, ExportReady, ExportFailed,
+    // Working on a map at different times: the map's version, its history, the ground it started from, and the
+    // level files it carries. See the factories under "Working at different times".
+    Version, History, Changes, Baseline, BaselineData, BaselineFail, FileInfo, FileGet, FileData,
 }
 
 public readonly struct Message
@@ -187,6 +190,68 @@ public readonly struct Message
     public static Message ExportFailed(string reason)
         => new() { Type = MsgType.ExportFailed, Args = Array.Empty<string>(), Payload = reason };
 
+    // -----------------------------------------------------------------------------------------------------
+    // Working at different times.
+    //
+    // A map on the server has a VERSION - a number that only goes up, one per edit, kept across restarts - and an
+    // EPOCH that names this incarnation of the map, so a copy synced with a map that was since deleted and made
+    // again is not mistaken for one synced with this. An editor keeps the version it last synced to inside the
+    // .rfa, which is how "what changed while I was away" and "what did I change offline" both become answerable.
+    // -----------------------------------------------------------------------------------------------------
+
+    /// <summary>Server -> client, just before the document: where the map stands and who touched it last.</summary>
+    public static Message Version(long seq, string epoch, long lastUnix, string lastAuthor)
+        => new()
+        {
+            Type = MsgType.Version,
+            Args = new[] { seq.ToString(CultureInfo.InvariantCulture), epoch, lastUnix.ToString(CultureInfo.InvariantCulture) },
+            Payload = lastAuthor,
+        };
+
+    /// <summary>Client -> server: who changed what since version <paramref name="sinceSeq"/>?</summary>
+    public static Message History(long sinceSeq)
+        => new() { Type = MsgType.History, Args = new[] { sinceSeq.ToString(CultureInfo.InvariantCulture) }, Payload = "" };
+
+    /// <summary>Server -> client: the answer, as base64 text - one "count TAB lastUnix TAB kinds TAB author" line per
+    /// person. <paramref name="complete"/> is false when the history no longer reaches back that far.</summary>
+    public static Message Changes(long sinceSeq, long nowSeq, bool complete, string payloadB64)
+        => new()
+        {
+            Type = MsgType.Changes,
+            Args = new[] { sinceSeq.ToString(CultureInfo.InvariantCulture), nowSeq.ToString(CultureInfo.InvariantCulture), complete ? "1" : "0" },
+            Payload = payloadB64,
+        };
+
+    /// <summary>Client -> server: send me the map as it was when the session began - the pinned archive's own
+    /// content, key by key. A copy that has never been synced compares itself against this.</summary>
+    public static Message Baseline() => new() { Type = MsgType.Baseline, Args = Array.Empty<string>(), Payload = "" };
+
+    /// <summary>Server -> client: the baseline, deflated and base64'd "key TAB hash" lines.</summary>
+    public static Message BaselineData(string payloadB64)
+        => new() { Type = MsgType.BaselineData, Args = Array.Empty<string>(), Payload = payloadB64 };
+
+    /// <summary>Server -> client: there is no baseline to give, and why.</summary>
+    public static Message BaselineFail(string reason)
+        => new() { Type = MsgType.BaselineFail, Args = Array.Empty<string>(), Payload = reason };
+
+    /// <summary>Server -> client, in the document: one level file the server holds - its version, hash and size,
+    /// not its bytes. A client asks for the ones it does not have with <see cref="FileGet"/>.</summary>
+    public static Message FileInfo(long seq, string hash, long size, string escapedPath)
+        => new()
+        {
+            Type = MsgType.FileInfo,
+            Args = new[] { seq.ToString(CultureInfo.InvariantCulture), hash, size.ToString(CultureInfo.InvariantCulture), escapedPath },
+            Payload = "",
+        };
+
+    /// <summary>Client -> server: send me this level file.</summary>
+    public static Message FileGet(string escapedPath)
+        => new() { Type = MsgType.FileGet, Args = new[] { escapedPath }, Payload = "" };
+
+    /// <summary>Server -> client: a requested file's bytes (base64), or "-" when the server does not have it.</summary>
+    public static Message FileData(string escapedPath, string base64OrDash)
+        => new() { Type = MsgType.FileData, Args = new[] { escapedPath }, Payload = base64OrDash };
+
     public string Encode()
     {
         return Type switch
@@ -217,6 +282,15 @@ public readonly struct Message
             MsgType.Export       => "EXPORT",
             MsgType.ExportReady  => $"EXPORTREADY {Args[0]} {Args[1]} {Args[2]}",
             MsgType.ExportFailed => $"EXPORTFAILED {Payload}",
+            MsgType.Version      => $"VERSION {Args[0]} {Args[1]} {Args[2]} {Payload}",
+            MsgType.History      => $"HISTORY {Args[0]}",
+            MsgType.Changes      => $"CHANGES {Args[0]} {Args[1]} {Args[2]} {Payload}",
+            MsgType.Baseline     => "BASELINE",
+            MsgType.BaselineData => $"BASELINEDATA {Payload}",
+            MsgType.BaselineFail => $"BASELINEFAIL {Payload}",
+            MsgType.FileInfo     => $"FILEINFO {Args[0]} {Args[1]} {Args[2]} {Args[3]}",
+            MsgType.FileGet      => $"FILEGET {Args[0]}",
+            MsgType.FileData     => $"FILEDATA {Args[0]} {Payload}",
             _ => throw new InvalidOperationException(),
         };
     }
@@ -298,6 +372,34 @@ public readonly struct Message
                 return ExportReady(p[0], long.Parse(p[1], CultureInfo.InvariantCulture), p.Length > 2 ? p[2] : "map");
             }
             case "EXPORTFAILED": return ExportFailed(rest);
+            case "VERSION":
+            {
+                var p = rest.Split(' ', 4);
+                return Version(long.Parse(p[0], CultureInfo.InvariantCulture), p[1],
+                               long.Parse(p[2], CultureInfo.InvariantCulture), p.Length > 3 ? p[3] : "");
+            }
+            case "HISTORY": return History(long.Parse(rest.Trim(), CultureInfo.InvariantCulture));
+            case "CHANGES":
+            {
+                var p = rest.Split(' ', 4);
+                return Changes(long.Parse(p[0], CultureInfo.InvariantCulture), long.Parse(p[1], CultureInfo.InvariantCulture),
+                               p[2] == "1", p.Length > 3 ? p[3] : "");
+            }
+            case "BASELINE":     return Baseline();
+            case "BASELINEDATA": return BaselineData(rest);
+            case "BASELINEFAIL": return BaselineFail(rest);
+            case "FILEINFO":
+            {
+                var p = rest.Split(' ', 4);
+                return FileInfo(long.Parse(p[0], CultureInfo.InvariantCulture), p[1],
+                                long.Parse(p[2], CultureInfo.InvariantCulture), p[3]);
+            }
+            case "FILEGET":  return FileGet(rest.Trim());
+            case "FILEDATA":
+            {
+                var p = rest.Split(' ', 2);
+                return FileData(p[0], p.Length > 1 ? p[1] : "-");
+            }
             default: throw new FormatException($"Unknown message '{type}'");
         }
     }

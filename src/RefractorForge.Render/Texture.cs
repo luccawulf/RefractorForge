@@ -875,17 +875,82 @@ public sealed class TerrainTexture
         return new Texture2D(atlasSize, atlasSize, rgba);
     }
 
+    public int GridW => _gridW;
+    public int GridH => _gridH;
+
+    /// <summary>The atlas rectangle a tile covers - the inverse of <see cref="SplitToTiles"/>'s sampling.</summary>
+    public (int X, int Y, int W, int H) TileRect(int col, int row, int atlasW, int atlasH)
+    {
+        int x0 = (int)((long)col * atlasW / _gridW), x1 = (int)((long)(col + 1) * atlasW / _gridW);
+        int y0 = (int)((long)row * atlasH / _gridH), y1 = (int)((long)(row + 1) * atlasH / _gridH);
+        return (x0, y0, x1 - x0, y1 - y0);
+    }
+
+    /// <summary>The tiles an atlas rectangle touches.</summary>
+    public IEnumerable<(int Col, int Row)> TilesIn(int x, int y, int w, int h, int atlasW, int atlasH)
+    {
+        if (w <= 0 || h <= 0 || atlasW <= 0 || atlasH <= 0) yield break;
+        int c0 = Math.Clamp((int)((long)x * _gridW / atlasW), 0, _gridW - 1);
+        int c1 = Math.Clamp((int)((long)(x + w - 1) * _gridW / atlasW), 0, _gridW - 1);
+        int r0 = Math.Clamp((int)((long)y * _gridH / atlasH), 0, _gridH - 1);
+        int r1 = Math.Clamp((int)((long)(y + h - 1) * _gridH / atlasH), 0, _gridH - 1);
+        for (int r = r0; r <= r1; r++)
+            for (int c = c0; c <= c1; c++)
+                if (_tiles[c, r] is not null) yield return (c, r);
+    }
+
+    /// <summary>Which tile a level file is, by its leaf name ("tx01x02.dds"), or null for anything else.</summary>
+    public (int Col, int Row)? TileFor(string pathOrLeaf)
+    {
+        var leaf = pathOrLeaf.Replace('\\', '/');
+        leaf = leaf[(leaf.LastIndexOf('/') + 1)..];
+        for (int r = 0; r < _gridH; r++)
+            for (int c = 0; c < _gridW; c++)
+            {
+                if (_tiles[c, r] is null) continue;
+                var n = (_tileNames?[c, r] ?? $"tx{c}x{r}.dds").Replace('\\', '/');
+                n = n[(n.LastIndexOf('/') + 1)..];
+                if (n.Equals(leaf, StringComparison.OrdinalIgnoreCase)) return (c, r);
+            }
+        return null;
+    }
+
+    /// <summary>Paint a tile that arrived from somewhere else into the atlas, at the atlas's own resolution.
+    /// Returns the atlas rectangle it covered.</summary>
+    public (int X, int Y, int W, int H) BlitTile(Texture2D atlas, int col, int row, Texture2D tile)
+    {
+        var (x0, y0, w, h) = TileRect(col, row, atlas.Width, atlas.Height);
+        var dst = atlas.Rgba;
+        for (int y = 0; y < h; y++)
+        {
+            float v = (y + 0.5f) / h;
+            for (int x = 0; x < w; x++)
+            {
+                var c = tile.Sample((x + 0.5f) / w, v);
+                int o = ((y0 + y) * atlas.Width + x0 + x) * 4;
+                dst[o] = (byte)Math.Clamp((int)(c.X * 255f + 0.5f), 0, 255);
+                dst[o + 1] = (byte)Math.Clamp((int)(c.Y * 255f + 0.5f), 0, 255);
+                dst[o + 2] = (byte)Math.Clamp((int)(c.Z * 255f + 0.5f), 0, 255);
+                dst[o + 3] = 255;
+            }
+        }
+        return (x0, y0, w, h);
+    }
+
     /// <summary>Split a (painted) atlas back into the level's terrain tiles for saving: for each tile that
     /// originally existed, resample the atlas region covering that tile into a fresh Texture2D at the tile's
     /// native size, yielding ("txCOLxROW.dds", tile). Inverts <see cref="BakeAtlas"/> (atlas u=worldX/ws ->
-    /// column, v=worldZ/ws -> row), so the saved tiles line up with the heightmap exactly as the originals did.</summary>
-    public IEnumerable<(string fileName, Texture2D tile)> SplitToTiles(Texture2D atlas)
+    /// column, v=worldZ/ws -> row), so the saved tiles line up with the heightmap exactly as the originals did.
+    /// <paramref name="include"/> limits it to the tiles that were actually painted: re-encoding an untouched tile
+    /// degrades it a little and changes its bytes, which to a sync looks like an edit nobody made.</summary>
+    public IEnumerable<(string fileName, Texture2D tile)> SplitToTiles(Texture2D atlas, Func<int, int, bool>? include = null)
     {
         for (int row = 0; row < _gridH; row++)
             for (int col = 0; col < _gridW; col++)
             {
                 var orig = _tiles[col, row];
                 if (orig is null) continue;                       // only re-emit tiles that existed
+                if (include is not null && !include(col, row)) continue;
                 // At the SHIPPED size, not the loaded one. A DXT tile goes back at its own size (256 in every retail
                 // level, 512 in some mods). An uncompressed tile - only this editor ever wrote those: 1024, no mips,
                 // which the game drew as black ground - goes back to the retail 256.

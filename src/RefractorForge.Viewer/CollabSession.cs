@@ -77,6 +77,19 @@ sealed class CollabSession
         s._relay.Register(new QueuedEndpoint(s.ClientId, s.Inbound));   // relay -> our queue (initial sync + ops)
         s.SendLine(Message.Join(s.ClientId, name).Encode());
         s.Status = $"Hosting on port {s.Port}";
+        // The relay's service loop: it walks requested archives and level files out a chunk at a time. The central
+        // server runs this in its main loop; a relay inside the editor had none, so a joiner who asked the host for
+        // a file waited forever.
+        var relayRef = s._relay;
+        new Thread(() =>
+        {
+            while (s._running)
+            {
+                int busy = 0;
+                try { busy = relayRef.PumpBaseSends(); } catch { }
+                Thread.Sleep(busy > 0 ? 1 : 100);
+            }
+        }) { IsBackground = true, Name = "collab-host-pump" }.Start();
 
         // Surface connection info: LAN IPv4 now, public IP best-effort (for internet play with port-forwarding).
         try
@@ -171,6 +184,27 @@ sealed class CollabSession
 
     private BaseSync? _base;
     private string? _pendingBasePath;   // what to re-announce once a map has been entered
+
+    // ---- working at different times -------------------------------------------------------------------
+    /// <summary>The server map's replica and the comparison against this copy's baseline. Null on a session that
+    /// does not keep one (an editor-hosted session, the AI bridge).</summary>
+    public MapSync? Sync { get; private set; }
+
+    /// <summary>Keep a replica of the server's map so offline work can be compared, downloaded and uploaded.</summary>
+    public void EnableMapSync() => Sync ??= new MapSync(SendLine);
+
+    /// <summary>Asked once a map has been entered: the archive this copy is derived from, if its record says it is
+    /// that map. A copy saved since it was synced no longer hashes to the map's archive; this is what lets it in.</summary>
+    public Func<string, LevelBase.Id?>? ClaimFor;
+
+    /// <summary>Say this copy is derived from the session's archive - the mapper's own decision, for a copy saved
+    /// before records existed. Its content is then compared against the map, not refused for its bytes.</summary>
+    public void ClaimBase(LevelBase.Id pin)
+    {
+        var b = Base();
+        BaseStatus = "Comparing your copy with the server's map...";
+        b.AnnounceAs(pin);
+    }
 
     // ---- choosing a map -------------------------------------------------------------------------------
     // A central relay hosts several maps and will not register this client anywhere until it names one, so
@@ -391,9 +425,14 @@ sealed class CollabSession
                 // The BASE line sent on connect went nowhere: a multi-map relay reads only PICKMAP while a
                 // client is in the lobby. Now that this client is in a map, say again what it is standing on -
                 // and the pin it is measured against belongs to THIS map, not to whatever was picked before.
-                if (_pendingBasePath is not null) AnnounceBase(_pendingBasePath);
+                // A copy whose record names this map says the archive it grew from, not its own bytes.
+                if (ClaimFor?.Invoke(CurrentMap) is { } claim) { BaseStatus = "Checking the session is on the same map..."; Base().AnnounceAs(claim); }
+                else if (_pendingBasePath is not null) AnnounceBase(_pendingBasePath);
                 return true;
         }
+        // The map replica: version, history, baseline and files are its alone; the document and the ops it keeps a
+        // copy of and hands on, because the editor decides separately whether to take them.
+        if (Sync is not null && Sync.Handle(m)) return true;
         return Base().Handle(m);
     }
 
@@ -436,7 +475,19 @@ sealed class CollabSession
         t.Start();
     }
 
-    public void SendOp(string wire) => SendLine(Message.Op(0, ClientId, ++_opId, wire).Encode());
+    /// <summary>Whether edits may go out live right now. A server map this copy has not yet caught up with keeps
+    /// its edits here - they are found by the comparison and go up with Upload - rather than landing on a map
+    /// that has moved on underneath them.</summary>
+    public Func<bool>? MaySendOps;
+
+    /// <summary>The archive the session's map is built on, once agreed.</summary>
+    public LevelBase.Id? SessionBase => _base?.Session;
+
+    public void SendOp(string wire)
+    {
+        if (MaySendOps is not null && !MaySendOps()) return;
+        SendLine(Message.Op(0, ClientId, ++_opId, wire).Encode());
+    }
 
     public void SendPresence(string selectionId, Vec3 cursor, float heading = 0f, float pitch = 0f)
         => SendLine(Message.Presence(ClientId, Name, string.IsNullOrEmpty(selectionId) ? "-" : selectionId, cursor, heading, pitch).Encode());

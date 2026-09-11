@@ -162,7 +162,7 @@ public sealed class MapLibrary
             {
                 world = CollabWorldState.Load(folder);
                 var soc = Path.Combine(folder, "StaticObjects.con");
-                if (File.Exists(soc)) objects = StaticObjectsFile.Load(soc);
+                if (File.Exists(soc)) objects = RelayHost.LoadObjects(soc);
                 var basetxt = Path.Combine(folder, "base.txt");
                 if (File.Exists(basetxt)) pin = LevelBase.Id.TryDecode(File.ReadAllText(basetxt).Trim());
             }
@@ -196,7 +196,7 @@ public sealed class MapLibrary
             {
                 Name = name,
                 Folder = folder,
-                Relay = new RelayServer(objects, world ?? new CollabWorldState(), _password, _store, pin),
+                Relay = new RelayServer(objects, world ?? new CollabWorldState(), _password, _store, pin, new MapStore(folder)),
             };
             // The relay knows the edits; only the library knows where the base lives and what the map is called.
             room.Relay.BuildExport = () =>
@@ -205,6 +205,8 @@ public sealed class MapLibrary
                 var id = MapExport.Build(room, _store, Path.Combine(room.Folder, "current.rfa"));
                 return id is null ? null : (id, Path.Combine(room.Folder, "current.rfa"));
             };
+            // What a never-synced editor compares itself against: the pinned archive, as it shipped.
+            room.Relay.BuildBaseline = () => _store is null ? null : MapExport.Baseline(room, _store);
             _rooms[name] = room;
             return room;
         }

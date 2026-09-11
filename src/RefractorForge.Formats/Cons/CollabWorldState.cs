@@ -55,7 +55,7 @@ public sealed class CollabWorldState
     /// never asked again and every later join was wiped too.</summary>
     public bool HasLevelContent => Height is not null || Material is not null || !string.IsNullOrEmpty(Gameplay);
 
-    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || !string.IsNullOrEmpty(Water) || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0 || LevelFiles.Count > 0 || !string.IsNullOrEmpty(LightRig) || !string.IsNullOrEmpty(LightBake);
+    public bool Any => Height is not null || Material is not null || Under is not null || Over is not null || !string.IsNullOrEmpty(Gameplay) || !string.IsNullOrEmpty(Water) || !string.IsNullOrEmpty(Overgrowth) || !string.IsNullOrEmpty(Light) || ObjMeshes.Count > 0 || LevelFiles.Count > 0 || !string.IsNullOrEmpty(LightRig) || !string.IsNullOrEmpty(LightBake) || !string.IsNullOrEmpty(Annotations);
 
     /// <summary>Apply one streamed op (TERRAIN/MATERIAL/GAMEPLAY) to the canonical state. Returns true if it was a
     /// recognised non-object op (so the caller knows not to treat it as an object edit). Terrain/material rects are
@@ -68,9 +68,16 @@ public sealed class CollabWorldState
         {
             case "TERRAIN":
             {
-                if (Height is null) return true;   // recognised, but nothing to write into
                 var p = payload.Split(' ');
                 int x0 = int.Parse(p[1]), y0 = int.Parse(p[2]), w = int.Parse(p[3]), h = int.Parse(p[4]);
+                // A whole square map arriving at 0,0 is how a level is SEEDED - the first editor on an empty relay
+                // uploads its terrain exactly like this. Dropping it because there was no map yet to write into is
+                // how an empty relay used to lose the first person's terrain; it is the map, so it becomes one.
+                if (Height is null)
+                {
+                    if (x0 != 0 || y0 != 0 || w != h || w < 2) return true;   // a stroke with no map under it
+                    Height = new Heightmap(w, h);
+                }
                 var buf = Convert.FromBase64String(p[5]);
                 for (int yy = 0; yy < h; yy++)
                     for (int xx = 0; xx < w; xx++)
@@ -87,7 +94,13 @@ public sealed class CollabWorldState
                 var p = payload.Split(' ');
                 int layer = int.Parse(p[1]), x0 = int.Parse(p[2]), y0 = int.Parse(p[3]), w = int.Parse(p[4]), h = int.Parse(p[5]);
                 var map = layer == 1 ? Under : layer == 2 ? Over : Material;
-                if (map is null) return true;
+                if (map is null)
+                {
+                    // Same as the terrain: a whole square layer at 0,0 is a seed, not a stroke to throw away.
+                    if (x0 != 0 || y0 != 0 || w != h || w < 2) return true;
+                    map = new MaterialMap(w, h);
+                    if (layer == 1) Under = map; else if (layer == 2) Over = map; else Material = map;
+                }
                 var buf = Convert.FromBase64String(p[6]);
                 for (int yy = 0; yy < h; yy++)
                     for (int xx = 0; xx < w; xx++)

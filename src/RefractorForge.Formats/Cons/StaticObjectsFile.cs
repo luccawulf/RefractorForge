@@ -16,6 +16,11 @@ public sealed class StaticObjectsFile
     /// <summary>Lines that appear before the first <c>object.create</c> (comments, etc.), preserved.</summary>
     public List<string> Header { get; } = new();
 
+    /// <summary>Write each object's id (<c>rem rfid:</c>) whenever this file is saved. On for a level kept in step
+    /// with a server and for the server's own copy; off, a save is byte-for-byte what it always was. A file that
+    /// was READ with ids keeps writing them.</summary>
+    public bool PersistIds { get; set; }
+
     public StaticObject? FindById(string id)
     {
         foreach (var o in Objects) if (o.Id == id) return o;
@@ -25,7 +30,7 @@ public sealed class StaticObjectsFile
     /// <summary>Deep copy including ids and source text (used to sync a collaborator's starting state).</summary>
     public StaticObjectsFile Clone()
     {
-        var f = new StaticObjectsFile();
+        var f = new StaticObjectsFile { PersistIds = PersistIds };
         f.Header.AddRange(Header);
         foreach (var o in Objects) f.Objects.Add(o.Clone());
         return f;
@@ -33,7 +38,11 @@ public sealed class StaticObjectsFile
 
     public static StaticObjectsFile Load(string path) => Parse(File.ReadLines(path));
 
-    public void Save(string path) => File.WriteAllLines(path, Write());
+    public void Save(string path) => File.WriteAllLines(path, Write(PersistIds));
+
+    /// <summary>The comment line that carries an object's id: <c>rem rfid:&lt;id&gt;</c>, right after its
+    /// <c>object.create</c>. The engine reads it as a comment.</summary>
+    public const string IdLinePrefix = "rem rfid:";
 
     public static StaticObjectsFile Parse(IEnumerable<string> lines)
     {
@@ -43,6 +52,15 @@ public sealed class StaticObjectsFile
         foreach (var raw in lines)
         {
             var line = raw.Trim();
+
+            // An object's persisted id. Consumed here rather than kept as an extra line, so a file that is read
+            // and written back does not grow a second copy of it.
+            if (current is not null && line.StartsWith(IdLinePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var id = line[IdLinePrefix.Length..].Trim();
+                if (IsUsableId(id)) { current.Id = id; current.IdFromFile = true; file.PersistIds = true; }
+                continue;
+            }
 
             // Blank or comment lines: keep in header if no object yet, else attach to current object.
             if (line.Length == 0 || IsComment(line))
@@ -92,13 +110,39 @@ public sealed class StaticObjectsFile
         return file;
     }
 
-    public IEnumerable<string> Write()
+    /// <summary>Give every object that did not bring an id from the file one that is the SAME on every machine
+    /// that loads the same file: <c>b&lt;index&gt;</c>, its place in file order. A relay seeded from a map and an
+    /// editor that opens the untouched map therefore agree on every object without talking to each other. Ids
+    /// already in use (read from the file) are never handed out twice.</summary>
+    public void AssignStableIds()
+    {
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var o in Objects) if (o.IdFromFile) used.Add(o.Id);
+        for (int i = 0; i < Objects.Count; i++)
+        {
+            var o = Objects[i];
+            if (o.IdFromFile) continue;
+            string id = "b" + i.ToString(CultureInfo.InvariantCulture);
+            for (int n = 1; used.Contains(id); n++) id = $"b{i}x{n}";
+            o.Id = id;
+            used.Add(id);
+        }
+    }
+
+    /// <summary>An id has to survive being one token on the collaboration wire and one word in a comment.</summary>
+    public static bool IsUsableId(string id) =>
+        id.Length is > 0 and <= 64 && id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.');
+
+    /// <summary>The file's lines. <paramref name="withIds"/> adds each object's <c>rem rfid:</c> line - only for a
+    /// level kept in step with a server, so an ordinary save stays byte-for-byte what it always was.</summary>
+    public IEnumerable<string> Write(bool withIds = false)
     {
         foreach (var h in Header) yield return h;
 
         foreach (var o in Objects)
         {
             yield return $"object.create {o.Template}";
+            if (withIds && IsUsableId(o.Id)) yield return IdLinePrefix + o.Id;
             yield return $"object.absolutePosition {o.PositionSource ?? o.Position.ToString()}";
             yield return $"object.rotation {o.RotationSource ?? o.Rotation.ToString()}";
             if (o.Layer is int l) yield return $"object.layer {l}";

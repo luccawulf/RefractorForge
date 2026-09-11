@@ -187,7 +187,7 @@ public static class RelayHost
         {
             world = CollabWorldState.Load(o.SavePath);
             var soc = Path.Combine(o.SavePath, "StaticObjects.con");
-            if (File.Exists(soc)) { try { objects = StaticObjectsFile.Load(soc); } catch { } }
+            if (File.Exists(soc)) { try { objects = LoadObjects(soc); } catch { } }
             resumed = world is not null || objects is not null;
         }
         if (!resumed) (objects, world) = LoadFullLevel(o.SeedPath);
@@ -213,7 +213,10 @@ public static class RelayHost
                 catch (Exception ex) { Console.WriteLine($"  could not take the seed into the base store: {ex.Message}"); }
             }
         }
-        var relay = new RelayServer(objects, world, o.Password, baseStore, basePin);
+        // With a state folder the map keeps its version, history and level files there; without one they live
+        // only as long as the process, like everything else about an unpersisted session.
+        var mapStore = string.IsNullOrEmpty(o.SavePath) ? null : new MapStore(o.SavePath);
+        var relay = new RelayServer(objects, world, o.Password, baseStore, basePin, mapStore);
         var host = new TcpRelayHost(relay, o.Bind, o.Port);
         host.Start();
 
@@ -370,10 +373,27 @@ public static class RelayHost
         catch (Exception ex) { Console.WriteLine($"  save failed: {ex.Message}"); }
     }
 
+    /// <summary>A StaticObjects.con as the server keeps it: ids read from the file, or - for a file that has never
+    /// carried them - the stable file-order ids every editor opening the same file gives it too.</summary>
+    public static StaticObjectsFile LoadObjects(string path)
+    {
+        var f = StaticObjectsFile.Load(path);
+        f.AssignStableIds();
+        f.PersistIds = true;
+        return f;
+    }
+
     /// <summary>Load a level (folder or .rfa) into the relay's canonical objects + world state. A bare
-    /// StaticObjects.con loads objects only (no terrain/material/gameplay maps to seed).</summary>
-    /// <summary>Public so the map library can seed a map from an archive dropped into the maps folder.</summary>
+    /// StaticObjects.con loads objects only (no terrain/material/gameplay maps to seed). Objects get stable ids.
+    /// Public so the map library can seed a map from an archive dropped into the maps folder.</summary>
     public static (StaticObjectsFile? Objects, CollabWorldState? World) LoadFullLevel(string? path)
+    {
+        var (o, w) = LoadFullLevelRaw(path);
+        if (o is not null) { o.AssignStableIds(); o.PersistIds = true; }
+        return (o, w);
+    }
+
+    private static (StaticObjectsFile? Objects, CollabWorldState? World) LoadFullLevelRaw(string? path)
     {
         if (string.IsNullOrEmpty(path)) return (null, null);
         try

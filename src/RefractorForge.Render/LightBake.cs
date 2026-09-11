@@ -323,6 +323,42 @@ public static class LightBake
         return true;
     }
 
+    /// <summary>How dark a merge made fully shadowed ground: 1 - its darkest factor. A bake always leaves some ground
+    /// fully shadowed, so the darkest texel IS the level the map was made at (0.5 darkness = kept x0.5).</summary>
+    public static float FactorDarkness(Texture2D factor)
+    {
+        var p = factor.Rgba; int min = 255;
+        for (int i = 0; i < factor.Width * factor.Height; i++) if (p[i * 4] < min) min = p[i * 4];
+        return 1f - min / 255f;
+    }
+
+    /// <summary>Share of the ground a merge darkens at all (factor below 254).</summary>
+    public static double FactorCoverage(Texture2D factor)
+    {
+        var p = factor.Rgba; long n = (long)factor.Width * factor.Height, dark = 0;
+        for (long i = 0; i < n; i++) if (p[i * 4] < 254) dark++;
+        return n == 0 ? 0 : (double)dark / n;
+    }
+
+    /// <summary>
+    /// The same shadow at a different darkness, without baking again. A factor is k = 1 - darkness x (1 - visibility),
+    /// so the visibility comes straight back out of the map and the new factor is 1 - (1 - k) x new / old - penumbrae
+    /// keep their shape. Darkness 0 gives a neutral map (nothing darkened).
+    /// </summary>
+    public static Texture2D RescaleFactor(Texture2D factor, float darkness)
+    {
+        float old = FactorDarkness(factor);
+        float s = old > 1e-3f ? Math.Clamp(darkness, 0f, 1f) / old : 0f;
+        var p = factor.Rgba; var rgba = new byte[p.Length];
+        for (int i = 0; i < factor.Width * factor.Height; i++)
+        {
+            float k = 1f - (1f - p[i * 4] / 255f) * s;
+            byte b = (byte)Math.Clamp((int)(k * 255f + 0.5f), 0, 255);
+            rgba[i * 4] = b; rgba[i * 4 + 1] = b; rgba[i * 4 + 2] = b; rgba[i * 4 + 3] = 255;
+        }
+        return new Texture2D(factor.Width, factor.Height, rgba);
+    }
+
     /// <summary>
     /// Burn a ground light map into the terrain atlas.
     ///

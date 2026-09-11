@@ -98,6 +98,9 @@ public sealed class CompositeCommand : IEditCommand
 {
     private readonly List<IEditCommand> _cmds;
     public CompositeCommand(IEnumerable<IEditCommand> cmds) { _cmds = cmds.ToList(); }
+
+    /// <summary>The parts, in order - so collaboration can send each the way it sends one on its own.</summary>
+    public IReadOnlyList<IEditCommand> Commands => _cmds;
     public int Count => _cmds.Count;
     public void Apply(StaticObjectsFile f) { foreach (var c in _cmds) c.Apply(f); }
     public void Undo(StaticObjectsFile f) { for (int i = _cmds.Count - 1; i >= 0; i--) _cmds[i].Undo(f); }
@@ -130,6 +133,10 @@ public sealed class MaterialStrokeCommand : IEditCommand
 
     public MaterialStrokeCommand(MaterialEdit edit, MaterialMap map, System.Action? onChanged)
     { _edit = edit; _map = map; _onChanged = onChanged; }
+
+    /// <summary>The map this stroke painted - material, undergrowth or overgrowth. The wire form does not say, and
+    /// guessing from whichever layer is active in the UI sent a foliage layer's data under the material's name.</summary>
+    public MaterialMap Map => _map;
 
     public void Apply(StaticObjectsFile _) { _edit.Redo(_map); _onChanged?.Invoke(); }
     public void Undo(StaticObjectsFile _) { _edit.Undo(_map); _onChanged?.Invoke(); }

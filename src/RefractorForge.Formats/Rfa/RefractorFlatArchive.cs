@@ -73,7 +73,7 @@ public sealed class RefractorFlatArchive
 
     public RefractorFlatArchive(string path)
     {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
         var (isV11, isCompressed, xpackId, entries, descriptor, trailers, tail) = ReadFrom(fs);
         _path = path;
         Entries = entries;
@@ -206,7 +206,7 @@ public sealed class RefractorFlatArchive
 
     private byte[] ReadRegionFromFile(RefractorFlatArchiveEntry e)
     {
-        using var fs = new FileStream(_path!, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var fs = new FileStream(_path!, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
         fs.Seek(e.Offset, SeekOrigin.Begin);
         var buf = new byte[e.BlockSize];
         fs.ReadExactly(buf);
@@ -507,7 +507,7 @@ public sealed class RefractorFlatArchive
     {
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             Span<byte> hdr = stackalloc byte[8 + 14];
             if (fs.Length < 156) return false;
             fs.ReadExactly(hdr);
@@ -525,7 +525,7 @@ public sealed class RefractorFlatArchive
         try
         {
             var a = new RefractorFlatArchive(path);
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             foreach (var e in a.Entries)
             {
                 if (e.BlockSize < 0 || e.UncompressedSize < 0 || e.Offset + (long)e.BlockSize > fs.Length)

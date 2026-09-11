@@ -112,11 +112,8 @@ uniform vec2 uTerUvScale; uniform vec2 uTerUvOffset;
 uniform int uShowMat; uniform sampler2D uMat;
 uniform int uHasDetail; uniform sampler2D uDetail; uniform float uDetailScale;
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map
-// The BAKED terrain sun-shadow - the level's LightmapShadowBits.lsb on load, or what 'Bake Sun Shadows' just made.
-// This is the one the GAME reads, so showing it is the only way to see what a bake actually did; the real-time map
-// above is a camera-following preview that is never written anywhere. Sampled with the raw terrain UV because
-// TerrainShadow.Bake writes texel (x,y) -> world (x/size*worldSize, y/size*worldSize), the untouched mapping.
-uniform int uUseBakedShadow; uniform sampler2D uBakedShadow;
+// No baked-shadow term: a baked sun shadow is darkened INTO the ground texture (uTer), which is where the game draws
+// it. Also cutting the sun here, as this shader once did, showed every baked shadow twice as dark as the game does.
 // The level's lighting (Init.con renderer.ambientColor / diffuseColor), balanced so the pair sums to the editor's
 // old flat 0.4/0.6 exposure - the level tints the light, it does not change how bright the editor is.
 uniform vec3 uAmbLight; uniform vec3 uDifLight;
@@ -193,7 +190,6 @@ void main(){
     if (uHasDetail==1) baseCol *= clamp(texture(uDetail, vUv*uDetailScale).rgb*2.0, 0.0, 1.0);
     vec3 n = normalize(vN);
     float vis = shadowVis(vWorld, n);                              // real-time sun cast-shadow visibility
-    if (uUseBakedShadow==1) vis *= texture(uBakedShadow, vUv).r;   // and the baked .lsb the game will read
     vec3 d = uAmbLight + uDifLight*max(0.0, dot(n, normalize(uLightDir)))*vis;
     d = mix(d, uNightAmb, uNight);                 // night pulls the sun down toward moonlight
     // A texel cannot hold more than white, so a pool can never be brighter than the scene light itself. Showing
@@ -805,7 +801,6 @@ bool sbBaking = false;
 int sbDone = 0, sbTotal = 0;
 double sbBakeStarted = 0;
 int sbTriangles = 0;                    // occluder size, for the progress readout
-bool sbWithObjects = true;              // include placed objects as shadow casters
 System.Threading.CancellationTokenSource? sbCancel = null;
 System.Threading.Tasks.Task? sbTask = null;
 Texture2D? sbPreview = null;            // the visibility map, for the viewport + the .dds export
@@ -813,16 +808,18 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? sbLsb = null;     // what the
 // The packed shadow the SAVE writes. Held from the bake so saving does not silently re-run a minutes-long bake -
 // and so what the game gets is exactly what the viewport showed.
 RefractorForge.Formats.Terrain.LightmapShadowBits? bakedShadowLsb = null;
-bool showBakedShadow = false;           // viewport layer for the baked shadow (separate from the real-time preview)
 bool sbThenObjects = false;             // "Bake Both": run the object lightmaps once the shadow bake finishes
-// Merge the baked shadow into the ground texture. This is the ONLY thing that makes a terrain sun-shadow visible
-// in game: retail paints the shadow into the tx tiles (measured on Fall_of_Saigon - see
+// A bake always darkens the shadow into the ground texture. That is the ONLY thing that makes a terrain sun-shadow
+// visible in game: retail paints the shadow into the tx tiles (measured on Fall_of_Saigon - see
 // LightBake.MultiplyShadowIntoAtlas), and a .lsb on its own changes nothing on screen, proven with a 50%
-// checkerboard .lsb that rendered identically in game.
-bool sbMergeToGround = true;
+// checkerboard .lsb that rendered identically in game. It used to be a checkbox, and so did casting the objects and
+// writing the .lsb - three ways for a bake to look right in the editor and never reach the game.
 Texture2D? groundMerge = null;       // the factor map the ground currently carries (see CurrentGroundMerge)
 bool groundMergeLoaded = false;      // read lazily from the level; reset whenever a level is opened
-float sbShadowLevel = 0.5f;             // what fully shadowed ground keeps; 0.5 matches retail
+// How much darker fully shadowed ground gets: 0 = none, 0.5 = what retail measures at. It was once the level the
+// ground KEPT, under the label "Shadow darkness" - so raising it to get darker shadows made them fainter.
+float sbShadowDarkness = 0.5f;
+Texture2D? groundMergeStatsFor = null; double groundMergeCoverage = 0; float groundMergeDarkness = 0;   // panel readout cache
 HashSet<string>? lmExisting = null;      // lightmap files the level already ships, snapshotted when a bake starts
 Dictionary<byte, byte[]> uniformLightmapCache = new();   // flat fallback lightmaps, cached by their grey value
 bool showTunnelEntries = true;    // draw the entry-point spheres: where a soldier passes through the terrain
@@ -959,6 +956,35 @@ Vector3[] pointMarkers = Array.Empty<Vector3>();
 TerrainTexture? terrainTex = null;   // level's baked tiles, flattened to a GPU atlas in OnLoad
 Texture2D? atlasCpu = null;          // CPU copy of the baked atlas, kept so the Texture paint tool can edit it
 bool atlasPainted = false;           // the atlas was texture-painted -> re-emit txCxR.dds tiles on save
+// The tiles painted since the last save, so a save re-encodes those and not every tile of the map: an untouched
+// tile re-encoded degrades a little and changes its bytes, which a map sync reads as an edit nobody made.
+HashSet<(int Col, int Row)> tilesDirty = new();
+bool applyingTile = false;           // a tile that ARRIVED is being painted in - not an edit of ours
+
+// ---- Working on a server map at different times (Collab > Map sync; RefractorForge.Collab.MapSync) ----
+// The open .rfa carries a record of which server map it was last in step with, at what version, and a hash of
+// every piece of the map at that version. Against it, the server's map says what others changed while this copy
+// was away and this copy says what was changed here - and nothing moves either way until the mapper says so.
+RefractorForge.Collab.SyncRecord? levelSyncRecord = null;
+int mapSyncState = 0;                // 0 not a server map, 1 comparing, 2 waiting for the mapper, 3 in step (edits go live), 4 fetching a download's files
+Dictionary<string, string>? mapSyncDownloadBase = null;   // the server's map as it was when a download began
+bool mapSyncBaseUploadStarted = false;
+RefractorForge.Collab.SyncPlan? mapSyncPlan = null;
+string mapSyncStatus = "";
+Dictionary<string, string>? localFileHashes = null;   // level path -> hash of the open archive's files (not the structured ones)
+bool localFilesBusy = false;
+RefractorForge.Collab.SyncRecord? mapSyncResyncBase = null;   // the replica just before a reconnect re-sent the map
+HashSet<string> mapSyncFetch = new(StringComparer.OrdinalIgnoreCase);   // files a download is still waiting for
+int mapSyncFetchTotal = 0;
+bool mapSyncUploadAfter = false;     // Upload pressed with the server's changes not yet taken: download first
+bool mapSyncWindowOpen = false;
+bool mapSyncKeepMine = false;        // what a conflict resolves to
+bool mapSyncSeeded = false;          // this client seeded an empty map: nothing to compare
+List<string> mapSyncUnsent = new();  // in step, but these keys differ from the server (edits that did not travel)
+double mapSyncNextCheck = 0;
+bool mapSyncBaselineAsked = false;   // the map's starting point has been asked for (a copy with no record of its own)
+double mapSyncBaselineAskedAt = 0;
+int localFilesGen = 0;               // bumped by every save, so a file-hash pass that straddled one is thrown away
 string? texturesDir = null;          // the level's Textures/ dir (where txCxR.dds tiles live), for save
 Heightmap? heightmap = null;         // kept so the ground-pick can sample terrain height for placement
 TerrainPick? terrainPick = null;
@@ -1080,6 +1106,7 @@ if (rfaList.Length > 0)
     heightmap = lvl.Heightmap;
     mesh = TerrainMesh.FromHeightmap(lvl.Heightmap, cfg, 1);
     so = lvl.StaticObjects;
+    so.AssignStableIds();      // the same ids on every machine that opens this file, or the ones it carries
     terrainTex = lvl.Terrain;
     gameplay = lvl.Gameplay;
     gameplayModes = ScanArchiveGameModes();
@@ -1089,7 +1116,10 @@ if (rfaList.Length > 0)
     env = lvl.Environment;
     if (env.IsTunnelMap) mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1, holes: true);   // a tunnel map: its holes are real
     sounds = lvl.Sounds ?? SoundLibrary.Empty;   // .rfa levels edit sounds too (saved back into the repack/patch)
-    loadedShadowBits = lvl.Shadow;               // the level's baked terrain sun-shadow (display via the Shadows toggle)
+    loadedShadowBits = lvl.Shadow;               // the level's baked terrain sun-shadow (its grid sizes the next bake)
+    // A copy of a server map knows which one, and at what version it last agreed with it.
+    levelSyncRecord = RefractorForge.Collab.SyncRecord.Parse(ReadLevelText(RefractorForge.Collab.SyncRecord.EntryLeaf));
+    if (levelSyncRecord is not null) so.PersistIds = true;
     // NOTE: object lightmaps are loaded LAZILY (EnsureObjectLightmaps) on first enable - decoding them here re-opens
     // the level .rfa and was a big chunk of the load time.
     // Can't write back into the .rfa yet, so F5 saves a loose StaticObjects.con beside the archive.
@@ -1116,6 +1146,9 @@ else if (levelDir is not null && Directory.Exists(levelDir))
     mesh = TerrainMesh.FromHeightmap(heightmap, cfg, 1);
     soPath = Find("StaticObjects.con");
     so = StaticObjectsFile.Load(soPath);
+    so.AssignStableIds();
+    levelSyncRecord = RefractorForge.Collab.SyncRecord.Parse(ReadLevelText(RefractorForge.Collab.SyncRecord.EntryLeaf));
+    if (levelSyncRecord is not null) so.PersistIds = true;
     gameplay = GameplayObjects.LoadFolder(levelDir);
     gameplayModes = GameplayModes.FromFolder(levelDir);
     gameplayEdit = new EditableGameplay(gameplay);
@@ -1780,8 +1813,7 @@ byte[]? foliageUnderBackup = null, foliageOverBackup = null;   // what "Clear" r
 bool unbakeLighting = false;            // write a FULLY LIT terrain shadow on save instead of a baked one
 double appClock = 0;                    // seconds since launch, drives the water ripple animation
 bool showWater = true, showSky = true;  // Layers-panel toggles
-uint shadowTexId = 0;                   // (legacy) baked sun-shadow buffer for the TerrainShadow.dds export only
-bool showShadows = false;              // real-time sun shadow map toggle (OFF by default - no dark-by-default ground)
+bool showShadows = false;             // real-time sun shadow map toggle (OFF by default - no dark-by-default ground)
 // Real-time sun shadow map: a depth render of terrain + objects from the sun's POV, sampled by the terrain/object
 // shaders for live cast shadows that follow the controllable sun. Replaces the old baked .lsb display.
 uint shadowMapFbo = 0, shadowMapDepthTex = 0;
@@ -1793,7 +1825,6 @@ float lastShadowRadius = 0f;
 uint depthProg = 0;
 int uLightSpaceD = -1, uModelD = -1;                            // depth-pass program uniforms
 int uLightSpaceT = -1, uShadowMapT = -1, uUseShadowMapT = -1;   // terrain program shadow uniforms
-int uUseBakedShadowT = -1;                                      // baked .lsb layer (sampler is on texture unit 4)
 int uLightSpaceO = -1, uShadowMapO = -1, uUseShadowMapO = -1;   // object program shadow uniforms
 // Sun-direction control (azimuth + elevation). When sunOverride is on, the editor lights with these instead of the
 // level's SkyAndSun.con; moving them relights terrain + objects + re-renders the shadow map in real time.
@@ -1812,7 +1843,6 @@ int uTerUvScaleL = -1, uTerUvOffsetL = -1;
 // no need to touch Q/E. The default fly camera instead flattens forward onto XZ and keeps your altitude fixed
 // until you press Q/E, which is the difference between the two modes.
 bool groundCam = AppPrefs.GroundCamera;   // AppPrefs.Load() already ran, so this picks up the remembered choice
-bool writeShadowLsb = false;            // on save, also bake + write the engine's LightmapShadowBits.lsb
 bool shadowLsbFlipX = false, shadowLsbFlipY = false;   // in-game shadow mirror correction (toggle if shadows land mirrored)
 uint detailTexId = 0;   // tiling detail texture (REPEAT + mipmaps), 0 = none
 uint minimapTexId = 0;  // top-down minimap shown in the in-editor Mini-Map panel (0 = not built)
@@ -3094,27 +3124,7 @@ void OnLoad()
     ApplyTheme();
     LoadPrefabs();
     // Seed the editable fog state from the level's Init.con (renderer.vertexFogEnable / fogColorVec / fog start-end).
-    if (env is not null)
-    {
-        fogEnabled = env.FogEnabled;
-        fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
-        fogStart = env.FogStart; fogEnd = env.FogEnd;
-        viewDistance = env.ViewDistance;
-        lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
-        lightAmb = new Vector3(env.AmbientColor.X, env.AmbientColor.Y, env.AmbientColor.Z);
-        lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
-        lightSpecular = new Vector3(env.SpecularColor.X, env.SpecularColor.Y, env.SpecularColor.Z);
-        lightingDirty = false;
-        waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);   // the level's water.color
-        deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);       // the level's water.deepcolor
-        waterAlpha = env.WaterAlpha;
-        belowColor = new Vector3(env.BelowColor.X, env.BelowColor.Y, env.BelowColor.Z);
-        belowDeepColor = new Vector3(env.BelowDeepColor.X, env.BelowDeepColor.Y, env.BelowDeepColor.Z);
-        belowAlpha = env.BelowAlpha;
-        belowAlphaDepth = env.BelowAlphaDepth; belowColorDepth = env.BelowColorDepth;
-        shallowColor = new Vector3(env.ShallowColor.X, env.ShallowColor.Y, env.ShallowColor.Z);
-        belowShallowColor = new Vector3(env.BelowShallowColor.X, env.BelowShallowColor.Y, env.BelowShallowColor.Z);
-    }
+    SeedEditorFromEnv();
     waterLevelLoaded = cfg.WaterLevel;   // remember for the Water Level "Reset" button
     // Build the library catalog: objects + a draggable Gameplay category + a Prefabs category (if any).
     RebuildCatalog();
@@ -3186,8 +3196,6 @@ void OnLoad()
     ApplyTerrainUv();
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uDetail"), 2); // detail sampler -> texture unit 2
     gl.Uniform1(gl.GetUniformLocation(terrainProg, "uShadowMap"), 3); // shadow-map sampler -> texture unit 3
-    gl.Uniform1(gl.GetUniformLocation(terrainProg, "uBakedShadow"), 4); // baked .lsb sampler -> texture unit 4
-    uUseBakedShadowT = gl.GetUniformLocation(terrainProg, "uUseBakedShadow");
     gl.Uniform1(uShowMat, 0);
     // Sun shadow-map depth program (depth render of terrain + objects from the sun).
     depthProg = BuildProgram(DepthVert, DepthFrag);
@@ -3214,6 +3222,7 @@ void OnLoad()
         if (terrainTex.HasLegacyTiles)
         {
             atlasPainted = true;
+            MarkAllTilesDirty();
             Console.WriteLine("Terrain tiles are uncompressed, a format the game cannot draw - they will be re-encoded as DXT1 + mipmaps on the next save.");
             Toast(Loc.T("This map's terrain tiles are in a format the game draws BLACK. Save (Ctrl+S) to re-encode them."));
         }
@@ -3549,6 +3558,7 @@ void OnUpdate(double dt)
     }
     // Collaboration: apply inbound edits on this (GL) thread, then broadcast our presence (camera + selection).
     CollabDrain();
+    MapSyncTick();
     if (collab is not null)
     {
         collabPresenceTimer += dt;
@@ -5098,35 +5108,60 @@ void DrawGizmos()
 
 void DoUndo() { if (hist is null || so is null) return; hist.Undo(); selected = -1; multi.Clear(); gpIndex = -1; gpDragging = false; gpRotDragging = false; SyncMarkers(); RebuildObjects(); UploadMarkers(); UploadActivePaintTexture(); }
 void DoRedo() { if (hist is null || so is null) return; hist.Redo(); selected = -1; multi.Clear(); gpIndex = -1; gpDragging = false; gpRotDragging = false; SyncMarkers(); RebuildObjects(); UploadMarkers(); UploadActivePaintTexture(); }
-// When "Write LightmapShadowBits.lsb" is on, bake the sun cast-shadow into the engine's packed shadow format
-// so the saved map's in-game lighting updates. gridDim is taken from the level's existing .lsb (the
-// authoritative per-map grid: 8x8 or 4x4), defaulting to 8 if there's none. Shared by DoSave + DoSavePatch.
+// The LightmapShadowBits.lsb a save writes: what this session's Bake Sun Shadows made, or a fully lit one after an
+// Unbake. Nothing to switch on - a switch here once let a bake reach the viewport and never the save. With neither
+// this session, the level's own .lsb is left exactly as it is. Shared by DoSave + DoSavePatch.
 RefractorForge.Formats.Terrain.LightmapShadowBits? BakeShadowLsb()
 {
-    if (!writeShadowLsb || heightmap is null) return null;
-    var es = EffectiveSun(); var sun = new Vec3(es.X, es.Y, es.Z);   // bake from the controllable editor sun
-    // Prefer the level's existing .lsb grid (authoritative 8x8 / 4x4); else derive from map size (Irving 512 -> 8x8).
-    int gridDim = Math.Clamp(cfg.MaterialSize / 64, 1, 16);
-    if (levelDir is not null && System.IO.Directory.Exists(levelDir))
-    {
-        var existing = RefractorForge.Formats.Terrain.LightmapShadowBits.TryLoadFolder(levelDir);
-        if (existing is { GridDim: > 0 }) gridDim = existing.GridDim;
-    }
+    if (heightmap is null) return null;
     if (unbakeLighting)
     {
-        Console.WriteLine($"Writing a fully lit LightmapShadowBits.lsb ({gridDim}x{gridDim} grid) - lighting unbaked.");
+        // Keep the level's own grid (authoritative 8x8 / 4x4); else derive it from the map size (Irving 512 -> 8x8).
+        int gridDim = Math.Clamp(cfg.MaterialSize / 64, 1, 16);
+        if (loadedShadowBits is { GridDim: > 0 } lb) gridDim = lb.GridDim;
+        else if (levelDir is not null && System.IO.Directory.Exists(levelDir)
+                 && RefractorForge.Formats.Terrain.LightmapShadowBits.TryLoadFolder(levelDir) is { GridDim: > 0 } existing) gridDim = existing.GridDim;
+        Console.WriteLine($"Writing a fully lit LightmapShadowBits.lsb ({gridDim}x{gridDim} grid) - sun shadows unbaked.");
         return TerrainShadow.UnshadowedLsb(gridDim);
     }
-    // What "Bake Sun Shadows" produced, if it has run. Saving must write exactly what the viewport showed, and it
-    // must not silently re-run a bake that now casts every building and takes minutes.
+    // Exactly what the bake made - never a silent re-run of a bake that casts every building and takes minutes.
     if (bakedShadowLsb is { } ready)
     {
         Console.WriteLine("Writing the LightmapShadowBits.lsb from the last sun shadow bake (objects included).");
         return ready;
     }
-    // No bake this session: fall back to the quick terrain-only one so an old save path still writes something.
-    Console.WriteLine($"Baking LightmapShadowBits.lsb ({gridDim}x{gridDim} grid{(shadowLsbFlipX ? ", flipX" : "")}{(shadowLsbFlipY ? ", flipY" : "")}) - terrain only; Tools > Lighting > Bake Sun Shadows also casts the objects.");
-    return TerrainShadow.BakeToLsb(heightmap, cfg, sun, gridDim, flipX: shadowLsbFlipX, flipY: shadowLsbFlipY);
+    return null;
+}
+
+// Appended to the save toast when the saved ground has no sun shadow because it was unbaked this session - al_vietnas
+// was saved like that straight after an Unbake, and in game it read as a bake that did not work.
+string UnbakedShadowNote()
+{
+    if (!unbakeLighting || atlasCpu is null) return "";
+    GroundShadowSummary();                          // refresh the measurement
+    return groundMergeCoverage > 0 ? "" : " " + Loc.T("The ground carries no sun shadow (unbaked).");
+}
+
+// One line for the log (and the Lighting panel) saying what sun shadow the ground carries - the part of a bake the
+// game actually shows. A save that came after an Unbake looked like a failed bake in game until this said so.
+// Drawn every frame by the Lighting panel, so the 2048^2 record is measured once per record, not once per frame.
+string GroundShadowSummary()
+{
+    if (!groundMergeLoaded) CurrentGroundMerge();   // the lazy read from the level
+    var m = groundMerge;
+    if (!ReferenceEquals(groundMergeStatsFor, m))
+    {
+        groundMergeStatsFor = m;
+        bool none = LightBake.IsNeutralFactor(m);
+        groundMergeCoverage = none ? 0 : LightBake.FactorCoverage(m!);
+        groundMergeDarkness = none ? 0 : LightBake.FactorDarkness(m!);
+        // The slider shows what the ground carries - the record's own darkness on opening a baked map, and the
+        // previous one again after a Z - so the next drag starts from the truth rather than from the default.
+        if (!none) sbShadowDarkness = MathF.Round(groundMergeDarkness, 2);
+    }
+    return groundMergeCoverage <= 0
+        ? Loc.T("No sun shadow on the ground - Bake Sun Shadows puts one there.")
+        : string.Format(Loc.T("Sun shadow on the ground: {0:0}% of the terrain, darkness {1:0.00}."), groundMergeCoverage * 100.0, groundMergeDarkness);
 }
 
 // The painted terrain atlas as in-memory txCxR.dds tile bytes (uncompressed BGRA DDS - the engine form).
@@ -5137,10 +5172,21 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? BakeShadowLsb()
 List<(string Name, byte[] Bytes)> PaintedTileBytes()
 {
     var list = new List<(string Name, byte[] Bytes)>();
-    if (!atlasPainted || atlasCpu is null || terrainTex is null) return list;
-    foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu))
+    if (!atlasPainted || atlasCpu is null || terrainTex is null || tilesDirty.Count == 0) return list;
+    // Only the tiles actually painted since the last save (see tilesDirty). Re-encoding the rest degraded them a
+    // little on every save and changed their bytes, which a map sync would read as ground nobody painted.
+    var dirty = tilesDirty;
+    foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu, (c, r) => dirty.Contains((c, r))))
         list.Add((fileName, DxtEncoder.EncodeDxt1Mipped(tile)));   // DXT1 + mips: the only form the game's terrain reads
     return list;
+}
+
+// Every tile, for the one path that must rewrite them all (a level whose tiles the game cannot draw).
+void MarkAllTilesDirty()
+{
+    if (terrainTex is null) return;
+    for (int r = 0; r < terrainTex.GridH; r++)
+        for (int c = 0; c < terrainTex.GridW; c++) tilesDirty.Add((c, r));
 }
 
 // Save the level, then launch BF1942 / BF Vietnam so the edits can be tested in the real engine. The client can't be
@@ -5340,7 +5386,8 @@ void DoSaveCore()
         {
             System.IO.Directory.CreateDirectory(dir);
             int n = 0;
-            foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu))
+            var dirty = tilesDirty;
+            foreach (var (fileName, tile) in terrainTex.SplitToTiles(atlasCpu, (c, r) => dirty.Contains((c, r))))
             {
                 // SplitToTiles yields the tile's ARCHIVE PATH now (Textures/tx00x00.dds); a folder save already
                 // has the Textures dir, so take the leaf or it would nest a second Textures/ inside it.
@@ -5348,7 +5395,7 @@ void DoSaveCore()
                 System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, leaf), DxtEncoder.EncodeDxt1Mipped(tile)); n++;
             }
             Console.WriteLine($"   Baked {n} terrain texture tile(s) -> {dir}");
-            atlasPainted = false;
+            atlasPainted = false; tilesDirty.Clear();
         }
         catch (Exception ex) { Console.WriteLine($"   texture-tile save failed: {ex.Message}"); }
     }
@@ -5361,6 +5408,7 @@ void DoSaveCore()
         Console.WriteLine($"Saved level to {levelDir} ({written.Count} files):");
         foreach (var w in written) Console.WriteLine("   " + w);
         SaveTextureTiles();
+        if (atlasCpu is not null) Console.WriteLine("   " + GroundShadowSummary());
         if (bakedObjectLightmaps.Count > 0)
         {
             try
@@ -5450,6 +5498,9 @@ void DoSaveCore()
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var mi in MapImagePieces(baseRfa)) wxFiles.Add(mi);   // in-game map re-cut to the combat area
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
+        // A copy of a server map carries its record inside the archive: which map, the version it agrees with, and
+        // every piece's hash at that version - what "changed here since" and "changed there since" are measured from.
+        if (SyncRecordForSave() is { } syncRec) wxFiles.Add((RefractorForge.Collab.SyncRecord.EntryLeaf, syncRec.ToBytes()));
 
         var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles);
         if (names.Count == 0) { Toast(Loc.T("Nothing changed - nothing written.")); return; }
@@ -5466,21 +5517,24 @@ void DoSaveCore()
 
         Console.WriteLine($"Saved {names.Count} file(s) into {Path.GetFileName(baseRfa)} (verified OK):");
         foreach (var nm in names) Console.WriteLine("   " + nm);
+        AfterSaveSync(baseRfa, names);                  // the files this save changed: noted, and sent when in step
         if (sndScripts.Count > 0) sounds.MarkAllSaved();
         // Only clear a dirty flag for an asset that ACTUALLY matched an entry (extraFiles silently drops a name
         // with no entry to override), so the editor never claims a save it did not make.
         int tileOk = tiles.Count > 0 ? tiles.Count(t => names.Any(n => n.EndsWith(t.Name, StringComparison.OrdinalIgnoreCase))) : 0;
-        if (tileOk > 0) { atlasPainted = false; Console.WriteLine($"   Wrote {tileOk} terrain texture tile(s)."); }
+        if (tileOk > 0) { atlasPainted = false; tilesDirty.Clear(); Console.WriteLine($"   Wrote {tileOk} terrain texture tile(s)."); }
         else if (tiles.Count > 0) Console.WriteLine("   (painted surface tiles NOT saved: this archive ships no Textures/ tiles to overwrite)");
         int navOk = navFiles.Count > 0 ? navFiles.Count(nf => names.Any(n => n.EndsWith(nf.Name, StringComparison.OrdinalIgnoreCase))) : 0;
         if (navOk > 0) { for (int v = 0; v < aiNavBufDirty.Length; v++) aiNavBufDirty[v] = false; aiNavDirty = false; Console.WriteLine($"   Wrote {navOk} AI navmap file(s)."); PreviewSavedNav(); }
         else if (navFiles.Count > 0) { Console.WriteLine("   AI navmaps FAILED to write."); Toast(Loc.T("AI navmaps failed to save - see Log / Errors.")); showLog = true; }
         if (skyFaceAssign.Count > 0) skyFacesDirty = false;
         waterLevelEdited = false; waterLevelLoaded = cfg.WaterLevel;
+        if (atlasCpu is not null) Console.WriteLine("   " + GroundShadowSummary());
         int shadowing = WarnAboutShadowingPatches(baseRfa);
-        Toast(shadowing > 0
+        Toast((shadowing > 0
             ? string.Format(Loc.T("Saved {0} file(s) into {1} - but {2} patch archive(s) beside it override it in game. See Log / Errors."), names.Count, Path.GetFileName(baseRfa), shadowing)
-            : string.Format(Loc.T("Saved {0} file(s) into {1} - verified OK."), names.Count, Path.GetFileName(baseRfa)));
+            : string.Format(Loc.T("Saved {0} file(s) into {1} - verified OK."), names.Count, Path.GetFileName(baseRfa)))
+            + UnbakedShadowNote());
         return;
     }
     // Otherwise (explicit path / no folder): fall back to a loose StaticObjects.con beside the source.
@@ -5899,6 +5953,7 @@ void DoGenerateMaterialMap()
     materialMap = RefractorForge.Formats.Terrain.MaterialMapGenerator.FromTerrain(cfg, heightmap);
     matPainter = new MaterialPainter(materialMap, cfg);
     if (paintLayer == 0) UploadActivePaintTexture();
+    BroadcastFullMaps();
     Console.WriteLine($"Generated material map {materialMap.Width}^2 from terrain (slope/height/water).");
     Toast($"Generated material map ({materialMap.Width}^2) from terrain.");
 }
@@ -5943,30 +5998,6 @@ void DoBatchTgaToDds()
         catch { fail++; }
     }
     Toast($"TGA->DDS: {ok} converted{(fail > 0 ? $", {fail} skipped" : "")} under {Path.GetFileName(folder)}.");
-}
-
-// Build a GPU shadow texture from the level's stored LightmapShadowBits (its baked terrain sun-shadow). The .lsb is a
-// GridDim x GridDim grid of 1024px tiles (up to ~8192 sq); downsample to <=2048 for display. Same UV orientation as the
-// terrain shader's uShadow (texel (x,y) -> world (x/size*ws, y/size*ws)), so it lines up with the ground. Honours the
-// File-menu .lsb flip X/Y toggles so a mirrored map can be corrected.
-Texture2D? ShadowTextureFromLsb(LightmapShadowBits lsb)
-{
-    int side; byte[] vis;
-    try { vis = lsb.ToVisibility(out side); } catch { return null; }
-    if (side <= 0 || vis.Length < (long)side * side) return null;
-    int target = Math.Min(side, 2048);
-    var rgba = new byte[target * target * 4];
-    for (int y = 0; y < target; y++)
-        for (int x = 0; x < target; x++)
-        {
-            int sx = (int)((long)x * side / target), sy = (int)((long)y * side / target);
-            if (shadowLsbFlipX) sx = side - 1 - sx;
-            if (shadowLsbFlipY) sy = side - 1 - sy;
-            byte v = vis[sy * side + sx];
-            int o = (y * target + x) * 4;
-            rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v; rgba[o + 3] = 255;
-        }
-    return new Texture2D(target, target, rgba);
 }
 
 // The effective sun direction (points TOWARD the sun): the user's azimuth/elevation override when on, else the level's
@@ -6070,26 +6101,6 @@ unsafe void RenderShadowMap(Vector3 sun, Vector3 focus, float radius)
     shadowMapDirty = false;
 }
 
-// On load, populate the terrain sun-shadow the "Shadows" checkbox toggles: prefer the level's stored lightmap
-// (LightmapShadowBits.lsb -> faithful, what the game shipped), else bake one from the heightmap + sun so the toggle is
-// still meaningful on maps without a stored lightmap. Previously the checkbox did nothing until you clicked Bake.
-void InitTerrainShadowOnLoad()
-{
-    if (heightmap is null) return;
-    if (shadowTexId != 0) { gl.DeleteTexture(shadowTexId); shadowTexId = 0; }
-    if (loadedShadowBits is not null && ShadowTextureFromLsb(loadedShadowBits) is { } lm)
-    {
-        shadowTexId = UploadTexture(lm);
-        Console.WriteLine($"Loaded level lightmap (LightmapShadowBits.lsb) -> {lm.Width}^2 terrain sun-shadow. Toggle with 'Shadows'.");
-    }
-    else
-    {
-        var sun = env?.SunDirection ?? new Vec3(-0.5f, 0.8f, -0.35f);
-        try { shadowTexId = UploadTexture(TerrainShadow.Bake(2048, heightmap, cfg, sun, blurRadius: 1)); } catch { return; }
-        Console.WriteLine("Baked terrain sun-shadow on load (no level lightmap present). Toggle with 'Shadows'.");
-    }
-}
-
 // Bake the terrain sun cast-shadow from the heightmap + sun direction, upload it for the terrain
 // shader to sample, and export an inspectable TerrainShadow.dds. (This is the editor preview/export;
 // the engine's packed LightmapShadowBits.lsb is a separate format and isn't written here.)
@@ -6115,14 +6126,14 @@ void DoBakeShadows(bool announce = true)
     var sun = env?.SunDirection ?? new Vec3(-0.5f, 0.8f, -0.35f);
     var es = EffectiveSun(); sun = new Vec3(es.X, es.Y, es.Z);      // bake from the sun the viewport is showing
 
-    // Resolve the meshes on THIS thread: the mesh library's cache is not thread-safe.
+    // Resolve the meshes on THIS thread: the mesh library's cache is not thread-safe. Always with the objects - they
+    // cast nearly every shadow a player sees, and a terrain-only bake of a flat map is close to empty.
     MeshOccluder? occ = null;
     sbTriangles = 0;
-    if (sbWithObjects)
     {
         var tris = ShadowCasterTriangles();
         sbTriangles = tris.Count;
-        occ = MeshOccluder.Build(tris);
+        if (tris.Count > 0) occ = MeshOccluder.Build(tris);
     }
 
     // gridDim comes from the level's own .lsb when it has one (8x8 or 4x4 is per-map and authoritative).
@@ -6157,7 +6168,7 @@ void DoBakeShadows(bool announce = true)
     if (!announce) return;
 }
 
-// The GL-side half: upload the preview, arm the save, export the .dds. Runs on the render thread.
+// The GL-side half: darken the shadow into the ground, arm the save, export the .dds. Runs on the render thread.
 void FinishShadowBake()
 {
     sbBaking = false;
@@ -6166,44 +6177,47 @@ void FinishShadowBake()
     sbCancel?.Dispose(); sbCancel = null; sbTask = null;
     if (shadow is null || lsb is null) { Toast(Loc.T("Sun shadow bake produced nothing.")); return; }
 
-    if (shadowTexId != 0) { gl.DeleteTexture(shadowTexId); shadowTexId = 0; }
-    shadowTexId = UploadTexture(shadow);
-    showBakedShadow = true;                      // SHOW it - a bake you cannot see reads as a bake that did nothing
-    bakedShadowLsb = lsb;                        // and hand the save exactly what the viewport is showing
-    writeShadowLsb = true; bakedLsb = true;      // what actually gets LightmapShadowBits.lsb written on save
+    bakedShadowLsb = lsb;                        // the save writes exactly this .lsb
+    bakedLsb = true;
     unbakeLighting = false;                      // baking again undoes an unbake
+    // The real-time preview is a camera-following shadow the game never draws; on top of the baked ground it would
+    // show every shadow twice. After a bake the viewport shows the ground exactly as the game will.
+    if (showShadows) { showShadows = false; shadowMapDirty = true; }
 
     // How much of the world the bake actually darkened - the number that says whether it did anything.
     long dark = 0; var rgba = shadow.Rgba;
     for (int i = 0; i < rgba.Length; i += 4) if (rgba[i] < 128) dark++;
     double pct = 400.0 * dark / Math.Max(rgba.Length, 1);
 
-    // ...and paint it into the ground, which is the only way the game shows it. The .lsb is written too (retail
+    // ...and darken it into the ground, which is the only way the game shows it. The .lsb is written too (retail
     // ships both), but the .lsb alone is invisible - a 50%-of-the-world checkerboard .lsb rendered no differently
     // in game, while retail's own tiles are ~x0.5 darker exactly where its .lsb flags shadow.
-    if (sbMergeToGround && atlasCpu is not null)
+    bool merged = false;
+    if (atlasCpu is not null)
     {
         // REPLACE whatever an earlier bake merged, never stack on it: divide the old factor map out, multiply the
         // new one in, and keep the new one so the next bake - this session or after a reopen - can do the same.
         var previous = CurrentGroundMerge();
-        var factor = LightBake.ShadowFactorMap(shadow, sbShadowLevel);
-        AtlasFullEdit(() =>
-        {
-            if (previous is not null) LightBake.DivideFactorOutOfAtlas(atlasCpu!, previous);
-            LightBake.MultiplyFactorIntoAtlas(atlasCpu!, factor);
-        }, onApply: () => SetGroundMerge(factor), onUndo: () => SetGroundMerge(previous));
-        Console.WriteLine($"   Merged the shadow into the ground texture at {sbShadowLevel:0.00}"
-                          + (previous is not null ? ", replacing the previous bake's shadow" : "")
-                          + " (Z undoes it; save re-encodes the tiles as DXT1).");
+        Texture2D? factor = sbShadowDarkness > 0.001f ? LightBake.ShadowFactorMap(shadow, 1f - sbShadowDarkness) : null;
+        if (factor is not null || previous is not null)
+            AtlasFullEdit(() =>
+            {
+                if (previous is not null) LightBake.DivideFactorOutOfAtlas(atlasCpu!, previous);
+                if (factor is not null) LightBake.MultiplyFactorIntoAtlas(atlasCpu!, factor);
+            }, onApply: () => SetGroundMerge(factor), onUndo: () => SetGroundMerge(previous));
+        merged = factor is not null;
+        Console.WriteLine(merged
+            ? $"   Darkened the shadow into the ground texture (darkness {sbShadowDarkness:0.00})"
+              + (previous is not null ? ", replacing the previous bake's shadow" : "") + " - Z undoes it; save writes the tiles."
+            : "   Shadow darkness is 0, so nothing was darkened into the ground - the game will show no sun shadow.");
     }
-    else if (sbMergeToGround)
-        Console.WriteLine("   No terrain texture atlas on this level, so the shadow could not be merged into the ground - the .lsb alone will not be visible in game.");
+    else
+        Console.WriteLine("   No terrain texture atlas on this level, so the shadow could not be darkened into the ground - the .lsb alone will not be visible in game.");
     Console.WriteLine($"Sun shadows baked: {pct:0.0}% of the terrain in shadow"
                       + (sbTriangles > 0 ? $" ({sbTriangles:N0} object triangle(s) cast)" : " (terrain only - no objects cast)") + ".");
 
     // The .dds is a convenience export for folder levels; the .lsb the game reads rides the save either way, so a
     // level opened straight from a .rfa is not a failure - say which happened rather than swallowing it.
-    string? wrote = null, failed = null;
     try
     {
         string? dir = (levelDir is not null && System.IO.Directory.Exists(levelDir))
@@ -6211,12 +6225,12 @@ void FinishShadowBake()
             : null;
         if (dir is not null)
         {
-            wrote = System.IO.Path.Combine(dir, "TerrainShadow.dds");
+            string wrote = System.IO.Path.Combine(dir, "TerrainShadow.dds");
             DdsTexture.Save(shadow, wrote);
             Console.WriteLine($"Baked sun shadows -> {wrote}");
         }
     }
-    catch (Exception ex) { failed = ex.Message; wrote = null; }
+    catch (Exception ex) { Console.WriteLine($"   (TerrainShadow.dds export failed: {ex.Message})"); }
 
     BroadcastLightBake();
     // "Bake Both" chains here so the two progress windows never overlap.
@@ -6226,11 +6240,26 @@ void FinishShadowBake()
         if (so is not null && meshLib is not null) { BakeObjectLightmaps(); bakedObjects = true; }
         return;
     }
-    Toast(failed is not null
-            ? string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow. Save writes LightmapShadowBits.lsb. (TerrainShadow.dds export failed: "), pct) + failed + ")"
-        : wrote is not null
-            ? string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow, and TerrainShadow.dds written. Save writes LightmapShadowBits.lsb."), pct)
-            : string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow. Save writes LightmapShadowBits.lsb into the level."), pct));
+    Toast(merged
+        ? string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow, darkened into the ground texture - what you see is what the game shows. Save writes it."), pct)
+        : string.Format(Loc.T("Sun shadows baked: {0:0}% of the ground in shadow, but Shadow darkness is 0 - raise it or the game shows no shadow."), pct));
+}
+
+// Change how dark the baked shadow is without baking again - the bake casts every object and takes minutes, the
+// re-darken a moment. The merge record already holds the shadow (see LightBake.RescaleFactor). One undo step.
+void RetuneGroundShadow()
+{
+    if (atlasCpu is null || CurrentGroundMerge() is not { } old) return;
+    float was = LightBake.FactorDarkness(old);
+    if (MathF.Abs(was - sbShadowDarkness) < 0.005f) return;
+    var scaled = LightBake.RescaleFactor(old, sbShadowDarkness);
+    Texture2D? factor = LightBake.IsNeutralFactor(scaled) ? null : scaled;
+    AtlasFullEdit(() =>
+    {
+        LightBake.DivideFactorOutOfAtlas(atlasCpu!, old);
+        if (factor is not null) LightBake.MultiplyFactorIntoAtlas(atlasCpu!, factor);
+    }, onApply: () => SetGroundMerge(factor), onUndo: () => SetGroundMerge(old));
+    Console.WriteLine($"Sun shadow darkness on the ground: {was:0.00} -> {sbShadowDarkness:0.00} (Z undoes it; save writes the tiles).");
 }
 
 // What the user sees while the shadow bake runs, and the pump that hands the result back to the GL thread -
@@ -8071,11 +8100,6 @@ void OnRender(double dt)
         gl.Uniform1(uUseShadowMapT, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
         unsafe { var ls = lightSpace; gl.UniformMatrix4(uLightSpaceT, 1, false, (float*)&ls); }
         if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
-        // The BAKED terrain shadow - the level's .lsb, or the one a bake just produced. Independent of the
-        // real-time map above: this is what the game will draw, so it is the layer to judge a bake by.
-        bool bakedOn = showBakedShadow && shadowTexId != 0;
-        gl.Uniform1(uUseBakedShadowT, bakedOn ? 1 : 0);
-        if (bakedOn) { gl.ActiveTexture(TextureUnit.Texture4); gl.BindTexture(TextureTarget.Texture2D, shadowTexId); gl.ActiveTexture(TextureUnit.Texture0); }
         bool showPaint = toolNames[tool] == "Paint" && paintLayer != 3 && matTexId != 0;   // Texture layer shows the real atlas, no tint
         bool showNav = toolNames[tool] == "AIPath";
         if (showNav) { EnsureAiNav(); if (aiNavTexDirty) UploadAiNavTexture(); if (aiNav is null || aiNavTexId == 0) showNav = false; }
@@ -11971,6 +11995,7 @@ void AfterFoliageMapsChanged()
     foliageDirty = true;
     BuildOvergrowthFoliage();
     BroadcastOvergrowth();
+    BroadcastFullMaps();          // the growth maps themselves - Clear and Restore rewrite them wholesale
 }
 
 // Fully lit terrain shadow, fully lit object lightmaps: what the level looked like before anyone baked it. Writing
@@ -12008,12 +12033,10 @@ void UnbakeObjectLightmaps()
 void UnbakeTerrainShadow()
 {
     if (heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
-    unbakeLighting = true;
-    writeShadowLsb = true;                      // the unshadowed map still has to be WRITTEN to replace the baked one
+    unbakeLighting = true;                      // the save writes a fully lit .lsb over the baked one
     bakedLsb = false;
     bakedShadowLsb = null;                      // drop any baked map so the save cannot prefer it over the unbake
     showShadows = false; shadowMapDirty = true;
-    showBakedShadow = false;
     // Take the editor's own merge back off the ground too - fully lit means the ground as well as the .lsb. Only the
     // shadow this editor merged can come off; shadows a map SHIPPED with are part of its ground art.
     bool groundToo = false;
@@ -13191,27 +13214,38 @@ void SavePrefabModal()
 }
 
 // ---- Collaboration ----
-// One locally-committed edit -> broadcast its object op(s). Composites (prefab stamp, multi-move) split into
-// per-object ops; non-object commands (terrain/material/gameplay) are skipped (object sync only for now).
+// One locally-committed edit -> broadcast it. A composite (road stamp: terrain + ground paint + material; a prefab; a
+// multi-move) goes part by part - only the first part used to be looked at, so a road's material and a stamped prefab
+// never reached anyone. Ground paint and navmap strokes travel as the level FILES they end up in, when saved.
 void OnLocalEdit(IEditCommand cmd)
 {
     sessionDirty = true;                             // every committed edit, local or a peer's, is work to keep
     if (collab is null || applyingRemote) return;   // an inbound edit must not be echoed back out
+    BroadcastEdit(cmd, undo: false);
+}
+
+void BroadcastEdit(IEditCommand cmd, bool undo)
+{
+    if (collab is null) return;
+    if (cmd is CompositeCommand cc) { foreach (var part in cc.Commands) BroadcastEdit(part, undo); return; }
     var wire = cmd.ToWire();
     int v = wire.IndexOf(' ');
     var verb = v < 0 ? wire : wire[..v];
     // Terrain/material wire forms only carry the rect; attach the actual data (read back from the map the
     // command just modified) so the remote can reproduce the stroke.
     if (verb == "TERRAIN") { collab.SendOp(EncTerrain(wire)); return; }
-    if (verb == "MATERIAL") { collab.SendOp(EncMaterial(wire)); return; }
+    if (verb == "MATERIAL") { collab.SendOp(EncMaterial(wire, (cmd as MaterialStrokeCommand)?.Map)); return; }
     // Gameplay (control points / vehicle spawns / soldier spawns) is index-addressed, so ship the WHOLE
     // layer as a full-state snapshot - the receiver replaces theirs. Small + can't desync.
     if (verb.StartsWith("GP")) { collab.SendOp("GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gameplayEdit)))); return; }
-    foreach (var part in wire.Split(" ; "))   // object ops (incl. composites: prefab stamp / multi-move)
+    foreach (var part in wire.Split(" ; "))   // object ops
     {
         int sp = part.IndexOf(' ');
         var t = sp < 0 ? part : part[..sp];
-        if (t is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL") collab.SendOp(part);
+        if (t is not ("ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL")) continue;
+        // After an undo/redo the command's own wire points the wrong way; send what the object IS now instead.
+        if (undo) { var toks = part.Split(' '); if (toks.Length >= 2) BroadcastObjectState(toks[1]); }
+        else collab.SendOp(part);
     }
 }
 
@@ -13224,18 +13258,17 @@ void OnLocalEdit(IEditCommand cmd)
 void OnUndoRedo(IEditCommand cmd)
 {
     if (collab is null) return;
-    var wire = cmd.ToWire();
-    int v = wire.IndexOf(' ');
-    var verb = v < 0 ? wire : wire[..v];
-    if (verb == "TERRAIN") { collab.SendOp(EncTerrain(wire)); return; }
-    if (verb == "MATERIAL") { collab.SendOp(EncMaterial(wire)); return; }
-    if (verb.StartsWith("GP")) { collab.SendOp("GAMEPLAY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(GameplaySync.Serialize(gameplayEdit)))); return; }
-    foreach (var part in wire.Split(" ; "))
-    {
-        var toks = part.Split(' ');
-        if (toks.Length >= 2 && toks[0] is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL")
-            BroadcastObjectState(toks[1]);
-    }
+    BroadcastEdit(cmd, undo: true);
+}
+
+// A whole material / foliage layer, for edits that rewrite one wholesale (Generate Material Map, Clear or Restore
+// foliage) and never pass through a stroke.
+void BroadcastFullMaps()
+{
+    if (collab is null) return;
+    if (materialMap is not null) collab.SendOp($"MATERIAL 0 0 0 {materialMap.Width} {materialMap.Height} {Convert.ToBase64String(materialMap.Samples)}");
+    if (growth?.Under is not null) collab.SendOp($"MATERIAL 1 0 0 {growth.Under.Width} {growth.Under.Height} {Convert.ToBase64String(growth.Under.Samples)}");
+    if (growth?.Over is not null) collab.SendOp($"MATERIAL 2 0 0 {growth.Over.Width} {growth.Over.Height} {Convert.ToBase64String(growth.Over.Samples)}");
 }
 
 // Broadcast an object's current state as absolute ops: ADD recreates it if a peer had deleted it (and sets
@@ -13272,12 +13305,18 @@ string EncTerrain(string wire)
     return $"TERRAIN {x0} {y0} {w} {h} {Convert.ToBase64String(buf)}";
 }
 
-// Encode the affected material/foliage rect (1 byte/cell) + the layer it belongs to.
-string EncMaterial(string wire)
+// Encode the affected material/foliage rect (1 byte/cell) + the layer it belongs to - the layer of the map the
+// stroke actually painted. Reading whichever layer was active in the UI sent a foliage layer's cells under the
+// material layer's name whenever a river bank, a road or a deathMaterial repaint ran with the foliage tab open.
+string EncMaterial(string wire, MaterialMap? painted = null)
 {
     var p = wire.Split(' ');
     int x0 = int.Parse(p[1]), y0 = int.Parse(p[2]), w = int.Parse(p[3]), h = int.Parse(p[4]);
-    var map = ActivePaintMap();
+    var map = painted ?? ActivePaintMap();
+    int layer = painted is null ? paintLayer
+              : ReferenceEquals(painted, materialMap) ? 0
+              : ReferenceEquals(painted, growth?.Under) ? 1
+              : ReferenceEquals(painted, growth?.Over) ? 2 : paintLayer;
     var buf = new byte[w * h];
     if (map is not null)
         for (int yy = 0; yy < h; yy++)
@@ -13286,7 +13325,7 @@ string EncMaterial(string wire)
                 int gx = x0 + xx, gy = y0 + yy;
                 buf[yy * w + xx] = (gx < map.Width && gy < map.Height) ? map[gx, gy] : (byte)0;
             }
-    return $"MATERIAL {paintLayer} {x0} {y0} {w} {h} {Convert.ToBase64String(buf)}";
+    return $"MATERIAL {layer} {x0} {y0} {w} {h} {Convert.ToBase64String(buf)}";
 }
 
 void ApplyRemoteTerrain(string payload)
@@ -13526,7 +13565,9 @@ void ApplyRemoteLightRig(string payload)
 // after everything it reads.
 string LightBakeWire() =>
     $"LIGHTBAKE {(bakedLsb ? 1 : 0)} {(shadowLsbFlipX ? 1 : 0)} {(shadowLsbFlipY ? 1 : 0)} {(bakedObjects ? 1 : 0)} {(bakedGround ? 1 : 0)} {Inv(groundBakeStrength)}";
-void BroadcastLightBake() { if (!applyingRemote && (bakedLsb || bakedObjects || bakedGround)) collab?.SendOp(LightBakeWire()); }
+// No longer sent. A bake travelled as a trigger each peer re-ran, and the re-runs looped (see ApplyWorldOp, LIGHTBAKE);
+// what a bake PRODUCES - lightmaps, the .lsb, the ground tiles - reaches everyone as level files when the baker saves.
+void BroadcastLightBake() { }
 void ApplyRemoteLightBake(string payload)
 {
     var p = payload.Split(' ');
@@ -13697,6 +13738,504 @@ void BroadcastFullTerrain()
     collab.SendOp($"TERRAIN 0 0 {heightmap.Width} {heightmap.Height} {Convert.ToBase64String(buf)}");
 }
 
+// ---- Working on a server map at different times ---------------------------------------------------------------
+// On connecting to a server map the editor does NOT adopt the server's copy over its own any more. It keeps a replica
+// of the server's map beside the open one (collab.Sync), compares both against the version this copy last agreed with
+// (the record inside the .rfa, or for a copy never synced, the map as it started on the server), and shows what came
+// in while it was away and what was changed here. Download takes the server's changes, Upload sends ours; a change
+// both sides made differently is the mapper's to settle. Once nothing is pending, edits go live as before.
+
+// The open map the way the sync sees it: the live objects and maps, and the settings as the wires the live
+// collaboration sends, so a hash here and a hash of what crossed the network agree. Against a record every setting
+// counts; against the map's starting point (which carries none) only the ones changed here do.
+RefractorForge.Formats.Con.CollabWorldState LocalSyncWorld(bool allSettings)
+{
+    var w = new RefractorForge.Formats.Con.CollabWorldState
+    {
+        Height = heightmap, Material = materialMap, Under = growth?.Under, Over = growth?.Over,
+        Gameplay = GameplaySync.Serialize(gameplayEdit),
+    };
+    if (allSettings || waterLevelEdited) w.Water = WaterWire();
+    if (allSettings || lightingDirty || sunEdited) w.Light = LightWire();
+    if (allSettings || lightRig.Lights.Count > 0 || lightRig.NightAmount > 0f) w.LightRig = LightRigWire();
+    if (allSettings || notes.Notes.Count > 0) w.Annotations = notes.ToWire();
+    foreach (var name in importedObjs.Keys.Concat(remoteMeshNames).Distinct(StringComparer.OrdinalIgnoreCase))
+        if (ObjMeshWire(name) is { } mw) w.ObjMeshes[name] = mw;
+    return w;
+}
+
+// The open archive's files, hashed. Every entry has to be decompressed, so it runs on a worker once per session and
+// is then kept current by each save (AfterSaveSync). A pass that straddled a save is thrown away and run again.
+void EnsureLocalFileHashes()
+{
+    if (localFileHashes is not null || localFilesBusy) return;
+    var rfa = OpenLevelArchive();
+    if (rfa is null) { localFileHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); return; }
+    localFilesBusy = true;
+    int gen = localFilesGen;
+    System.Threading.Tasks.Task.Run(() =>
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            string prefix = RefractorForge.Formats.LevelSaver.ArchivePrefix(new RefractorFlatArchive(rfa));
+            foreach (var e in RefractorForge.Formats.Rfa.LevelBase.Manifest(rfa))
+            {
+                var rel = RefractorForge.Collab.SyncKeys.LevelRelative(e.Name, prefix);
+                if (rel is null || RefractorForge.Collab.SyncKeys.IsStructuredEntry(rel)) continue;
+                d[rel] = e.Hash;
+            }
+        }
+        catch { }
+        if (gen == localFilesGen) localFileHashes = d;
+        localFilesBusy = false;
+    });
+}
+
+// One level file from the open archive (or from the save queue, if it has not been saved yet).
+Func<string, byte[]?> LocalFileReader()
+{
+    var rfa = OpenLevelArchive();
+    RefractorFlatArchive? arch = null;
+    string prefix = "";
+    Dictionary<string, RefractorForge.Formats.Rfa.RefractorFlatArchiveEntry>? byName = null;
+    return rel =>
+    {
+        var pend = pendingLevelFiles.LastOrDefault(f => RefractorForge.Collab.SyncKeys.NormPath(f.RelPath).Equals(RefractorForge.Collab.SyncKeys.NormPath(rel), StringComparison.OrdinalIgnoreCase));
+        if (pend.Bytes is not null) return pend.Bytes;
+        if (rfa is null) return null;
+        try
+        {
+            if (arch is null)
+            {
+                arch = new RefractorFlatArchive(rfa);
+                prefix = RefractorForge.Formats.LevelSaver.ArchivePrefix(arch);
+                byName = new(StringComparer.OrdinalIgnoreCase);
+                foreach (var e in arch.Entries) byName[e.Name.Replace('\\', '/')] = e;
+            }
+            return byName!.TryGetValue(prefix + RefractorForge.Collab.SyncKeys.NormPath(rel), out var en) ? arch.Read(en) : null;
+        }
+        catch { return null; }
+    };
+}
+
+// Start keeping a server map in step: a replica beside the open map, the record's claim at the door, and no edit
+// going out live until this copy has caught up.
+void EnableMapSyncFor(CollabSession s)
+{
+    s.EnableMapSync();
+    mapSyncState = 1; mapSyncPlan = null; mapSyncSeeded = false; mapSyncResyncBase = null; mapSyncBaselineAsked = false;
+    mapSyncStatus = Loc.T("Comparing your copy with the server's map...");
+    mapSyncFetch.Clear(); mapSyncFetchTotal = 0; mapSyncUploadAfter = false; mapSyncUnsent.Clear();
+    s.MaySendOps = () => mapSyncState == 3 || mapSyncState == 0;
+    // A copy whose record names this map is let in on the archive it grew from, whatever its own bytes hash to.
+    s.ClaimFor = map => levelSyncRecord is { } r && r.Map.Equals(map, StringComparison.OrdinalIgnoreCase) ? r.Base : null;
+    s.Sync!.OnFile = (path, bytes) =>
+    {
+        if (bytes is not null) ApplyRemoteFile(path, bytes);
+        if (mapSyncFetch.Remove(path) && mapSyncFetch.Count == 0 && mapSyncFetchTotal > 0) FinishMapSyncDownload();
+    };
+    EnsureLocalFileHashes();
+}
+
+// Per frame: move the comparison along as its pieces arrive, and in step, keep an eye out for edits that did not travel.
+void MapSyncTick()
+{
+    if (collab?.Sync is not { } msync) { if (collab is null) mapSyncState = 0; return; }
+    if (localFileHashes is null) EnsureLocalFileHashes();
+    // A map this copy started: the server holds its objects and terrain already, but not the archive under them,
+    // and without it nobody else can be given the map or download it as one .rfa. Sent once, with the progress bar.
+    if (mapSyncSeeded && !mapSyncBaseUploadStarted && collab.BaseAgreed && !collab.BaseStored && !collab.BaseBusy
+        && OpenLevelArchive() is string seedRfa)
+    {
+        mapSyncBaseUploadStarted = true;
+        collab.UploadBase(seedRfa);
+        Toast(Loc.T("Sending your map's archive to the server, so others can open this map too."));
+    }
+    if (mapSyncSeeded && msync.Baseline is null)
+    {
+        // This copy seeded an empty map: the server's map IS this copy, so this copy is what both agree on.
+        if (localFileHashes is not null)
+        {
+            msync.UseRecord(new RefractorForge.Collab.SyncRecord { Epoch = msync.Epoch, Seq = msync.ServerSeq,
+                Hashes = RefractorForge.Collab.SyncKeys.Hashes(so, LocalSyncWorld(true), localFileHashes) });
+            mapSyncStatus = Loc.T("You started this map on the server. Your edits go straight to it.");
+        }
+        else EnsureLocalFileHashes();
+    }
+    if (mapSyncState == 1 && msync.Synced && !mapSyncSeeded)
+    {
+        if (msync.Baseline is null)
+        {
+            if (mapSyncResyncBase is { } rb) { msync.UseRecord(rb); mapSyncResyncBase = null; }
+            else if (levelSyncRecord is { } rec && rec.IsFor(collab.CurrentMap, msync.Epoch)) msync.UseRecord(rec);
+            else if (msync.BaselineError.Length > 0)
+            {
+                // The server cannot say what the map was at the start (it holds no archive for it). Then nothing is
+                // known about who changed what, and everything that differs is the mapper's call.
+                msync.UseRecord(new RefractorForge.Collab.SyncRecord { Epoch = msync.Epoch });
+                Console.WriteLine($"Map sync: the server has no starting point for this map ({msync.BaselineError}) - every difference is shown as a choice.");
+            }
+            else if (!mapSyncBaselineAsked) { mapSyncBaselineAsked = true; mapSyncBaselineAskedAt = appClock; msync.RequestBaseline(); mapSyncStatus = Loc.T("Asking the server what the map was when it started..."); }
+            // A server older than map sync never answers; after a while, compare without knowing the start.
+            else if (appClock - mapSyncBaselineAskedAt > 20.0) msync.FailBaseline("the server did not answer (it may be an older version)");
+            if (msync.Baseline is null) return;
+        }
+        EnsureLocalFileHashes();
+        if (localFileHashes is null) { mapSyncStatus = Loc.T("Reading your copy of the map..."); return; }
+        ComputeMapSyncPlan();
+        return;
+    }
+    // In step: now and then, compare the open map with the server's and say what has not reached it.
+    if (mapSyncState == 3 && localFileHashes is not null && appClock >= mapSyncNextCheck && so is not null)
+    {
+        mapSyncNextCheck = appClock + 4.0;
+        mapSyncUnsent = MapSyncDifferences(msync);
+    }
+}
+
+// Keys where the open map and the server's differ, as things that would go UP: this copy's value of each.
+List<string> MapSyncDifferences(RefractorForge.Collab.MapSync msync)
+{
+    var local = RefractorForge.Collab.SyncKeys.Hashes(so, LocalSyncWorld(true), localFileHashes);
+    msync.FillUnknown(local);
+    var server = msync.ServerHashes();
+    var keys = new List<string>();
+    foreach (var k in local.Keys.Union(server.Keys))
+    {
+        local.TryGetValue(k, out var l); server.TryGetValue(k, out var s);
+        if (l == s) continue;
+        if (l is null && !k.StartsWith("o:", StringComparison.Ordinal)) continue;   // not held here: nothing to send
+        // A level-local object's file group is not kept here as one piece - its files travel as files.
+        if (k.StartsWith("lvl:", StringComparison.Ordinal)) continue;
+        // A setting the server has never been sent and nobody here has touched is the level's own, on both sides.
+        if (s is null && k.StartsWith("s:", StringComparison.Ordinal) && !LocalSettingEdited(k)) continue;
+        keys.Add(k);
+    }
+    keys.Sort(StringComparer.Ordinal);
+    return keys;
+}
+
+// Whether a setting was changed in this editor this session - the settings every level carries whether or not
+// anyone touched them count as a change only then.
+bool LocalSettingEdited(string key) => key switch
+{
+    "s:WATER" => waterLevelEdited,
+    "s:LIGHT" => lightingDirty || sunEdited,
+    "s:LIGHTRIG" => lightRig.Lights.Count > 0 || lightRig.NightAmount > 0f,
+    "s:ANNOT" => notes.Notes.Count > 0,
+    _ => true,
+};
+
+void ComputeMapSyncPlan()
+{
+    var msync = collab!.Sync!;
+    var world = LocalSyncWorld(msync.BaselineFromRecord);
+    RefractorForge.Collab.SyncPlan plan;
+    try { plan = msync.Plan(so!, world, localFileHashes!, out int rekeyed);
+          if (rekeyed > 0)
+          {
+              // Objects of a copy saved before ids existed were lined up with the server's by what they are. Undo
+              // entries that name the old ids could now reach the wrong object, so they go.
+              hist?.Clear(); selected = -1; multi.Clear(); SyncMarkers(); RebuildObjects(); UploadMarkers();
+              Console.WriteLine($"Map sync: lined up {rekeyed} object(s) with the server's copy (undo history cleared).");
+          }
+          so!.PersistIds = true; }
+    catch (Exception ex) { mapSyncStatus = "Map sync: " + ex.Message; mapSyncState = 2; return; }
+    mapSyncPlan = plan;
+    msync.RequestHistory(msync.BaselineSeq);
+    var theirs = plan.ServerChanged.Except(plan.Conflicts).ToList();
+    var mine = plan.LocalChanged.Except(plan.Conflicts).ToList();
+    Console.WriteLine($"Map sync with {collab.CurrentMap} (server version {msync.ServerSeq}, this copy at {msync.BaselineSeq}"
+                      + $"{(msync.BaselineFromRecord ? "" : ", measured from the map's start")}): "
+                      + $"on the server {RefractorForge.Collab.SyncKeys.Describe(theirs)}; here {RefractorForge.Collab.SyncKeys.Describe(mine)}; "
+                      + $"both {plan.Conflicts.Count}.");
+    if (plan.NothingToDo)
+    {
+        mapSyncState = 3;
+        mapSyncStatus = Loc.T("In step with the server. Your edits go straight to it.");
+        Toast(string.Format(Loc.T("{0}: in step with the server - nothing new either way."), collab.CurrentMap));
+        return;
+    }
+    mapSyncState = 2;
+    mapSyncWindowOpen = true;
+    mapSyncStatus = "";
+    Toast(plan.ServerChanged.Count > 0
+        ? string.Format(Loc.T("{0} has changed on the server since you last had it. Map sync shows what - Download takes it."), collab.CurrentMap)
+        : string.Format(Loc.T("You have changes to {0} that are not on the server. Map sync - Upload sends them."), collab.CurrentMap));
+}
+
+// Take the server's changes: every key it moved since the baseline, except the conflicts the mapper keeps. Worked out
+// again NOW rather than taken from the plan on screen: the server's map may have moved since, and a change that
+// arrived in the meantime would otherwise be missed here - and later sent back over as if it were ours.
+void MapSyncDownload()
+{
+    if (collab?.Sync is not { } msync || so is null || localFileHashes is null || msync.Baseline is null) return;
+    RefractorForge.Collab.SyncPlan plan;
+    try { plan = msync.Plan(so, LocalSyncWorld(msync.BaselineFromRecord), localFileHashes, out _); }
+    catch (Exception ex) { Toast("Map sync: " + ex.Message); return; }
+    var take = plan.ServerChanged.Where(k => !(mapSyncKeepMine && plan.Conflicts.Contains(k))).ToList();
+    mapSyncDownloadBase = msync.ServerHashes();
+    TakeFromServer(msync, take);
+    Console.WriteLine($"Map sync: taking {RefractorForge.Collab.SyncKeys.Describe(take)} from the server.");
+    mapSyncPlan = null;
+    mapSyncState = 4;                       // still catching up until the files are in
+    if (mapSyncFetch.Count == 0) FinishMapSyncDownload();
+}
+
+// Apply the server's value of these keys here, and ask for the files among them.
+void TakeFromServer(RefractorForge.Collab.MapSync msync, List<string> take)
+{
+    var ops = msync.DownloadOps(take);
+    applyingRemote = true;
+    try { foreach (var op in ops) ApplySyncOp(op); }
+    finally { applyingRemote = false; }
+    if (so is not null)
+    {
+        if (selected >= so.Objects.Count) selected = -1;
+        multi.RemoveWhere(i => i >= so.Objects.Count);
+    }
+    SyncMarkers(); RebuildObjects(); UploadMarkers();
+    foreach (var f in msync.FilesFor(take))
+        if (mapSyncFetch.Add(f)) { msync.RequestFile(f); mapSyncFetchTotal++; }
+    if (mapSyncFetch.Count > 0) mapSyncStatus = string.Format(Loc.T("Fetching {0} file(s) from the server..."), mapSyncFetch.Count);
+}
+
+// The files are in. Anything the server got while they were on their way is taken too, until nothing is left - only
+// then is this copy in step, and the .rfa takes all of it at once, packed, with its record.
+void FinishMapSyncDownload()
+{
+    if (collab?.Sync is { } msync && mapSyncDownloadBase is { } before)
+    {
+        var now = msync.ServerHashes();
+        var newer = now.Keys.Union(before.Keys)
+                       .Where(k => { now.TryGetValue(k, out var a); before.TryGetValue(k, out var b); return a != b; })
+                       .ToList();
+        mapSyncDownloadBase = now;
+        if (newer.Count > 0)
+        {
+            Console.WriteLine($"Map sync: {RefractorForge.Collab.SyncKeys.Describe(newer)} changed on the server during the download - taking that too.");
+            TakeFromServer(msync, newer);
+            if (mapSyncFetch.Count > 0) return;          // more files on their way; this runs again when they land
+        }
+    }
+    mapSyncDownloadBase = null;
+    mapSyncFetchTotal = 0;
+    mapSyncState = 3;
+    mapSyncStatus = Loc.T("In step with the server. Your edits go straight to it.");
+    DoSave();
+    Toast(Loc.T("Downloaded the server's changes and saved them into your .rfa."));
+    if (mapSyncUploadAfter) { mapSyncUploadAfter = false; MapSyncUpload(); }
+    else mapSyncUnsent = collab?.Sync is { } ms2 ? MapSyncDifferences(ms2) : new List<string>();
+}
+
+// Send this copy's changes. The server's changes come first if there are any not yet taken - an upload onto a map
+// that has moved on underneath would undo whatever it did - then the map is saved (so every file is in the archive
+// to read and hash) and whatever still differs from the server goes up.
+void MapSyncUpload()
+{
+    if (collab?.Sync is not { } msync || so is null) return;
+    if (mapSyncState is 1 or 4) { Toast(Loc.T("Still catching up with the server - try again in a moment.")); return; }
+    if (mapSyncState == 2)
+    {
+        if (localFileHashes is null || msync.Baseline is null) return;
+        RefractorForge.Collab.SyncPlan fresh;
+        try { fresh = msync.Plan(so, LocalSyncWorld(msync.BaselineFromRecord), localFileHashes, out _); }
+        catch (Exception ex) { Toast("Map sync: " + ex.Message); return; }
+        if (fresh.ServerChanged.Any(k => !(mapSyncKeepMine && fresh.Conflicts.Contains(k))))
+        {
+            mapSyncUploadAfter = true;
+            MapSyncDownload();
+            return;
+        }
+        // Keeping mine on every conflict: the server's side of those is not taken, and ours goes up over it.
+    }
+    mapSyncState = 3;                        // from here edits go live; the upload itself is live ops
+    mapSyncPlan = null;
+    DoSave();
+    var keys = MapSyncDifferences(msync);
+    var ops = RefractorForge.Collab.MapSync.UploadOps(keys, so, LocalSyncWorld(true),
+                localFileHashes ?? new Dictionary<string, string>(), LocalFileReader());
+    long bytesSent = 0;
+    foreach (var op in ops)
+    {
+        collab.SendOp(op);
+        bytesSent += op.Length;
+        // The server does not echo a file back; note it so the next look does not send it again.
+        if (op.StartsWith("FILE ", StringComparison.Ordinal) && RefractorForge.Collab.SyncKeys.TryParseFileOp(op, out var frel, out var fb))
+            msync.NoteSentFile(frel, fb);
+    }
+    mapSyncUnsent.Clear();
+    mapSyncNextCheck = appClock + 6.0;       // give the server a moment to echo before looking again
+    Console.WriteLine($"Map sync: sent {RefractorForge.Collab.SyncKeys.Describe(keys)} to the server ({ops.Count} edit(s), {bytesSent / 1048576.0:0.#} MB).");
+    Toast(keys.Count == 0 ? Loc.T("Nothing to upload - the server already has everything here.")
+                          : string.Format(Loc.T("Uploaded your changes: {0}."), RefractorForge.Collab.SyncKeys.Describe(keys)));
+}
+
+// One op from the server's map into the open one, without an undo entry - the same routes a live edit takes.
+void ApplySyncOp(string payload)
+{
+    int pv = payload.IndexOf(' ');
+    var pverb = pv < 0 ? payload : payload[..pv];
+    try
+    {
+        if (ApplyWorldOp(pverb, payload)) return;
+        if (so is not null && EditWire.IsObjectOp(payload)) EditWire.Parse(payload).Apply(so);
+    }
+    catch { }
+}
+
+// A level file from the server: a ground tile is painted into the editor's ground, a bake output is taken into the
+// bake, settings files reload the settings panels, and every file is queued so the next save writes these bytes.
+void ApplyRemoteFile(string rel, byte[] bytes)
+{
+    rel = RefractorForge.Collab.SyncKeys.NormPath(rel);
+    if (RefractorForge.Collab.SyncKeys.IsStructuredEntry(rel) || !RefractorForge.Collab.FileStore.IsSafeRelative(rel)) return;
+    var leaf = rel[(rel.LastIndexOf('/') + 1)..].ToLowerInvariant();
+    if (leaf.EndsWith(".dds") && terrainTex?.TileFor(rel) is { } tile && atlasCpu is not null)
+    {
+        try
+        {
+            var tex = DdsTexture.Decode(bytes);
+            applyingTile = true;
+            var (x, y, w, h) = terrainTex.BlitTile(atlasCpu, tile.Col, tile.Row, tex);
+            UploadAtlasRectMips(x, y, w, h);
+        }
+        catch (Exception ex) { Console.WriteLine($"   ground tile {rel} from the server could not be read: {ex.Message}"); }
+        finally { applyingTile = false; }
+        tilesDirty.Remove(tile);             // the server's tile stands; ours for it is not written over it
+    }
+    if (rel.StartsWith("ObjectLightMaps/", StringComparison.OrdinalIgnoreCase))
+        bakedObjectLightmaps[rel["ObjectLightMaps/".Length..]] = bytes;   // the save writes these, once
+    else
+        QueueLevelFile(rel, bytes);
+    if (leaf is "init.con" or "skyandsun.con" or "terrain.con") ReloadEnvFromLevel();
+    else if (leaf == "lightmapshadowbits.lsb") { try { loadedShadowBits = LightmapShadowBits.Decode(bytes); } catch { } }
+    else if (leaf == "rf_groundshadowmerge.tga") { try { groundMerge = TgaTexture.Decode(bytes); groundMergeLoaded = true; groundMergeStatsFor = null; } catch { } }
+    if (localFileHashes is not null) localFileHashes[rel] = RefractorForge.Collab.SyncKeys.Hash(bytes);
+}
+
+// A settings file arrived (Init.con, SkyAndSun.con, Terrain.con): rebuild the level's settings from the newest copy
+// of each and put them back in the panels. Without this the next save would patch the arriving file with this
+// editor's OLD fog, lighting and water, and quietly undo the other person's change.
+void ReloadEnvFromLevel()
+{
+    try
+    {
+        string? Text(string leaf)
+        {
+            var p = pendingLevelFiles.LastOrDefault(f => f.RelPath.Replace('\\', '/').EndsWith(leaf, StringComparison.OrdinalIgnoreCase));
+            return p.Bytes is not null ? System.Text.Encoding.Latin1.GetString(p.Bytes) : ReadLevelText(leaf);
+        }
+        IEnumerable<string>? L(string? t) => t?.Replace("\r\n", "\n").Split('\n');
+        var fresh = EnvironmentSettings.Parse(L(Text("SkyAndSun.con")), L(Text("Terrain.con")), L(Text("Init.con")));
+        env = fresh;
+        SeedEditorFromEnv();
+        Console.WriteLine("   Level settings reloaded from the server's copy (fog, view distance, lighting, water).");
+    }
+    catch (Exception ex) { Console.WriteLine($"   could not reload the level settings: {ex.Message}"); }
+}
+
+// After a save: the files it wrote are what this copy holds now, and in step, the ones the server does not have
+// go to it - which is how everything the editor writes into the .rfa (fog, sky, sounds, decals, bakes, tiles,
+// navmaps...) reaches the others and the server's map, without a separate op for each.
+void AfterSaveSync(string rfaPath, List<string> names)
+{
+    localFilesGen++;
+    if (localFilesBusy) localFileHashes = null;          // a pass that straddled this save is stale: run it again
+    if (localFileHashes is null && collab?.Sync is null) return;
+    try
+    {
+        var arch = new RefractorFlatArchive(rfaPath);
+        string prefix = RefractorForge.Formats.LevelSaver.ArchivePrefix(arch);
+        var server = mapSyncState == 3 && collab?.Sync is { } ms ? ms.ServerHashes() : null;
+        var byName = new Dictionary<string, RefractorForge.Formats.Rfa.RefractorFlatArchiveEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in arch.Entries) byName[e.Name.Replace('\\', '/')] = e;
+        int sent = 0; long sentBytes = 0;
+        foreach (var name in names.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var rel = RefractorForge.Collab.SyncKeys.LevelRelative(name, prefix);
+            if (rel is null || RefractorForge.Collab.SyncKeys.IsStructuredEntry(rel)) continue;
+            if (!byName.TryGetValue(name.Replace('\\', '/'), out var en)) continue;
+            var bytes = arch.Read(en);
+            var h = RefractorForge.Collab.SyncKeys.Hash(bytes);
+            if (localFileHashes is not null) localFileHashes[rel] = h;
+            if (server is not null && (!server.TryGetValue(RefractorForge.Collab.SyncKeys.FileKey(rel), out var sh) || sh != h))
+            {
+                collab!.SendOp(RefractorForge.Collab.SyncKeys.FileOp(rel, bytes));
+                collab.Sync?.NoteSentFile(rel, bytes);
+                sent++; sentBytes += bytes.LongLength;
+            }
+        }
+        if (sent > 0) Console.WriteLine($"   Sent {sent} changed level file(s) ({sentBytes / 1048576.0:0.#} MB) to the server's map.");
+    }
+    catch (Exception ex) { Console.WriteLine($"   map sync after save: {ex.Message}"); }
+    if (localFileHashes is null) EnsureLocalFileHashes();
+}
+
+// The record a save writes: in step, the server's map at its current version; otherwise the one the level came with.
+RefractorForge.Collab.SyncRecord? SyncRecordForSave()
+{
+    if (collab?.Sync is { } msync && mapSyncState == 3 && msync.Synced && msync.Baseline is not null && msync.Epoch.Length > 0)
+        levelSyncRecord = msync.RecordNow(collab.CurrentMap, collab.SessionBase ?? levelSyncRecord?.Base);
+    if (levelSyncRecord is not null && so is not null) so.PersistIds = true;
+    return levelSyncRecord;
+}
+
+// The panels' editable copies of the level's settings - fog, view distance, the renderer lights, water colours - from
+// `env`. At load, and again when a settings file arrives from the server, so the next save patches the level with
+// what it now says rather than with what this editor had before.
+void SeedEditorFromEnv()
+{
+    if (env is null) return;
+    fogEnabled = env.FogEnabled;
+    fogColor = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z);
+    fogStart = env.FogStart; fogEnd = env.FogEnd;
+    viewDistance = env.ViewDistance;
+    lightGlobalAmb = new Vector3(env.GlobalAmbientColor.X, env.GlobalAmbientColor.Y, env.GlobalAmbientColor.Z);
+    lightAmb = new Vector3(env.AmbientColor.X, env.AmbientColor.Y, env.AmbientColor.Z);
+    lightDiffuse = new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z);
+    lightSpecular = new Vector3(env.SpecularColor.X, env.SpecularColor.Y, env.SpecularColor.Z);
+    lightingDirty = false;
+    waterColor = new Vector3(env.WaterColor.X, env.WaterColor.Y, env.WaterColor.Z);   // the level's water.color
+    deepColor = new Vector3(env.DeepColor.X, env.DeepColor.Y, env.DeepColor.Z);       // the level's water.deepcolor
+    waterAlpha = env.WaterAlpha;
+    belowColor = new Vector3(env.BelowColor.X, env.BelowColor.Y, env.BelowColor.Z);
+    belowDeepColor = new Vector3(env.BelowDeepColor.X, env.BelowDeepColor.Y, env.BelowDeepColor.Z);
+    belowAlpha = env.BelowAlpha;
+    belowAlphaDepth = env.BelowAlphaDepth; belowColorDepth = env.BelowColorDepth;
+    shallowColor = new Vector3(env.ShallowColor.X, env.ShallowColor.Y, env.ShallowColor.Z);
+    belowShallowColor = new Vector3(env.BelowShallowColor.X, env.BelowShallowColor.Y, env.BelowShallowColor.Z);
+}
+
+// Every non-object op a peer or the server can send, onto the open map. True when the verb was one of them.
+bool ApplyWorldOp(string pverb, string payload)
+{
+    switch (pverb)
+    {
+        case "TERRAIN": try { ApplyRemoteTerrain(payload); } catch { } return true;
+        case "ATLAS": try { ApplyRemoteAtlas(payload); } catch { } return true;
+        case "MATERIAL": try { ApplyRemoteMaterial(payload); } catch { } return true;
+        case "GAMEPLAY": try { ApplyRemoteGameplay(payload); } catch { } return true;
+        case "WATER": try { ApplyRemoteWater(payload); } catch { } return true;
+        case "OVERGROWTH": try { ApplyRemoteOvergrowth(payload); } catch { } return true;
+        case "LIGHT": try { ApplyRemoteLight(payload); } catch { } return true;
+        case "ANNOT": try { if (RefractorForge.Formats.Editing.Annotations.TryParseWire(payload, out var aj)) notes.ApplyText(aj); } catch { } return true;
+        case "OBJMESH": try { ApplyRemoteObjMesh(payload); } catch { } return true;
+        case "LVLFILE": try { ApplyRemoteLevelFiles(payload); } catch { } return true;
+        case "LIGHTRIG": try { ApplyRemoteLightRig(payload); } catch { } return true;
+        case "FILE":
+            try { if (RefractorForge.Collab.SyncKeys.TryParseFileOp(payload, out var frel, out var fbytes)) ApplyRemoteFile(frel, fbytes); } catch { }
+            return true;
+        // A lighting bake used to travel as a trigger each peer re-ran - and a re-run finished after the guard
+        // that stops echoes, sent the trigger again, and every machine baked forever, multiplying the ground
+        // lights in each time. What a bake produces are FILES (lightmaps, the .lsb, the ground tiles), and those
+        // now reach everyone when the baker saves. The trigger is taken and ignored.
+        case "LIGHTBAKE": return true;
+    }
+    return false;
+}
+
 // Apply queued inbound protocol lines on the GL thread; rebuild render state if the document changed.
 void CollabDrain()
 {
@@ -13713,6 +14252,24 @@ void CollabDrain()
         // The base level archive - what map everyone is standing on - is not document state, and a transfer of
         // it is hundreds of MB that must not touch the undo stack or the object list. CollabSession owns it.
         if (collab.HandleBaseMessage(m)) continue;
+        // A server map this copy keeps in step (collab.Sync). The replica has already taken this line; whether the
+        // OPEN map takes it too depends on where the comparison stands.
+        if (collab.Sync is { } syncR)
+        {
+            if (m.Type == MsgType.SyncBegin && mapSyncState == 3)
+            {
+                // A reconnect re-sends the whole map. Compare again rather than adopt it: what was done here while
+                // the line was down is this copy's to upload, and the replica just before the drop is what both
+                // sides last agreed on.
+                mapSyncResyncBase = syncR.PreviousAgreed;
+                syncR.ForgetBaseline();
+                mapSyncState = 1; mapSyncPlan = null;
+                mapSyncStatus = Loc.T("Reconnected - comparing your copy with the server's map again...");
+                continue;
+            }
+            // Not in step yet: the server's document and edits stay in the replica until the mapper downloads.
+            if (mapSyncState is 1 or 2 or 4 && m.Type is MsgType.SyncBegin or MsgType.SyncObj or MsgType.SyncEnd or MsgType.Op) continue;
+        }
         switch (m.Type)
         {
             case MsgType.SyncBegin:
@@ -13732,21 +14289,15 @@ void CollabDrain()
                 // which was harmless while the ApplyRemote* handlers sent nothing - but WATER now re-broadcasts what
                 // it applies (the colours are map data the receiver must save too), and two peers would have volleyed
                 // it forever. The flag covers the whole dispatch.
+                // Our own world edit coming back from the relay: it is already here. Re-applying it was harmless for
+                // most of them and not for all - an imported mesh's echo replaced the textured preview with the
+                // untextured wire mesh. (Object ops still come through: they are absolute and cost nothing.)
+                if (m.Type == MsgType.Op && m.Args.Length > 1 && m.Args[1] == collab.ClientId && !EditWire.IsObjectOp(payload)) break;
                 applyingRemote = true;
                 try
                 {
-                if (pverb == "TERRAIN") { try { ApplyRemoteTerrain(payload); } catch { } }
-                else if (pverb == "ATLAS") { try { ApplyRemoteAtlas(payload); } catch { } }
-                else if (pverb == "MATERIAL") { try { ApplyRemoteMaterial(payload); } catch { } }
-                else if (pverb == "GAMEPLAY") { try { ApplyRemoteGameplay(payload); } catch { } }
-                else if (pverb == "WATER") { try { ApplyRemoteWater(payload); } catch { } }
-                else if (pverb == "OVERGROWTH") { try { ApplyRemoteOvergrowth(payload); } catch { } }
-                else if (pverb == "LIGHT") { try { ApplyRemoteLight(payload); } catch { } }
-                else if (pverb == "ANNOT") { try { if (RefractorForge.Formats.Editing.Annotations.TryParseWire(payload, out var aj)) notes.ApplyText(aj); } catch { } }
-                else if (pverb == "OBJMESH") { try { ApplyRemoteObjMesh(payload); changed = true; } catch { } }
-                else if (pverb == "LVLFILE") { try { ApplyRemoteLevelFiles(payload); } catch { } }
-                else if (pverb == "LIGHTRIG") { try { ApplyRemoteLightRig(payload); } catch { } }
-                else if (pverb == "LIGHTBAKE") { try { ApplyRemoteLightBake(payload); } catch { } }
+                if (pverb == "OBJMESH") { if (ApplyWorldOp(pverb, payload)) changed = true; }
+                else if (ApplyWorldOp(pverb, payload)) { }
                 else if (so is not null)
                 {
                     try
@@ -13785,6 +14336,9 @@ void CollabDrain()
                 // overgrowth settings + any imported .obj meshes.
                 if (so is not null && collab is not null)
                 {
+                    // A map this copy is starting: there is nothing to compare - the server's map is about to BE this
+                    // copy - so it is in step at once and the seed goes out live.
+                    if (collab.Sync is not null) { mapSyncSeeded = true; mapSyncState = 3; mapSyncPlan = null; so.PersistIds = true; }
                     foreach (var o in so.Objects)
                     {
                         collab.SendOp(new AddObject(o.Id, o.Template, o.Position, o.Rotation).ToWire());
@@ -13961,6 +14515,7 @@ void CollabAutoFetchMap()
                 collab = CollabSession.StartJoin(centralAddr.Trim(), centralPort,
                                                  string.IsNullOrWhiteSpace(collabName) ? Environment.UserName : collabName.Trim(),
                                                  string.IsNullOrEmpty(centralPass) ? null : centralPass);
+                EnableMapSyncFor(collab);
                 collab.AnnounceBase(OpenLevelArchive());
                 Toast(string.Format(Loc.T("Reconnected - entering {0}"), rejoinMap));
             }
@@ -13985,6 +14540,9 @@ void CollabAutoFetchMap()
     if (collab is null || !collab.AutoDownloadPending) return;
     if (collab.BaseBusy || collab.BaseMismatch is null || !collab.BaseAvailable) { collab.ClearAutoDownload(); return; }
     collab.ClearAutoDownload();
+    // A map kept in sync is never fetched over the mapper's copy unasked: their copy may hold work the server has
+    // never seen. Map sync asks whether to merge it or replace it.
+    if (collab.Sync is not null) { mapSyncWindowOpen = true; return; }
     DownloadSessionBase();
 }
 
@@ -14117,6 +14675,141 @@ void MapPickerModal()
     ImGui.EndPopup();
 }
 
+// "just now", "12 min ago", "3 h ago", "2 days ago" - for when the server's map last changed.
+string AgoText(long unix)
+{
+    if (unix <= 0) return Loc.T("some time ago");
+    double s = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - unix;
+    if (s < 90) return Loc.T("just now");
+    if (s < 3600) return string.Format(Loc.T("{0:0} min ago"), s / 60);
+    if (s < 86400 * 2) return string.Format(Loc.T("{0:0} h ago"), s / 3600);
+    return string.Format(Loc.T("{0:0} days ago"), s / 86400);
+}
+
+// One line for the Collab menu: where this copy stands against the server's map.
+string MapSyncHeadline()
+{
+    if (collab?.Sync is not { } msync) return "";
+    if (collab.BaseMismatch is not null) return Loc.T("Map sync: your copy is not the server's archive - see Map sync");
+    return mapSyncState switch
+    {
+        1 or 4 => mapSyncStatus.Length > 0 ? mapSyncStatus : Loc.T("Map sync: comparing your copy with the server's..."),
+        2 when mapSyncPlan is { } p => string.Format(Loc.T("Map sync: {0} new on the server, {1} here, {2} both"),
+                                         p.ServerChanged.Except(p.Conflicts).Count(), p.LocalChanged.Except(p.Conflicts).Count(), p.Conflicts.Count),
+        3 when mapSyncUnsent.Count > 0 => string.Format(Loc.T("Map sync: {0} here not on the server yet"), RefractorForge.Collab.SyncKeys.Describe(mapSyncUnsent)),
+        3 => string.Format(Loc.T("Map sync: in step with the server (version {0})"), msync.ServerSeq),
+        _ => "",
+    };
+}
+
+// Working on a server map at different times: what the server got while this copy was away, what this copy has that
+// the server does not, and the buttons that carry each across. Not modal - the mapper can look around the map first.
+void MapSyncWindow()
+{
+    if (!mapSyncWindowOpen || collab?.Sync is not { } msync) return;
+    var fbs = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbs.X * 0.5f, fbs.Y * 0.35f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(580f * uiScale, 0f), ImGuiCond.Appearing);
+    if (!ImGui.Begin(Loc.TL("Map sync") + "###mapsync", ref mapSyncWindowOpen, ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoSavedSettings))
+    { ImGui.End(); return; }
+    ImGui.PushTextWrapPos(0f);
+
+    Theme.Heading(string.Format(Loc.T("{0} on the server"), collab.CurrentMap));
+    Theme.Muted(string.Format(Loc.T("Server version {0} - last changed {1}{2}."), msync.ServerSeq, AgoText(msync.LastChangeUnix),
+                              msync.LastChangeBy.Length > 0 ? string.Format(Loc.T(" by {0}"), msync.LastChangeBy) : ""));
+    if (msync.Baseline is not null)
+        Theme.Muted(msync.BaselineFromRecord
+            ? string.Format(Loc.T("Your copy was last in step with it at version {0}."), msync.BaselineSeq)
+            : Loc.T("Your copy has never been synced with this map, so it is compared with the map as it started on the server."));
+    ImGui.Spacing();
+
+    // A copy saved before records existed is refused for its bytes. The mapper knows whether it is this map.
+    if (collab.BaseMismatch is { } pin)
+    {
+        Theme.Section(Loc.T("YOUR COPY IS NOT THE SERVER'S ARCHIVE"));
+        ImGui.TextWrapped(Loc.T("Your .rfa for this map was saved without a record of the server, so the server cannot tell it is the same map. If it is this map with your own edits in it, compare it with the server's map - nothing changes on either side until you download or upload. Otherwise, replace it with the server's copy (yours is kept beside it as .before-download)."));
+        ImGui.Spacing();
+        if (Theme.AccentButton(Loc.TL("Compare my copy with the server's map"), new Vector2(0f, 0f)))
+        {
+            collab.ClaimBase(pin);
+            mapSyncState = 1; mapSyncPlan = null; mapSyncBaselineAsked = false; msync.ForgetBaseline();
+        }
+        ImGui.SameLine();
+        if (!collab.BaseBusy && ImGui.Button(Loc.TL("Replace mine with the server's map")))
+        {
+            collab.OpenWhenDownloaded = true;
+            DownloadCurrentMapArchive();
+        }
+        ImGui.PopTextWrapPos();
+        ImGui.End();
+        return;
+    }
+
+    if (mapSyncState is 1 or 4)
+    {
+        Theme.Muted(mapSyncState == 4 && mapSyncFetchTotal > 0
+            ? string.Format(Loc.T("Fetching files from the server: {0} of {1}..."), mapSyncFetchTotal - mapSyncFetch.Count, mapSyncFetchTotal)
+            : mapSyncStatus.Length > 0 ? mapSyncStatus : Loc.T("Comparing your copy with the server's map..."));
+    }
+    else if (mapSyncState == 2 && mapSyncPlan is { } plan)
+    {
+        var theirs = plan.ServerChanged.Except(plan.Conflicts).ToList();
+        var mine = plan.LocalChanged.Except(plan.Conflicts).ToList();
+
+        Theme.Section(Loc.T("NEW ON THE SERVER"));
+        if (plan.ServerChanged.Count == 0) Theme.Muted(Loc.T("Nothing - the server has not changed since your copy last had it."));
+        else
+        {
+            if (msync.History is { Count: > 0 } hist2)
+                foreach (var c in hist2.Take(8))
+                    ImGui.BulletText(string.Format(Loc.T("{0}: {1} change(s) - {2} - {3}"), c.Author, c.Count, string.Join(", ", c.Kinds), AgoText(c.LastUnix)));
+            if (theirs.Count > 0) ImGui.TextWrapped(string.Format(Loc.T("Coming in: {0}."), RefractorForge.Collab.SyncKeys.Describe(theirs)));
+        }
+        ImGui.Spacing();
+        Theme.Section(Loc.T("YOUR CHANGES NOT ON THE SERVER"));
+        ImGui.TextWrapped(mine.Count == 0 ? Loc.T("None.") : RefractorForge.Collab.SyncKeys.Describe(mine));
+        if (plan.Conflicts.Count > 0)
+        {
+            ImGui.Spacing();
+            Theme.Section(string.Format(Loc.T("CHANGED ON BOTH SIDES ({0})"), plan.Conflicts.Count));
+            ImGui.TextWrapped(RefractorForge.Collab.SyncKeys.Describe(plan.Conflicts));
+            if (ImGui.RadioButton(Loc.TL("Keep the server's"), !mapSyncKeepMine)) mapSyncKeepMine = false;
+            ImGui.SameLine();
+            if (ImGui.RadioButton(Loc.TL("Keep mine"), mapSyncKeepMine)) mapSyncKeepMine = true;
+            Theme.Muted(Loc.T("Whichever you keep, the other side's version of those is replaced when you download or upload."));
+        }
+        ImGui.Spacing();
+        ImGui.Separator();
+        bool canDown = plan.ServerChanged.Count > 0;
+        bool canUp = plan.LocalChanged.Count > 0;
+        ImGui.BeginDisabled(!canDown);
+        if (Theme.AccentButton(Loc.TL("Download changes"), new Vector2(190f * uiScale, 0f))) MapSyncDownload();
+        ImGui.EndDisabled();
+        Theme.Tip(Loc.T("Takes the server's changes into your map and saves them straight into your .rfa.\nYour own changes stay; upload them after."));
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!canUp);
+        if (ImGui.Button(Loc.TL("Upload my changes"), new Vector2(190f * uiScale, 0f))) MapSyncUpload();
+        ImGui.EndDisabled();
+        Theme.Tip(Loc.T("Sends your changes to the server so everyone gets them. Anything new on the server\nis downloaded first, so nothing of theirs is written over."));
+    }
+    else if (mapSyncState == 2 && mapSyncStatus.Length > 0)
+        Theme.Muted(mapSyncStatus);          // the comparison itself failed; say why rather than show nothing
+    else if (mapSyncState == 3)
+    {
+        ImGui.TextColored(new Vector4(0.55f, 0.85f, 0.55f, 1f), Loc.T("In step with the server. Your edits go straight to it, and everyone else's come in as they make them."));
+        if (mapSyncUnsent.Count > 0)
+        {
+            ImGui.Spacing();
+            ImGui.TextWrapped(string.Format(Loc.T("Here but not on the server yet: {0}."), RefractorForge.Collab.SyncKeys.Describe(mapSyncUnsent)));
+            if (Theme.AccentButton(Loc.TL("Upload my changes"), new Vector2(190f * uiScale, 0f))) MapSyncUpload();
+        }
+        ImGui.Spacing();
+        Theme.Muted(Loc.T("Ground paint, lighting bakes, sounds, decals and level settings reach the server when you save."));
+    }
+    ImGui.PopTextWrapPos();
+    ImGui.End();
+}
+
 // A finished download is only half of what the user asked for. They picked a map from the server, so the point
 // was to WORK on that map - leaving the archive sitting in a folder and the wrong level open is the thing that
 // made the first test confusing. This offers the swap the moment the file is complete and verified.
@@ -14205,6 +14898,8 @@ void DoCollabCentral()
         collab = CollabSession.StartJoin(centralAddr.Trim(), centralPort,
                                          string.IsNullOrWhiteSpace(collabName) ? Environment.UserName : collabName.Trim(),
                                          string.IsNullOrEmpty(centralPass) ? null : centralPass);
+        // A central map is one people work on at different times: compare, then Download / Upload - never adopt.
+        EnableMapSyncFor(collab);
         collab.AnnounceBase(OpenLevelArchive());
         Console.WriteLine(collab.Status);
         ImGui.CloseCurrentPopup();
@@ -14730,8 +15425,9 @@ void BuildUi()
                 // Two separate processes, kept apart on purpose. OBJECT LIGHTMAPS is every per-object map the game
                 // reads (ObjectLightMaps/*.tga) - any lightmap in general. SUN SHADOWS + TERRAIN is the terrain's
                 // own light: the packed sun shadow (LightmapShadowBits.lsb) and the placed lights burned into the
-                // ground tiles. Each heading has its own bake, its own unbake and its own save switch, and nothing
-                // under one heading touches the other's files. The combined commands sit last, named as both.
+                // ground tiles. Each heading has its own bake and its own unbake - Save writes whichever ran, with
+                // no switch to forget - and nothing under one heading touches the other's files. The combined
+                // commands sit last, named as both.
                 ImGui.TextDisabled(Loc.T("OBJECT LIGHTMAPS"));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
                 if (ImGui.MenuItem(Loc.TL("Lightmap-Ready Objects..."), null, false, so is not null && meshLib is not null)) OpenLmReady();
@@ -14762,22 +15458,12 @@ void BuildUi()
                 Theme.Tip(Loc.T("Replaces every placed object's lightmap with a fully lit one on Save - the map as it was\nbefore any object bake. Leaves the terrain shadow exactly as it is."));
                 ImGui.Separator();
                 ImGui.TextDisabled(Loc.T("SUN SHADOWS + TERRAIN"));
-                if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows (terrain .lsb)"), null, false, heightmap is not null)) DoBakeShadows();
-                Theme.Tip(Loc.T("The terrain's sun cast-shadow, shown at once and armed for saving:\nSave writes LightmapShadowBits.lsb, which is what the game reads.\nTerrain only - no object lightmap is touched."));
-                if (ImGui.MenuItem(Loc.TL("Write LightmapShadowBits.lsb on Save"), null, writeShadowLsb, heightmap is not null)) writeShadowLsb = !writeShadowLsb;
-                if (ImGui.MenuItem(Loc.TL("   .lsb: flip X (if shadows are mirrored L/R)"), null, shadowLsbFlipX, heightmap is not null)) { shadowLsbFlipX = !shadowLsbFlipX; InitTerrainShadowOnLoad(); }
-                if (ImGui.MenuItem(Loc.TL("   .lsb: flip Y (if mirrored top/bottom)"), null, shadowLsbFlipY, heightmap is not null)) { shadowLsbFlipY = !shadowLsbFlipY; InitTerrainShadowOnLoad(); }
-                if (ImGui.MenuItem(Loc.TL("Show baked terrain shadow"), null, showBakedShadow, heightmap is not null))
-                {
-                    showBakedShadow = !showBakedShadow;
-                    if (showBakedShadow && shadowTexId == 0) InitTerrainShadowOnLoad();
-                }
-                Theme.Tip(Loc.T("Draws the BAKED terrain shadow on the ground - the level's LightmapShadowBits.lsb, or\nwhat the last bake made. This is the one the game reads. The real-time toggle above is a\npreview that follows the camera and is never saved."));
-                if (ImGui.MenuItem(Loc.TL("   Reload the level's shadow from its .lsb"), null, false, heightmap is not null)) { InitTerrainShadowOnLoad(); showBakedShadow = true; }
+                if (ImGui.MenuItem(Loc.TL("Bake Sun Shadows"), null, false, heightmap is not null)) DoBakeShadows();
+                Theme.Tip(Loc.T("Casts the terrain and every placed object into a sun shadow and darkens it into the ground\ntexture - where the game draws a sun shadow - so what you see after the bake is what the game\nshows. Save writes it, with LightmapShadowBits.lsb. Object lightmaps are a separate bake."));
+                if (ImGui.MenuItem(Loc.TL("Unbake sun shadows"), null, false, heightmap is not null)) UnbakeTerrainShadow();
+                Theme.Tip(Loc.T("Takes the baked sun shadow back off the ground; Save writes the ground and a fully lit\nLightmapShadowBits.lsb. Object lightmaps are untouched."));
                 if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
                 Theme.Tip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
-                if (ImGui.MenuItem(Loc.TL("Unbake Sun Shadows (fully lit .lsb)"), null, unbakeLighting, heightmap is not null)) UnbakeTerrainShadow();
-                Theme.Tip(Loc.T("Save writes a fully lit LightmapShadowBits.lsb - the terrain as it was before any shadow\nbake. Leaves the object lightmaps exactly as they are. Baking shadows again undoes it."));
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Bake Both (object lightmaps + sun shadows)"), null, false, heightmap is not null)) BakeAllLighting();
                 Theme.Tip(Loc.T("Both processes in one go, for a map that wants everything: the terrain sun-shadow (.lsb),\nevery object's lightmap and the placed lights' colour in the ground texture. Save writes it all."));
@@ -14941,11 +15627,25 @@ void BuildUi()
                         collab.UploadBase(OpenLevelArchive()!);
                 }
 
+                // Working on the map at different times: where this copy stands, and the two buttons that carry changes
+                // across. The full picture (who changed what, conflicts) is in the Map sync window.
+                if (collab.Sync is not null)
+                {
+                    ImGui.Separator();
+                    var headline = MapSyncHeadline();
+                    if (headline.Length > 0) ImGui.MenuItem(headline, null, false, false);
+                    bool canDownload = mapSyncState == 2 && mapSyncPlan is { ServerChanged.Count: > 0 };
+                    bool canUpload = (mapSyncState == 2 && mapSyncPlan is { LocalChanged.Count: > 0 }) || (mapSyncState == 3 && mapSyncUnsent.Count > 0);
+                    if (ImGui.MenuItem(Loc.TL("Download changes"), null, false, canDownload)) MapSyncDownload();
+                    if (ImGui.MenuItem(Loc.TL("Upload my changes"), null, false, canUpload)) MapSyncUpload();
+                    if (ImGui.MenuItem(Loc.TL("Map sync..."))) mapSyncWindowOpen = true;
+                }
+
                 // What the session itself is carrying, so it is obvious whether the relay actually has the level
                 // or is holding an empty document that will hand a joiner nothing.
                 ImGui.Separator();
                 ImGui.MenuItem(string.Format(Loc.T("{0} objects in the session"), so?.Objects.Count ?? 0), null, false, false);
-                if (!collab.IsHost) ImGui.MenuItem(Loc.T("Edits are saved on the server, not here."), null, false, false);
+                if (!collab.IsHost && collab.Sync is null) ImGui.MenuItem(Loc.T("Edits are saved on the server, not here."), null, false, false);
 
                 ImGui.Separator();
                 ImGui.MenuItem(string.Format(Loc.T("{0} peer(s) connected"), collab.Peers.Count), null, false, false);
@@ -15251,6 +15951,7 @@ void BuildUi()
     BaseTransferProgress();
     MapPickerModal();
     DownloadedMapModal();
+    MapSyncWindow();
     PointToolOverlay();
     LightGizmos();
     TunnelGizmos();
@@ -18152,23 +18853,22 @@ void LightsPanel()
     ImGui.Separator();
     Theme.Section(Loc.T("SUN SHADOWS + TERRAIN"));
     Theme.Tip(Loc.T("The terrain's own light: the sun cast-shadow the game reads from LightmapShadowBits.lsb,\nand the placed lights' colour burned into the ground texture tiles. Separate from the object\nlightmaps above - baking or unbaking one never touches the other."));
-    ImGui.Checkbox(Loc.TL("Merge into ground texture"), ref sbMergeToGround);
-    Theme.Tip(Loc.T("THIS is what makes a sun shadow visible in game. The engine does not draw the .lsb on the ground -\na deliberately unmissable checkerboard .lsb rendered no differently in game - it is painted into the\nterrain tiles, exactly as retail does (every retail map's tiles are darker where its own .lsb flags\nshadow). The level keeps a record of what this editor painted in, so baking again REPLACES that shadow\nand Unbake takes it off. Shadows a map SHIPPED with are part of its ground art and are not touched."));
-    ImGui.SameLine();
-    ImGui.SetNextItemWidth(120f * uiScale);
-    SldF(Loc.TL("Shadow darkness"), ref sbShadowLevel, 0.15f, 1f, "%.2f");
-    Theme.Tip(Loc.T("What fully shadowed ground keeps of its brightness. 0.50 is what retail measures at; 1.00 is off."));
-    ImGui.Checkbox(Loc.TL("Objects cast shadows"), ref sbWithObjects);
-    Theme.Tip(Loc.T("Every placed object casts into the terrain shadow. Leave this ON: with it off the bake only asks\nwhether the ground shadows itself, which on a flat or built-up map is almost nothing and looks\nlike the bake did nothing. It is what makes the bake take a minute instead of a second."));
-    ImGui.SameLine();
-    ImGui.Checkbox(Loc.TL("Show baked shadow"), ref showBakedShadow);
-    Theme.Tip(Loc.T("Draw the BAKED terrain shadow on the ground - what the game reads. The real-time sun shadow\nis a separate camera-following preview that is never saved."));
+    // Bake, then save: nothing else to arm. The shadow goes into the ground texture, the only place the game draws
+    // it, and the viewport shows that ground exactly as the game will.
+    string groundShadow = GroundShadowSummary();   // first: it also points the slider at what the ground carries
     if (ImGui.Button(Loc.TL("Bake Sun Shadows")) && heightmap is not null) DoBakeShadows();
+    Theme.Tip(Loc.T("Casts the terrain and every placed object into a sun shadow and darkens it into the ground\ntexture - where the game draws a sun shadow - so what you see after the bake is what the game\nshows. Save writes it, with LightmapShadowBits.lsb. Object lightmaps are a separate bake."));
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Unbake sun shadows")) && heightmap is not null) UnbakeTerrainShadow();
-    ImGui.SameLine();
-    ImGui.Checkbox(Loc.TL("Write .lsb on save"), ref writeShadowLsb);
-    Theme.Tip(Loc.T("Bake shows the sun's cast-shadow on the terrain at once and arms it for saving; Unbake arms a\nfully lit one. Save writes LightmapShadowBits.lsb while the box is ticked - object lightmaps\nare a separate file and a separate bake."));
+    Theme.Tip(Loc.T("Takes the baked sun shadow back off the ground; Save writes the ground and a fully lit\nLightmapShadowBits.lsb. Object lightmaps are untouched."));
+    ImGui.SetNextItemWidth(150f * uiScale);
+    bool darkChanged = SldF(Loc.TL("Shadow darkness"), ref sbShadowDarkness, 0f, 0.85f, "%.2f");
+    // Applied on release, not every frame of a drag: each re-darken rewrites the whole ground texture.
+    if (ImGui.IsItemDeactivatedAfterEdit() || (darkChanged && !ImGui.IsItemActive())) RetuneGroundShadow();
+    Theme.Tip(Loc.T("How much darker the ground gets where the sun is blocked: 0.50 matches retail maps, 0 is none.\nChanging it after a bake re-darkens the baked shadow at once - no need to bake again."));
+    ImGui.PushTextWrapPos(0f);
+    Theme.Muted(groundShadow);
+    ImGui.PopTextWrapPos();
     ImGui.SetNextItemWidth(150f * uiScale);
     SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
     if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
@@ -19100,6 +19800,10 @@ void SaveCloudsToEnv()
 // Uses UNPACK_ROW_LENGTH/SKIP so the sub-rect is read straight out of the full atlas buffer.
 unsafe void UploadAtlasRect(int x, int y, int w, int h)
 {
+    // Every change to the ground texture passes through here - strokes, fills, bakes, undo and redo - so this is
+    // where the tiles it touched are noted for the next save. A tile arriving from the server is not an edit.
+    if (!applyingTile && atlasCpu is not null && terrainTex is not null)
+        foreach (var t in terrainTex.TilesIn(x, y, w, h, atlasCpu.Width, atlasCpu.Height)) tilesDirty.Add(t);
     if (atlasCpu is null || terrainTexId == 0 || w <= 0 || h <= 0) return;
     gl.BindTexture(TextureTarget.Texture2D, terrainTexId);
     gl.PixelStore(PixelStoreParameter.UnpackRowLength, atlasCpu.Width);

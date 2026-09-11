@@ -32,6 +32,10 @@ public sealed class EditHistory
         OnDo?.Invoke(cmd);
     }
 
+    /// <summary>Forget both stacks - for when the objects the commands name have been given new ids (a copy of a
+    /// server map lined up with the server's), so no command can reach the wrong object.</summary>
+    public void Clear() { _undo.Clear(); _redo.Clear(); }
+
     public bool Undo()
     {
         if (_undo.Count == 0) return false;

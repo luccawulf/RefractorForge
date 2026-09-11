@@ -31,12 +31,31 @@ public sealed class RelayServer
     private LevelBase.Id? _basePin;
     private string? _uploader;   // the one client currently allowed to write into the store
 
+    // Working at different times: the map's version survives restarts, its history says who changed what, and the
+    // level files people send are kept. A relay with no folder of its own (an editor hosting, a test) keeps the
+    // files in memory and starts a fresh epoch every run - its state dies with it, so no record could match anyway.
+    private readonly MapStore? _store;
+    private readonly Dictionary<string, (byte[] Bytes, string Hash, long Seq)> _memFiles = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>This incarnation of the map. A copy synced with a map that was since deleted and made again carries
+    /// a different epoch, and is treated as never synced rather than as a few versions behind.</summary>
+    public string Epoch { get; }
+
+    public MapStore? Store => _store;
+
     public RelayServer(StaticObjectsFile? initial = null, CollabWorldState? world = null, string? password = null,
-                       BaseArchiveStore? baseStore = null, LevelBase.Id? basePin = null)
+                       BaseArchiveStore? baseStore = null, LevelBase.Id? basePin = null, MapStore? store = null)
     {
         _baseStore = baseStore;
         _basePin = basePin;
+        _store = store;
+        // The document's ids are kept exactly as handed over - an editor hosting its own level keeps editing by
+        // them. Whoever LOADS a document from a file gives it stable ids first (see RelayHost.LoadObjects). The
+        // server's own copy always writes its ids, so they survive a restart.
         _doc = initial?.Clone() ?? new StaticObjectsFile();
+        _doc.PersistIds = true;
+        _seq = store?.LoadSeq() ?? 0;
+        Epoch = store?.Epoch ?? Guid.NewGuid().ToString("N")[..16];
         _world = world;
         _password = string.IsNullOrEmpty(password) ? null : password;
         // Already holding a LEVEL -> never ask. Judged on objects / terrain / materials / gameplay, not on "any op at
@@ -111,8 +130,28 @@ public sealed class RelayServer
             System.IO.Directory.CreateDirectory(dir);
             _doc.Save(System.IO.Path.Combine(dir, "StaticObjects.con"));
             _world?.Save(dir);
+            _store?.SaveSeq(_seq);
         }
     }
+
+    /// <summary>The level files the map holds - path, hash, size and the version each was last written at.</summary>
+    public List<(string Path, string Hash, long Size, long Seq)> FileList()
+    {
+        if (_store is not null) return _store.Files.All().Select(t => (t.Path, t.Entry.Hash, t.Entry.Size, t.Entry.Seq)).ToList();
+        lock (_gate) return _memFiles.Select(kv => (kv.Key, kv.Value.Hash, kv.Value.Bytes.LongLength, kv.Value.Seq)).ToList();
+    }
+
+    /// <summary>A level file's bytes, or null when the map does not hold it.</summary>
+    public byte[]? ReadFile(string relPath)
+    {
+        if (_store is not null) return _store.Files.Read(relPath);
+        lock (_gate) return _memFiles.TryGetValue(SyncKeys.NormPath(relPath), out var f) ? f.Bytes : null;
+    }
+
+    /// <summary>Build the baseline a never-synced editor compares itself against: the pinned archive's own
+    /// content, key by key, deflated and base64'd. Set by whatever knows where the archive lives; null when the
+    /// relay cannot say. Runs on a worker - it reads the archive.</summary>
+    public Func<string?>? BuildBaseline;
 
     /// <summary>
     /// Register a freshly-connected client and immediately stream it the current state so it
@@ -151,12 +190,19 @@ public sealed class RelayServer
         lock (_gate)
         {
             if (!_clients.TryGetValue(clientId, out var ep)) return;
+            // Where the map stands, before the map itself: an editor that knows the version it last synced to can
+            // tell from this line alone whether anything happened while it was away.
+            ep.Deliver(Message.Version(_seq, Epoch, _store?.Journal.LastUnix ?? 0, _store?.Journal.LastAuthor ?? "").Encode());
             ep.Deliver(Message.SyncBegin(_seq).Encode());
             foreach (var line in SnapshotAsWire(_doc))
                 ep.Deliver(Message.SyncObj(line).Encode());
             if (_world is not null)                                   // replay terrain / material / gameplay too
                 foreach (var op in _world.SnapshotOps())
                     ep.Deliver(Message.SyncObj(op).Encode());
+            // The level files by name and hash only. Tiles and bakes run to hundreds of MB; an editor already has
+            // most of them in its own archive and fetches just the ones that differ (FILEGET).
+            foreach (var (path, hash, size, fseq) in FileList())
+                ep.Deliver(Message.FileInfo(fseq, hash, size, SyncKeys.EscapePath(path)).Encode());
             ep.Deliver(Message.SyncEnd().Encode());
 
             // A fresh central relay (started empty) has no canonical state, so the FIRST client to connect is
@@ -199,16 +245,69 @@ public sealed class RelayServer
                     var payload = m.Payload;
                     int pv = payload.IndexOf(' ');
                     string verb = pv < 0 ? payload : payload[..pv];
+                    bool isFile = verb == "FILE";
                     try
                     {
                         if (verb is "ADD" or "MOVE" or "ROT" or "SCALE" or "DEL" or "TPL") EditWire.Parse(payload).Apply(_doc);
-                        else _world?.ApplyOp(payload);
+                        else if (isFile && !StoreFileLocked(payload, seq)) { --_seq; break; }   // refused: not kept, not passed on
+                        else if (!isFile) _world?.ApplyOp(payload);
                     }
-                    catch { /* malformed op: drop, do not advance state */ }
-                    // Rebroadcast in canonical order to everyone, including the sender (acts as ack/ordering).
-                    BroadcastLocked(Message.Op(seq, m.Args[1], long.Parse(m.Args[2]), payload).Encode(), except: null);
+                    catch { if (isFile) { --_seq; break; } /* malformed op: drop, do not advance state */ }
+                    string author = _names.TryGetValue(clientId, out var who) ? who : clientId;
+                    try { _store?.Journal.Add(seq, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), author, SyncKeys.KeysOf(payload)); } catch { }
+                    // Rebroadcast in canonical order to everyone, including the sender (acts as ack/ordering). A
+                    // FILE is the exception: it can be a megabyte of tile, and the sender already has it - it gets a
+                    // one-line receipt instead, so its copy of the server's file list knows the server has it now.
+                    BroadcastLocked(Message.Op(seq, m.Args[1], long.Parse(m.Args[2]), payload).Encode(), except: isFile ? clientId : null);
+                    if (isFile && SyncKeys.TryParseFileOp(payload, out var frel, out var fbytes) && _clients.TryGetValue(clientId, out var fsender))
+                        fsender.Deliver(Message.FileInfo(seq, SyncKeys.Hash(fbytes), fbytes.LongLength, SyncKeys.EscapePath(frel)).Encode());
                 }
                 break;
+
+            case MsgType.History:
+                lock (_gate)
+                {
+                    if (!_clients.TryGetValue(clientId, out var hep)) break;
+                    long since = long.Parse(m.Args[0]);
+                    bool complete = true;
+                    var list = _store?.Journal.Since(since, out complete) ?? new List<ChangeJournal.Contribution>();
+                    if (_store is null) complete = since >= _seq;
+                    hep.Deliver(Message.Changes(since, _seq, complete, ChangeJournal.Encode(list)).Encode());
+                }
+                break;
+
+            case MsgType.FileGet:
+                lock (_gate)
+                {
+                    if (!_clients.ContainsKey(clientId)) break;
+                    if (!_fileSends.TryGetValue(clientId, out var q)) _fileSends[clientId] = q = new Queue<string>();
+                    q.Enqueue(SyncKeys.UnescapePath(m.Args[0]));
+                }
+                break;
+
+            case MsgType.Baseline:
+            {
+                var builder = BuildBaseline;
+                if (builder is null)
+                {
+                    lock (_gate)
+                        if (_clients.TryGetValue(clientId, out var nb)) nb.Deliver(Message.BaselineFail("this server cannot describe the map's starting point").Encode());
+                    break;
+                }
+                var tb = new Thread(() =>
+                {
+                    string? payload = null, why = null;
+                    try { payload = builder(); if (payload is null) why = "this map has no base archive on the server"; }
+                    catch (Exception ex) { why = ex.Message; }
+                    lock (_gate)
+                    {
+                        if (!_clients.TryGetValue(clientId, out var bep)) return;
+                        bep.Deliver(payload is not null ? Message.BaselineData(payload).Encode() : Message.BaselineFail(why ?? "failed").Encode());
+                    }
+                }) { IsBackground = true, Name = "relay-baseline" };
+                tb.Start();
+                break;
+            }
 
             case MsgType.Presence:
                 // Ephemeral; relay to others, never touches the document.
@@ -316,6 +415,20 @@ public sealed class RelayServer
     // thousands of chunks and holding the relay's only lock across them would stall every edit in the session.
     private readonly Dictionary<string, Send> _pendingSends = new();
 
+    // Level files a client asked for, one queue per client, walked out a file per pump pass for the same reason.
+    private readonly Dictionary<string, Queue<string>> _fileSends = new();
+
+    /// <summary>Keep a level file someone sent. The path came off the network and is checked by the store before
+    /// it goes anywhere near the disk; a file that fails the check is dropped rather than half-kept.</summary>
+    private bool StoreFileLocked(string payload, long seq)
+    {
+        if (!SyncKeys.TryParseFileOp(payload, out var rel, out var bytes)) return false;
+        if (SyncKeys.IsStructuredEntry(rel) || !FileStore.IsSafeRelative(rel)) return false;
+        if (_store is not null) return _store.Files.Put(rel, bytes, seq);
+        _memFiles[rel] = (bytes, SyncKeys.Hash(bytes), seq);
+        return true;
+    }
+
     /// <summary>One transfer in flight to one client. The path is carried because a client may be pulling an
     /// exported archive rather than the pinned base, and those are different files.</summary>
     private sealed class Send
@@ -343,10 +456,29 @@ public sealed class RelayServer
     /// service loop; returns the number of clients still receiving, so an idle relay does no work.</summary>
     public int PumpBaseSends()
     {
+        // One requested level file per client per pass, read outside the lock.
+        List<(IClientEndpoint Ep, string Path)> files = new();
+        lock (_gate)
+        {
+            foreach (var kv in _fileSends.ToList())
+            {
+                if (!_clients.TryGetValue(kv.Key, out var fep) || kv.Value.Count == 0) { _fileSends.Remove(kv.Key); continue; }
+                files.Add((fep, kv.Value.Dequeue()));
+            }
+        }
+        foreach (var (fep, path) in files)
+        {
+            var bytes = ReadFile(path);
+            try { fep.Deliver(Message.FileData(SyncKeys.EscapePath(path), bytes is null ? "-" : Convert.ToBase64String(bytes)).Encode()); }
+            catch { }
+        }
+        int fileWork;
+        lock (_gate) fileWork = _fileSends.Sum(kv => kv.Value.Count);
+
         List<(IClientEndpoint Ep, string Fp, string Path, int Index)> work = new();
         lock (_gate)
         {
-            if (_pendingSends.Count == 0) return 0;
+            if (_pendingSends.Count == 0) return fileWork;
             foreach (var kv in _pendingSends.ToList())
                 if (_clients.TryGetValue(kv.Key, out var ep)) work.Add((ep, kv.Value.Fingerprint, kv.Value.Path, kv.Value.Index));
                 else _pendingSends.Remove(kv.Key);
@@ -369,7 +501,7 @@ public sealed class RelayServer
             }
             catch { lock (_gate) _pendingSends.Remove(ep.ClientId); }
         }
-        lock (_gate) return _pendingSends.Count;
+        lock (_gate) return _pendingSends.Count + _fileSends.Sum(kv => kv.Value.Count);
     }
 
     /// <summary>Decide what to tell a client that has just said what archive it is standing on.</summary>
