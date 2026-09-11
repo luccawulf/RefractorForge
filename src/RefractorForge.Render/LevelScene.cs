@@ -295,6 +295,86 @@ public sealed class LevelScene
         return tris;
     }
 
+    /// <summary>
+    /// The same triangles, plus what colour each one REFLECTS - which is the difference between an occlusion
+    /// pass and indirect light. A bounce off a red wall has to arrive red, and visibility alone cannot say that.
+    ///
+    /// <para>A part's albedo is the mean of its diffuse texture, computed once per part rather than per triangle
+    /// and never per ray: the bounce integral is already hundreds of rays per texel, and sampling a texture at
+    /// the hit point would multiply that cost for a term that is low-frequency by nature. A part with no resolved
+    /// texture falls back to its material colour.</para>
+    ///
+    /// <para>Values are LINEAR. Texture bytes are sRGB-ish, so they are de-gamma'd on the way in; averaging
+    /// sRGB bytes directly would make every bounce noticeably too bright, which is the classic way a
+    /// gamma-incorrect bake announces itself.</para>
+    /// </summary>
+    public static (List<(Vector3 A, Vector3 B, Vector3 C)> Tris, List<Vector3> Albedo) ObjectTrianglesShaded(
+        StaticObjectsFile? objs, MeshLibrary? meshes, bool solidOnly = false)
+    {
+        var tris = new List<(Vector3, Vector3, Vector3)>();
+        var albedo = new List<Vector3>();
+        if (objs is null || meshes is null) return (tris, albedo);
+        var meanCache = new Dictionary<MeshLibrary.MaterialPart, Vector3>();
+
+        foreach (var o in objs.Objects)
+        {
+            var meshName = meshes.LodGeometryNames(o.Template).FirstOrDefault();
+            if (meshName is null || !meshes.TryGet(meshName, out var m)) continue;
+            var world = MeshWorld(o);
+            var pos = m.Positions;
+            foreach (var part in m.Parts)
+            {
+                if (part.Foliage || part.Blend) continue;
+                if (solidOnly && part.AlphaTest) continue;
+                if (!meanCache.TryGetValue(part, out var col)) meanCache[part] = col = MeanAlbedo(part);
+                var idx = part.Indices;
+                for (int t = 0; t + 2 < idx.Length; t += 3)
+                {
+                    int a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                    if ((uint)a >= (uint)pos.Length || (uint)b >= (uint)pos.Length || (uint)c >= (uint)pos.Length) continue;
+                    tris.Add((Vector3.Transform(pos[a], world),
+                              Vector3.Transform(pos[b], world),
+                              Vector3.Transform(pos[c], world)));
+                    albedo.Add(col);
+                }
+            }
+        }
+        return (tris, albedo);
+    }
+
+    /// <summary>A material part's average reflectance, linear 0..1. Subsampled - a few thousand texels settle a
+    /// mean to far better than a bounce needs, and some of these textures are 1024 square.</summary>
+    private static Vector3 MeanAlbedo(MeshLibrary.MaterialPart part)
+    {
+        var tex = part.Texture;
+        if (tex is null || tex.Width <= 0 || tex.Height <= 0)
+            return Clamp01(part.Color);
+
+        int step = Math.Max(1, (int)MathF.Sqrt(tex.Width * (float)tex.Height / 4096f));
+        double r = 0, g = 0, b = 0; long n = 0;
+        for (int y = 0; y < tex.Height; y += step)
+            for (int x = 0; x < tex.Width; x += step)
+            {
+                int i = (y * tex.Width + x) * 4;
+                // Alpha-tested parts: a fully transparent texel contributes no colour, only a hole.
+                if (part.AlphaTest && tex.Rgba[i + 3] < 128) continue;
+                r += SrgbToLinear(tex.Rgba[i]); g += SrgbToLinear(tex.Rgba[i + 1]); b += SrgbToLinear(tex.Rgba[i + 2]);
+                n++;
+            }
+        if (n == 0) return Clamp01(part.Color);
+        // Real surfaces do not reflect everything; capping keeps a bright texture from turning a bounce into a
+        // light source and letting energy grow with each extra bounce.
+        return Vector3.Min(new Vector3((float)(r / n), (float)(g / n), (float)(b / n)), new Vector3(0.9f));
+    }
+
+    private static Vector3 Clamp01(Vector3 v) => Vector3.Clamp(v, Vector3.Zero, Vector3.One);
+
+    private static float SrgbToLinear(byte v)
+    {
+        float c = v / 255f;
+        return c <= 0.04045f ? c / 12.92f : MathF.Pow((c + 0.055f) / 1.055f, 2.4f);
+    }
+
     /// <summary>Small ground marker (3 m cube) for mesh-less / invisible gameplay objects.</summary>
     private static Matrix4x4 MarkerWorld(StaticObject o)
     {

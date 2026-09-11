@@ -263,11 +263,32 @@ likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' slider
     retail BFV level) is what a shadowed texel keeps. The bake writes exactly that: 1 where the sun reaches the
     surface, 0 where the terrain **or the object itself** is in the way (ceilings under roofs, bunker interiors),
     plus your placed lights as extra visibility. The viewport draws the same formula.
-  - Not every mesh can carry one. BfVietnam's props, sandbags, clutter and small walls ship the lightmap-UV slot
-    *empty* (0,0 on every vertex; the game's own generator unwraps those itself). The bake skips them and says how
-    many: they stay sun-lit in the editor and in the game, and a placed light cannot reach them - only the pool
-    on the ground under them shows. Buildings, huts, bunkers, the big walls and the tunnel meshes carry real
-    unwraps and take the lights.
+  - **Lightmap quality** (Lighting panel): **Draft** (1 sample, 256 px), **Good** (2×2, 512 px), **High** (3×3,
+    1024 px - the engine's limit; 2048 crashes the game) and **Ultra**, an offline-renderer bake at the same 1024 px:
+    a **soft sun** (the sun is a disc, so a shadow is sharp where it touches and widens with distance), **ambient
+    occlusion** (**Contact shadow**), sky-weighted **Shadow fill** so a shadow is not pure black however open it
+    is, one bounce of **coloured indirect light** (real colour in BF1942; BfVietnam's shader reads one channel, so
+    there it is brightness only) and a denoiser that stops at edges. **Sun size** 0.53° is the real sun; larger
+    reads as haze, and around 1-1.5° is a good start for interiors lit through a window. Ultra takes minutes per
+    object on the CPU - **Bake selected only (preview)** bakes just the selected object and keeps every other map.
+  - **Bake on the GPU** runs Ultra's rays on a dedicated graphics card (OpenGL 4.3). It is off until **Test GPU**
+    has baked a small scene on the card and on the CPU and found them to agree; the result line shows the card,
+    the speed-up and how far apart they were. It only runs on a *dedicated* card: on a machine with two GPUs,
+    Windows starts the editor on the integrated one unless **RefractorForge.exe** is set to *High performance* in
+    Windows Settings ▸ System ▸ Display ▸ Graphics (or the NVIDIA Control Panel), and the panel says so. Placed
+    lamps and the Draft/Good/High tiers stay on the CPU; if anything goes wrong mid-bake the rest of it finishes on
+    the CPU.
+  - Not every mesh can carry a lightmap. Most of BfVietnam's props, sandbags, clutter and small walls - and nine
+    in ten of BF1942's meshes - have no lightmap channel, or ship it *empty* (0,0 on every vertex). The engine has
+    no way to make one: its generator needs exporter `.samples` files that ship in no archive. The bake skips
+    them and says how many: they stay sun-lit in the editor and in the game, and a placed light cannot reach them.
+    Buildings, huts, bunkers, the big walls and the tunnel meshes carry real unwraps and take the lights.
+  - **Make selected object lightmap-ready** gives the selected object one: it unwraps the mesh (filling an empty
+    slot where there is one, otherwise widening the vertex to the 40-byte layout that both games' own lightmapped
+    meshes use) and writes the copy into *this level's* archive - `O_Sandbags_m1` becomes
+    `StandardMesh/O_Sandbags_lm_m1.sm` - with a new template pointing at it, so nothing outside the map changes.
+    **Not yet confirmed in game** - do it to one object, save, and check it draws and takes its bake before doing
+    it to many.
   - A light placed *after* a bake still shows on a lightmapped object in the viewport (combined by maximum with
     the map, so a light that is already baked is not doubled); bake again to ship it.
   - The files go out the way the game files them: one map per **LOD mesh** (`O_HueHouse_B_M1_<x>-<y>-<z>.tga`

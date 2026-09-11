@@ -37,6 +37,25 @@ public sealed class SmMaterial
     public float[]? PlanarExtra { get; init; }
     /// <summary>Triangles as vertex-index triples (already wound for engine display).</summary>
     public (int A, int B, int C)[] Faces { get; init; } = Array.Empty<(int, int, int)>();
+
+    /// <summary>The 12 bytes the reader skips after the material's name (zero on every retail mesh, but kept
+    /// verbatim so a rewrite reproduces them rather than assuming them).</summary>
+    public byte[] HeaderUnknown12 { get; init; } = new byte[12];
+
+    /// <summary>The index buffer EXACTLY as stored - <see cref="NumFaceValues"/> u16 values, before any winding
+    /// flip or strip expansion. <see cref="Faces"/> is a lossy view of this: a strip is expanded naively and a
+    /// triangle list is reversed. A rewriter must emit THESE, remapped, or a strip mesh is silently rebuilt wrong.</summary>
+    public ushort[] RawIndices { get; init; } = Array.Empty<ushort>();
+
+    /// <summary>Absolute file offset of this material's vertex region (<see cref="NumVertices"/> x
+    /// <see cref="VertexByteSize"/> bytes, whether the layout is interleaved or planar).</summary>
+    public int VertexDataOffset { get; init; }
+
+    /// <summary>Absolute file offset of this material's index region (<see cref="NumFaceValues"/> x u16).</summary>
+    public int IndexDataOffset { get; init; }
+
+    /// <summary>Bytes in the vertex region: <c>NumVertices * VertexByteSize</c>.</summary>
+    public int VertexDataLength => NumVertices * (int)VertexByteSize;
 }
 
 /// <summary>
@@ -97,11 +116,13 @@ public sealed class StandardMesh
     {
         int p = 0;
         uint version = U32(buf, ref p);
-        p += 4; // unknown (0,0,0,0)
+        var headerUnknown4 = buf.Slice(p, 4).ToArray();   // unknown (0,0,0,0) - kept so a rewrite reproduces it
+        p += 4;
         var bbox = new float[6];
         for (int i = 0; i < 6; i++) bbox[i] = F32(buf, ref p);
 
-        if (version == 10) p += 1;            // qflag (u8)
+        byte qflag = 0;
+        if (version == 10) { qflag = buf[p]; p += 1; }   // qflag (u8) - see the QFlag property
         else if (version != 9) throw new InvalidDataException($"Unexpected .sm version {version}.");
 
         int numCol = (int)U32(buf, ref p);
@@ -120,19 +141,20 @@ public sealed class StandardMesh
             int numMat = (int)U32(buf, ref p);
 
             // Pass 1: all material headers.
-            var hdrs = new (string name, uint rt, uint vf, uint vbs, int nv, int nfv, uint ms)[numMat];
+            var hdrs = new (string name, uint rt, uint vf, uint vbs, int nv, int nfv, uint ms, byte[] unk12)[numMat];
             for (int m = 0; m < numMat; m++)
             {
                 int nlen = (int)U32(buf, ref p);
                 string name = Encoding.Latin1.GetString(buf.Slice(p, nlen)); p += nlen;
-                p += 12;                                   // unknown (12 bytes, 0)
+                var unk12 = buf.Slice(p, 12).ToArray();    // unknown (12 bytes, 0)
+                p += 12;
                 uint rt  = U32(buf, ref p);
                 uint vf  = U32(buf, ref p);
                 uint vbs = U32(buf, ref p);
                 int nv   = (int)U32(buf, ref p);
                 int nfv  = (int)U32(buf, ref p);
                 uint ms  = U32(buf, ref p);
-                hdrs[m] = (name, rt, vf, vbs, nv, nfv, ms);
+                hdrs[m] = (name, rt, vf, vbs, nv, nfv, ms, unk12);
             }
 
             // Pass 2: vertex + face data for each material.
@@ -159,6 +181,7 @@ public sealed class StandardMesh
                 // confirmed against real meshes (French_Barn_Lrg_M1 40B, O_BurntHut01_M1 64B). Reading it is what makes
                 // BFV object lightmaps work.
                 bool hasLm = extra >= 8;
+                int vertexDataOffset = p;                  // where the whole nv*vbs region starts
                 for (int v = 0; v < h.nv; v++)
                 {
                     float vx = F32(buf, ref p), vy = F32(buf, ref p), vz = F32(buf, ref p);
@@ -183,8 +206,10 @@ public sealed class StandardMesh
                         for (int v = 0; v < h.nv; v++) lmuvs[v] = (planarExtra[v * fpv], planarExtra[v * fpv + 1]);
                 }
 
+                int indexDataOffset = p;
                 var fv = new int[h.nfv];
-                for (int i = 0; i < h.nfv; i++) fv[i] = U16(buf, ref p);
+                var rawIdx = new ushort[h.nfv];
+                for (int i = 0; i < h.nfv; i++) { rawIdx[i] = (ushort)U16(buf, ref p); fv[i] = rawIdx[i]; }
 
                 List<(int, int, int)> faces;
                 if (h.rt == 5)                              // triangle strip (naive expansion)
@@ -206,6 +231,8 @@ public sealed class StandardMesh
                     NumVertices = h.nv, NumFaceValues = h.nfv, MaterialSettings = h.ms,
                     Vertices = verts, Normals = norms, Uvs = uvs, Faces = faces.ToArray(),
                     LightmapUvs = lmuvs, HasLightmapUv = hasLm, PlanarExtra = planarExtra,
+                    HeaderUnknown12 = h.unk12, RawIndices = rawIdx,
+                    VertexDataOffset = vertexDataOffset, IndexDataOffset = indexDataOffset,
                 });
             }
             lods.Add(mats);
@@ -218,6 +245,7 @@ public sealed class StandardMesh
         // this shape simply has no shadow to report.
         ShadowMesh? shadow = null;
         int trailerLen = 0;
+        int trailerOffset = p;                 // everything from here on is copied verbatim by a rewrite
         try
         {
             int q = p;
@@ -260,6 +288,7 @@ public sealed class StandardMesh
         {
             Version = version, BoundingBox = bbox, NumCollisionMeshes = numCol, CollisionSections = col,
             NumLods = numLods, Lods = lods, Consumed = p, Total = buf.Length, Shadow = shadow, TrailerLength = trailerLen,
+            HeaderUnknown4 = headerUnknown4, QFlag = qflag, TrailerOffset = trailerOffset,
         };
     }
 
@@ -271,6 +300,23 @@ public sealed class StandardMesh
     public ShadowMesh? Shadow { get; private init; }
     /// <summary>The size the file declares for its portal chunk after the shadow block (0 on nearly every mesh).</summary>
     public int TrailerLength { get; private init; }
+
+    /// <summary>The 4 bytes between the version and the bounding box (zero everywhere, kept for a loss-less rewrite).</summary>
+    public byte[] HeaderUnknown4 { get; private init; } = new byte[4];
+
+    /// <summary>
+    /// The version-10 <c>qflag</c> byte. MEASURED across both retail corpora (BfVietnam 1,997 meshes, BF1942 1,445):
+    /// it is 1 exactly when the mesh carries a REAL lightmap unwrap, not merely when it owns the UV slot. 227/227
+    /// BfVietnam and 144/144 BF1942 unwrapped meshes set it, and of the 452 BfVietnam meshes that own the slot with
+    /// (0,0) on every vertex, 451 leave it 0. So writing an unwrap into a mesh means writing this 1 as well.
+    /// (StandardMeshWriter called it "declares a lightmap channel" - close, but the channel is declared by
+    /// <see cref="SmMaterial.VertexByteSize"/>; this declares that the channel has something in it.)
+    /// </summary>
+    public byte QFlag { get; private init; }
+
+    /// <summary>Absolute offset of everything after the LODs - the shadow block and the portal chunk. A rewrite
+    /// copies from here to the end verbatim, which is what keeps those (partly undecoded) sections byte-exact.</summary>
+    public int TrailerOffset { get; private init; }
 
     /// <summary>
     /// Parse without throwing. Returns <c>false</c> for malformed input so a single bad asset

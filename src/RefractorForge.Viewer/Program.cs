@@ -731,10 +731,47 @@ bool showTunnels = false;         // the Tunnels (BFV 1.2) window
 // surface, and a ceiling on any one map. The bake is pure CPU across every core, and the cost is roughly
 // samples squared times the texel count, so the top setting is minutes rather than seconds on a big map - which
 // is why it runs in the background behind a progress bar instead of freezing the editor.
-int lmQuality = 2;                 // 0 draft, 1 good, 2 high - and High is the ceiling, see ApplyLightmapQuality
+int lmQuality = 2;                 // 0 draft, 1 good, 2 high, 3 ultra - see ApplyLightmapQuality
 int lmBakeSamples = 3;
 float lmTexelsPerMetre = 40f;
 int lmBakeMaxSize = 1024;
+// The offline-renderer terms, all off below Ultra so the three familiar tiers bake exactly what they always did.
+// These are the difference between a shadow mask and something that looks rendered: a sun with real angular size
+// (so shadows have a penumbra), sky visibility (so creases and undersides darken), a little sun-coloured fill in
+// the shadows so that occlusion is visible there at all, path-traced bounce, and a denoiser to pay for it.
+bool lmAdvanced = false;
+float lmSunAngleDeg = 2.5f;        // MEASURED default - see below, not the physical 0.53
+// The sun is really 0.53 degrees across, and that is the wrong default here. Penumbra width is roughly
+// distance-to-occluder x tan(angle), so at 0.53 a shadow edge 4 m from the wall casting it spreads about
+// 6 cm - which at the 30 texels/m these maps actually bake at is TWO TEXELS, and under one texel on the
+// 256 px maps that are 68% of retail. Physically right, visually identical to the hard shadow it replaces.
+// Measured at 32 texels/m with a 4 m occluder distance: 0.53 deg = 2 texels, 1 = 4, 2 = 7, 4 = 14, 8 = 29.
+// 2.5 gives about 9 - a shadow that is still sharp where it touches and clearly soft further out, which is
+// the character retail's own baked maps have. Set it to 0.53 for physical accuracy, higher for haze.
+int lmSunSamples = 1;
+int lmSkySamples = 0;
+float lmAoRadius = 2.5f;           // metres; 0 = unbounded sky visibility
+float lmAoStrength = 0.6f;
+float lmSkyFill = 0.12f;
+int lmBounceSamples = 0;
+int lmBounceDepth = 1;
+int lmDenoise = 0;
+RefractorForge.Render.RayScene? lmRayScene = null;   // the level as a BVH, rebuilt per bake
+// The GPU lightmap shader. Created only when someone asks for it - the Test button or the checkbox - so a user who
+// never touches it never runs compute-shader code. It is OFF until its self-test passes on this machine: the kernel's
+// bookkeeping is proven on the CPU, but its arithmetic is the card's own and has to be measured on the card.
+RefractorForge.Viewer.GpuLightmapShader? gpuLm = null;
+System.Threading.Tasks.Task<(RefractorForge.Render.LightmapGpuSelfTest.Comparison Cmp, double CpuS, double GpuS)>? gpuTestTask = null;
+string gpuTestResult = "";
+bool gpuTestPassed = false;   // the checkbox can only switch the GPU on once the self-test has passed on this card
+// A preview bake covers only the SELECTED objects. Judging a lighting setting should not cost a whole map: at
+// Ultra a full bake is tens of minutes, and nobody tunes a slider on an hour-long feedback loop. A preview must
+// therefore also never DISCARD the maps a full bake already produced - it adds to them.
+bool lmSelectedOnly = false;
+// Progress measured in TEXELS, not in objects. Object cost spans a factor of 256 - a 1024px map is that much
+// more work than a 64px one - so counting finished objects gives an estimate that swings wildly early on and
+// reads as "this will take an hour" while it is chewing through the big buildings first.
+long lmWorkDone = 0, lmWorkTotal = 0;
 // A bake in flight: the worker, its progress, and everything the finish step needs back on the GL thread.
 bool lmBaking = false;
 int lmDone = 0, lmTotal = 0;
@@ -7399,18 +7436,50 @@ int LightmapSizeFor(MeshLibrary.Mesh mesh)
 // size is proven; anything above it is not a frontier worth revisiting.
 void ApplyLightmapQuality()
 {
-    lmQuality = Math.Clamp(lmQuality, 0, 2);
-    // These are the settings that produced the reference bake the user confirmed looks good AND loads: measured
-    // back off that archive at median 10.9 texels/m, p90 44.3, with 133 maps at 1024px and 161.8 MB of lightmap
-    // surface in total. A previous attempt to "keep the bake inside a texture budget" (32 MB, sizes capped) was
-    // based on a wrong diagnosis and simply made every map coarse - nothing above 256px. Do not reintroduce it
-    // without evidence that texture memory is actually the constraint; 161.8 MB demonstrably is not too much.
-    (lmBakeSamples, lmTexelsPerMetre, lmBakeMaxSize) = lmQuality switch
-    {
-        0 => (1, 16f, 256),
-        1 => (2, 24f, 512),
-        _ => (3, 40f, 1024),
-    };
+    // Clamp against the TIER COUNT, never a literal. A literal 2 here is what made the Ultra tier unselectable:
+    // picking it snapped straight back to High, so the option looked broken and every bake quietly ran at the old
+    // settings. The tier table now lives in LightmapQuality, where it is covered by tests.
+    lmQuality = Math.Clamp(lmQuality, 0, RefractorForge.Render.LightmapQuality.Count - 1);
+    var q = RefractorForge.Render.LightmapQuality.For(lmQuality);
+
+    // Draft / Good / High are exactly what they have always been - the settings that produced the reference bake
+    // the user confirmed looks right AND loads. A previous attempt to "keep the bake inside a texture budget"
+    // (32 MB, sizes capped) came from a wrong diagnosis and simply made every map coarse; do not reintroduce it
+    // without evidence that texture memory is actually the constraint. 161.8 MB demonstrably is not too much.
+    lmBakeSamples = q.SubSamples;
+    lmTexelsPerMetre = q.TexelsPerMetre;
+    lmBakeMaxSize = q.MaxSize;
+
+    // ULTRA is the offline tier: everything an offline renderer does that this format can actually carry. Every
+    // term stays OFF for the other three, so no existing map changes.
+    lmAdvanced = q.Advanced;
+    lmSunSamples = q.SunSamples;
+    lmSkySamples = q.SkySamples;
+    lmBounceSamples = q.BounceSamples;
+    lmDenoise = q.DenoiseIterations;
+}
+
+// The advanced terms as the baker wants them, or null for the three classic tiers - in which case the bake is
+// bit-for-bit what it has always been.
+RefractorForge.Render.ObjectLightmapBaker.Advanced? LightmapAdvanced()
+{
+    if (!lmAdvanced) return null;
+    var dif = env is not null
+        ? new Vector3(env.DiffuseColor.X, env.DiffuseColor.Y, env.DiffuseColor.Z)
+        : Vector3.One;
+    return new RefractorForge.Render.ObjectLightmapBaker.Advanced(
+        Scene: lmRayScene,
+        SunAngularDiameterDeg: lmSunAngleDeg,
+        SunSamples: lmSunSamples,
+        SkySamples: lmSkySamples,
+        AoRadius: lmAoRadius,
+        AoStrength: lmAoStrength,
+        SkyFill: lmSkyFill,
+        BounceSamples: lmBounceSamples,
+        BounceDepth: lmBounceDepth,
+        BounceDistance: 30f,
+        SunColour: dif,
+        DenoiseIterations: lmDenoise);
 }
 
 // The bake runs on a worker; this is what the user sees while it does. Also the pump that hands the finished
@@ -7438,7 +7507,10 @@ void LightmapBakeProgress()
     {
         Theme.Heading(Loc.T("Baking object lightmaps"));
         int done = System.Threading.Volatile.Read(ref lmDone);
-        float frac = lmTotal > 0 ? Math.Clamp(done / (float)lmTotal, 0f, 1f) : 0f;
+        long workDone = System.Threading.Interlocked.Read(ref lmWorkDone);
+        // Fraction of the WORK, not of the object count - see lmWorkTotal.
+        float frac = lmWorkTotal > 0 ? Math.Clamp(workDone / (float)lmWorkTotal, 0f, 1f)
+                   : lmTotal > 0 ? Math.Clamp(done / (float)lmTotal, 0f, 1f) : 0f;
         ImGui.ProgressBar(frac, new Vector2(-1f, 0f), $"{done} / {lmTotal}");
         double el = appClock - lmBakeStarted;
         // Only guess at a finish once enough of it is done for the guess to mean anything.
@@ -7463,8 +7535,10 @@ void BakeObjectLightmaps()
     // its own unwrap, so each is baked on its own mesh. Resolve serially (the library cache is not thread-safe).
     var jobs = new List<(StaticObject O, string MeshName, MeshLibrary.Mesh Mesh, bool Primary)>();
     int noSlot = 0;
-    foreach (var o in so.Objects)
+    for (int oi = 0; oi < so.Objects.Count; oi++)
     {
+        if (lmSelectedOnly && !multi.Contains(oi)) continue;
+        var o = so.Objects[oi];
         bool any = false; int k = 0;
         foreach (var meshName in meshLib.LodGeometryNames(o.Template))
         {
@@ -7473,7 +7547,13 @@ void BakeObjectLightmaps()
         }
         if (!any) noSlot++;
     }
-    if (jobs.Count == 0) { Toast(Loc.T("No placed objects with bakeable lightmap UVs on this map.")); return; }
+    if (jobs.Count == 0)
+    {
+        Toast(lmSelectedOnly
+            ? Loc.T("None of the selected objects has a lightmap unwrap to bake.")
+            : Loc.T("No placed objects with bakeable lightmap UVs on this map."));
+        return;
+    }
 
     // Bake on a worker so the editor keeps drawing and the progress bar can move. Everything the baker touches is
     // pure CPU - meshes already resolved, the heightmap, the light rig - and the GL-side finish happens back on
@@ -7487,6 +7567,18 @@ void BakeObjectLightmaps()
     // running; otherwise it is built here, on this thread, from meshes that are already resolved.
     if (rigRef is not null && lmNightScene is null && so is not null && meshLib is not null)
         lmNightScene = NightBake.Build(heightmap, cfg, LevelScene.ObjectTriangles(so, meshLib));
+    // The whole level as a BVH, with each triangle's albedo, so the advanced terms can see one building shadow
+    // another and can carry the colour of what a bounce came off. Built once per bake on this thread (the mesh
+    // library is not thread-safe) and then shared, unlocked, by every worker - the BVH is read-only in use.
+    lmRayScene = null;
+    if (lmAdvanced && so is not null && meshLib is not null)
+    {
+        var shaded = LevelScene.ObjectTrianglesShaded(so, meshLib);
+        lmRayScene = RayScene.Build(shaded.Tris, shaded.Albedo);
+    }
+    var advRef = LightmapAdvanced();
+    // The GPU only takes the Ultra tier's terms; anything else it hands straight back to the CPU itself.
+    RefractorForge.Render.ILightmapShader? gpuRef = gpuLm is { Enabled: true, Available: true } && advRef is not null ? gpuLm : null;
     if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); lmMoonLevel = 1f; }
     var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples; float moonRef = lmMoonLevel;
     bool uniformRef = nightUniformUnwrapless && nbStage == 2;
@@ -7494,6 +7586,8 @@ void BakeObjectLightmaps()
     var worlds = new Matrix4x4[jobs.Count];
     var sizes = new int[jobs.Count];
     for (int i = 0; i < jobs.Count; i++) { worlds[i] = LevelScene.MeshWorld(jobs[i].O); sizes[i] = LightmapSizeFor(jobs[i].Mesh); }
+    lmWorkDone = 0; lmWorkTotal = 0;
+    foreach (var sz in sizes) lmWorkTotal += (long)sz * sz;
 
     lmExisting = ExistingLightmapNames();
     lmJobs = jobs; lmResults = results; lmFallbackLit = fallbackLit; lmNoSlot = noSlot;
@@ -7511,14 +7605,17 @@ void BakeObjectLightmaps()
                 // Ambient 0: shadow goes to black in the file, as in every retail lightmap, and
                 // renderer.LMambientColor is what lifts it - in the game and in this viewport alike. Baking a
                 // floor in as well lit everything twice.
+                if (token.IsCancellationRequested) return;
                 results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
                     sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef,
-                    night: nightRef, colour: colourRef, lampSamples: lampRef, sunLevel: moonRef);
+                    night: nightRef, colour: colourRef, lampSamples: lampRef, sunLevel: moonRef,
+                    advanced: advRef, cancel: token, shader: gpuRef);
                 // No unwrap: the engine will read one texel, so give it the one value the surface averages to.
                 if (results[i] is null && uniformRef && nightRef is not null && rigRef is not null && jobMeshes[i].LightmapUvs is { Length: > 0 })
                     fallbackRgb[i] = NightBake.AverageLamp(nightRef, jobMeshes[i], worlds[i], rigRef,
                         new Vector3(sunV.X, sunV.Y, sunV.Z), moonRef, lampRef);
                 System.Threading.Interlocked.Increment(ref lmDone);
+                System.Threading.Interlocked.Add(ref lmWorkDone, (long)sizes[i] * sizes[i]);
             });
         }
         catch (OperationCanceledException) { }
@@ -7531,8 +7628,10 @@ void FinishObjectLightmapBake()
 {
     if (lmJobs is not { } jobs || lmResults is not { } results || so is null || meshLib is null) { lmBaking = false; return; }
     int noSlot = lmNoSlot;
-    var olm = new ObjectLightmaps();
-    bakedObjectLightmaps.Clear();
+    // A preview merges into what is already there. Clearing would throw away every map a full bake produced -
+    // and a level that loses lightmaps renders wrong, which is a failure this project has already shipped once.
+    var olm = lmSelectedOnly && objectLightmaps is not null ? objectLightmaps : new ObjectLightmaps();
+    if (!lmSelectedOnly) bakedObjectLightmaps.Clear();
     int baked = 0, noUnwrap = 0, lodMaps = 0, uniform = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
@@ -7575,7 +7674,7 @@ void FinishObjectLightmapBake()
     objectLightmaps = olm; objectLightmapsLoaded = true;
     sunOverride = false; showObjectLightmaps = true;     // turn off the dynamic-sun preview so the baked result shows
     glObjects?.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
-    string qName = lmQuality switch { 0 => "draft", 1 => "good", _ => "high" };
+    string qName = RefractorForge.Render.LightmapQuality.For(lmQuality).Name.ToLowerInvariant();
     Console.WriteLine($"Baked {baked} object lightmap(s) + {lodMaps} far-LOD map(s) from the editor sun at {qName} quality " +
                       $"({lmBakeSamples}x{lmBakeSamples} samples/texel, {lmTexelsPerMetre:0} texels/m, max {lmBakeMaxSize}px) " +
                       $"in {appClock - lmBakeStarted:0.0}s; {noUnwrap} mesh(es) have no lightmap unwrap and are left without a map " +
@@ -10385,6 +10484,135 @@ string? EnsureGlowTemplate(Vec3 colour, float size, float brightness)
         return built.Template;
     }
     catch (Exception ex) { Toast(Loc.T("Glow object failed: ") + ex.Message); return null; }
+}
+
+// Give the SELECTED object a lightmap-capable copy of its mesh, shipped inside this level.
+//
+// This is the whole of Part 2 in one button: unwrap the mesh, widen its vertex from 32 to 40 bytes so it has
+// somewhere to put a second UV set, write the patched .sm into the level's own archive, and point the object at
+// it by path. Roughly two thirds of BfVietnam's meshes and ninety percent of BF1942's have no lightmap channel
+// at all, so without this a bake can never reach them - and the engine has no way to make one either, since its
+// own generator needs exporter .samples files that ship in no archive.
+//
+// Deliberately ONE object at a time. Whether the engine actually draws a mesh whose vertex declaration we changed
+// is not established - both games ship meshes at exactly this declaration with real unwraps, which is why it is
+// the shape chosen, but that is not the same as "it will load THIS mesh after I rewrote it". Get one object
+// rendering in game before doing this to a map full of them.
+void PatchSelectedForLightmapping()
+{
+    if (so is null || meshLib is null || levelDir is null) { Toast(Loc.T("Open a level first.")); return; }
+    if (selected < 0 || selected >= so.Objects.Count) { Toast(Loc.T("Select an object first.")); return; }
+    var obj = so.Objects[selected];
+
+    string? meshName = meshLib.LodGeometryNames(obj.Template).FirstOrDefault();
+    if (meshName is null || !meshLib.TryGetMeshBytes(meshName, out _, out var smBytes))
+    { Toast(string.Format(Loc.T("Could not find the mesh file for {0}."), obj.Template)); return; }
+
+    if (RefractorForge.Formats.Con.LightmapMeshPatch.AlreadyPatched(meshName, pendingLevelFiles.Select(f => f.RelPath)))
+    { Toast(Loc.T("This level already has a lightmap-ready copy of that mesh.")); return; }
+
+    try
+    {
+        string? initText = PendingText("Init.con") ?? ReadLevelText("Init.con");
+        if (initText is null) { Toast(Loc.T("This level has no Init.con to register the object in.")); return; }
+        var (baseSub, levelName) = LevelIdentity();
+        meshLib.TryGetRsText(meshName, out _, out var rsText);
+
+        var built = RefractorForge.Formats.Con.LightmapMeshPatch.Build(
+            levelName, meshName, smBytes, rsText, baseSub, out var status);
+        if (built is null)
+        {
+            Toast(string.Format(Loc.T("{0} cannot be unwrapped ({1}) - nothing was written."), meshName, status.ToString()));
+            return;
+        }
+
+        foreach (var f in built.Files) QueueLevelFile(f.RelPath, f.Bytes);
+        BroadcastLevelFiles(built.Template, built.Files);
+
+        string? ocExisting = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
+        QueueLevelFile("Objects/objects.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(ocExisting, built.RunLine)));
+        QueueLevelFile("Init.con", System.Text.Encoding.Latin1.GetBytes(
+            RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub)));
+
+        // Show it straight away, with its new UVs - otherwise the object would keep drawing the unpatched mesh
+        // until the map was saved and reopened, and a bake done in between would be of the wrong geometry.
+        var sm = built.Files.First(f => f.RelPath.EndsWith(".sm", StringComparison.OrdinalIgnoreCase)).Bytes;
+        if (meshLib.TryBuildMeshFromSm(sm, rsText, out var newMesh)) meshLib.AddMesh(built.Template, newMesh);
+
+        obj.Template = built.Template;
+        SyncMarkers(); RebuildObjects(); UploadMarkers(); RebuildCatalog();
+
+        var d = built.Diagnostics;
+        Toast(string.Format(
+            Loc.T("{0} is now lightmap-ready as {1}: {2} charts, {3} to {4} vertices, bake at {5}px or larger. Save writes it into the level."),
+            meshName, built.Template, d.Charts, d.VerticesIn, d.VerticesOut, d.MinBakeSize));
+    }
+    catch (Exception ex) { Toast(Loc.T("Lightmap patch failed: ") + ex.Message); }
+}
+
+// Bake a small fixed scene on the CPU and on the GPU and measure how far apart they are. The kernel's data handling
+// is proven bit-for-bit by the test suite; this measures the one thing that cannot be - the card's own arithmetic.
+// Runs on a worker; the GPU half is serviced by gpuLm.Pump on this thread each frame.
+void StartGpuSelfTest()
+{
+    if (gpuTestTask is not null) return;
+    try { gpuLm ??= new RefractorForge.Viewer.GpuLightmapShader(gl); }
+    catch (Exception ex) { Toast(Loc.T("GPU lightmaps unavailable: ") + ex.Message); return; }
+    if (!gpuLm.Available) { Toast(gpuLm.Status); gpuTestResult = gpuLm.Status; return; }
+    var g = gpuLm;
+    gpuTestResult = Loc.T("Testing the GPU against the CPU...");
+    gpuTestTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        var scene = RefractorForge.Render.LightmapGpuSelfTest.Build();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var cpu = RefractorForge.Render.LightmapGpuSelfTest.Bake(scene, null)!;
+        double cpuS = sw.Elapsed.TotalSeconds;
+        long shaded0 = System.Threading.Interlocked.Read(ref g.SamplesShaded);
+        long fell0 = System.Threading.Interlocked.Read(ref g.SamplesFellBack);
+        sw.Restart();
+        // Through the Unproven view: the test is what decides whether the GPU is trusted, so it must not have to
+        // switch the GPU on to run - a real bake started meanwhile would pick it up untested.
+        var gpu = RefractorForge.Render.LightmapGpuSelfTest.Bake(scene, g.Unproven);
+        double gpuS = sw.Elapsed.TotalSeconds;
+        if (gpu is null) throw new InvalidOperationException(g.Status);
+        // Any of it shaded on the CPU instead - the render thread never collected it, or the GPU failed - and the
+        // comparison is partly the CPU against itself, which passes and proves nothing. Only a run done wholly on
+        // the card counts.
+        long fell = System.Threading.Interlocked.Read(ref g.SamplesFellBack) - fell0;
+        long shaded = System.Threading.Interlocked.Read(ref g.SamplesShaded) - shaded0;
+        if (fell > 0 || shaded == 0)
+            throw new InvalidOperationException(string.Format(Loc.T("{0} of {1} samples ran on the CPU instead of the GPU. {2}"),
+                                                              fell, fell + shaded, g.Status));
+        return (RefractorForge.Render.LightmapGpuSelfTest.Compare(cpu, gpu), cpuS, gpuS);
+    });
+}
+
+void GpuSelfTestPoll()
+{
+    if (gpuTestTask is not { IsCompleted: true } t) return;
+    gpuTestTask = null;
+    if (gpuLm is null) return;
+    if (t.IsFaulted || !gpuLm.Available)
+    {
+        gpuLm.Enabled = false;
+        gpuTestPassed = false;
+        gpuTestResult = Loc.T("GPU test failed: ") + (t.Exception?.GetBaseException().Message ?? gpuLm.Status);
+        Console.WriteLine(gpuTestResult);
+        Toast(gpuTestResult);
+        return;
+    }
+    var (cmp, cpuS, gpuS) = t.Result;
+    gpuTestPassed = cmp.Passed;
+    gpuLm.Enabled = cmp.Passed;
+    gpuTestResult = string.Format(
+        Loc.T("{0}: GPU {1:0.00}s vs CPU {2:0.00}s ({3:0.0}x). Difference: mean {4:0.00}, max {5}, {6:P1} of texels over 24."),
+        cmp.Passed ? Loc.T("PASSED") : Loc.T("FAILED"), gpuS, cpuS, cpuS / Math.Max(gpuS, 1e-6),
+        cmp.MeanAbs, cmp.Max, cmp.FractionOver24);
+    Console.WriteLine("GPU lightmap self-test: " + gpuTestResult + " on " + gpuLm.Status);
+    Toast(cmp.Passed
+        ? Loc.T("The GPU matches the CPU - Ultra bakes will now run on it.")
+        : Loc.T("The GPU does not match the CPU closely enough, so Ultra bakes stay on the CPU."));
 }
 
 void BrightenDialog()
@@ -14042,13 +14270,14 @@ void BuildUi()
                 // but that is not where anyone goes to start a bake.
                 if (ImGui.BeginMenu(Loc.TL("   Lightmap quality")))
                 {
-                    for (int q = 0; q < 3; q++)
+                    for (int q = 0; q < 4; q++)
                     {
                         string qLabel = q switch
                         {
                             0 => Loc.T("Draft - 1 sample, 256px max (fast)"),
                             1 => Loc.T("Good - 2x2, 512px max"),
-                            _ => Loc.T("High - 3x3, 1024px max (the engine's limit)"),
+                            2 => Loc.T("High - 3x3, 1024px max (the engine's limit)"),
+                            _ => Loc.T("Ultra - soft sun, ambient occlusion, bounce (minutes)"),
                         };
                         if (ImGui.MenuItem(qLabel, null, lmQuality == q)) { lmQuality = q; ApplyLightmapQuality(); }
                     }
@@ -14533,6 +14762,10 @@ void BuildUi()
     HelpWindow();
     ValidateModal();
     ExitPromptModal();
+    // GPU work happens here, on the render thread that owns the GL context, a slice at a time so the editor keeps
+    // drawing. A no-op when nothing is queued.
+    gpuLm?.Pump(12.0);
+    GpuSelfTestPoll();
     LightmapBakeProgress();
     ShadowBakeProgress();
     BrightenDialog();
@@ -17353,10 +17586,45 @@ void LightsPanel()
     Theme.Tip(Loc.T("Everything that is a lightmap: the ObjectLightMaps/*.tga the game reads for each placed\nobject (sun + placed lights, as brightness). Nothing here touches the terrain - the sun\nshadow and the ground bake are the separate process below."));
     ImGui.SetNextItemWidth(150f * uiScale);
     if (CboZ(Loc.TL("Lightmap quality"), ref lmQuality,
-             Loc.T("Draft (fast)") + "\0" + Loc.T("Good") + "\0" + Loc.T("High (engine limit)") + "\0"))
+             Loc.T("Draft (fast)") + "\0" + Loc.T("Good") + "\0" + Loc.T("High (engine limit)") + "\0"
+             + Loc.T("Ultra (offline: soft sun, AO, bounce)") + "\0"))
         ApplyLightmapQuality();
     Theme.Tip(Loc.T("How the object lightmaps are baked. Sub-samples per texel is what smooths a shadow edge -\none sample per texel is what makes a bake look jagged - and texels per metre is how much\ndetail a surface gets. High is the engine's ceiling; larger maps crash the game.\nThe bake runs in the background with a progress bar, so a long one is not a freeze."));
     Theme.Muted(string.Format(Loc.T("{0}x{0} samples per texel, {1:0} texels/m, up to {2}px"), lmBakeSamples, lmTexelsPerMetre, lmBakeMaxSize));
+    if (lmAdvanced)
+    {
+        Theme.Muted(string.Format(Loc.T("Sun {0} rays, sky {1}, bounce {2}, denoise x{3}"),
+                                  lmSunSamples, lmSkySamples, lmBounceSamples, lmDenoise));
+        ImGui.SetNextItemWidth(150f * uiScale);
+        SldF(Loc.TL("Sun size (deg)"), ref lmSunAngleDeg, 0f, 15f, "%.2f");
+        Theme.Tip(Loc.T("How wide the sun is in the sky. 0.53 is the real one, which makes a shadow sharp where it\ntouches and soft further out. Larger reads as haze or overcast. 0 gives the old hard shadow."));
+        ImGui.SetNextItemWidth(150f * uiScale);
+        SldF(Loc.TL("Contact shadow"), ref lmAoStrength, 0f, 1f, "%.2f");
+        Theme.Tip(Loc.T("Ambient occlusion: how much a crease or an overhang darkens the SUNLIT surface near it.\nIt cannot darken the engine's own ambient light, which is added after the lightmap is\napplied - that is what the shadow fill below is for."));
+        ImGui.SetNextItemWidth(150f * uiScale);
+        SldF(Loc.TL("Shadow fill"), ref lmSkyFill, 0f, 0.5f, "%.2f");
+        Theme.Tip(Loc.T("A little sun-coloured light in the shadows, scaled by how much sky the spot can see.\nWithout it a shadow is pure black however open it is, because the engine gives the map no\nseparate ambient channel to work with. This is what makes occlusion visible in shade."));
+        ImGui.Separator();
+        if (ImGui.Button(Loc.TL("Test GPU")) && gpuTestTask is null) StartGpuSelfTest();
+        ImGui.SameLine();
+        bool gpuOn = gpuLm is { Enabled: true, Available: true };
+        if (ImGui.Checkbox(Loc.TL("Bake on the GPU"), ref gpuOn))
+        {
+            if (!gpuOn) { if (gpuLm is not null) gpuLm.Enabled = false; }
+            else if (gpuTestPassed && gpuLm is { Available: true }) gpuLm.Enabled = true;
+            // Not proven on this card yet (never tested, or it failed): run the test, which switches it on if it passes.
+            // Ticking the box must never be a way round a failed test.
+            else if (gpuTestTask is null) StartGpuSelfTest();
+        }
+        Theme.Tip(Loc.T("Runs the Ultra bake's rays on the graphics card instead of the processor. The shader is checked\nagainst the CPU on your own card first - press Test - and only switched on if they agree.\nAnything the GPU cannot do (the plain tiers, placed lamps) still runs on the CPU automatically."));
+        if (gpuLm is not null || gpuTestResult.Length > 0)
+        {
+            ImGui.PushTextWrapPos(0f);
+            if (gpuLm is not null) Theme.Muted(gpuLm.Status);
+            if (gpuTestResult.Length > 0 && gpuTestResult != gpuLm?.Status) Theme.Muted(gpuTestResult);
+            ImGui.PopTextWrapPos();
+        }
+    }
     // Measured over all 35 retail BFV levels: 4,152 object lightmaps - 68% at 256px, 15% at 512, 1.6% at 1024
     // (Saigon68, Fall_of_Saigon, Cedar_Falls, Landing_Zone_Albany) and NONE larger. 2048 was tried and crashed
     // the game, so this is a real limit rather than a stylistic one.
@@ -17364,6 +17632,11 @@ void LightsPanel()
     if (ImGui.Button(Loc.TL("Bake Object Lightmaps")) && so is not null && meshLib is not null && heightmap is not null) BakeObjectLightmaps();
     ImGui.SameLine();
     if (ImGui.Button(Loc.TL("Unbake lightmaps")) && so is not null && meshLib is not null) UnbakeObjectLightmaps();
+    if (ImGui.Button(Loc.TL("Bake selected only (preview)")) && so is not null && meshLib is not null && heightmap is not null)
+    { lmSelectedOnly = true; BakeObjectLightmaps(); lmSelectedOnly = false; }
+    Theme.Tip(Loc.T("Bakes ONLY the objects you have selected, so a lighting setting can be judged in seconds instead of\nwaiting out a whole map. It ADDS to the lightmaps the level already has - it never clears them - so a\npreview is safe to run as often as you like. Bake the whole map once the settings look right."));
+    if (ImGui.Button(Loc.TL("Make selected object lightmap-ready"))) PatchSelectedForLightmapping();
+    Theme.Tip(Loc.T("Most meshes in both games have no lightmap channel at all, so a bake can never reach them.\nThis unwraps the selected object's mesh, widens its vertex to hold the second UV set, and ships\nthe patched copy inside THIS level - nothing outside the map changes. Do one object and look at\nit in game before doing a whole map: a changed vertex declaration is not proven to load."));
     Theme.Tip(Loc.T("Bake writes a lightmap per placed object (with these lights); Unbake queues fully lit ones\ninstead. Either way Save writes them, and the terrain shadow is left alone."));
 
     // ---- Sun shadows + terrain: the other process ----------------------------------------------------------------

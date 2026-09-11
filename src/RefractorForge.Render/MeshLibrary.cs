@@ -1535,7 +1535,37 @@ public sealed class MeshLibrary
 
         // Bind the matching .rs shader (level overrides win, else the archive shader next to the mesh).
         var shaders = LoadShaders(entry);
+        return BuildFromParsed(sm, shaders);
+    }
 
+    /// <summary>
+    /// Build a render-ready mesh from raw <c>.sm</c> bytes that are not in any archive - a mesh this session has
+    /// just rewritten, typically one the lightmap unwrapper has widened and given a second UV set. Without this
+    /// the editor could write such a mesh into the level but not SHOW it, and the object would go on drawing with
+    /// the unpatched geometry until the map was saved and reopened.
+    /// </summary>
+    /// <param name="rsText">The mesh's shader, or null for untextured material colours.</param>
+    public bool TryBuildMeshFromSm(byte[] smBytes, string? rsText, out Mesh mesh)
+    {
+        mesh = null!;
+        if (!StandardMesh.TryParse(smBytes, out var sm) || sm is null || sm.Lods.Count == 0 || sm.Lods[0].Count == 0)
+            return false;
+        RsShaderSet? shaders = null;
+        if (rsText is { Length: > 0 })
+        {
+            try { shaders = RsShaderSet.Parse(rsText); } catch { shaders = null; }
+        }
+        var built = BuildFromParsed(sm, shaders);
+        if (built is null) return false;
+        mesh = built;
+        return true;
+    }
+
+    /// <summary>The shared half of <see cref="BuildFromEntry"/>: flatten a parsed mesh's LOD0 into one vertex
+    /// array plus a material part per section. Extracted so a mesh built in memory takes exactly the same path an
+    /// archived one does - including the second UV set, which is the whole point of patching a mesh.</summary>
+    private Mesh? BuildFromParsed(StandardMesh sm, RsShaderSet? shaders)
+    {
         var pos = new List<Vector3>();
         var uvs = new List<System.Numerics.Vector2>();
         var lmuvs = new List<System.Numerics.Vector2>();
@@ -1747,6 +1777,22 @@ public sealed class MeshLibrary
     /// attached override folder), for tools that rewrite material bindings — e.g. the skybox face editor, which
     /// ships a level-side override .rs pointing a face at a different texture or a Bink movie. False when the
     /// mesh has no indexed .rs.</summary>
+    /// <summary>
+    /// The raw bytes of a mesh's <c>.sm</c>, as they sit in the archive - what a lightmap unwrap has to start
+    /// from, because the unwrapper rewrites the FILE and everything it must preserve (the collision BSP tails,
+    /// the shadow block, the portal chunk) lives in bytes this library never decodes.
+    /// </summary>
+    /// <param name="nameOrTemplate">A mesh name, or a placed template - resolved the same way the renderer
+    /// resolves geometry, so a caller can hand over either.</param>
+    public bool TryGetMeshBytes(string nameOrTemplate, out string entryName, out byte[] bytes)
+    {
+        entryName = ""; bytes = Array.Empty<byte>();
+        var entry = Resolve(nameOrTemplate) ?? (LodStem(nameOrTemplate) is { } stem ? Resolve(stem) : null);
+        if (entry is null) return false;
+        try { bytes = OwningArchive(entry).Read(entry); entryName = entry.Name; return true; }
+        catch { return false; }
+    }
+
     public bool TryGetRsText(string meshName, out string entryName, out string text)
     {
         entryName = ""; text = "";
