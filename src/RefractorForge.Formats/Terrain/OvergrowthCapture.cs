@@ -80,6 +80,27 @@ public static class OvergrowthCapture
     }
 
     /// <summary>
+    /// Every name the static template for an overgrowth geometry could plausibly be, best first, for the caller to
+    /// check against the templates the archives actually declare.
+    ///
+    /// Why a list and not one answer: a geometry name does not always carry the <c>_m1</c>/<c>_m2</c> part that
+    /// <see cref="StaticTemplateFor"/> rewrites. The overgrowth "F_Fern06" is the template "F_Fern06_M1", and
+    /// nothing in the name says so. Guessing wrong is not harmless - the name is written straight into
+    /// StaticObjects.con as <c>object.create</c>, and a template the game does not know is an "unknown
+    /// objectTemplate" error, two more parse errors for the position and rotation lines that follow it, and a tree
+    /// that never appears. One map shipped 56 of them.
+    /// </summary>
+    public static IEnumerable<string> StaticTemplateCandidates(string geometryName)
+    {
+        if (string.IsNullOrWhiteSpace(geometryName)) yield break;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primary = StaticTemplateFor(geometryName);
+        var stem = Regex.Replace(primary, @"_[mMlL]\d+$", "");
+        foreach (var c in new[] { primary, stem + "_M1", geometryName, stem })
+            if (!string.IsNullOrEmpty(c) && seen.Add(c)) yield return c;
+    }
+
+    /// <summary>
     /// Empty every <c>&lt;types&gt;</c> block in a <c>.wst</c>, leaving the file otherwise byte-identical.
     ///
     /// This is the other half of baking: with the trees now placed as static objects, the engine must stop

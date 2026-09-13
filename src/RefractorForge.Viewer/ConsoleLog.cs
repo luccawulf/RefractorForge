@@ -44,6 +44,10 @@ internal static class ConsoleLog
         catch { _file = null; }
 
         try { Console.SetOut(new TeeWriter(Console.Out)); } catch { }
+        // STDERR too. Only stdout used to be teed, so anything reported with Console.Error - including the save
+        // path's own "Save failed: ..." - went nowhere at all: the user saw no message and the log file held no
+        // trace, which is exactly what "it just doesn't save" looks like from the outside.
+        try { Console.SetError(new TeeWriter(Console.Error)); } catch { }
     }
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool AttachConsole(int dwProcessId);

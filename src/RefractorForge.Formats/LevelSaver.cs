@@ -296,11 +296,12 @@ public static class LevelSaver
         return leaf.Equals("refractorforge.game", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("refractorforge.json", System.StringComparison.OrdinalIgnoreCase)
             // Placed lights are authoring data. The engine has no concept of them - they reach the game only
-            // once baked into the lightmaps - so the sidecar must never be packed.
-            || leaf.Equals(Terrain.LightRig.FileName, System.StringComparison.OrdinalIgnoreCase)
+            // once baked into the lightmaps - so the sidecar must never be packed. A PACKED level keeps its
+            // sidecars beside the archive as <level>.<name>.json, so match that spelling too.
+            || LevelSidecar.IsNamed(leaf, Terrain.LightRig.FileName)
             // Object groups and review notes are editor-side too: the engine has no notion of either.
-            || leaf.Equals(Editing.ObjectGroups.FileName, System.StringComparison.OrdinalIgnoreCase)
-            || leaf.Equals(Editing.Annotations.FileName, System.StringComparison.OrdinalIgnoreCase)
+            || LevelSidecar.IsNamed(leaf, Editing.ObjectGroups.FileName)
+            || LevelSidecar.IsNamed(leaf, Editing.Annotations.FileName)
             || leaf.Equals("sound_debug.log", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("imgui.ini", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("Thumbs.db", System.StringComparison.OrdinalIgnoreCase)

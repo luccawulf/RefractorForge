@@ -105,6 +105,7 @@ public sealed class MeshLibrary
         EnsureAllTemplates();
         _memScripts.RemoveAll(s => s.Source.Equals(source, StringComparison.OrdinalIgnoreCase));
         _memScripts.Add((source, text));
+        _templatesByMeshStem = null;   // rebuilt from the geometry maps below on next use
         foreach (var t in ParseConTemplates(text))
         {
             if (t.Name.Length == 0) continue;
@@ -1021,6 +1022,44 @@ public sealed class MeshLibrary
     {
         EnsureAllTemplates();
         return _allTemplates is not null && _allTemplates.ContainsKey(template);
+    }
+
+    /// <summary>The template's name as its .con spells it (the registry is case-insensitive), or null when nothing
+    /// declares it. Exact, like <see cref="KnowsTemplate"/> - no LOD suffix is added or stripped.</summary>
+    public string? DeclaredTemplateName(string template)
+    {
+        EnsureAllTemplates();
+        return _allTemplates is not null && _allTemplates.TryGetValue(template, out var t) ? t.Name : null;
+    }
+
+    /// <summary>How many templates the loaded .con files declare. Zero means the registry cannot vouch for any name
+    /// (e.g. only a StandardMesh archive was opened), so a check against it would reject everything.</summary>
+    public int TemplateCount
+    {
+        get { EnsureAllTemplates(); return _allTemplates?.Count ?? 0; }
+    }
+
+    private Dictionary<string, List<string>>? _templatesByMeshStem;       // library stem -> templates drawing it (lazy)
+
+    /// <summary>The templates whose <c>ObjectTemplate.geometry</c> draws a mesh the Object Library lists under this
+    /// stem (<see cref="RefractorForge.Formats.Con.LibraryTemplate.DisplayName"/>): "O_USAmmo" -> USAmmobox, whose
+    /// geometry is O_USAmmo_M1.sm. For resolving a library entry whose template is named nothing like its mesh.</summary>
+    public IReadOnlyList<string> TemplatesDrawing(string meshStem)
+    {
+        EnsureObjectGeometry();
+        if (_templatesByMeshStem is null)
+        {
+            var idx = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (tpl, geom) in _objGeom!)
+            {
+                string file = _geomFile!.TryGetValue(geom, out var f) ? f : geom;
+                string stem = RefractorForge.Formats.Con.LibraryTemplate.DisplayName(Leaf(file));
+                if (!idx.TryGetValue(stem, out var list)) idx[stem] = list = new List<string>();
+                list.Add(tpl);
+            }
+            _templatesByMeshStem = idx;
+        }
+        return _templatesByMeshStem.TryGetValue(meshStem, out var hit) ? hit : Array.Empty<string>();
     }
 
     public TunnelInfo? TunnelInfoOf(string template)

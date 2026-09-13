@@ -33,7 +33,8 @@ public sealed class Annotations
 
     public List<Annotation> Notes { get; set; } = new();
 
-    public static string PathFor(string levelDir) => Path.Combine(levelDir, FileName);
+    /// <summary>Beside the archive for a packed level, in the folder otherwise - see <see cref="LevelSidecar"/>.</summary>
+    public static string PathFor(string levelDir) => LevelSidecar.PathFor(levelDir, FileName);
 
     public static Annotations Load(string levelDir)
     {
@@ -50,8 +51,7 @@ public sealed class Annotations
     {
         var p = PathFor(levelDir);
         if (Notes.Count == 0) { try { if (File.Exists(p)) File.Delete(p); } catch { } return; }
-        Directory.CreateDirectory(levelDir);
-        File.WriteAllText(p, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        LevelSidecar.Write(p, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     // ---- wire ----

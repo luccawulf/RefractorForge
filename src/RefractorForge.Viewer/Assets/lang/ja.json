@@ -1857,5 +1857,8 @@
  "{0} on the server": "サーバー上の {0}",
  "{0}: in step with the server - nothing new either way.": "{0}: サーバーと同期済み - どちらにも新しいものはありません。",
  "{0}: {1} change(s) - {2} - {3}": "{0}: {1} 件の変更 - {2} - {3}",
- "Sending your map's archive to the server, so others can open this map too.": "他の人もこのマップを開けるように、あなたのマップのアーカイブをサーバーへ送信しています。"
+ "Sending your map's archive to the server, so others can open this map too.": "他の人もこのマップを開けるように、あなたのマップのアーカイブをサーバーへ送信しています。",
+ "Save FAILED - nothing was written. See the Log window.": "保存に失敗しました - 何も書き込まれていません。ログウィンドウを確認してください。",
+ "Not placed: no loaded .con declares an object template for '{0}'.": "配置されませんでした: 読み込まれた .con に '{0}' のオブジェクトテンプレートを宣言しているものがありません。",
+ "Prefab '{0}' not stamped - no loaded .con declares: {1}": "プレハブ '{0}' は配置されませんでした - 読み込まれた .con に宣言がありません: {1}"
 }

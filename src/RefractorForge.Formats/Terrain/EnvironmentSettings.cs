@@ -53,6 +53,22 @@ public sealed class EnvironmentSettings
     /// <summary>Skybox StandardMesh name from SkyAndSun.con (GeometryTemplate.file), if present.</summary>
     public string? SkyBoxMesh { get; set; }
 
+    /// <summary>
+    /// The skybox as <c>GeometryTemplate.file</c> must name it: a mesh NAME, never a file name.
+    ///
+    /// The engine appends the extension itself, so a stray ".sm" makes it look for
+    /// <c>StandardMesh/Sky_HCMT2_m1.sm.sm</c> - "StandardMesh file not found", the SkyBox template fails to
+    /// precache, and the map loads with no sky at all. Retail writes the bare name (Sky_H_m1, Sky_ID_m1).
+    /// </summary>
+    public static string SkyBoxMeshName(string? mesh)
+    {
+        var n = (mesh ?? "").Trim().Replace('\\', '/');
+        n = n[(n.LastIndexOf('/') + 1)..];                     // a path is not a mesh name either
+        foreach (var ext in new[] { ".sm", ".rs" })
+            if (n.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) { n = n[..^ext.Length]; break; }
+        return n;
+    }
+
     // ---- Animated clouds (Refractor's dormant Cloud system: a UV-scrolling cloud layer above the sky). Parsed from
     // and re-emitted into SkyAndSun.con AFTER Sky.initSky. The cloud StandardMesh ("cloud") was stripped from public
     // game files, so a level needs one supplied for clouds to show in-game; the EDITOR renders its own cloud layer. ----
@@ -407,7 +423,7 @@ public sealed class EnvironmentSettings
         yield return "rem *** Sky ***";
         yield return "rem ************************";
         yield return "GeometryTemplate.create StandardMesh SkyBox";
-        yield return $"GeometryTemplate.file {(string.IsNullOrEmpty(SkyBoxMesh) ? "Sky_OI_m1" : SkyBoxMesh)}";
+        yield return $"GeometryTemplate.file {(string.IsNullOrEmpty(SkyBoxMesh) ? "Sky_OI_m1" : SkyBoxMeshName(SkyBoxMesh))}";
         yield return "Sky.initSky";
         yield return "";
         yield return "TextureManager.mipmaps 1";
@@ -471,7 +487,7 @@ public sealed class EnvironmentSettings
                 && !string.IsNullOrWhiteSpace(SkyBoxMesh))
             {
                 wroteMesh = true;
-                outLines.Add(raw[..(raw.Length - raw.TrimStart().Length)] + $"GeometryTemplate.file {SkyBoxMesh}");
+                outLines.Add(raw[..(raw.Length - raw.TrimStart().Length)] + $"GeometryTemplate.file {SkyBoxMeshName(SkyBoxMesh)}");
                 continue;
             }
             if (WriteSkyRotation && t.StartsWith("sky.setRotAngle", StringComparison.OrdinalIgnoreCase))

@@ -53,6 +53,12 @@ public sealed class StaticObjectsFile
         {
             var line = raw.Trim();
 
+            // Header lines are kept as written, indentation included, but never their line ending. A packed level is
+            // split on '\n', so a CRLF line arrives ending in '\r'; kept, the "\r\n" the saver rejoins with turned it
+            // into "\r\r\n", one more CR per header line per save (al_vietnas reached fourteen). Trimming every
+            // trailing CR also mends a file that already carries them.
+            var header = raw.TrimEnd('\r', '\n');
+
             // An object's persisted id. Consumed here rather than kept as an extra line, so a file that is read
             // and written back does not grow a second copy of it.
             if (current is not null && line.StartsWith(IdLinePrefix, StringComparison.OrdinalIgnoreCase))
@@ -65,7 +71,7 @@ public sealed class StaticObjectsFile
             // Blank or comment lines: keep in header if no object yet, else attach to current object.
             if (line.Length == 0 || IsComment(line))
             {
-                if (current is null) file.Header.Add(raw);
+                if (current is null) file.Header.Add(header);
                 else current.ExtraLines.Add(line);
                 continue;
             }
@@ -102,7 +108,7 @@ public sealed class StaticObjectsFile
                 default:
                     // Unknown object.* (or anything attached to an object) -> preserve verbatim.
                     if (current is not null) current.ExtraLines.Add(line);
-                    else file.Header.Add(raw);
+                    else file.Header.Add(header);
                     break;
             }
         }

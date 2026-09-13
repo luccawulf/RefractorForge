@@ -388,6 +388,37 @@ public class SoundDistanceTests
         Assert.Equal(90f, lib.Get("frogs")!.Script!.MaxDistance!.Value, 3);
     }
 
+    // ---- The name written is an object TEMPLATE ----------------------------------------------------------------
+    // What goes into StaticObjects.con is `object.create <name>`. The converter used to accept a name because the
+    // MESH library resolved it - and the mesh resolver deliberately tolerates the _m1/_m2 suffix, so "F_Fern06"
+    // resolved through F_Fern06_M1.sm and passed. The game then had no template called "F_Fern06": 56 objects in
+    // one map, each an "unknown objectTemplate" plus two parse errors, and not a single tree drawn.
+
+    [Theory]
+    [InlineData("c05f_trees_m2", "C05F_Trees_M1")]     // the suffixed case StaticTemplateFor already handled
+    [InlineData("F_Fern06", "F_Fern06_M1")]            // ...and the unsuffixed one it did not
+    [InlineData("F_Palmtree01", "F_Palmtree01_M1")]
+    [InlineData("o_woodenCart", "o_Woodencart_M1")]
+    public void The_M1_template_is_among_the_candidates(string geom, string expected)
+        => Assert.Contains(expected,
+               RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateCandidates(geom),
+               StringComparer.OrdinalIgnoreCase);
+
+    [Fact]
+    public void Candidates_lead_with_the_suffixed_name_and_never_repeat()
+    {
+        var c = RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateCandidates("F_Fern06").ToList();
+        Assert.Equal("F_Fern06", c[0]);                                   // what the old rule produced, still first
+        Assert.Contains("F_Fern06_M1", c, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(c.Count, c.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+
+        // An _m2 impostor still leads with its _M1 template, so nothing about the old behaviour regresses.
+        Assert.Equal("C05F_Trees_M1",
+            RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateCandidates("c05f_trees_m2").First());
+
+        Assert.Empty(RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateCandidates(""));
+    }
+
     /// <summary>The placeable shape is an AreaObject: a SimpleObject ties the sound to a DRAWN object, so the
     /// engine culls it with the geometry and the sound is inaudible wherever the object is not on screen.</summary>
     [Fact]

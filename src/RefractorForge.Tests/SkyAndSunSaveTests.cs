@@ -179,6 +179,38 @@ public class SkyBoxSwitchTests
         Assert.Equal("Sky_Stalingrad_M1", EnvironmentSettings.Parse(outLines.ToArray(), null, null).SkyBoxMesh);
     }
 
+    // ---- A mesh NAME, never a mesh FILE ------------------------------------------------------------------------
+    // The skybox catalogue was built from archive file names, so choosing a sky wrote "GeometryTemplate.file
+    // Sky_HCMT2_m1.sm". The engine appends the extension itself, went looking for "StandardMesh/Sky_HCMT2_m1.sm.sm",
+    // failed to precache the SkyBox template, and the map loaded with no sky at all.
+
+    [Theory]
+    [InlineData("Sky_HCMT2_m1.sm", "Sky_HCMT2_m1")]
+    [InlineData("Sky_HCMT2_m1.SM", "Sky_HCMT2_m1")]
+    [InlineData("Sky_HCMT2_m1.rs", "Sky_HCMT2_m1")]
+    [InlineData("standardMesh/Sky_HCMT2_m1.sm", "Sky_HCMT2_m1")]
+    [InlineData("Sky_HCMT2_m1", "Sky_HCMT2_m1")]              // already a name: untouched
+    [InlineData("", "")]
+    [InlineData(null, "")]
+    public void A_skybox_is_written_as_a_mesh_name(string? given, string expected)
+        => Assert.Equal(expected, EnvironmentSettings.SkyBoxMeshName(given));
+
+    [Fact]
+    public void A_file_name_never_reaches_the_con_file()
+    {
+        var e = EnvironmentSettings.Parse(Sky(), null, null);
+        e.SkyBoxMesh = "Sky_Stalingrad_M1.sm";                   // what the catalogue used to hand over
+        e.WriteSkyBoxMesh = true;
+
+        var outLines = e.PatchSkyAndSunConLines(Sky()).ToList();
+        Assert.Contains(outLines, l => l.Trim() == "GeometryTemplate.file Sky_Stalingrad_M1");
+        Assert.DoesNotContain(outLines, l => l.Contains(".sm", StringComparison.OrdinalIgnoreCase));
+
+        // and the same when the file is written from scratch rather than patched
+        e.SkyBoxMesh = "Sky_Stalingrad_M1.sm";
+        Assert.Contains(e.ToSkyAndSunConLines(), l => l.Trim() == "GeometryTemplate.file Sky_Stalingrad_M1");
+    }
+
     [Fact]
     public void A_second_mesh_in_the_same_file_is_left_alone()
     {

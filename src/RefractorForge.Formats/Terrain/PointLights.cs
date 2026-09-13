@@ -196,7 +196,9 @@ public sealed class LightRig
     public float NightG { get; set; } = 0.13f;
     public float NightB { get; set; } = 0.22f;
 
-    public static string PathFor(string levelDir) => System.IO.Path.Combine(levelDir, FileName);
+    /// <summary>Where the rig lives for this level. A folder level keeps it in the folder; a packed level keeps
+    /// it beside the archive, since you cannot write a file inside a .rfa - see <see cref="LevelSidecar"/>.</summary>
+    public static string PathFor(string levelDir) => LevelSidecar.PathFor(levelDir, FileName);
 
     public static LightRig Load(string levelDir)
     {
@@ -229,8 +231,7 @@ public sealed class LightRig
             try { if (File.Exists(p)) File.Delete(p); } catch { }
             return;
         }
-        Directory.CreateDirectory(levelDir);
-        File.WriteAllText(p, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        LevelSidecar.Write(p, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     /// <summary>

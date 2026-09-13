@@ -172,5 +172,15 @@ public static class LevelArchive
         return new Loaded(cfg, hm, so, tex, gameplay, material, growth, env, shadow, sounds);
     }
 
-    private static IEnumerable<string> Lines(byte[] textBytes) => Encoding.Latin1.GetString(textBytes).Split('\n');
+    // A .con's lines as every parser here reads them. Splitting on '\n' leaves CRLF lines ending in '\r' (the parsers
+    // trim; StaticObjectsFile trims what it keeps) and turns a file that ends in a newline into one with a trailing
+    // EMPTY line. StaticObjectsFile kept that phantom as a blank line on the last object and the saver terminated it
+    // again, so every save added a blank line to StaticObjects.con - al_vietnas had piled up fifteen. Dropping it,
+    // as LevelSaver.EntryLines does for the gameplay files, makes a zero-edit save byte-identical.
+    internal static string[] Lines(byte[] textBytes)
+    {
+        var lines = Encoding.Latin1.GetString(textBytes).Split('\n');
+        if (lines.Length > 0 && lines[^1].Length == 0) System.Array.Resize(ref lines, lines.Length - 1);
+        return lines;
+    }
 }

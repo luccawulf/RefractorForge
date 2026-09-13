@@ -1120,6 +1120,12 @@ if (rfaList.Length > 0)
     // A copy of a server map knows which one, and at what version it last agreed with it.
     levelSyncRecord = RefractorForge.Collab.SyncRecord.Parse(ReadLevelText(RefractorForge.Collab.SyncRecord.EntryLeaf));
     if (levelSyncRecord is not null) so.PersistIds = true;
+    // The editor's own sidecars sit BESIDE a packed level (<level>.RefractorForgeLights.json and friends), the way
+    // the loose StaticObjects.con below does - so placed lights, the night amount, groups and notes come back.
+    lightRig = LightRig.Load(levelDir);
+    objGroups = RefractorForge.Formats.Editing.ObjectGroups.Load(levelDir);
+    groupsDirty = true;
+    notes = RefractorForge.Formats.Editing.Annotations.Load(levelDir);
     // NOTE: object lightmaps are loaded LAZILY (EnsureObjectLightmaps) on first enable - decoding them here re-opens
     // the level .rfa and was a big chunk of the load time.
     // Can't write back into the .rfa yet, so F5 saves a loose StaticObjects.con beside the archive.
@@ -2799,20 +2805,22 @@ void OnLoad()
             if (toolNames[tool] == "Place" && browserTemplate is not null && terrainPick is not null
                 && so is not null && hist is not null && PlacementHit(ray, out var hitPos))
             {
+                // The selection may be a library display name; what is written is the template it resolves to.
+                if (PlaceableTemplate(browserTemplate) is not { } placeTpl) { RefusePlacement(browserTemplate); return; }
                 var id = Guid.NewGuid().ToString("N");
                 var ppos = SnapXZ(new Vec3(hitPos.X, hitPos.Y, hitPos.Z));
                 // A video screen whose sound is an ambient brings its emitter with it, at the same spot.
                 if (decalSoundCompanion.TryGetValue(browserTemplate, out var compTpl))
                     hist.Do(new CompositeCommand(new List<IEditCommand>
                     {
-                        new AddObject(id, browserTemplate, ppos, Vec3.Zero),
+                        new AddObject(id, placeTpl, ppos, Vec3.Zero),
                         new AddObject(Guid.NewGuid().ToString("N"), compTpl, ppos, Vec3.Zero),
                     }));
-                else hist.Do(new AddObject(id, browserTemplate, ppos, Vec3.Zero));
+                else hist.Do(new AddObject(id, placeTpl, ppos, Vec3.Zero));
                 SyncMarkers(); RebuildObjects(); UploadMarkers();
                 selected = so.Objects.FindIndex(o => o.Id == id);
                 multi.Clear(); if (selected >= 0) multi.Add(selected);
-                Console.WriteLine($"Placed {browserTemplate} at {ppos.X:0.#}, {ppos.Y:0.##}, {ppos.Z:0.#}");
+                Console.WriteLine($"Placed {placeTpl} at {ppos.X:0.#}, {ppos.Y:0.##}, {ppos.Z:0.#}");
                 return;
             }
 
@@ -5360,13 +5368,39 @@ void DoSave()
 {
     if (so is null) return;
     AutoBackup();
-    try { DoSaveCore(); MarkSaved(); } catch (Exception ex) { Console.Error.WriteLine($"Save failed: {ex.Message}"); showLog = true; }
+    // A failed save must never be silent. This went to Console.Error, which was not teed into the log, and no
+    // toast was raised - so a save that threw looked exactly like a save that did nothing.
+    try { DoSaveCore(); MarkSaved(); }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Save failed: {ex.GetType().Name}: {ex.Message}");
+        Toast(Loc.T("Save FAILED - nothing was written. See the Log window."));
+        showLog = true;
+    }
     // Project workflow: keep the .rfproj manifest + Recent Projects list current on every save.
     if (activeRfProject is not null)
         try { activeRfProject.Save(); RecentProjects.Touch(activeRfProject); } catch { }
 }
+// The editor's own files - placed lights (and the night amount), object groups, review notes. They are not level
+// content: no engine reads them, and the packer keeps them out of the archive. A folder level keeps them in the
+// folder, a packed one beside the .rfa (LevelSidecar). A failure here is reported and then ignored - losing a note
+// must never cost the mapper their level save.
+void SaveEditorSidecars()
+{
+    if (levelDir is null) return;
+    try
+    {
+        lightRig.Save(levelDir);
+        objGroups.Save(levelDir);
+        notes.Save(levelDir);
+    }
+    catch (Exception ex) { Console.WriteLine($"   editor sidecar save failed: {ex.Message}"); }
+}
+
 void DoSaveCore()
 {
+    SaveEditorSidecars();
+
     // Where the video screens stand, for the bink patch. Beside the mod, not in the level: it is a client-side
     // aid, and nothing in the game reads it.
     WriteVideoScreensFile();
@@ -8649,13 +8683,9 @@ List<(string label, string[] items)> LoadCatalog()
     }
     catch { /* no catalog -> flat list from the archive */ }
 
-    // Normalize a mesh/template name to a grouping key: drop ".sm" + a trailing LOD suffix, lowercased.
-    static string Stem(string n)
-    {
-        var s = n.EndsWith(".sm", StringComparison.OrdinalIgnoreCase) ? n[..^3] : n;
-        s = System.Text.RegularExpressions.Regex.Replace(s, @"_(?:m\d+|l\d+|lod\d+)$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return s;
-    }
+    // Normalize a mesh/template name to a grouping key: drop ".sm" + a trailing LOD suffix. This is a DISPLAY name, not
+    // a template - PlaceableTemplate resolves it back through the same rule (LibraryTemplate) before anything is placed.
+    static string Stem(string n) => RefractorForge.Formats.Con.LibraryTemplate.DisplayName(n);
 
     // (1) A mesh library is open -> build the list from the ACTUAL loaded archives, so BF1942 / mod
     // objects.rfa shows ITS objects (not the bundled BFV list), grouped by the BFV catalog where names match.
@@ -11159,13 +11189,18 @@ void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z,
     {
         if (ogStaticKeep < 1f && rng.NextDouble() > ogStaticKeep) { skipped++; continue; }
         // Overgrowth ships as _m2 impostor geometry; the same tree exists as an _M1 object template that stock
-        // BfVietnam already defines, so a baked forest needs nothing declared. Fall back to the raw geometry name
-        // when the _M1 does not resolve, and only give up if neither does.
+        // BfVietnam already defines, so a baked forest needs nothing declared. Which name that is has to be settled
+        // against the TEMPLATE registry, not the mesh library: what gets written is `object.create <name>`, and a
+        // mesh lookup answers a different question - TryGet("F_Fern06") resolves happily through F_Fern06_M1.sm, so
+        // the check passed and the map got 56 objects naming a template the game has never heard of (one "unknown
+        // objectTemplate" each, two more parse errors apiece for the position and rotation lines, no tree drawn).
         string tmpl = RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateFor(geom);
-        if (meshLib is not null && !meshLib.TryGet(tmpl, out _))
+        if (meshLib is not null)
         {
-            if (meshLib.TryGet(geom, out _)) tmpl = geom;
-            else { unresolved[tmpl] = unresolved.GetValueOrDefault(tmpl) + 1; continue; }
+            var hit = RefractorForge.Formats.Terrain.OvergrowthCapture.StaticTemplateCandidates(geom)
+                          .FirstOrDefault(c => meshLib.KnowsTemplate(c));
+            if (hit is null) { unresolved[tmpl] = unresolved.GetValueOrDefault(tmpl) + 1; continue; }
+            tmpl = hit;
         }
         used[tmpl] = used.GetValueOrDefault(tmpl) + 1;
         cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), tmpl, new Vec3(x, y, z), new Vec3(yaw, 0f, 0f)));
@@ -11634,7 +11669,12 @@ void BuildSkyBoxCatalogue()
 {
     skyBoxOriginal = env?.SkyBoxMesh;
     if (meshLib is null) { skyBoxChoices = System.Array.Empty<string>(); skyBoxChoice = -1; return; }
+    // MeshBaseNames are archive FILE names ("Sky_HCMT2_m1.sm"). What goes in SkyAndSun.con is the mesh NAME -
+    // the engine appends the extension - so a name kept with its ".sm" made the game look for
+    // "Sky_HCMT2_m1.sm.sm", fail to precache the SkyBox, and load the map with no sky. It also meant the combo
+    // never showed the level's current sky as the selected one, because the level's name carries no extension.
     skyBoxChoices = meshLib.MeshBaseNames
+        .Select(RefractorForge.Formats.Terrain.EnvironmentSettings.SkyBoxMeshName)
         .Where(n => n.StartsWith("sky", StringComparison.OrdinalIgnoreCase) && n.Contains('_'))
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
@@ -11648,6 +11688,7 @@ void BuildSkyBoxCatalogue()
 void ApplySkyBox(string meshName)
 {
     if (env is null) return;
+    meshName = RefractorForge.Formats.Terrain.EnvironmentSettings.SkyBoxMeshName(meshName);
     env.SkyBoxMesh = meshName;
     env.WriteSkyBoxMesh = true;
     skyRotEdited = true;                 // SkyAndSun.con has to be rewritten for this to reach the game
@@ -12080,8 +12121,7 @@ void SaveLightingFolder()
 {
     RebindObjectMaps();
     if (!lightingDirty || env is null || levelDir is null || !System.IO.Directory.Exists(levelDir)) return;
-    SaveLightingToEnv();
-    if (levelDir is not null) { lightRig.Save(levelDir); objGroups.Save(levelDir); notes.Save(levelDir); }   // sidecars, never packed
+    SaveLightingToEnv();   // the sidecars are written by SaveEditorSidecars, once, for both kinds of level
     try
     {
         var initPath = System.IO.Directory.EnumerateFiles(levelDir, "Init.con", System.IO.SearchOption.AllDirectories)
@@ -12101,7 +12141,6 @@ void SaveLightingFolder()
     RebindObjectMaps();
     if (!lightingDirty || env is null) return null;
     SaveLightingToEnv();
-    if (levelDir is not null) lightRig.Save(levelDir);   // sidecar, never packed
     try
     {
         // A decal made this session already holds a newer Init.con in the pending queue (its registration lines).
@@ -13127,6 +13166,35 @@ void NewMapModal()
     ImGui.EndPopup();
 }
 
+// ---- From a library pick to the template written ----
+// The template a library pick places, or null when no loaded .con declares one and the caller must refuse. The library
+// lists MESH stems ("o_speakers" for o_speakers_m1.sm), and a drop used to write the stem as `object.create` - a
+// template the game has never heard of. Resolved against the TEMPLATE registry (exact), never the mesh library.
+// Names the editor declares itself on save - imports, decals, light pools, models, sounds, weather emitters, imported
+// trees - are in no archive yet, so they pass as they are; so does everything when there is no registry to ask.
+string? PlaceableTemplate(string t)
+{
+    if (meshLib is null || meshLib.TemplateCount == 0) return t;
+    if (importedObjs.ContainsKey(t) || remoteMeshNames.Contains(t) || treeMeshNames.Contains(t, StringComparer.OrdinalIgnoreCase)
+        || sounds.IsSound(t) || RefractorForge.Formats.Con.WeatherEffect.TypeOfBundle(t) is not null)
+        return t;
+    return RefractorForge.Formats.Con.LibraryTemplate.Resolve(t, meshLib.DeclaredTemplateName,
+        RefractorForge.Formats.Con.LibraryTemplate.MeshesListedAs(t, meshLib.MeshBaseNames), meshLib.TemplatesDrawing);
+}
+void LogRefusedTemplate(string t)
+{
+    if (meshLib is null) return;
+    var tried = RefractorForge.Formats.Con.LibraryTemplate.Candidates(t, RefractorForge.Formats.Con.LibraryTemplate.MeshesListedAs(t, meshLib.MeshBaseNames));
+    var drawing = meshLib.TemplatesDrawing(t);
+    Console.WriteLine($"Not placed: no object template is declared for '{t}' (tried {string.Join(", ", tried)})" +
+                      (drawing.Count > 1 ? $"; its mesh is drawn by {drawing.Count} templates, too many to pick one: {string.Join(", ", drawing.Take(6))}" : "") + ".");
+}
+void RefusePlacement(string t)
+{
+    Toast(string.Format(Loc.T("Not placed: no loaded .con declares an object template for '{0}'."), t));
+    LogRefusedTemplate(t);
+}
+
 // ---- Object-group prefabs (Battlecraft-style stamps) ----
 bool IsPrefab(string t) => prefabByKey.ContainsKey(t);
 
@@ -13158,14 +13226,27 @@ void RebuildCatalog()
 void StampPrefab(string key, Vec3 hit)
 {
     if (so is null || hist is null || !prefabByKey.TryGetValue(key, out var pf) || pf.Members.Count == 0) return;
+    // A prefab keeps the names its objects were placed with, so one saved from a stem drop carries the stem. Every
+    // member goes through the same resolution as a library drop, and one that nothing declares stops the whole stamp:
+    // half a group placed is worse than a clear refusal.
+    var memberTpls = pf.Members.Select(m => PlaceableTemplate(m.Template)).ToList();
+    var unknownTpls = pf.Members.Where((m, i) => memberTpls[i] is null).Select(m => m.Template)
+                               .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    if (unknownTpls.Count > 0)
+    {
+        Toast(string.Format(Loc.T("Prefab '{0}' not stamped - no loaded .con declares: {1}"), pf.Name, string.Join(", ", unknownTpls)));
+        foreach (var u in unknownTpls) LogRefusedTemplate(u);
+        return;
+    }
     var cmds = new List<IEditCommand>();
     var ids = new List<string>();
-    foreach (var m in pf.Members)
+    for (int mi = 0; mi < pf.Members.Count; mi++)
     {
+        var m = pf.Members[mi];
         var id = Guid.NewGuid().ToString("N"); ids.Add(id);
         float wx = hit.X + m.Offset.X, wz = hit.Z + m.Offset.Z;
         float wy = (terrainPick is not null ? terrainPick.HeightAt(wx, wz) : hit.Y) + m.Offset.Y;
-        cmds.Add(new AddObject(id, m.Template, new Vec3(wx, wy, wz), m.Rotation));
+        cmds.Add(new AddObject(id, memberTpls[mi]!, new Vec3(wx, wy, wz), m.Rotation));
         if (MathF.Abs(m.Scale - 1f) > 1e-3f) cmds.Add(new ScaleObject(id, m.Scale));   // preserve the member's authored scale
     }
     hist.Do(new CompositeCommand(cmds));
@@ -15892,14 +15973,19 @@ void BuildUi()
                 }
                 else if (so is not null)
                 {
-                    // Static object drop.
-                    var id = Guid.NewGuid().ToString("N");
-                    hist.Do(new AddObject(id, dragTemplate, dhit, Vec3.Zero));
-                    browserTemplate = dragTemplate;
-                    SyncMarkers(); RebuildObjects(); UploadMarkers();
-                    selected = so.Objects.FindIndex(o => o.Id == id);
-                    multi.Clear(); if (selected >= 0) multi.Add(selected);
-                    Console.WriteLine($"Dropped {dragTemplate} at {hit.X:0.#}, {hit.Y:0.##}, {hit.Z:0.#}");
+                    // Static object drop. The library entry is a display name ("o_speakers"); what is written is the
+                    // template it resolves to ("o_speakers_m1"). The library selection keeps the display name.
+                    if (PlaceableTemplate(dragTemplate) is not { } dropTpl) RefusePlacement(dragTemplate);
+                    else
+                    {
+                        var id = Guid.NewGuid().ToString("N");
+                        hist.Do(new AddObject(id, dropTpl, dhit, Vec3.Zero));
+                        browserTemplate = dragTemplate;
+                        SyncMarkers(); RebuildObjects(); UploadMarkers();
+                        selected = so.Objects.FindIndex(o => o.Id == id);
+                        multi.Clear(); if (selected >= 0) multi.Add(selected);
+                        Console.WriteLine($"Dropped {dropTpl} at {hit.X:0.#}, {hit.Y:0.##}, {hit.Z:0.#}");
+                    }
                 }
             }
         }
