@@ -44,7 +44,7 @@ public sealed record TeamNames(string Neutral, string Team1, string Team2)
             if (bytes is null || bytes.Length == 0) continue;
             string text;
             try { text = Encoding.Latin1.GetString(bytes); } catch { continue; }
-            foreach (var raw in text.Split('\n'))
+            foreach (var raw in ConLines.Split(text))
             {
                 var line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;

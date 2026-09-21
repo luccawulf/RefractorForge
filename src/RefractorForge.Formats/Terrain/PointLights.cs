@@ -212,6 +212,38 @@ public sealed class LightRig
         return new LightRig();
     }
 
+    /// <summary>
+    /// "Street lamp 12" -> "Street lamp". The index a numbered rename hands out is not part of the name that was
+    /// typed, so it has to come off again before the next one goes on - otherwise renaming a selection twice gives
+    /// "Street lamp 3 7". A number that is not a separate word is left alone: "M16" is a name, "Lamp 4" is a name
+    /// and an index.
+    /// </summary>
+    public static string NameStem(string? name)
+    {
+        var s = (name ?? "").TrimEnd();
+        int cut = s.Length;
+        while (cut > 0 && char.IsAsciiDigit(s[cut - 1])) cut--;
+        if (cut == s.Length || cut == 0) return s;              // no trailing number, or nothing but digits
+        return s[cut - 1] == ' ' ? s[..(cut - 1)].TrimEnd() : s;
+    }
+
+    /// <summary>
+    /// Rename a selection of lights from one typed stem, numbered in the order given: "Street lamp" over 48 lamps
+    /// gives "Street lamp 1".."Street lamp 48".
+    ///
+    /// Numbering rather than stamping one name on all of them is the point - forty lights called "Sodium 3" would
+    /// make the light list useless, which is the only place a name is ever read. A single light keeps exactly what
+    /// was typed; it needs no index. A blank stem is not a rename.
+    /// </summary>
+    public static void RenameNumbered(IReadOnlyList<PointLight> lights, string? typed)
+    {
+        if (lights is null || lights.Count == 0) return;
+        var stem = NameStem(typed);
+        if (stem.Length == 0) return;
+        if (lights.Count == 1) { lights[0].Name = (typed ?? "").Trim(); return; }
+        for (int i = 0; i < lights.Count; i++) lights[i].Name = $"{stem} {i + 1}";
+    }
+
     /// <summary>The rig as JSON text - what <see cref="Save"/> writes, and what a collaborator receives. Full-state,
     /// like the gameplay layer: two peers can never hold two different lists.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

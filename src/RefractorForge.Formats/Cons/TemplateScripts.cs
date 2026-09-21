@@ -80,7 +80,7 @@ public sealed class TemplateScripts
             if (!body.SequenceEqual(d.Lines, StringComparer.OrdinalIgnoreCase)) d.ConflictingCreates = true;
         }
 
-        foreach (var raw in (text ?? "").Split('\n'))
+        foreach (var raw in ConLines.Split(text ?? ""))
         {
             string line = raw.Trim();
             if (line.Length == 0) continue;

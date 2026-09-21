@@ -200,6 +200,79 @@ public static class LightBake
         }
     }
 
+    /// <summary>
+    /// What a light-pool bake multiplies the ground by, per channel and per texel, in a form that can be taken
+    /// back off again - the pool equivalent of <see cref="ShadowFactorMap"/>.
+    ///
+    /// Without it a second bake multiplied on top of the first, so baking twice at the same strength made every
+    /// pool twice as bright and there was no way back short of the undo stack. The shadow merge solved exactly
+    /// this by keeping its factors; pools need one map per CHANNEL, because a lamp has a colour.
+    ///
+    /// Stored as <c>255/k</c> rather than k. The multiplier is <c>1 + strength·pool/scene</c>, which is ≥ 1 and
+    /// unbounded - under a near-black night ambient it reaches into the tens - so it does not fit a byte, while
+    /// its reciprocal lands in (0,1] and quantises finest exactly where k is small and the texel is NOT saturated.
+    /// Applying and removing both go through this quantised map, so the two are inverses of each other rather
+    /// than of some float the bake no longer has.
+    /// </summary>
+    public static Texture2D PoolFactorMap(Texture2D groundLight, float[] sceneLight, int sceneSize, float strength = 1f)
+    {
+        int w = groundLight.Width, h = groundLight.Height;
+        var lp = groundLight.Rgba;
+        var rgba = new byte[w * h * 4];
+        const float floor = 0.03f;                 // matches MultiplyIntoAtlas: no infinite ratios
+
+        for (int y = 0; y < h; y++)
+        {
+            float v = (y + 0.5f) / h;
+            int sy = Math.Clamp((int)(v * sceneSize), 0, sceneSize - 1);
+            for (int x = 0; x < w; x++)
+            {
+                float u = (x + 0.5f) / w;
+                int sx = Math.Clamp((int)(u * sceneSize), 0, sceneSize - 1);
+                int so = (sy * sceneSize + sx) * 3;
+                int o = (y * w + x) * 4;
+                for (int c = 0; c < 3; c++)
+                {
+                    float k = 1f + strength * (lp[o + c] / 255f) / MathF.Max(sceneLight[so + c], floor);
+                    rgba[o + c] = (byte)Math.Clamp((int)(255f / MathF.Max(k, 1f) + 0.5f), 1, 255);
+                }
+                rgba[o + 3] = 255;
+            }
+        }
+        return new Texture2D(w, h, rgba);
+    }
+
+    /// <summary>
+    /// Multiply a <see cref="PoolFactorMap"/> into the ground - or, with <paramref name="remove"/>, take it back
+    /// off. Sampled by normalised position, so the map need not match the atlas's size, and identically in both
+    /// directions so that removing inverts applying to within the usual rounding.
+    /// </summary>
+    public static void ApplyPoolFactor(Texture2D atlas, Texture2D factor, bool remove = false)
+    {
+        int aw = atlas.Width, ah = atlas.Height, fw = factor.Width, fh = factor.Height;
+        var ap = atlas.Rgba; var fp = factor.Rgba;
+        System.Threading.Tasks.Parallel.For(0, ah, y =>
+        {
+            float v = (y + 0.5f) / ah;
+            for (int x = 0; x < aw; x++)
+            {
+                var (fr, fg, fb) = Bilinear(fp, fw, fh, (x + 0.5f) / aw, v);
+                if (fr >= 0.999f && fg >= 0.999f && fb >= 0.999f) continue;      // this texel got no light
+                int ao = (y * aw + x) * 4;
+                ap[ao + 0] = Scale(ap[ao + 0], Mul(fr, remove));
+                ap[ao + 1] = Scale(ap[ao + 1], Mul(fg, remove));
+                ap[ao + 2] = Scale(ap[ao + 2], Mul(fb, remove));
+            }
+        });
+    }
+
+    // A stored factor f is 255/k as a 0..1 fraction: applying multiplies by k, removing multiplies by 1/k.
+    private static float Mul(float f, bool remove)
+    {
+        f = MathF.Max(f, 1f / 255f);               // never divide by nothing
+        return remove ? f : 1f / f;
+    }
+
     /// <summary>Bilinear sample of an RGBA8 map at normalised (u,v), as linear 0..1 RGB.</summary>
     private static (float R, float G, float B) Bilinear(byte[] px, int w, int h, float u, float v)
     {

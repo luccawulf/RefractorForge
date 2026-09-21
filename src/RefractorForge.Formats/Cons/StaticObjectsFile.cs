@@ -36,7 +36,9 @@ public sealed class StaticObjectsFile
         return f;
     }
 
-    public static StaticObjectsFile Load(string path) => Parse(File.ReadLines(path));
+    // The same split a packed level gets (ConLines), so a folder and an archive holding the same bytes load the same
+    // header - File.ReadLines would read the old CR-growth artefact "rem x\r\r\r\n" as three lines, not one.
+    public static StaticObjectsFile Load(string path) => Parse(ConLines.Split(File.ReadAllText(path)));
 
     public void Save(string path) => File.WriteAllLines(path, Write(PersistIds));
 
@@ -53,10 +55,10 @@ public sealed class StaticObjectsFile
         {
             var line = raw.Trim();
 
-            // Header lines are kept as written, indentation included, but never their line ending. A packed level is
-            // split on '\n', so a CRLF line arrives ending in '\r'; kept, the "\r\n" the saver rejoins with turned it
-            // into "\r\r\n", one more CR per header line per save (al_vietnas reached fourteen). Trimming every
-            // trailing CR also mends a file that already carries them.
+            // Header lines are kept as written, indentation included, but never their line ending. A packed level was
+            // once split on '\n', so a CRLF line arrived ending in '\r'; kept, the "\r\n" the saver rejoins with turned
+            // it into "\r\r\n", one more CR per header line per save (al_vietnas reached fourteen). ConLines strips
+            // them now, but a caller may still hand in '\n'-split lines, so trimming stays.
             var header = raw.TrimEnd('\r', '\n');
 
             // An object's persisted id. Consumed here rather than kept as an extra line, so a file that is read

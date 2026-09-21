@@ -718,6 +718,15 @@ RefractorForge.Formats.Validation.IssueSeverity mapReportMin = RefractorForge.Fo
 // declared textually before it.
 Dictionary<uint, int[]> plLocs = new();
 int selLight = -1;              // index into lightRig.Lights, -1 = none
+// Lights selected ALONGSIDE selLight. Every control in the Night Lighting panel writes to the whole set, which is
+// how a street's worth of lamps is made to match - the alternative was typing the same brightness in forty-eight
+// times and hoping. selLight stays the one whose values the controls show.
+HashSet<int> lightMulti = new();
+// The Name box while a whole selection is being renamed. It needs a buffer of its own because the rename is applied
+// on COMMIT, not per keystroke: a live rename would renumber the lights under the cursor and feed its own output
+// back into the box on the next frame ("Street lamp 1" + "x" -> "Street lamp 1x 1").
+string lightNameBuf = "";
+int lightNameBufFor = -1, lightNameBufCount = 0;
 bool showLightGizmos = true;
 bool groundLightsLive = true;     // draw the placed lights on the terrain live; a ground bake turns this off (the pool is in the texture then)
 float groundBakeStrength = 1f;    // scales the pool a ground bake burns in
@@ -820,6 +829,18 @@ bool groundMergeLoaded = false;      // read lazily from the level; reset whenev
 // ground KEPT, under the label "Shadow darkness" - so raising it to get darker shadows made them fainter.
 float sbShadowDarkness = 0.5f;
 Texture2D? groundMergeStatsFor = null; double groundMergeCoverage = 0; float groundMergeDarkness = 0;   // panel readout cache
+// The same record, for the OTHER thing that multiplies into the ground: the placed lights' pools. Without it a
+// second light bake stacked on the first (twice as bright at the same strength, with no way back but Z).
+Texture2D? groundPoolMerge = null;
+bool groundPoolLoaded = false;
+// The ground as it was before any bake burned light into it (Formats.Terrain.GroundOriginal). The shadow merge is
+// reversible arithmetic, but a light pool SATURATES where it is brightest, so dividing it back out cannot return the
+// texel it clipped - and after a save there was nothing left to divide. A copy taken before the first bake is the
+// only thing that reverts exactly, so that is what Revert restores.
+Texture2D? groundOriginal = null;
+bool groundOriginalLoaded = false;   // read lazily from the sidecar; a level open restarts the app, so once is enough
+long groundAtlasVersion = 0;         // bumped on every atlas upload, so the "differs from the original" readout can cache
+long groundDiffVersion = -1; double groundDiffShare = 0;   // panel readout cache
 HashSet<string>? lmExisting = null;      // lightmap files the level already ships, snapshotted when a bake starts
 Dictionary<byte, byte[]> uniformLightmapCache = new();   // flat fallback lightmaps, cached by their grey value
 bool showTunnelEntries = true;    // draw the entry-point spheres: where a soldier passes through the terrain
@@ -2018,6 +2039,21 @@ bool pathmapPreviewOpen = false;
 float pathmapPreviewT = 0f;                           // >0 = auto-close countdown (post-save); 0 while open = manual/persistent
 string pathmapPreviewLabel = "";
 int pathmapPreviewSide = 0;
+// Texture Terrain: paint the material map from the SHAPE of the ground - World Machine's idea (slope, height, water
+// flow, distance to the shore decide the material) with the node graph replaced by a look and four sliders.
+bool texTerrainOpen = false;
+int texStyleIdx = 0;
+RefractorForge.Formats.Terrain.TexturingStyle texStyle = RefractorForge.Formats.Terrain.TexturingStyle.TropicalIsland();
+List<RefractorForge.Formats.Terrain.MaterialRule>? texRules = null;
+RefractorForge.Formats.Terrain.TexturingOptions texOpts = new();
+RefractorForge.Formats.Terrain.TerrainAnalysis? texAnalysis = null;   // cached: the terrain does not move while sliders do
+RefractorForge.Formats.Terrain.MaterialMap? texPreviewMap = null;
+RefractorForge.Formats.Terrain.MaterialMap? texUndoMap = null;        // the map as it was before the last Apply
+bool texRulesEdited = false;                                          // hand-edited rules survive slider changes
+bool texPreviewDirty = true;
+bool texBakeAtlas = true;
+uint texPreviewTex = 0;
+int texPreviewSide = 0;
 float meshViewerZoom = 1f;                            // scroll/+/- zoom (1 = framed to fit; >1 closer, <1 farther)
 uint mvFbo = 0, mvColorTex = 0, mvDepthRbo = 0;       // the preview render target (lazy, reused)
 const int mvSize = 512;                                // preview resolution
@@ -2738,11 +2774,23 @@ void OnLoad()
                 int lHit = PickLight(new Vector2(lastMouse.X, lastMouse.Y));
                 if (lHit >= 0)
                 {
-                    selLight = lHit;
-                    var ll = lightRig.Lights[lHit];
-                    lightDragging = true;
-                    lightDragVertical = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
-                    lightDragOffset = ll.Position.Y - GroundUnder(ll.Position.X, ll.Position.Z);
+                    // Ctrl adds to (or takes out of) the selection, the same as in the light list. It never starts
+                    // a drag: the drag moves whichever light the panel is showing, which after a ctrl-click that
+                    // DESELECTED something is no longer the one under the cursor.
+                    bool ctrl = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight));
+                    if (ctrl)
+                    {
+                        if (lHit == selLight) { if (lightMulti.Count > 0) { selLight = lightMulti.First(); lightMulti.Remove(selLight); } }
+                        else if (!lightMulti.Remove(lHit)) lightMulti.Add(lHit);
+                    }
+                    else
+                    {
+                        lightMulti.Clear(); selLight = lHit;
+                        var ll = lightRig.Lights[lHit];
+                        lightDragging = true;
+                        lightDragVertical = kb is not null && (kb.IsKeyPressed(Key.ShiftLeft) || kb.IsKeyPressed(Key.ShiftRight));
+                        lightDragOffset = ll.Position.Y - GroundUnder(ll.Position.X, ll.Position.Z);
+                    }
                     // Selecting a light clears the object selection, so the two never look simultaneously active.
                     multi.Clear(); selected = -1; SyncTransformEdit();
                     return;
@@ -4794,7 +4842,7 @@ void ScanLevelWeather()
                 }
         }
         foreach (var text in ConTexts())
-            foreach (var raw in text.Split('\n'))
+            foreach (var raw in ConLines.Split(text))
             {
                 var l = raw.Trim();
                 if (!l.StartsWith("ObjectTemplate.create", StringComparison.OrdinalIgnoreCase)) continue;
@@ -5980,6 +6028,194 @@ void PathmapPreviewWindow()
     ImGui.End();
 }
 
+// ---- Texture Terrain -------------------------------------------------------------------------------------------
+// The engine paints ground from ONE material index per cell out of sixteen, with no blending, so "texturing" here is
+// deciding which of the sixteen each cell is. The rules answer that from what the ground IS (steepness, height above
+// the water, whether water runs across it, how far the shore is) - and the edges dither rather than cut, which is the
+// only way to get a soft transition out of a format that has no blend.
+
+void TexTerrainEnsureAnalysis(bool force = false)
+{
+    if (heightmap is null) { texAnalysis = null; return; }
+    if (!force && texAnalysis is not null && texAnalysis.Size == cfg.MaterialSize) return;
+    texAnalysis = RefractorForge.Formats.Terrain.TerrainAnalysis.From(cfg, heightmap);
+    texPreviewDirty = true;
+}
+
+unsafe void TexTerrainRebuildPreview()
+{
+    if (texAnalysis is null) return;
+    if (texRules is null || !texRulesEdited) texRules = texStyle.Build();
+    texPreviewMap = RefractorForge.Formats.Terrain.TerrainTexturing.Generate(texAnalysis, texRules, texOpts, materialMap);
+
+    int n = texPreviewMap.Width;
+    var rgba = new byte[n * n * 4];
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+        {
+            var c = matPalette[texPreviewMap[x, y] & 15];
+            int o = ((n - 1 - y) * n + x) * 4;                    // north up, like the minimap
+            rgba[o] = (byte)(c.X * 255f); rgba[o + 1] = (byte)(c.Y * 255f); rgba[o + 2] = (byte)(c.Z * 255f); rgba[o + 3] = 255;
+        }
+    if (texPreviewTex == 0) texPreviewTex = gl.GenTexture();
+    gl.BindTexture(TextureTarget.Texture2D, texPreviewTex);
+    gl.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+    fixed (byte* pp = rgba)
+        gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)n, (uint)n, 0, PixelFormat.Rgba, PixelType.UnsignedByte, pp);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+    gl.BindTexture(TextureTarget.Texture2D, 0);
+    texPreviewSide = n;
+    texPreviewDirty = false;
+}
+
+void TexTerrainApply()
+{
+    if (materialMap is null || texPreviewMap is null) return;
+    if (texPreviewMap.Width != materialMap.Width || texPreviewMap.Height != materialMap.Height)
+    { Toast(Loc.T("The preview no longer matches this level's material map - reopen the window.")); return; }
+
+    var keep = new RefractorForge.Formats.Terrain.MaterialMap(materialMap.Width, materialMap.Height);
+    Array.Copy(materialMap.Samples, keep.Samples, materialMap.Samples.Length);
+    texUndoMap = keep;
+
+    Array.Copy(texPreviewMap.Samples, materialMap.Samples, materialMap.Samples.Length);
+    matPainter = new MaterialPainter(materialMap, cfg);
+    if (paintLayer == 0) UploadActivePaintTexture();
+    BroadcastFullMaps();
+    if (texBakeAtlas && atlasCpu is not null) DoGenerateSurfaceMaps();
+    Console.WriteLine($"Textured terrain with the '{texStyle.Name}' look ({materialMap.Width}^2 cells, {texRules?.Count ?? 0} rules).");
+    Toast($"Textured the terrain ({texStyle.Name}). Ctrl+S writes it.");
+}
+
+void TexTerrainRestore()
+{
+    if (materialMap is null || texUndoMap is null) return;
+    Array.Copy(texUndoMap.Samples, materialMap.Samples, materialMap.Samples.Length);
+    matPainter = new MaterialPainter(materialMap, cfg);
+    if (paintLayer == 0) UploadActivePaintTexture();
+    BroadcastFullMaps();
+    texUndoMap = null;
+    texPreviewDirty = true;
+    Toast(Loc.T("Put the material map back the way it was."));
+}
+
+void TexTerrainWindow()
+{
+    if (!texTerrainOpen) return;
+    ImGui.SetNextWindowSize(new System.Numerics.Vector2(620, 720), ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Texture Terrain"), ref texTerrainOpen))
+    {
+        ImGui.PushTextWrapPos(0f);
+        if (heightmap is null || materialMap is null)
+        {
+            ImGui.TextDisabled(Loc.T("Open a level with terrain first."));
+            ImGui.PopTextWrapPos(); ImGui.End(); return;
+        }
+        TexTerrainEnsureAnalysis();
+        ImGui.Text(Loc.T("The ground paints itself: height above the water, steepness, where water runs and how near the shore is pick the material for every cell."));
+        ImGui.Spacing();
+
+        var styles = RefractorForge.Formats.Terrain.TexturingStyle.All;
+        var styleNames = new string[styles.Count];
+        for (int i = 0; i < styles.Count; i++) styleNames[i] = styles[i].Name;
+        if (Cbo(Loc.TL("Look"), ref texStyleIdx, styleNames, styleNames.Length))
+        {
+            texStyle = styles[Math.Clamp(texStyleIdx, 0, styles.Count - 1)].Clone();
+            texRulesEdited = false; texPreviewDirty = true;
+        }
+        ImGui.TextDisabled(texStyle.Description);
+        ImGui.Spacing();
+
+        float beach = texStyle.BeachMeters, cliff = texStyle.CliffDeg, varia = texStyle.Variation, wet = texStyle.Wetness;
+        bool ch = false;
+        ch |= SldF(Loc.TL("Beach width"), ref beach, 0f, 80f, "%.0f m");
+        ch |= SldF(Loc.TL("Cliffs steeper than"), ref cliff, 12f, 70f, "%.0f deg");
+        ch |= SldF(Loc.TL("Variation"), ref varia, 0f, 1f, "%.2f");
+        ch |= SldF(Loc.TL("Wetness"), ref wet, 0f, 1f, "%.2f");
+        if (ch)
+        {
+            texStyle.BeachMeters = beach; texStyle.CliffDeg = cliff; texStyle.Variation = varia; texStyle.Wetness = wet;
+            texRulesEdited = false; texPreviewDirty = true;
+        }
+
+        int seed = texOpts.Seed;
+        if (InI(Loc.TL("Seed"), ref seed)) { texOpts.Seed = seed; texPreviewDirty = true; }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Shuffle"))) { texOpts.Seed = System.Random.Shared.Next(1, 1 << 20); texPreviewDirty = true; }
+
+        bool keepVoid = texOpts.KeepOutOfBounds, keepRoads = texOpts.KeepRoads;
+        if (ImGui.Checkbox(Loc.TL("Keep out-of-bounds ground"), ref keepVoid)) { texOpts.KeepOutOfBounds = keepVoid; texPreviewDirty = true; }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Material 7 is the engine's out of bounds - the painted void around a map. Leave this on unless you mean to move the edge of the world."));
+        if (ImGui.Checkbox(Loc.TL("Keep roads"), ref keepRoads)) { texOpts.KeepRoads = keepRoads; texPreviewDirty = true; }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Dirt, sand, paved and wet road cells stay exactly as painted."));
+        ImGui.Checkbox(Loc.TL("Bake the surface atlas after applying"), ref texBakeAtlas);
+
+        if (ImGui.Button(Loc.TL("Recalculate from the terrain"))) TexTerrainEnsureAnalysis(force: true);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("Press this after sculpting: the slope and water-flow measurements are cached."));
+
+        if (ImGui.CollapsingHeader(Loc.TL("Advanced: the rules")))
+        {
+            ImGui.TextDisabled(Loc.T("Applied top to bottom - the last rule that accepts a cell wins."));
+            if (texRules is not null)
+                for (int i = 0; i < texRules.Count; i++)
+                {
+                    var r = texRules[i];
+                    ImGui.PushID(i);
+                    bool on = r.Enabled;
+                    if (ImGui.Checkbox("##on", ref on)) { r.Enabled = on; texRulesEdited = true; texPreviewDirty = true; }
+                    ImGui.SameLine();
+                    if (ImGui.TreeNode($"{r.Name} -> {MatLabel(r.Material)}"))
+                    {
+                        int mat = r.Material;
+                        if (Cbo(Loc.TL("Material"), ref mat, matNames, matNames.Length) && mat != RefractorForge.Formats.Terrain.DeathMaterial.Index)
+                        { r.Material = mat; texRulesEdited = true; texPreviewDirty = true; }
+                        float smin = r.MinSlopeDeg, smax = r.MaxSlopeDeg, amin = r.MinAltitude, amax = r.MaxAltitude, cov = r.Coverage, soft = r.EdgeSoftness;
+                        bool rc = false;
+                        rc |= SldF(Loc.TL("Slope from"), ref smin, 0f, 90f, "%.0f deg");
+                        rc |= SldF(Loc.TL("Slope to"), ref smax, 0f, 90f, "%.0f deg");
+                        rc |= SldF(Loc.TL("Height band from"), ref amin, 0f, 1f, "%.2f");
+                        rc |= SldF(Loc.TL("Height band to"), ref amax, 0f, 1f, "%.2f");
+                        rc |= SldF(Loc.TL("Coverage"), ref cov, 0f, 1f, "%.2f");
+                        rc |= SldF(Loc.TL("Soft edge"), ref soft, 0f, 1f, "%.2f");
+                        if (rc)
+                        {
+                            r.MinSlopeDeg = smin; r.MaxSlopeDeg = smax; r.MinAltitude = amin; r.MaxAltitude = amax;
+                            r.Coverage = cov; r.EdgeSoftness = soft;
+                            texRulesEdited = true; texPreviewDirty = true;
+                        }
+                        ImGui.TreePop();
+                    }
+                    ImGui.PopID();
+                }
+            if (ImGui.Button(Loc.TL("Back to the preset's rules"))) { texRulesEdited = false; texPreviewDirty = true; }
+        }
+
+        if (texPreviewDirty) TexTerrainRebuildPreview();
+
+        ImGui.Separator();
+        if (ImGui.Button(Loc.TL("Apply to the level"), new System.Numerics.Vector2(180, 0))) TexTerrainApply();
+        ImGui.SameLine();
+        if (texUndoMap is null) ImGui.BeginDisabled();
+        if (ImGui.Button(Loc.TL("Put it back"))) TexTerrainRestore();
+        if (texUndoMap is null) ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.TextDisabled(Loc.T("Preview - the level is only changed when you press Apply."));
+
+        if (texPreviewTex != 0 && texPreviewSide > 0)
+        {
+            float sz = MathF.Min(ImGui.GetContentRegionAvail().X, 512f);
+            ImGui.PopTextWrapPos();
+            ImGui.Image((IntPtr)texPreviewTex, new System.Numerics.Vector2(sz, sz));
+            ImGui.PushTextWrapPos(0f);
+        }
+        ImGui.PopTextWrapPos();
+    }
+    ImGui.End();
+}
+
 // Auto material map from terrain (water line / slope / altitude) - the editor's "Generate Material Map".
 void DoGenerateMaterialMap()
 {
@@ -6231,6 +6467,7 @@ void FinishShadowBake()
     {
         // REPLACE whatever an earlier bake merged, never stack on it: divide the old factor map out, multiply the
         // new one in, and keep the new one so the next bake - this session or after a reopen - can do the same.
+        CapturePreBakeGround();   // so Revert can reach the ground this level had before ANY bake, not just this one
         var previous = CurrentGroundMerge();
         Texture2D? factor = sbShadowDarkness > 0.001f ? LightBake.ShadowFactorMap(shadow, 1f - sbShadowDarkness) : null;
         if (factor is not null || previous is not null)
@@ -6992,6 +7229,144 @@ void SetGroundMerge(Texture2D? factor)
     pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(GroundMergePath, StringComparison.OrdinalIgnoreCase));
     if (ReadLevelText(GroundMergePath) is not null)
         QueueLevelFile(GroundMergePath, TgaTexture.EncodeGrayColormapped(new Texture2D(1, 1, new byte[] { 255, 255, 255, 255 })));
+}
+
+// ---- The ground as it was before any bake -------------------------------------------------------------------------
+// The shadow merge above is reversible arithmetic. A light pool is not: it SATURATES where it is brightest, so
+// dividing the same pool back out returns a texel darker than the one it clipped, and after a save there was nothing
+// left to divide out at all. The only exact way back is a copy of the ground taken before the first bake - see
+// Formats/Terrain/GroundOriginal.cs for where it lives and why it never reaches the game.
+
+Texture2D? PreBakeGround()
+{
+    if (!groundOriginalLoaded)
+    {
+        groundOriginalLoaded = true;
+        groundOriginal = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(levelDir))
+            {
+                var p = RefractorForge.Formats.Terrain.GroundOriginal.PathFor(levelDir);
+                if (File.Exists(p)) groundOriginal = DdsTexture.Load(p);
+            }
+        }
+        catch (Exception ex) { Console.WriteLine("Pre-bake ground copy could not be read: " + ex.Message); groundOriginal = null; }
+    }
+    return groundOriginal;
+}
+
+// Take the copy, once, just before a bake changes the ground. It is never overwritten: what makes it worth having is
+// that it is the ground before the FIRST bake, not before the latest one.
+void CapturePreBakeGround()
+{
+    if (atlasCpu is null || string.IsNullOrEmpty(levelDir)) return;
+    if (PreBakeGround() is not null) return;
+    try
+    {
+        var p = RefractorForge.Formats.Terrain.GroundOriginal.PathFor(levelDir);
+        var dir = Path.GetDirectoryName(Path.GetFullPath(p));      // the sidecar's FOLDER - never the level itself
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        DdsTexture.Save(atlasCpu, p);
+        groundOriginal = new Texture2D(atlasCpu.Width, atlasCpu.Height, (byte[])atlasCpu.Rgba.Clone());
+        groundOriginalLoaded = true;
+        Console.WriteLine($"Kept the ground as it is before this bake ({atlasCpu.Width}x{atlasCpu.Height}) -> {p}");
+    }
+    catch (Exception ex) { Console.WriteLine("Could not keep a pre-bake copy of the ground: " + ex.Message); }
+}
+
+// Put the ground texture back the way it was before anything was baked into it.
+void RevertGroundToOriginal()
+{
+    if (atlasCpu is null) { Toast(Loc.T("This level has no terrain texture atlas.")); return; }
+
+    // The copy taken before the first bake is exact. Without one - nothing has ever baked here, or the level was
+    // already baked when it was first opened - the best original available is the tiles this session loaded.
+    var src = PreBakeGround();
+    bool exact = src is not null && src.Width == atlasCpu.Width && src.Height == atlasCpu.Height;
+    if (src is not null && !exact)
+        Console.WriteLine($"The pre-bake ground copy is {src.Width}x{src.Height} but the atlas is {atlasCpu.Width}x{atlasCpu.Height} - falling back to the tiles as loaded.");
+    var from = exact ? src : terrainTex?.BakeAtlas(atlasCpu.Width);
+    if (from is null) { Toast(Loc.T("Nothing to revert to: this level has no original ground to restore.")); return; }
+
+    // Both records go with it: the ground no longer carries either merge, and a later bake must not try to take
+    // off a shadow or a pool that is not there any more.
+    var merged = CurrentGroundMerge();
+    var pooled = CurrentPoolMerge();
+    var pixels = from.Rgba;
+    AtlasFullEdit(() => Array.Copy(pixels, atlasCpu!.Rgba, Math.Min(pixels.Length, atlasCpu!.Rgba.Length)),
+                  onApply: () => { SetGroundMerge(null); SetPoolMerge(null); },
+                  onUndo: () => { SetGroundMerge(merged); SetPoolMerge(pooled); });
+    MarkAllTilesDirty();        // every tile goes back, not just the ones a brush happened to touch
+    groundLightsLive = true;    // a bake turns the live preview off; with the bake gone the lights light again
+    int tiles = terrainTex is null ? 0 : terrainTex.GridW * terrainTex.GridH;
+    Toast(exact
+        ? Loc.T("Ground texture reverted to the copy taken before the first bake. Save writes the tiles.")
+        : Loc.T("Ground texture reverted to the tiles this level was opened with. Save writes the tiles."));
+    Console.WriteLine($"Ground reverted to {(exact ? "the pre-bake copy" : "the tiles as loaded")}; {tiles} tile(s) queued for save.");
+}
+
+// What the ground texture actually carries right now, MEASURED against the pre-bake copy rather than remembered from
+// a flag. "Maybe it already reverts but I cannot tell" is exactly what this is here to answer. Sampled on a stride:
+// a 4096 atlas is 16 M texels and this is read every frame the panel is open, while a percentage needs nothing like
+// that many samples to be right.
+string GroundBakeSummary()
+{
+    if (atlasCpu is null) return "";
+    var src = PreBakeGround();
+    if (src is null) return Loc.T("No copy of the ground has been kept yet - the first bake takes one, and Revert can then put the ground back exactly.");
+    if (src.Width != atlasCpu.Width || src.Height != atlasCpu.Height)
+        return Loc.T("The kept copy of the ground does not match this atlas - Revert falls back to the tiles as loaded.");
+
+    if (groundDiffVersion != groundAtlasVersion)
+    {
+        groundDiffVersion = groundAtlasVersion;
+        var a = atlasCpu.Rgba; var b = src.Rgba;
+        long n = Math.Min(a.Length, b.Length) / 4;
+        long stride = Math.Max(1, n / 1_000_000);
+        long seen = 0, diff = 0;
+        for (long i = 0; i < n; i += stride)
+        {
+            long o = i * 4;
+            seen++;
+            if (a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2]) diff++;
+        }
+        groundDiffShare = seen == 0 ? 0 : (double)diff / seen;
+    }
+    return groundDiffShare <= 0
+        ? Loc.T("The ground texture matches the copy kept before the first bake - nothing is baked into it.")
+        : string.Format(Loc.T("The ground texture differs from the kept copy over {0:0.0}% of the map (baked light, shadow or paint)."), groundDiffShare * 100.0);
+}
+
+// The pool bake's record, kept exactly the way the shadow merge keeps its own (above) and for exactly the same
+// reason: the ground tiles are the only copy of the ground art, so a bake that leaves no record of what it
+// multiplied in can only ever stack. RGB rather than grey - a lamp has a colour.
+const string PoolMergePath = "Textures/RF_GroundLightMerge.tga";
+
+Texture2D? CurrentPoolMerge()
+{
+    if (!groundPoolLoaded)
+    {
+        groundPoolLoaded = true;
+        groundPoolMerge = null;
+        try
+        {
+            var pending = pendingLevelFiles.LastOrDefault(f => f.RelPath.Equals(PoolMergePath, StringComparison.OrdinalIgnoreCase)).Bytes;
+            var bytes = pending ?? (ReadLevelText(PoolMergePath) is { } t ? System.Text.Encoding.Latin1.GetBytes(t) : null);
+            if (bytes is not null) groundPoolMerge = TgaTexture.Decode(bytes);
+        }
+        catch { groundPoolMerge = null; }
+    }
+    return LightBake.IsNeutralFactor(groundPoolMerge) ? null : groundPoolMerge;
+}
+
+void SetPoolMerge(Texture2D? factor)
+{
+    groundPoolMerge = factor; groundPoolLoaded = true;
+    if (factor is not null) { QueueLevelFile(PoolMergePath, TgaTexture.EncodeRgb24(factor)); return; }
+    pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(PoolMergePath, StringComparison.OrdinalIgnoreCase));
+    if (ReadLevelText(PoolMergePath) is not null)
+        QueueLevelFile(PoolMergePath, TgaTexture.EncodeRgb24(new Texture2D(1, 1, new byte[] { 255, 255, 255, 255 })));
 }
 
 void FillTerrainWith(Texture2D tex, float tile)
@@ -10264,6 +10639,61 @@ void ApplyDecalBrightness()
 
 int NightLampSamples() => nightQuality switch { 0 => 1, 1 => 4, _ => 8 };
 
+// ---- Editing several lights at once ------------------------------------------------------------------------------
+// A map lit by hand ends up with forty street lamps at forty slightly different brightnesses, because each one was
+// dialled in on its own. These let a whole run of lamps be picked and edited as one, so "all of them match" is the
+// default rather than something to be achieved by care.
+
+// The lights every control writes to: the one showing its values, plus anything ctrl- or shift-picked with it.
+// Returned in RIG ORDER, not selection order - a rename numbers the selection, and numbers handed out in the order
+// a HashSet happened to enumerate would be arbitrary and would shuffle between runs.
+List<PointLight> SelectedLights()
+{
+    var idx = new List<int>();
+    if (selLight >= 0 && selLight < lightRig.Lights.Count) idx.Add(selLight);
+    foreach (var i in lightMulti)
+        if (i != selLight && i >= 0 && i < lightRig.Lights.Count) idx.Add(i);
+    idx.Sort();
+    var list = new List<PointLight>(idx.Count);
+    foreach (var i in idx) list.Add(lightRig.Lights[i]);
+    return list;
+}
+
+// Rename the whole selection from one typed stem, numbered in rig order. The rule itself lives with the rig
+// (LightRig.RenameNumbered / NameStem) so it can be tested away from the UI.
+void RenameSelectedLights(string typed) => LightRig.RenameNumbered(SelectedLights(), typed);
+
+void ForSelectedLights(Action<PointLight> set) { foreach (var l in SelectedLights()) set(l); }
+
+// Which lamp object a light belongs to, if any. Uses the SAME rule "Under lamp objects" places by - the object's
+// position plus its measured bulb offset - so a light that button created always matches the lamp it came from,
+// and one nudged a little still does.
+string? LampTemplateUnder(PointLight l)
+{
+    if (so is null) return null;
+    foreach (var o in so.Objects)
+    {
+        if (!RefractorForge.Formats.Con.LightPool.LooksLikeLamp(o.Template)) continue;
+        if (RefractorForge.Formats.Con.LightPool.LightBelongsTo(o.Template, o.Position, l.Position)) return o.Template;
+    }
+    return null;
+}
+
+// Select every light the predicate accepts. The first match becomes the one whose values the controls show.
+int SelectLightsWhere(Func<PointLight, bool> want)
+{
+    lightMulti.Clear();
+    int first = -1, n = 0;
+    for (int i = 0; i < lightRig.Lights.Count; i++)
+    {
+        if (!want(lightRig.Lights[i])) continue;
+        if (first < 0) first = i; else lightMulti.Add(i);
+        n++;
+    }
+    if (first >= 0) selLight = first;
+    return n;
+}
+
 void AddNightLight(Vector3 at, bool onGround)
 {
     var preset = RefractorForge.Formats.Terrain.LightPreset.All[Math.Clamp(nightPresetIdx, 0, RefractorForge.Formats.Terrain.LightPreset.All.Count - 1)];
@@ -10272,6 +10702,9 @@ void AddNightLight(Vector3 at, bool onGround)
     float y = onGround && heightmap is not null ? GroundUnder(at.X, at.Z) + preset.Height : at.Y;
     l.Position = new Vec3(at.X, y, at.Z);
     lightRig.Lights.Add(l);
+    // A new light is the selection, on its own: otherwise the next slider edit would quietly reach whatever run
+    // of lamps was still picked from before.
+    lightMulti.Clear();
     selLight = lightRig.Lights.Count - 1;
     showLightGizmos = true;
 }
@@ -10345,9 +10778,20 @@ void NightLightingWindow()
             int n = 0;
             foreach (var o in lamps)
             {
-                // Skip a lamp that already has a light within a metre - this button is safe to press twice.
-                if (lightRig.Lights.Any(x => MathF.Abs(x.Position.X - o.Position.X) < 1f && MathF.Abs(x.Position.Z - o.Position.Z) < 1f)) continue;
-                AddNightLight(new Vector3(o.Position.X, 0f, o.Position.Z), true); n++;
+                // A template with a measured bulb offset gets the light in its lamp head: the offset is added to
+                // the object's OWN position, so the light keeps the height the mapper placed it at rather than
+                // being dropped to the ground and pushed back up by the preset. Anything unmeasured falls back
+                // to the old behaviour - on the ground under the object, at the preset's height.
+                bool measured = RefractorForge.Formats.Con.LightPool.HasOffset(o.Template);
+                var anchor = RefractorForge.Formats.Con.LightPool.LightAnchor(o.Template, o.Position);
+                var at = measured ? new Vector3(anchor.X, anchor.Y, anchor.Z)
+                                  : new Vector3(o.Position.X, 0f, o.Position.Z);
+
+                // Skip a lamp that already has a light, so this button is safe to press twice. It is the SAME
+                // test "Same lamp type" selects by (LightPool.LightBelongsTo), so a lamp can never both be given
+                // a second light and fail to recognise the one it has.
+                if (lightRig.Lights.Any(x => RefractorForge.Formats.Con.LightPool.LightBelongsTo(o.Template, o.Position, x.Position))) continue;
+                AddNightLight(at, onGround: !measured); n++;
             }
             Toast(string.Format(Loc.T("{0} light(s) added under lamp objects."), n));
         }
@@ -10356,6 +10800,37 @@ void NightLightingWindow()
 
     if (lightRig.Lights.Count > 0)
     {
+        // Pick a whole run of lamps, then edit them as one. "Same lamp type" is the one that answers "make every
+        // street light match": it selects every light standing on the same lamp template as this one.
+        ImGui.TextDisabled(Loc.T("Select:"));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("All##lsel")))
+        {
+            int n = SelectLightsWhere(_ => true);
+            Toast(string.Format(Loc.T("{0} light(s) selected - edits apply to all of them."), n));
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("None##lsel"))) lightMulti.Clear();
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("On lamps##lsel")))
+        {
+            int n = SelectLightsWhere(x => LampTemplateUnder(x) is not null);
+            Toast(n > 0 ? string.Format(Loc.T("{0} light(s) selected - edits apply to all of them."), n)
+                        : Loc.T("No light is standing on a lamp object."));
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.TL("Same lamp type##lsel")))
+        {
+            var here = selLight >= 0 && selLight < lightRig.Lights.Count ? LampTemplateUnder(lightRig.Lights[selLight]) : null;
+            if (here is null) Toast(Loc.T("Select a light that stands on a lamp object first."));
+            else
+            {
+                int n = SelectLightsWhere(x => string.Equals(LampTemplateUnder(x), here, StringComparison.OrdinalIgnoreCase));
+                Toast(string.Format(Loc.T("{0} light(s) on {1} selected - edits apply to all of them."), n, here));
+            }
+        }
+        Theme.Tip(Loc.T("Ctrl-click a light to add or remove it, Shift-click to take the run between.\n\"Same lamp type\" picks every light standing on the same lamp object as the selected one,\nso one change to brightness, colour or reach lands on the whole street at once."));
+
         float listH = Math.Min(8, lightRig.Lights.Count) * 20f * uiScale + 8f;
         if (ImGui.BeginListBox("##nightlights", new Vector2(-1f, listH)))
         {
@@ -10364,7 +10839,22 @@ void NightLightingWindow()
                 var l = lightRig.Lights[i];
                 string tag = (l.Enabled ? "" : "(off) ") + l.Name + (l.IsSpot ? "  [spot]" : "") + (l.Glow ? "" : "  [no glow]");
                 ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.55f + 0.45f * l.ColorR, 0.55f + 0.45f * l.ColorG, 0.55f + 0.45f * l.ColorB, l.Enabled ? 1f : 0.5f));
-                if (ImGui.Selectable(tag + "##NL" + i, i == selLight)) selLight = i;
+                if (ImGui.Selectable(tag + "##NL" + i, i == selLight || lightMulti.Contains(i)))
+                {
+                    var io = ImGui.GetIO();
+                    if (io.KeyCtrl)
+                    {
+                        // Ctrl on the one being shown hands that role to another rather than leaving the panel blank.
+                        if (i == selLight) { if (lightMulti.Count > 0) { selLight = lightMulti.First(); lightMulti.Remove(selLight); } }
+                        else if (!lightMulti.Remove(i)) lightMulti.Add(i);
+                    }
+                    else if (io.KeyShift && selLight >= 0)
+                    {
+                        for (int k = Math.Min(selLight, i); k <= Math.Max(selLight, i); k++)
+                            if (k != selLight) lightMulti.Add(k);
+                    }
+                    else { lightMulti.Clear(); selLight = i; }
+                }
                 ImGui.PopStyleColor();
             }
             ImGui.EndListBox();
@@ -10376,76 +10866,117 @@ void NightLightingWindow()
     {
         var l = lightRig.Lights[selLight];
         ImGui.PushID(selLight);
-        string nm = l.Name;
+        // Everything below writes to the WHOLE selection, so a value typed once lands on every lamp picked.
+        int selCount = SelectedLights().Count;
+        if (selCount > 1)
+        {
+            ImGui.PushTextWrapPos(0f);
+            Theme.Muted(string.Format(Loc.T("{0} lights selected - every change below applies to all of them."), selCount));
+            ImGui.PopTextWrapPos();
+        }
         ImGui.SetNextItemWidth(200f * uiScale);
-        if (InT(Loc.TL("Name"), ref nm, 40)) l.Name = nm;
-        bool on = l.Enabled; if (ImGui.Checkbox(Loc.TL("Enabled"), ref on)) l.Enabled = on;
+        if (selCount > 1)
+        {
+            // Renaming a selection NUMBERS it rather than stamping one name on forty lights, which would leave the
+            // list unreadable. Applied when the box is left or Enter is pressed - see lightNameBuf.
+            if (lightNameBufFor != selLight || lightNameBufCount != selCount)
+            { lightNameBuf = LightRig.NameStem(l.Name); lightNameBufFor = selLight; lightNameBufCount = selCount; }
+            InT(Loc.TL("Name"), ref lightNameBuf, 40);
+            if (ImGui.IsItemDeactivatedAfterEdit()) RenameSelectedLights(lightNameBuf);
+            Theme.Tip(Loc.T("Renames every selected light, numbered in map order: \"Street lamp\" over a whole street\ngives \"Street lamp 1\", \"Street lamp 2\" and so on. Applied when you press Enter or click away.\nA number you type at the end is replaced rather than kept."));
+        }
+        else
+        {
+            string nm = l.Name;
+            if (InT(Loc.TL("Name"), ref nm, 40)) l.Name = nm;
+            lightNameBufFor = -1;                    // so the next multi-select reseeds from whatever is selected then
+        }
+        bool on = l.Enabled; if (ImGui.Checkbox(Loc.TL("Enabled"), ref on)) ForSelectedLights(x => x.Enabled = on);
         ImGui.SameLine();
         int kind = l.Kind;
         ImGui.SetNextItemWidth(110f * uiScale);
-        if (CboZ(Loc.TL("Type"), ref kind, Loc.T("Point") + "\0" + Loc.T("Spot") + "\0")) l.Kind = kind;
+        if (CboZ(Loc.TL("Type"), ref kind, Loc.T("Point") + "\0" + Loc.T("Spot") + "\0")) ForSelectedLights(x => x.Kind = kind);
         ImGui.SameLine();
         int pi = -1;
         ImGui.SetNextItemWidth(150f * uiScale);
-        if (Cbo(Loc.TL("Preset"), ref pi, presetNames, presetNames.Length) && pi >= 0) presets[pi].ApplyTo(l);
-        Theme.Tip(Loc.T("Apply a preset's look to this light, keeping its position."));
+        if (Cbo(Loc.TL("Preset"), ref pi, presetNames, presetNames.Length) && pi >= 0) ForSelectedLights(x => presets[pi].ApplyTo(x));
+        Theme.Tip(Loc.T("Apply a preset's look to every selected light, keeping their positions. With a whole street\nselected this is the quickest way to make them all match."));
 
         var colv = new Vector3(l.ColorR, l.ColorG, l.ColorB);
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (Col3(Loc.TL("Colour"), ref colv)) { l.ColorR = colv.X; l.ColorG = colv.Y; l.ColorB = colv.Z; }
+        if (Col3(Loc.TL("Colour"), ref colv)) ForSelectedLights(x => { x.ColorR = colv.X; x.ColorG = colv.Y; x.ColorB = colv.Z; });
         float inten = l.Intensity, rad = l.Radius, fall = l.Falloff, src = l.SourceSize;
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (SldF(Loc.TL("Brightness"), ref inten, 0f, 5f, "%.2f")) l.Intensity = inten;
+        if (SldF(Loc.TL("Brightness"), ref inten, 0f, 5f, "%.2f")) ForSelectedLights(x => x.Intensity = inten);
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (SldF(Loc.TL("Reach (m)"), ref rad, 1f, 200f, "%.0f")) l.Radius = rad;
+        if (SldF(Loc.TL("Reach (m)"), ref rad, 1f, 200f, "%.0f")) ForSelectedLights(x => x.Radius = rad);
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 4f, "%.2f")) l.Falloff = fall;
+        if (SldF(Loc.TL("Falloff"), ref fall, 0.5f, 4f, "%.2f")) ForSelectedLights(x => x.Falloff = fall);
         Theme.Tip(Loc.T("2 is inverse-square, physically right and quite tight. Lower spreads the pool out."));
         float ground = GroundUnder(l.Position.X, l.Position.Z);
         float above = l.Position.Y - ground;
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (SldF(Loc.TL("Height above ground (m)"), ref above, 0f, 40f, "%.1f")) l.Position = new Vec3(l.Position.X, ground + above, l.Position.Z);
+        // Height is set as a height ABOVE EACH LIGHT'S OWN GROUND, not as one world Y: lamps on a slope should
+        // stay at the same height above the road, not all sink to the level of whichever one is selected.
+        if (SldF(Loc.TL("Height above ground (m)"), ref above, 0f, 40f, "%.1f"))
+            ForSelectedLights(x => x.Position = new Vec3(x.Position.X, GroundUnder(x.Position.X, x.Position.Z) + above, x.Position.Z));
         ImGui.SetNextItemWidth(180f * uiScale);
-        if (SldF(Loc.TL("Shadow softness (m)"), ref src, 0f, 3f, "%.2f")) l.SourceSize = src;
+        if (SldF(Loc.TL("Shadow softness (m)"), ref src, 0f, 3f, "%.2f")) ForSelectedLights(x => x.SourceSize = src);
         Theme.Tip(Loc.T("The size of the bulb or fixture. It is what gives a shadow a soft edge that widens with\ndistance - 0 is razor-sharp, 0.3 a bulb, 1 a big fixture or a fire."));
         if (l.IsSpot)
         {
             float yaw = l.SpotYawDeg, pitch = l.SpotPitchDeg, cone = l.ConeDeg, soft = l.ConeSoft;
             ImGui.SetNextItemWidth(180f * uiScale);
-            if (SldF(Loc.TL("Aim - heading (deg)"), ref yaw, -180f, 180f, "%.0f")) l.SpotYawDeg = yaw;
+            if (SldF(Loc.TL("Aim - heading (deg)"), ref yaw, -180f, 180f, "%.0f")) ForSelectedLights(x => x.SpotYawDeg = yaw);
             ImGui.SetNextItemWidth(180f * uiScale);
-            if (SldF(Loc.TL("Aim - tilt (deg)"), ref pitch, -90f, 20f, "%.0f")) l.SpotPitchDeg = pitch;
+            if (SldF(Loc.TL("Aim - tilt (deg)"), ref pitch, -90f, 20f, "%.0f")) ForSelectedLights(x => x.SpotPitchDeg = pitch);
             Theme.Tip(Loc.T("-90 points straight down (a street lamp head); -30 is a floodlight on a wall."));
             ImGui.SetNextItemWidth(180f * uiScale);
-            if (SldF(Loc.TL("Cone (deg)"), ref cone, 5f, 170f, "%.0f")) l.ConeDeg = cone;
+            if (SldF(Loc.TL("Cone (deg)"), ref cone, 5f, 170f, "%.0f")) ForSelectedLights(x => x.ConeDeg = cone);
             ImGui.SetNextItemWidth(180f * uiScale);
-            if (SldF(Loc.TL("Cone edge softness"), ref soft, 0f, 1f, "%.2f")) l.ConeSoft = soft;
+            if (SldF(Loc.TL("Cone edge softness"), ref soft, 0f, 1f, "%.2f")) ForSelectedLights(x => x.ConeSoft = soft);
         }
-        bool sh = l.CastsShadows; if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) l.CastsShadows = sh;
+        bool sh = l.CastsShadows; if (ImGui.Checkbox(Loc.TL("Casts shadows"), ref sh)) ForSelectedLights(x => x.CastsShadows = sh);
         ImGui.SameLine();
-        bool og = l.OnGround; if (ImGui.Checkbox(Loc.TL("Ground"), ref og)) l.OnGround = og;
+        bool og = l.OnGround; if (ImGui.Checkbox(Loc.TL("Ground"), ref og)) ForSelectedLights(x => x.OnGround = og);
         ImGui.SameLine();
-        bool oo = l.OnObjects; if (ImGui.Checkbox(Loc.TL("Objects"), ref oo)) l.OnObjects = oo;
+        bool oo = l.OnObjects; if (ImGui.Checkbox(Loc.TL("Objects"), ref oo)) ForSelectedLights(x => x.OnObjects = oo);
         Theme.Tip(Loc.T("Which bake this light goes into: the ground tiles, the object lightmaps, or both."));
-        bool gw = l.Glow; if (ImGui.Checkbox(Loc.TL("Glow at the bulb"), ref gw)) l.Glow = gw;
+        bool gw = l.Glow; if (ImGui.Checkbox(Loc.TL("Glow at the bulb"), ref gw)) ForSelectedLights(x => x.Glow = gw);
         if (l.Glow)
         {
             ImGui.SameLine();
             float gs = l.GlowSize, gb = l.GlowBrightness;
             ImGui.SetNextItemWidth(90f * uiScale);
-            if (SldF(Loc.TL("Size (m)##glow"), ref gs, 0.5f, 12f, "%.1f")) l.GlowSize = gs;
+            if (SldF(Loc.TL("Size (m)##glow"), ref gs, 0.5f, 12f, "%.1f")) ForSelectedLights(x => x.GlowSize = gs);
             ImGui.SameLine();
             ImGui.SetNextItemWidth(90f * uiScale);
-            if (SldF(Loc.TL("Bright##glow"), ref gb, 0.2f, 3f, "%.1f")) l.GlowBrightness = gb;
+            if (SldF(Loc.TL("Bright##glow"), ref gb, 0.2f, 3f, "%.1f")) ForSelectedLights(x => x.GlowBrightness = gb);
         }
         Theme.Tip(Loc.T("An additive sprite at the light itself, so the lamp reads as switched on. The retail recipe:\nBfVietnam's e_Streetlight and Dystopia City's lamps are a 1.5-4 m additive sprite."));
         if (ImGui.Button(Loc.TL("Duplicate")))
         {
-            var c = l.Clone(); c.Name = l.Name + " copy"; c.Position = new Vec3(l.Position.X + 2f, l.Position.Y, l.Position.Z);
-            lightRig.Lights.Add(c); selLight = lightRig.Lights.Count - 1;
+            // A selection duplicates as a selection: every copy lands 2 m along and stays picked, so the run can
+            // be dragged into place still matching.
+            var copies = new List<PointLight>();
+            foreach (var s in SelectedLights())
+            {
+                var c = s.Clone(); c.Name = s.Name + " copy";
+                c.Position = new Vec3(s.Position.X + 2f, s.Position.Y, s.Position.Z);
+                copies.Add(c);
+            }
+            lightMulti.Clear();
+            foreach (var c in copies) lightRig.Lights.Add(c);
+            selLight = lightRig.Lights.Count - copies.Count;
+            for (int k = selLight + 1; k < lightRig.Lights.Count; k++) lightMulti.Add(k);
         }
         ImGui.SameLine();
-        if (ImGui.Button(Loc.TL("Delete##nightlight"))) { lightRig.Lights.RemoveAt(selLight); selLight = -1; }
+        if (ImGui.Button(Loc.TL("Delete##nightlight")))
+        {
+            var doomed = SelectedLights();
+            lightRig.Lights.RemoveAll(doomed.Contains);
+            lightMulti.Clear(); selLight = -1;
+        }
         ImGui.PopID();
     }
 
@@ -10542,9 +11073,18 @@ void NightBakeProgress()
             var sun = EffectiveSun();
             var scene = LightBake.SceneLight(heightmap!, cfg, size, new Vec3(ambN.X, ambN.Y, ambN.Z), new Vec3(difN.X, difN.Y, difN.Z), new Vec3(sun.X, sun.Y, sun.Z));
             var g = nbGround;
-            AtlasFullEdit(() => LightBake.MultiplyIntoAtlas(atlasCpu!, g, scene, size, groundBakeStrength));
+            CapturePreBakeGround();   // same reason as the direct bake: pools saturate, so keep the ground first
+            // And the same replace-don't-stack record - a night bake is a light bake with a better occluder.
+            var prevPool = CurrentPoolMerge();
+            var nbFactor = LightBake.PoolFactorMap(g, scene, size, groundBakeStrength);
+            AtlasFullEdit(() =>
+            {
+                if (prevPool is not null) LightBake.ApplyPoolFactor(atlasCpu!, prevPool, remove: true);
+                LightBake.ApplyPoolFactor(atlasCpu!, nbFactor);
+            }, onApply: () => SetPoolMerge(nbFactor), onUndo: () => SetPoolMerge(prevPool));
             groundLightsLive = false;
-            Console.WriteLine($"Night bake: ground pools burned at {size}x{size} in {appClock - nbStarted:0.0}s.");
+            Console.WriteLine($"Night bake: ground pools burned at {size}x{size} in {appClock - nbStarted:0.0}s"
+                + (prevPool is not null ? ", replacing the previous bake's pools." : "."));
         }
         nbGround = null; nbTask = null;
         if (nightBakeObjects && so is not null && meshLib is not null)
@@ -11609,7 +12149,7 @@ string[]? LayeredConLines(string suffix)
             if (hits.Count == 0) continue;
             var e = hits.FirstOrDefault(x => x.Name.Replace('\\', '/').Contains("/init/", StringComparison.OrdinalIgnoreCase))
                     ?? hits[0];
-            return System.Text.Encoding.Latin1.GetString(a.Read(e)).Replace("\r\n", "\n").Split('\n');
+            return ConLines.Split(a.Read(e));
         }
         catch { }
     }
@@ -11841,7 +12381,7 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
         var arch = new RefractorFlatArchive(baseRfa);
         var e = arch.Entries.FirstOrDefault(x => x.Name.EndsWith("SkyAndSun.con", StringComparison.OrdinalIgnoreCase));
         if (e is null) return null;
-        var lines = System.Text.Encoding.Latin1.GetString(arch.Read(e)).Replace("\r\n", "\n").Split('\n');
+        var lines = ConLines.Split(arch.Read(e));
         var patched = string.Join("\r\n", env.PatchSkyAndSunConLines(lines)) + "\r\n";
         return ("SkyAndSun.con", System.Text.Encoding.Latin1.GetBytes(patched));
     }
@@ -12158,13 +12698,12 @@ void SaveLightingFolder()
             if (e is null) return null;
             text = System.Text.Encoding.Latin1.GetString(arch.Read(e));
         }
-        var norm = text.Replace("\r\n", "\n");
-        bool trailingNewline = norm.EndsWith("\n", StringComparison.Ordinal);
-        var lines = norm.Split("\n"[0]);
-        // A trailing newline terminates the last line, it does not begin another one. Splitting says otherwise, and
+        // A trailing newline terminates the last line, it does not begin another one. A '\n' split said otherwise, and
         // passing that phantom element through the patcher (then appending a newline as well) added a blank line
-        // per pass - two per save, unbounded, on a file that is real gameplay.
-        if (trailingNewline && lines.Length > 0) System.Array.Resize(ref lines, lines.Length - 1);
+        // per pass - two per save, unbounded, on a file that is real gameplay. ConLines makes no phantom, and reads a
+        // CR-only Init.con as lines rather than one.
+        bool trailingNewline = ConLines.EndsWithTerminator(text);
+        var lines = ConLines.Split(text);
         var patched = string.Join("\r\n", env.PatchInitConLines(lines)) + (trailingNewline ? "\r\n" : "");
         if (pending is not null)
         {
@@ -13637,6 +14176,7 @@ void ApplyRemoteLightRig(string payload)
     lightRig = LightRig.FromJson(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload[(b + 1)..])));
     lastRigWire = payload;                                   // what we now hold IS what was sent: no echo
     if (selLight >= lightRig.Lights.Count) selLight = -1;
+    lightMulti.RemoveWhere(i => i >= lightRig.Lights.Count);   // a collaborator's rig may be shorter than ours was
     shadowMapDirty = true; lightingDirty = true;
 }
 
@@ -14193,6 +14733,7 @@ void ApplyRemoteFile(string rel, byte[] bytes)
     if (leaf is "init.con" or "skyandsun.con" or "terrain.con") ReloadEnvFromLevel();
     else if (leaf == "lightmapshadowbits.lsb") { try { loadedShadowBits = LightmapShadowBits.Decode(bytes); } catch { } }
     else if (leaf == "rf_groundshadowmerge.tga") { try { groundMerge = TgaTexture.Decode(bytes); groundMergeLoaded = true; groundMergeStatsFor = null; } catch { } }
+    else if (leaf == "rf_groundlightmerge.tga") { try { groundPoolMerge = TgaTexture.Decode(bytes); groundPoolLoaded = true; } catch { } }
     if (localFileHashes is not null) localFileHashes[rel] = RefractorForge.Collab.SyncKeys.Hash(bytes);
 }
 
@@ -14208,7 +14749,7 @@ void ReloadEnvFromLevel()
             var p = pendingLevelFiles.LastOrDefault(f => f.RelPath.Replace('\\', '/').EndsWith(leaf, StringComparison.OrdinalIgnoreCase));
             return p.Bytes is not null ? System.Text.Encoding.Latin1.GetString(p.Bytes) : ReadLevelText(leaf);
         }
-        IEnumerable<string>? L(string? t) => t?.Replace("\r\n", "\n").Split('\n');
+        IEnumerable<string>? L(string? t) => t is null ? null : ConLines.Split(t);
         var fresh = EnvironmentSettings.Parse(L(Text("SkyAndSun.con")), L(Text("Terrain.con")), L(Text("Init.con")));
         env = fresh;
         SeedEditorFromEnv();
@@ -15545,6 +16086,8 @@ void BuildUi()
                 Theme.Tip(Loc.T("Takes the baked sun shadow back off the ground; Save writes the ground and a fully lit\nLightmapShadowBits.lsb. Object lightmaps are untouched."));
                 if (ImGui.MenuItem(Loc.TL("Bake Placed Lights into Ground Texture"), null, false, heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0)) BakeLightsToGround();
                 Theme.Tip(Loc.T("Burns the placed lights into the ground texture, which is where their COLOUR\ncan live - per-object lightmaps are grey and carry brightness only. Z undoes it."));
+                if (ImGui.MenuItem(Loc.TL("Revert Ground Texture to Original"), null, false, atlasCpu is not null)) RevertGroundToOriginal();
+                Theme.Tip(Loc.T("The terrain texture as it was before anything was baked into it - the first bake keeps a copy\nof the ground beside the level, so this works sessions later, not just while Z still can.\nSave then writes every tile back."));
                 ImGui.Separator();
                 if (ImGui.MenuItem(Loc.TL("Bake Both (object lightmaps + sun shadows)"), null, false, heightmap is not null)) BakeAllLighting();
                 Theme.Tip(Loc.T("Both processes in one go, for a map that wants everything: the terrain sun-shadow (.lsb),\nevery object's lightmap and the placed lights' colour in the ground texture. Save writes it all."));
@@ -15635,6 +16178,8 @@ void BuildUi()
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
             if (ImGui.MenuItem(Loc.TL("Generate Surface Maps (bake from set)"), null, false, materialMap is not null && atlasCpu is not null)) DoGenerateSurfaceMaps();
+            if (ImGui.MenuItem(Loc.TL("Texture Terrain (from the ground's shape)..."), null, false, heightmap is not null && materialMap is not null))
+            { texTerrainOpen = true; TexTerrainEnsureAnalysis(force: true); }
             ImGui.EndMenu();
         }
         LayerMenu();
@@ -16055,6 +16600,7 @@ void BuildUi()
     MeshViewerWindow();
     BikWindow();
     PathmapPreviewWindow();
+    TexTerrainWindow();
 }
 
 // Battlecraft's Level Tree (guide figure 20): everything PLACED in the level, listed by name. The 3D view can only
@@ -16166,8 +16712,8 @@ void NudgeLightHeight(float dir)
 {
     if (selLight < 0 || selLight >= lightRig.Lights.Count) return;
     float step = kb is not null && (kb.IsKeyPressed(Key.ControlLeft) || kb.IsKeyPressed(Key.ControlRight)) ? 0.25f : 1f;
-    var l = lightRig.Lights[selLight];
-    l.Position = new Vec3(l.Position.X, l.Position.Y + dir * step, l.Position.Z);
+    // The whole selection moves together, so a street of lamps raised by a metre stays a street of lamps.
+    ForSelectedLights(x => x.Position = new Vec3(x.Position.X, x.Position.Y + dir * step, x.Position.Z));
 }
 
 // Ground height under a world position, sampled the way the rest of the file does.
@@ -18421,7 +18967,7 @@ List<(string Mode, RefractorForge.Formats.Validation.SpawnBelowGround.Flags Flag
     {
         string rel = mode + "/SoldierSpawnTemplates.con";
         if ((PendingText(rel) ?? ReadLevelText(rel)) is not { } text) continue;
-        list.Add((mode, RefractorForge.Formats.Validation.SpawnBelowGround.Parse(text.Replace("\r\n", "\n").Split('\n'))));
+        list.Add((mode, RefractorForge.Formats.Validation.SpawnBelowGround.Parse(ConLines.Split(text))));
     }
     return list;
 }
@@ -18604,7 +19150,7 @@ void RunLevelDiff()
             var e = a.Entries.Where(x => x.Name.EndsWith("StaticObjects.con", StringComparison.OrdinalIgnoreCase))
                              .OrderBy(x => x.Name.Count(c => c == '/')).FirstOrDefault();
             if (e is null) { Toast(Loc.T("That archive has no StaticObjects.con.")); return; }
-            before = StaticObjectsFile.Parse(System.Text.Encoding.Latin1.GetString(a.Read(e)).Replace("\r\n", "\n").Split((char)10));
+            before = StaticObjectsFile.Parse(ConLines.Split(a.Read(e)));
         }
         else before = StaticObjectsFile.Load(path);
 
@@ -18734,6 +19280,9 @@ void BakeLightsToGround()
     var enabled = lightRig.Lights.Count(l => l.Enabled && l.Intensity > 0f && l.Radius > 0f);
     if (enabled == 0) { Toast(Loc.T("No enabled lights to bake.")); return; }
 
+    // Before anything is burned in: a pool saturates, so only a copy of the ground can take it back off again.
+    CapturePreBakeGround();
+
     var sw = System.Diagnostics.Stopwatch.StartNew();
     try
     {
@@ -18752,15 +19301,25 @@ void BakeLightsToGround()
         var sun = EffectiveSun();
         var scene = LightBake.SceneLight(heightmap, cfg, size, new Vec3(ambN.X, ambN.Y, ambN.Z), new Vec3(difN.X, difN.Y, difN.Z), new Vec3(sun.X, sun.Y, sun.Z));
 
-        // One undoable atlas edit, uploaded and flagged for save like the road and layer bakes.
-        AtlasFullEdit(() => LightBake.MultiplyIntoAtlas(atlasCpu!, ground, scene, size, groundBakeStrength));
+        // REPLACE the previous light bake, never stack on it: the last bake's own factor map comes back off first,
+        // then this one goes in, and the new map is kept so the next bake - this session or after a reopen - can do
+        // the same. Without this, baking twice at the same strength made every pool twice as bright. It is exactly
+        // how the shadow merge behaves, and the record is a level file for the same reason.
+        var previousPool = CurrentPoolMerge();
+        var poolFactor = LightBake.PoolFactorMap(ground, scene, size, groundBakeStrength);
+        AtlasFullEdit(() =>
+        {
+            if (previousPool is not null) LightBake.ApplyPoolFactor(atlasCpu!, previousPool, remove: true);
+            LightBake.ApplyPoolFactor(atlasCpu!, poolFactor);
+        }, onApply: () => SetPoolMerge(poolFactor), onUndo: () => SetPoolMerge(previousPool));
         // The pool is in the texture now. Drawing the lights live on top would show it twice over, so the live
         // ground lighting goes off - what you see after a bake is what the game shows.
         groundLightsLive = false;
 
         Toast(string.Format(Loc.T("Baked {0} light(s) into the ground texture in {1:0.0}s - Z undoes it, save writes it."),
             enabled, sw.Elapsed.TotalSeconds));
-        Console.WriteLine($"Ground light bake: {enabled} light(s) at {size}x{size}, strength {groundBakeStrength:0.00}, night {night:0.00}, in {sw.Elapsed.TotalSeconds:0.0}s.");
+        Console.WriteLine($"Ground light bake: {enabled} light(s) at {size}x{size}, strength {groundBakeStrength:0.00}, night {night:0.00}, in {sw.Elapsed.TotalSeconds:0.0}s"
+            + (previousPool is not null ? ", replacing the previous bake's pools (not stacked on them)." : "."));
 
         // A pool baked against the night preview only looks the same in the game if the LEVEL is that dark too.
         var lvl = lightGlobalAmb + lightAmb + lightDiffuse;
@@ -18801,7 +19360,9 @@ void LightGizmos()
         // The bulb, in the light's own colour so a rig reads at a glance.
         var col = new Vector4(l.ColorR, l.ColorG, l.ColorB, l.Enabled ? 1f : 0.35f);
         uint c = ImGui.GetColorU32(col);
-        bool sel = i == selLight;
+        // Everything being edited draws as selected, not just the one the panel is showing - otherwise a change
+        // that lands on forty lamps looks like it landed on one.
+        bool sel = i == selLight || lightMulti.Contains(i);
 
         // A soft halo behind the bulb. Fixed screen size on purpose: the marker has to stay findable and
         // clickable whatever the radius is, and a light whose reach is 2 m must not become an invisible speck.
@@ -18959,6 +19520,12 @@ void LightsPanel()
     SldF(Loc.TL("Bake strength"), ref groundBakeStrength, 0.1f, 4f, "%.2f");
     if (ImGui.Button(Loc.TL("Bake into ground")) && heightmap is not null && atlasCpu is not null && lightRig.Lights.Count > 0) BakeLightsToGround();
     Theme.Tip(Loc.T("Burns the lights into the terrain texture exactly as the viewport shows them:\nthe pool goes in as a RATIO to the ground around it, so it keeps the ground's own\ndetail and colour. Z undoes it; save writes the tiles. Bake with the night preview\nand the Night preset both set, or the game will be brighter than the preview."));
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Revert ground to original")) && atlasCpu is not null) RevertGroundToOriginal();
+    Theme.Tip(Loc.T("Puts the terrain texture back the way it was before anything was baked into it, however many\nbakes and sessions ago that was - the first bake keeps a copy of the ground beside the level for\nexactly this. Save then writes every tile back. Terrain painting done since the bake goes too."));
+    ImGui.PushTextWrapPos(0f);
+    Theme.Muted(GroundBakeSummary());
+    ImGui.PopTextWrapPos();
     if (ImGui.Button(Loc.TL("Bake both (lightmaps + sun shadows)")) && heightmap is not null) BakeAllLighting();
     Theme.Tip(Loc.T("Both processes in one go. Also under Tools > Lighting."));
 
@@ -19890,6 +20457,7 @@ unsafe void UploadAtlasRect(int x, int y, int w, int h)
     // where the tiles it touched are noted for the next save. A tile arriving from the server is not an edit.
     if (!applyingTile && atlasCpu is not null && terrainTex is not null)
         foreach (var t in terrainTex.TilesIn(x, y, w, h, atlasCpu.Width, atlasCpu.Height)) tilesDirty.Add(t);
+    groundAtlasVersion++;   // the "differs from the kept copy" readout re-measures when this moves (GroundBakeSummary)
     if (atlasCpu is null || terrainTexId == 0 || w <= 0 || h <= 0) return;
     gl.BindTexture(TextureTarget.Texture2D, terrainTexId);
     gl.PixelStore(PixelStoreParameter.UnpackRowLength, atlasCpu.Width);
@@ -19991,7 +20559,7 @@ GameplayModes ScanArchiveGameModes()
                 var mode = dir[(dir.LastIndexOf('/') + 1)..];
                 if (mode.Length == 0) continue;
                 string[] lines;
-                try { lines = System.Text.Encoding.Latin1.GetString(arc.Read(e)).Split((char)10); } catch { continue; }
+                try { lines = ConLines.Split(arc.Read(e)); } catch { continue; }
                 per.TryGetValue(mode, out var cur);
                 per[mode] = (isCp ? lines : cur.Cp, isVeh ? lines : cur.Veh, isSol ? lines : cur.Sol);
             }
@@ -20060,7 +20628,7 @@ Vector3? LevelStartCamera()
     {
         try
         {
-            foreach (var raw in System.Text.Encoding.Latin1.GetString(bytes).Split('\n'))
+            foreach (var raw in ConLines.Split(bytes))
             {
                 var line = raw.Trim();
                 if (line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;

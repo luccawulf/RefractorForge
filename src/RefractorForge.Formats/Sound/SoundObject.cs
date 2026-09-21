@@ -166,9 +166,12 @@ public static class SoundObject
     public static string PatchEnvironmentCon(string? existing, string runLine)
     {
         string text = existing ?? DefaultEnvironmentCon;
-        foreach (var ln in text.Split('\n'))
+        var lines = Con.ConLines.Split(text);
+        foreach (var ln in lines)
             if (ln.Trim().Equals(runLine, StringComparison.OrdinalIgnoreCase)) return text;
         string nl = text.Contains("\r\n") ? "\r\n" : "\n";
+        // A CR-only file is written back as CRLF rather than gaining one LF-terminated line.
+        if (!text.Contains('\n') && text.Contains('\r')) { text = string.Join("\r\n", lines); nl = "\r\n"; }
         return text.TrimEnd('\r', '\n') + nl + runLine + nl;
     }
 

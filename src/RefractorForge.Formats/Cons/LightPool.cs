@@ -134,6 +134,76 @@ public static class LightPool
         "lamp", "light", "lantern", "torch", "candle", "bulb", "streetlight", "chandelier",
     };
 
+    /// <summary>
+    /// Where the bulb actually sits, relative to a lamp object's own origin.
+    ///
+    /// An object's origin is at its base, so a light dropped at the placement lands in the dirt at the foot of
+    /// the post rather than in the lamp head — and a street lamp hangs its bulb out on an arm, so the bulb is
+    /// not even above the origin. Each entry is measured once from a light placed by eye on a real lamp and
+    /// then reused for every other instance of that template.
+    ///
+    /// The offset is in WORLD axes and is deliberately NOT rotated by the object's own rotation: every lamp of
+    /// a given template gets its light at the same delta, whichever way the post is turned.
+    ///
+    /// Measured: <c>dc_streetlamp2_m1</c> at 464.479/26.6187/343.854 with its glow at 465.1482/32.67572/343.854.
+    /// </summary>
+    private static readonly (string Key, Vec3 Offset)[] LampOffsets =
+    {
+        ("dc_streetlamp2", new Vec3(0.669f, 6.057f, 0f)),
+    };
+
+    /// <summary>
+    /// The bulb offset for a template, or <see cref="Vec3.Zero"/> when none is known. Matched on a substring so
+    /// one entry covers a template and its mesh-suffixed variants (<c>dc_streetlamp2</c> → <c>..._m1</c>), with
+    /// the longest key winning so a more specific entry beats a general one.
+    /// </summary>
+    public static Vec3 OffsetFor(string template)
+    {
+        if (string.IsNullOrWhiteSpace(template)) return Vec3.Zero;
+
+        var best = Vec3.Zero;
+        int bestLen = -1;
+        foreach (var (key, offset) in LampOffsets)
+        {
+            if (!template.Contains(key, StringComparison.OrdinalIgnoreCase)) continue;
+            if (key.Length <= bestLen) continue;
+            best = offset;
+            bestLen = key.Length;
+        }
+        return best;
+    }
+
+    /// <summary>True when this template has a measured bulb offset, so the caller can use the object's own
+    /// height instead of dropping the light to the ground.</summary>
+    public static bool HasOffset(string template) => OffsetFor(template) != Vec3.Zero;
+
+    /// <summary>Where a lamp's light belongs: the object's own position plus its measured bulb offset.</summary>
+    public static Vec3 LightAnchor(string template, Vec3 lampPosition)
+    {
+        var off = OffsetFor(template);
+        return new Vec3(lampPosition.X + off.X, lampPosition.Y + off.Y, lampPosition.Z + off.Z);
+    }
+
+    /// <summary>
+    /// How close a light has to sit to a lamp's anchor to count as that lamp's, in metres.
+    ///
+    /// It has to be small enough that no lamp ever claims its neighbour's light: the closest pair on al_vietnas is
+    /// 5.7 m apart, so anything under half of that is safe, and 2.5 m still allows a light to be nudged about a bit
+    /// without losing which post it belongs to.
+    /// </summary>
+    public const float MatchRadiusMetres = 2.5f;
+
+    /// <summary>
+    /// Does this light belong to this lamp? Compared HORIZONTALLY only - a light raised or lowered along the post
+    /// is still that post's light, and the whole point of the height controls is that it can be moved.
+    /// </summary>
+    public static bool LightBelongsTo(string template, Vec3 lampPosition, Vec3 lightPosition)
+    {
+        var a = LightAnchor(template, lampPosition);
+        float dx = lightPosition.X - a.X, dz = lightPosition.Z - a.Z;
+        return dx * dx + dz * dz < MatchRadiusMetres * MatchRadiusMetres;
+    }
+
     /// <summary>Every placed object that looks like a lamp, as (template, position). The editor turns each into a
     /// light and a pool.</summary>
     public static List<(string Template, Vec3 Position)> FindLamps(IEnumerable<(string Template, Vec3 Position)> placed)

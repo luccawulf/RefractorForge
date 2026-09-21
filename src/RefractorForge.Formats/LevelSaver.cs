@@ -299,6 +299,9 @@ public static class LevelSaver
             // once baked into the lightmaps - so the sidecar must never be packed. A PACKED level keeps its
             // sidecars beside the archive as <level>.<name>.json, so match that spelling too.
             || LevelSidecar.IsNamed(leaf, Terrain.LightRig.FileName)
+            // The pre-bake copy of the ground texture is authoring data too - packing it would ship a second,
+            // unbaked copy of every terrain tile to the game. See Terrain.GroundOriginal.
+            || LevelSidecar.IsNamed(leaf, Terrain.GroundOriginal.FileName)
             // Object groups and review notes are editor-side too: the engine has no notion of either.
             || LevelSidecar.IsNamed(leaf, Editing.ObjectGroups.FileName)
             || LevelSidecar.IsNamed(leaf, Editing.Annotations.FileName)
@@ -410,16 +413,12 @@ public static class LevelSaver
         return names;
     }
 
-    // Splitting on '\n' turns a file that ends in a newline into one with a trailing EMPTY line, and every gameplay
-    // patcher rejoins with a separator and appends a newline of its own - so each save added one blank line to each
-    // file, for ever. Ctf/ControlPoints.con walked 498 -> 506 -> 512 -> 514 bytes over four saves of this map.
-    // Dropping that one empty element makes a zero-edit save byte-identical again; no .con parser can tell.
+    // Every gameplay patcher rejoins with CRLF and appends one of its own, so the lines must carry no phantom EMPTY
+    // line after the final newline - a '\n' split made one, and each save added a blank line to each file, for ever
+    // (Ctf/ControlPoints.con walked 498 -> 506 -> 512 -> 514 bytes over four saves of one map). ConLines never makes
+    // it, and also ends a line at a lone CR, so a CR-only file is patched line by line and written back as CRLF.
     private static string[] EntryLines(RefractorFlatArchive a, string name)
-    {
-        var lines = Encoding.Latin1.GetString(a.Read(a.Entries.First(e => e.Name == name))).Split('\n');
-        if (lines.Length > 0 && lines[^1].Length == 0) System.Array.Resize(ref lines, lines.Length - 1);
-        return lines;
-    }
+        => ConLines.Split(a.Read(a.Entries.First(e => e.Name == name)));
 
     /// <summary>Compute the name->bytes substitutions for the edited files against a base archive: each edited
     /// asset is matched to its existing entry (by trailing file name) so the replacement reuses the archive's
@@ -467,8 +466,12 @@ public static class LevelSaver
             var tcName = FindEntry(arch, "Terrain.con", false);
             if (tcName is not null)
             {
-                var lines = Encoding.Latin1.GetString(arch.Read(arch.Entries.First(e => e.Name == tcName))).Split('\n');
-                Put(tcName, Latin1(string.Join("\n", terrainConfig.PatchConLines(lines))));
+                // Split on every line ending and rejoin as CRLF. The old '\n' split carried each line's CR through
+                // untouched lines but not the rewritten water lines (which came out LF-only), and it saw a CR-only
+                // Terrain.con as ONE line, so a water edit there was silently never written.
+                var text = Encoding.Latin1.GetString(arch.Read(arch.Entries.First(e => e.Name == tcName)));
+                var body = string.Join(ConLines.NewLine, terrainConfig.PatchConLines(ConLines.Split(text)));
+                Put(tcName, Latin1(ConLines.EndsWithTerminator(text) ? body + ConLines.NewLine : body));
             }
         }
         if (so is not null) PutOrAdd("StaticObjects.con", SerializeStaticObjects(so));

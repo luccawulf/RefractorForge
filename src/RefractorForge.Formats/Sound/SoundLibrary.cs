@@ -111,7 +111,7 @@ public sealed class SoundLibrary
     private static IEnumerable<(string Template, string SscName)> ParseTemplateMap(string conText)
     {
         string? cur = null; int remDepth = 0;
-        foreach (var raw in conText.Split('\n'))
+        foreach (var raw in Con.ConLines.Split(conText))
         {
             var line = raw.Replace("\r", "").Trim();
             if (line.Length == 0) continue;
