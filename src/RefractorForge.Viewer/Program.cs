@@ -2012,7 +2012,23 @@ int nmWorldSizeIdx = 3;                                          // -> 2048
 float nmYScale = 0.5f, nmWaterLevel = 30f;
 int nmTerrainType = 1;                                 // 0=Flat 1=Rolling Hills 2=Mountains 3=Islands 4=Import .raw
 string[] nmTerrainTypeLabels = { "Flat", "Rolling Hills", "Mountains", "Islands", "Heightmap (.raw)" };
-string nmHeightmapPath = "";                           // 16-bit LE square .raw to seed the terrain from (type 4)
+string nmHeightmapPath = "";                           // 16-bit LE square .raw, or a 16-bit PNG, to seed the terrain from (type 4)
+float nmImportTop = 300f;                               // type 4 from a PNG: how many metres the image's white stands for
+
+// ---- Terrain made in another tool (Blender, Gaea, World Machine, L3DT) ----------------------------------------------
+// Import a heightmap PNG into an open level, and a colour map (one picture, or a folder of pre-cut tiles) as its
+// ground texture. See Formats/Terrain/HeightmapImport.cs and Render/TerrainColorImport.cs for the rules.
+bool showHmImport = false;
+string hmImportPath = "";
+float hmImportTop = 300f;
+bool showTerrainImport = false;
+string tiSource = "";                                   // a colour-map picture, or a folder of tile pictures
+int tiTileSizeIdx = 2;                                  // into TerrainColorImport.TileSizes: 1024, what Interstate maps use
+string tiStatus = "";
+System.Threading.Tasks.Task<List<(string Name, byte[] Dds)>>? tiTask = null;
+System.Threading.CancellationTokenSource? tiCancel = null;
+int tiDone = 0, tiTotal = 0;
+string tiSourceInfoFor = ""; string tiSourceInfo = ""; int tiSourcePx = 0;   // what the chosen source is, cached per path
 float nmFlatHeight = 32f;                              // metres (Flat)
 int nmSeed = 2026;
 float nmRoughness = 0.55f, nmMinH = 22f, nmMaxH = 160f; // Fractal: a more dramatic default relief (auto-fit yScale)
@@ -6725,8 +6741,14 @@ int? RawSquareSide(string path)
 void DoImportHeightmap()
 {
     if (heightmap is null) return;
-    var path = Picker.File("Import Heightmap.raw (16-bit LE, square)", "Raw heightmap|*.raw|All files|*.*", texturesDir ?? levelDir);
+    var path = Picker.File("Import a heightmap (16-bit PNG, or a headerless 16-bit .raw)", "Heightmaps|*.png;*.raw|All files|*.*", texturesDir ?? levelDir);
     if (path is null) return;
+    // A PNG needs to be told how many metres its white is - a .raw is already in the engine's units.
+    if (Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase))
+    {
+        hmImportPath = path; showHmImport = true;
+        return;
+    }
     try
     {
         var imported = Heightmap.LoadRawSquare(path);
@@ -6740,6 +6762,263 @@ void DoImportHeightmap()
             : $"Imported {Path.GetFileName(path)} ({srcSide}^2 -> {cfg.MaterialSize}^2 resampled).");
     }
     catch (Exception ex) { Toast(Loc.T("Import failed: ") + ex.Message); }
+}
+
+// ---- Terrain made in another tool -----------------------------------------------------------------------------------
+
+bool IsPngPath(string path) => Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase);
+
+// A PNG's size from its header alone - the colour maps this is for run to hundreds of megabytes.
+(int W, int H)? PngSize(string path)
+{
+    try
+    {
+        var head = new byte[24];
+        using (var fs = File.OpenRead(path)) if (fs.ReadAtLeast(head, 24, throwOnEndOfStream: false) < 24) return null;
+        if (!RefractorForge.Formats.Imaging.PngReader.IsPng(head)) return null;
+        return ((int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(head.AsSpan(16)),
+                (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(head.AsSpan(20)));
+    }
+    catch { return null; }
+}
+
+// A picture as RGBA. PNG goes through our own reader, which takes far bigger images than Windows' decoder; anything
+// else through the loader the texture library uses.
+(byte[] Rgba, int W, int H)? LoadColourPicture(string path)
+{
+    if (Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase))
+    {
+        var rgba = RefractorForge.Formats.Imaging.PngReader.ReadRgba8(File.ReadAllBytes(path), out int w, out int h);
+        return (rgba, w, h);
+    }
+    var t = LoadImageAsTexture(path);
+    return t is null ? null : (t.Rgba, t.Width, t.Height);
+}
+
+// A heightmap PNG into the open level. It keeps the level's yScale: a PNG's white is "the highest point", so the user
+// says how high that is and the samples are mapped onto it - anything above what the yScale can hold is cut flat,
+// and said so. A NEW map made from a PNG picks the yScale to fit instead (see CreateNewMap).
+void HeightmapImportWindow()
+{
+    if (!showHmImport) return;
+    if (heightmap is null) { showHmImport = false; return; }
+    ImGui.SetNextWindowSize(new Vector2(520f, 250f) * uiScale, ImGuiCond.FirstUseEver);
+    if (ImGui.Begin(Loc.TL("Import heightmap##hmimp"), ref showHmImport))
+    {
+        ImGui.PushTextWrapPos(0f);
+        var sz = PngSize(hmImportPath);
+        ImGui.TextUnformatted(Path.GetFileName(hmImportPath) + (sz is { } s ? $"  ({s.W} x {s.H})" : ""));
+        Theme.Muted(Loc.T("The top of the picture is north, the way a map is drawn. White is the highest point of the terrain and black the lowest, at 0 m."));
+        ImGui.SetNextItemWidth(150f * uiScale);
+        InF(Loc.TL("Highest point (m)"), ref hmImportTop, 10f, 100f, "%.1f");
+        hmImportTop = Math.Clamp(hmImportTop, 1f, 20000f);
+        float max = RefractorForge.Formats.Terrain.HeightmapImport.MaxMetres(cfg.YScale);
+        Theme.Muted(string.Format(Loc.T("This level holds terrain up to {0:0} m (yScale {1:0.###})."), max, cfg.YScale));
+        if (hmImportTop > max + 0.5f)
+            ImGui.TextColored(new Vector4(1f, 0.6f, 0.3f, 1f), string.Format(Loc.T("Anything above {0:0} m will be cut flat. For taller terrain, make a new map from this heightmap instead - it picks the yScale to fit."), max));
+        ImGui.PopTextWrapPos();
+        if (ImGui.Button(Loc.TL("Import##hmimp")))
+        {
+            try
+            {
+                var samples = RefractorForge.Formats.Imaging.PngReader.ReadGray16(File.ReadAllBytes(hmImportPath), out int w, out int h);
+                var imported = RefractorForge.Formats.Terrain.HeightmapImport.FromNorthUpImage(samples, w, h, heightmap.Width, hmImportTop, cfg.YScale, out int clamped);
+                heightmap.CopyFrom(imported);
+                RebuildTerrain();
+                BroadcastFullTerrain();
+                Console.WriteLine($"Imported heightmap {hmImportPath} ({w}x{h} -> {heightmap.Width}^2), highest point {hmImportTop:0.#} m, {clamped} sample(s) clamped.");
+                Toast(clamped == 0
+                    ? string.Format(Loc.T("Imported {0} ({1} x {2}) as the terrain."), Path.GetFileName(hmImportPath), w, h)
+                    : string.Format(Loc.T("Imported {0}, but {1:N0} sample(s) were higher than this level can hold and were cut flat."), Path.GetFileName(hmImportPath), clamped));
+                showHmImport = false;
+            }
+            catch (Exception ex) { Toast(Loc.T("Import failed: ") + ex.Message); }
+        }
+    }
+    ImGui.End();
+}
+
+// The ground texture from another tool: one north-up picture, or a folder of pre-cut tile pictures (for a texture
+// too big to be one image - an 8 km map at 1024 px a tile is 32768 px across). Cut and DXT-encoded on a worker; the
+// result replaces the level's tiles on the render thread (FinishTerrainColorImport).
+void TerrainImportWindow()
+{
+    TerrainColorImportPoll();
+    if (!showTerrainImport) return;
+    if (heightmap is null) { showTerrainImport = false; return; }
+    int grid = RefractorForge.Render.TerrainColorImport.GridSide(heightmap.Width);
+    float mPerTile = cfg.WorldSize / (float)grid;
+    bool running = tiTask is not null;
+    ImGui.SetNextWindowSize(new Vector2(600f, 430f) * uiScale, ImGuiCond.FirstUseEver);
+    bool open = true;
+    if (ImGui.Begin(Loc.TL("Import terrain texture##tiimp"), ref open))
+    {
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextUnformatted(string.Format(Loc.T("This map is {0} x {0} tiles of {1:0} m ({2:N0} tiles): one tile for every 64 x 64 heightmap samples."), grid, mPerTile, grid * grid));
+        Theme.Muted(Loc.T("A picture of the whole map, NORTH at the top and west on the left - the way a map is drawn. Or a folder of tile pictures named tile_<column>_<row>: column 0 is the west edge, row 0 the SOUTH edge, each picture north-up."));
+        ImGui.PopTextWrapPos();
+
+        ImGui.BeginDisabled(running);
+        ImGui.PushItemWidth(-190f * uiScale);
+        InT(Loc.TL("Source##tiimp"), ref tiSource, 1024);
+        ImGui.PopItemWidth();
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Picture...##tiimp")))
+        {
+            var f = Picker.File("Terrain colour map (north at the top)", "Images|*.png;*.tga;*.bmp;*.jpg;*.jpeg;*.dds|All files|*.*", levelDir);
+            if (f is not null) tiSource = f;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Folder...##tiimp")))
+        {
+            var d = Picker.Folder("Folder of tile pictures (tile_<column>_<row>)", levelDir);
+            if (d is not null) tiSource = d;
+        }
+
+        // What the source is - worked out once per path, not every frame.
+        string src = tiSource.Trim();
+        if (src != tiSourceInfoFor)
+        {
+            tiSourceInfoFor = src; tiSourcePx = 0; tiSourceInfo = "";
+            if (Directory.Exists(src))
+            {
+                var names = Directory.EnumerateFiles(src).Select(f => RefractorForge.Render.TerrainColorImport.ParseTileName(f))
+                                     .Where(t => t is { } p && p.Col < grid && p.Row < grid).Distinct().Count();
+                tiSourceInfo = string.Format(Loc.T("{0:N0} of the {1:N0} tiles found in the folder."), names, grid * grid);
+            }
+            else if (File.Exists(src))
+            {
+                var sz = PngSize(src);
+                if (sz is { } s) { tiSourcePx = Math.Max(s.W, s.H); tiSourceInfo = $"{s.W} x {s.H}"; }
+                else tiSourceInfo = Path.GetExtension(src).ToUpperInvariant().TrimStart('.');
+                if (tiSourcePx > 0) tiTileSizeIdx = Math.Max(0, Array.IndexOf(RefractorForge.Render.TerrainColorImport.TileSizes,
+                                                   RefractorForge.Render.TerrainColorImport.SuggestTileSize(tiSourcePx, grid)));
+            }
+        }
+        if (tiSourceInfo.Length > 0) Theme.Muted(tiSourceInfo);
+
+        var sizes = RefractorForge.Render.TerrainColorImport.TileSizes;
+        var labels = sizes.Select(px => string.Format(Loc.T("{0} px - {1:0.#} px per metre, about {2}"), px, px / mPerTile,
+                                          FormatBytes(RefractorForge.Render.TerrainColorImport.EstimateBytes(grid, px)))).ToArray();
+        ImGui.SetNextItemWidth(360f * uiScale);
+        Cbo(Loc.TL("Tile size##tiimp"), ref tiTileSizeIdx, labels, labels.Length);
+        Theme.Tip(Loc.T("Both games load textures up to 4096 px. Retail maps are 1 px per metre; most Interstate maps use 1024 px tiles\non 256 m, which is 4. Larger than your picture holds only stores a blurrier copy in more space."));
+        ImGui.EndDisabled();
+
+        bool offset = cfg.TexOffsetX != 0 || cfg.TexOffsetY != 0;
+        ImGui.PushTextWrapPos(0f);
+        if (offset)
+            ImGui.TextColored(new Vector4(1f, 0.6f, 0.3f, 1f), Loc.T("This level textures only part of its world (texOffsetX/Y are not 0), so a whole-map texture would not line up. Import onto a new map instead."));
+        Theme.Muted(Loc.T("Painting the texture here afterwards redraws the painted tiles from the editor's preview, which holds less detail than a high-resolution import - do texture work in the terrain tool, and use this editor for everything else."));
+        ImGui.PopTextWrapPos();
+
+        if (running)
+        {
+            float f = tiTotal > 0 ? (float)tiDone / tiTotal : 0f;
+            ImGui.ProgressBar(f, new Vector2(-1f, 0f), $"{tiDone:N0} / {tiTotal:N0}");
+            if (ImGui.Button(Loc.TL("Cancel##tiimp"))) tiCancel?.Cancel();
+        }
+        else
+        {
+            ImGui.BeginDisabled(offset || src.Length == 0 || !(File.Exists(src) || Directory.Exists(src)));
+            if (Theme.AccentButton(Loc.TL("Import##tiimp"))) StartTerrainColorImport(grid, sizes[Math.Clamp(tiTileSizeIdx, 0, sizes.Length - 1)]);
+            ImGui.EndDisabled();
+        }
+        if (tiStatus.Length > 0) { ImGui.PushTextWrapPos(0f); ImGui.TextUnformatted(tiStatus); ImGui.PopTextWrapPos(); }
+    }
+    ImGui.End();
+    if (!open && !running) showTerrainImport = false;           // stays up while it runs, so the progress is not lost
+}
+
+string FormatBytes(long b) => b >= 1L << 30 ? $"{b / (double)(1L << 30):0.0} GB" : $"{b / (double)(1L << 20):0} MB";
+
+void StartTerrainColorImport(int grid, int tilePx)
+{
+    string src = tiSource.Trim();
+    bool folder = Directory.Exists(src);
+    tiTotal = grid * grid; tiDone = 0; tiStatus = "";
+    tiCancel = new System.Threading.CancellationTokenSource();
+    var token = tiCancel.Token;
+    Console.WriteLine($"Terrain texture import: {src} -> {grid}x{grid} tiles of {tilePx} px.");
+    tiTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        var result = new (string Name, byte[] Dds)?[grid * grid];
+        var opts = new System.Threading.Tasks.ParallelOptions { CancellationToken = token };
+        if (folder)
+        {
+            var files = Directory.EnumerateFiles(src)
+                .Select(f => (Path: f, At: RefractorForge.Render.TerrainColorImport.ParseTileName(f)))
+                .Where(x => x.At is { } p && p.Col < grid && p.Row < grid)
+                .GroupBy(x => x.At!.Value).Select(g => g.First()).ToList();
+            var missing = grid * grid - files.Count;
+            if (missing > 0) throw new InvalidDataException(string.Format(Loc.T("The folder is missing {0:N0} of the {1:N0} tiles this map needs."), missing, grid * grid));
+            System.Threading.Tasks.Parallel.ForEach(files, opts, x =>
+            {
+                var pic = LoadColourPicture(x.Path) ?? throw new InvalidDataException("Cannot read " + Path.GetFileName(x.Path));
+                var (c, r) = x.At!.Value;
+                var tile = RefractorForge.Render.TerrainColorImport.FromTilePicture(pic.Rgba, pic.W, pic.H, tilePx);
+                result[r * grid + c] = (RefractorForge.Render.TerrainColorImport.TileFileName(c, r), RefractorForge.Render.TerrainColorImport.Encode(tile));
+                System.Threading.Interlocked.Increment(ref tiDone);
+            });
+        }
+        else
+        {
+            var pic = LoadColourPicture(src) ?? throw new InvalidDataException("Cannot read " + Path.GetFileName(src));
+            System.Threading.Tasks.Parallel.For(0, grid * grid, opts, i =>
+            {
+                int c = i % grid, r = i / grid;
+                var tile = RefractorForge.Render.TerrainColorImport.CutTile(pic.Rgba, pic.W, pic.H, grid, c, r, tilePx);
+                result[i] = (RefractorForge.Render.TerrainColorImport.TileFileName(c, r), RefractorForge.Render.TerrainColorImport.Encode(tile));
+                System.Threading.Interlocked.Increment(ref tiDone);
+            });
+        }
+        return result.Select(t => t!.Value).ToList();
+    }, token);
+}
+
+// Per frame: hand a finished import to the render thread.
+void TerrainColorImportPoll()
+{
+    if (tiTask is not { IsCompleted: true } t) return;
+    tiTask = null;
+    if (t.IsCanceled || tiCancel?.IsCancellationRequested == true) tiStatus = Loc.T("Cancelled - the map is unchanged.");
+    else if (t.IsFaulted) { tiStatus = Loc.T("Import failed: ") + t.Exception?.GetBaseException().Message; Console.WriteLine("Terrain texture import: " + t.Exception?.GetBaseException()); }
+    else FinishTerrainColorImport(t.Result);
+    tiCancel?.Dispose(); tiCancel = null;
+}
+
+void FinishTerrainColorImport(List<(string Name, byte[] Dds)> tiles)
+{
+    // The new tiles ARE the level's ground now: rebuilt exactly the way a level's tiles are at load, and queued for
+    // the save. The atlas is only the editor's preview of them, so nothing is marked painted - a save must write these
+    // tiles as imported, never re-cut them from the lower-resolution preview.
+    var fresh = TerrainTexture.FromTileBytes(tiles.Select(t => ("Textures/" + t.Name, t.Dds)), cfg.WorldSize);
+    if (fresh is null) { tiStatus = Loc.T("Import failed: no tiles were produced."); return; }
+    fresh.Detail = terrainTex?.Detail;
+    terrainTex = fresh;
+    Span<int> mt = stackalloc int[1]; gl.GetInteger(GLEnum.MaxTextureSize, mt);
+    int atlasCap = Math.Min(8192, mt[0] > 0 ? mt[0] : 8192);
+    int atlasSize = Math.Clamp(terrainTex.NativeSize, 2048, atlasCap);
+    atlasCpu = terrainTex.BakeAtlas(atlasSize);
+    if (terrainTexId != 0) gl.DeleteTexture(terrainTexId);
+    terrainTexId = UploadTexture(atlasCpu);
+    gl.UseProgram(terrainProg);
+    gl.Uniform1(uHasTexT, 1);
+    foreach (var t in tiles) QueueLevelFile("Textures/" + t.Name, t.Dds);
+    atlasPainted = false; tilesDirty.Clear();
+
+    // What the editor remembered about the OLD ground describes a ground that is gone: a bake's merge records, and the
+    // copy "Revert ground to original" restores. The next bake keeps a copy of this one instead.
+    SetGroundMerge(null); SetPoolMerge(null);
+    try { if (!string.IsNullOrEmpty(levelDir)) File.Delete(RefractorForge.Formats.Terrain.GroundOriginal.PathFor(levelDir)); } catch { }
+    groundOriginal = null; groundOriginalLoaded = true;
+    groundAtlasVersion++;
+    BuildMinimap();
+
+    long bytes = tiles.Sum(t => (long)t.Dds.Length);
+    tiStatus = string.Format(Loc.T("Imported {0:N0} tiles ({1}). Save writes them into the level."), tiles.Count, FormatBytes(bytes));
+    Console.WriteLine($"Terrain texture import: {tiles.Count} tiles, {bytes:N0} bytes, atlas {atlasSize}^2.");
+    Toast(tiStatus);
 }
 
 // Export the current terrain as a raw Heightmap.raw (headerless 16-bit LE, side == materialSize).
@@ -10668,15 +10947,41 @@ void ForSelectedLights(Action<PointLight> set) { foreach (var l in SelectedLight
 // Which lamp object a light belongs to, if any. Uses the SAME rule "Under lamp objects" places by - the object's
 // position plus its measured bulb offset - so a light that button created always matches the lamp it came from,
 // and one nudged a little still does.
-string? LampTemplateUnder(PointLight l)
+string? LampTemplateUnder(PointLight l) => LampUnder(l)?.Template;
+
+// The lamp object a light belongs to: the NEAREST lamp whose bulb is within LightPool.MatchRadiusMetres. Nearest,
+// not first-found - two lamps with their arms reaching toward each other have bulbs closer than their posts.
+StaticObject? LampUnder(PointLight l)
 {
     if (so is null) return null;
+    StaticObject? best = null;
+    float bestD = RefractorForge.Formats.Con.LightPool.MatchRadiusMetres;
     foreach (var o in so.Objects)
     {
         if (!RefractorForge.Formats.Con.LightPool.LooksLikeLamp(o.Template)) continue;
-        if (RefractorForge.Formats.Con.LightPool.LightBelongsTo(o.Template, o.Position, l.Position)) return o.Template;
+        float d = RefractorForge.Formats.Con.LightPool.DistanceToBulb(o.Template, o.Position, o.Rotation, l.Position, o.Scale ?? 1f);
+        if (d < bestD) { bestD = d; best = o; }
     }
-    return null;
+    return best;
+}
+
+// Move every light that belongs to a measured lamp into that lamp's bulb. For a map whose lamps were lit before the
+// bulb was measured - or before it turned with the lamp - where the lights sit over the object's origin, between
+// the pole and the head. Lamps with no measured bulb are left alone: there is nowhere better to put their light.
+int SnapLightsToBulbs()
+{
+    int n = 0;
+    foreach (var l in lightRig.Lights)
+    {
+        var o = LampUnder(l);
+        if (o is null || !RefractorForge.Formats.Con.LightPool.HasOffset(o.Template)) continue;
+        var a = RefractorForge.Formats.Con.LightPool.LightAnchor(o.Template, o.Position, o.Rotation, o.Scale ?? 1f);
+        float dx = l.Position.X - a.X, dy = l.Position.Y - a.Y, dz = l.Position.Z - a.Z;
+        if (dx * dx + dy * dy + dz * dz < 1e-4f) continue;          // already in the head
+        l.Position = a;
+        n++;
+    }
+    return n;
 }
 
 // Select every light the predicate accepts. The first match becomes the one whose values the controls show.
@@ -10782,21 +11087,32 @@ void NightLightingWindow()
                 // the object's OWN position, so the light keeps the height the mapper placed it at rather than
                 // being dropped to the ground and pushed back up by the preset. Anything unmeasured falls back
                 // to the old behaviour - on the ground under the object, at the preset's height.
+                // The bulb turns WITH the lamp: its position is in the lamp's own axes, so it is rotated by the
+                // object's rotation (LightPool.LightAnchor) - a street of lamps facing four ways gets its light in
+                // every head, not only in the heads that happen to face the way the bulb was measured.
                 bool measured = RefractorForge.Formats.Con.LightPool.HasOffset(o.Template);
-                var anchor = RefractorForge.Formats.Con.LightPool.LightAnchor(o.Template, o.Position);
+                var anchor = RefractorForge.Formats.Con.LightPool.LightAnchor(o.Template, o.Position, o.Rotation, o.Scale ?? 1f);
                 var at = measured ? new Vector3(anchor.X, anchor.Y, anchor.Z)
                                   : new Vector3(o.Position.X, 0f, o.Position.Z);
 
                 // Skip a lamp that already has a light, so this button is safe to press twice. It is the SAME
                 // test "Same lamp type" selects by (LightPool.LightBelongsTo), so a lamp can never both be given
-                // a second light and fail to recognise the one it has.
-                if (lightRig.Lights.Any(x => RefractorForge.Formats.Con.LightPool.LightBelongsTo(o.Template, o.Position, x.Position))) continue;
+                // a second light and fail to recognise the one it has. "Snap to bulbs" moves an existing one.
+                if (lightRig.Lights.Any(x => RefractorForge.Formats.Con.LightPool.LightBelongsTo(o.Template, o.Position, o.Rotation, x.Position, o.Scale ?? 1f))) continue;
                 AddNightLight(at, onGround: !measured); n++;
             }
             Toast(string.Format(Loc.T("{0} light(s) added under lamp objects."), n));
         }
     }
     Theme.Tip(Loc.T("Every placed object whose name reads as a lamp (lamp, light, lantern, torch, candle, bulb,\nstreetlight) gets a light of the chosen preset at its position."));
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Snap to bulbs")) && so is not null)
+    {
+        int n = SnapLightsToBulbs();
+        Toast(n > 0 ? string.Format(Loc.T("{0} light(s) moved into their lamp's bulb."), n)
+                    : Loc.T("Every lamp light is already in its bulb."));
+    }
+    Theme.Tip(Loc.T("Moves each light standing on a lamp into that lamp's bulb, turned the way the lamp faces.\nFor lights placed before the bulb was measured, which sit over the middle of the lamp\ninstead of in its head. Lamps with no measured bulb are left as they are."));
 
     if (lightRig.Lights.Count > 0)
     {
@@ -13183,15 +13499,23 @@ void DoCreateNewMap()
         // why cranking the height range still looked flat. The user's yScale is kept as a floor.
         // Validate the heightmap pick up front (type 4) so we fail with a clear message before creating anything.
         if (nmTerrainType == 4 && (nmHeightmapPath.Trim().Length == 0 || !File.Exists(nmHeightmapPath.Trim())))
-        { nmError = Loc.T("Choose a heightmap .raw file to import."); return; }
+        { nmError = Loc.T("Choose a heightmap (.png or .raw) to import."); return; }
+        bool pngHeightmap = nmTerrainType == 4 && IsPngPath(nmHeightmapPath.Trim());
 
         float maxMeters = MathF.Max(MathF.Max(nmMinH, nmMaxH), nmFlatHeight);
-        // Flat + imported terrain use the user's yScale verbatim; the fractal types auto-fit it so tall peaks aren't clamped.
-        float effYScale = (nmTerrainType == 0 || nmTerrainType == 4) ? nmYScale : MathF.Max(nmYScale, maxMeters * 256f / 60000f);
+        // Flat + imported .raw terrain use the user's yScale verbatim; the fractal types auto-fit it so tall peaks aren't
+        // clamped; a PNG gets the yScale that makes its white exactly the highest point asked for.
+        float effYScale = pngHeightmap ? RefractorForge.Formats.Terrain.HeightmapImport.YScaleFor(nmImportTop)
+                        : (nmTerrainType == 0 || nmTerrainType == 4) ? nmYScale : MathF.Max(nmYScale, maxMeters * 256f / 60000f);
         var ncfg = new TerrainConfig { MaterialSize = matSize, WorldSize = worldSize, YScale = effYScale, WaterLevel = nmWaterLevel, SeaFloorLevel = 0f, WaveHeight = 1f };
 
         Heightmap nhm;
-        if (nmTerrainType == 4)
+        if (pngHeightmap)
+        {
+            var samples = RefractorForge.Formats.Imaging.PngReader.ReadGray16(File.ReadAllBytes(nmHeightmapPath.Trim()), out int pw, out int ph);
+            nhm = RefractorForge.Formats.Terrain.HeightmapImport.FromNorthUpImage(samples, pw, ph, matSize, nmImportTop, effYScale, out _);
+        }
+        else if (nmTerrainType == 4)
         {
             var imp = Heightmap.LoadRawSquare(nmHeightmapPath.Trim());          // throws if not a square 16-bit raw
             nhm = imp.Width == matSize ? imp : imp.Resample(matSize, matSize);  // resample to the chosen grid if needed
@@ -13210,7 +13534,8 @@ void DoCreateNewMap()
             };
         }
 
-        RefractorForge.Formats.LevelSaver.CreateNewLevel(dir, name, ncfg, nhm, new EnvironmentSettings(), null, nmPlayable);
+        RefractorForge.Formats.LevelSaver.CreateNewLevel(dir, name, ncfg, nhm, new EnvironmentSettings(), null, nmPlayable,
+                                                         baseSub: nmGameBf1942 ? "bf1942" : "BfVietnam");
         // Persist the chosen target game beside the level (a tiny sidecar) so it survives the relaunch + future opens.
         try { System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "refractorforge.game"), nmGameBf1942 ? "1942" : "vietnam"); } catch { }
 
@@ -13647,30 +13972,43 @@ void NewMapModal()
         nmFlatHeight = SliderInput("Ground height (m)", nmFlatHeight, -100f, 500f, "%.1f", "%.1f");
     else if (nmTerrainType == 4)
     {
-        // Import a headerless 16-bit LE square .raw as the starting terrain (resampled to the grid if sizes differ).
+        // Import a 16-bit PNG (north at the top) or a headerless 16-bit LE square .raw as the starting terrain,
+        // resampled to the grid if sizes differ.
         ImGui.PushItemWidth(-160);   // reserve room for the "Heightmap" label (drawn to the right) AND the Browse button
         InT(Loc.TL("Heightmap"), ref nmHeightmapPath, 512);
         ImGui.PopItemWidth();
         ImGui.SameLine();
         if (ImGui.Button(Loc.TL("Browse...##hm")))
         {
-            var hp = Picker.File("Import Heightmap.raw (16-bit LE, square)", "Raw heightmap|*.raw|All files|*.*",
+            var hp = Picker.File("Import a heightmap (16-bit PNG, or a headerless 16-bit .raw)", "Heightmaps|*.png;*.raw|All files|*.*",
                                  Directory.Exists(nmFolder) ? nmFolder : null);
             if (hp is not null)
             {
                 nmHeightmapPath = hp;
-                // If the .raw's native side is one of our grid sizes, snap Material size to it (no resample needed).
-                if (RawSquareSide(hp) is int sd && Array.IndexOf(nmMatSizes, sd) is int mi && mi >= 0) nmMatSizeIdx = mi;
+                // If the file's native side is one of our grid sizes, snap Material size to it (no resample needed).
+                int? side = IsPngPath(hp) ? (PngSize(hp) is { } ps && ps.W == ps.H ? ps.W : null) : RawSquareSide(hp);
+                if (side is int sd && Array.IndexOf(nmMatSizes, sd) is int mi && mi >= 0) nmMatSizeIdx = mi;
             }
         }
         if (nmHeightmapPath.Length > 0 && File.Exists(nmHeightmapPath))
         {
             int tms = nmMatSizes[Math.Clamp(nmMatSizeIdx, 0, nmMatSizes.Length - 1)];
-            if (RawSquareSide(nmHeightmapPath) is int sd)
+            if (IsPngPath(nmHeightmapPath))
+            {
+                if (PngSize(nmHeightmapPath) is { } ps)
+                    ImGui.TextDisabled(ps.W == tms && ps.H == tms ? $"{ps.W}^2 PNG (matches grid)" : $"{ps.W}x{ps.H} PNG -> resampled to {tms}^2");
+                else ImGui.TextColored(new Vector4(1f, 0.55f, 0.3f, 1f), Loc.T("not a PNG"));
+                // A PNG's white is "the highest point" - how many metres that is decides the yScale, so the terrain
+                // comes in at its true height with the whole 16 bits used (the Y scale above does not apply).
+                nmImportTop = SliderInput("Highest point (m)", nmImportTop, 1f, 3000f, "%.0f", "%.1f");
+                ImGui.TextDisabled(string.Format(Loc.T("yScale {0:0.###}, picked so the picture's white is exactly this high."),
+                                                 RefractorForge.Formats.Terrain.HeightmapImport.YScaleFor(nmImportTop)));
+            }
+            else if (RawSquareSide(nmHeightmapPath) is int sd)
                 ImGui.TextDisabled(sd == tms ? $"{sd}^2 raw (matches grid)" : $"{sd}^2 raw -> resampled to {tms}^2");
             else ImGui.TextColored(new Vector4(1f, 0.55f, 0.3f, 1f), Loc.T("not a square 16-bit .raw"));
         }
-        else ImGui.TextDisabled(Loc.T("Headerless 16-bit LE square .raw (e.g. Terrain -> Export, World Machine, L3DT)."));
+        else ImGui.TextDisabled(Loc.T("A 16-bit PNG (north at the top) or a headerless 16-bit .raw - from Blender, Gaea, World Machine or L3DT."));
     }
     else
     {
@@ -16173,7 +16511,10 @@ void BuildUi()
         }
         if (ImGui.BeginMenu(Loc.TL("Terrain")))
         {
-            if (ImGui.MenuItem(Loc.TL("Import Heightmap.raw..."), null, false, heightmap is not null)) DoImportHeightmap();
+            if (ImGui.MenuItem(Loc.TL("Import Heightmap (.png / .raw)..."), null, false, heightmap is not null)) DoImportHeightmap();
+            Theme.Tip(Loc.T("A heightmap from Blender, Gaea, World Machine or L3DT: a 16-bit PNG (north at the top), or a\nheaderless 16-bit .raw already in the engine's order. Any size - it is resampled to this map's grid."));
+            if (ImGui.MenuItem(Loc.TL("Import Terrain Texture (colour map)..."), null, false, heightmap is not null)) showTerrainImport = true;
+            Theme.Tip(Loc.T("The ground texture from another tool - one picture of the whole map, or a folder of tiles for a\ntexture too big to be one image - cut into this map's tiles at up to 4096 px each."));
             if (ImGui.MenuItem(Loc.TL("Export Heightmap.raw..."), null, false, heightmap is not null)) DoExportHeightmap();
             ImGui.Separator();
             if (ImGui.MenuItem(Loc.TL("Generate Material Map (from terrain)"), null, false, heightmap is not null)) DoGenerateMaterialMap();
@@ -16578,6 +16919,8 @@ void BuildUi()
     BrightenDialog();
     NightLightingWindow();
     NightBakeProgress();
+    HeightmapImportWindow();
+    TerrainImportWindow();
     CollabAutoFetchMap();
     BaseTransferProgress();
     MapPickerModal();

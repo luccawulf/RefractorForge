@@ -135,27 +135,31 @@ public static class LightPool
     };
 
     /// <summary>
-    /// Where the bulb actually sits, relative to a lamp object's own origin.
+    /// Where the bulb actually sits, in the lamp's OWN axes - object-local metres, before its rotation.
     ///
     /// An object's origin is at its base, so a light dropped at the placement lands in the dirt at the foot of
-    /// the post rather than in the lamp head — and a street lamp hangs its bulb out on an arm, so the bulb is
-    /// not even above the origin. Each entry is measured once from a light placed by eye on a real lamp and
-    /// then reused for every other instance of that template.
+    /// the post rather than in the lamp head - and a street lamp hangs its bulb out on an arm, so the bulb is
+    /// not even above the origin. Each entry is read off the lamp's own mesh and then reused for every instance.
     ///
-    /// The offset is in WORLD axes and is deliberately NOT rotated by the object's own rotation: every lamp of
-    /// a given template gets its light at the same delta, whichever way the post is turned.
+    /// LOCAL, and turned with the lamp (<see cref="LightAnchor"/>). This was once a fixed WORLD offset, measured
+    /// on one lamp facing -89 degrees - which put the light in the head of every lamp facing that way and nowhere
+    /// else: al_vietnas's 49 street lamps face four directions, and on the 34 not facing -90 the light landed up to
+    /// 1.34 m off, on the pole side of the arm.
     ///
-    /// Measured: <c>dc_streetlamp2_m1</c> at 464.479/26.6187/343.854 with its glow at 465.1482/32.67572/343.854.
+    /// <c>dc_streetlamp2_m1</c>: the head is a shallow cone, a 10-vertex ring at Y 6.1473 around (0, -0.6706) with
+    /// its apex - the underside of the shade, where the bulb is - at (0, 6.1042, -0.6706). The pole stands at local
+    /// Z +0.50, so the origin is between pole and head. A glow placed by eye on the lamp at 464.479/26.6187/343.854
+    /// (rotation -89.125) sat at 465.1482/32.67572/343.854; this entry, turned by that rotation, puts it within 5 cm.
     /// </summary>
-    private static readonly (string Key, Vec3 Offset)[] LampOffsets =
+    private static readonly (string Key, Vec3 Local)[] LampBulbs =
     {
-        ("dc_streetlamp2", new Vec3(0.669f, 6.057f, 0f)),
+        ("dc_streetlamp2", new Vec3(0f, 6.1042f, -0.6706f)),
     };
 
     /// <summary>
-    /// The bulb offset for a template, or <see cref="Vec3.Zero"/> when none is known. Matched on a substring so
-    /// one entry covers a template and its mesh-suffixed variants (<c>dc_streetlamp2</c> → <c>..._m1</c>), with
-    /// the longest key winning so a more specific entry beats a general one.
+    /// The bulb's position in the lamp's own axes, or <see cref="Vec3.Zero"/> when none is known. Matched on a
+    /// substring so one entry covers a template and its mesh-suffixed variants (<c>dc_streetlamp2</c> →
+    /// <c>..._m1</c>), with the longest key winning so a more specific entry beats a general one.
     /// </summary>
     public static Vec3 OffsetFor(string template)
     {
@@ -163,46 +167,60 @@ public static class LightPool
 
         var best = Vec3.Zero;
         int bestLen = -1;
-        foreach (var (key, offset) in LampOffsets)
+        foreach (var (key, local) in LampBulbs)
         {
             if (!template.Contains(key, StringComparison.OrdinalIgnoreCase)) continue;
             if (key.Length <= bestLen) continue;
-            best = offset;
+            best = local;
             bestLen = key.Length;
         }
         return best;
     }
 
-    /// <summary>True when this template has a measured bulb offset, so the caller can use the object's own
+    /// <summary>True when this template has a measured bulb position, so the caller can use the object's own
     /// height instead of dropping the light to the ground.</summary>
     public static bool HasOffset(string template) => OffsetFor(template) != Vec3.Zero;
 
-    /// <summary>Where a lamp's light belongs: the object's own position plus its measured bulb offset.</summary>
-    public static Vec3 LightAnchor(string template, Vec3 lampPosition)
+    /// <summary>
+    /// Where a lamp's light belongs in the WORLD: its bulb turned by the object's rotation and scale, then placed at
+    /// its position - the same transform the editor draws the mesh with (<c>LevelScene.MeshWorld</c>: scale, then
+    /// yaw/pitch/roll from rotation X/Y/Z, then translate), so the light lands in the head as drawn.
+    /// </summary>
+    public static Vec3 LightAnchor(string template, Vec3 lampPosition, Vec3 lampRotation, float scale = 1f)
     {
-        var off = OffsetFor(template);
-        return new Vec3(lampPosition.X + off.X, lampPosition.Y + off.Y, lampPosition.Z + off.Z);
+        var local = OffsetFor(template);
+        var m = System.Numerics.Matrix4x4.CreateScale(scale)
+              * System.Numerics.Matrix4x4.CreateFromYawPitchRoll(Rad(lampRotation.X), Rad(lampRotation.Y), Rad(lampRotation.Z));
+        var w = System.Numerics.Vector3.Transform(new System.Numerics.Vector3(local.X, local.Y, local.Z), m);
+        return new Vec3(lampPosition.X + w.X, lampPosition.Y + w.Y, lampPosition.Z + w.Z);
     }
 
+    private static float Rad(float degrees) => degrees * MathF.PI / 180f;
+
     /// <summary>
-    /// How close a light has to sit to a lamp's anchor to count as that lamp's, in metres.
+    /// How close a light has to sit to a lamp's bulb to count as that lamp's, in metres.
     ///
-    /// It has to be small enough that no lamp ever claims its neighbour's light: the closest pair on al_vietnas is
-    /// 5.7 m apart, so anything under half of that is safe, and 2.5 m still allows a light to be nudged about a bit
-    /// without losing which post it belongs to.
+    /// Under HALF the closest two bulbs ever get, so no point can belong to two lamps. That is measured at the BULB,
+    /// not the base: two lamps whose arms reach toward each other have their bulbs closer than their posts - on
+    /// al_vietnas 5.65 m apart at the base but 4.31 m at the bulb, which is why the old 2.5 m was too wide. 1.5 m
+    /// still lets a light be nudged well away from the head without losing which post it belongs to.
     /// </summary>
-    public const float MatchRadiusMetres = 2.5f;
+    public const float MatchRadiusMetres = 1.5f;
 
     /// <summary>
-    /// Does this light belong to this lamp? Compared HORIZONTALLY only - a light raised or lowered along the post
-    /// is still that post's light, and the whole point of the height controls is that it can be moved.
+    /// How far this light is from this lamp's bulb, horizontally - a light raised or lowered along the post is still
+    /// that post's light, and the whole point of the height controls is that it can be moved.
     /// </summary>
-    public static bool LightBelongsTo(string template, Vec3 lampPosition, Vec3 lightPosition)
+    public static float DistanceToBulb(string template, Vec3 lampPosition, Vec3 lampRotation, Vec3 lightPosition, float scale = 1f)
     {
-        var a = LightAnchor(template, lampPosition);
+        var a = LightAnchor(template, lampPosition, lampRotation, scale);
         float dx = lightPosition.X - a.X, dz = lightPosition.Z - a.Z;
-        return dx * dx + dz * dz < MatchRadiusMetres * MatchRadiusMetres;
+        return MathF.Sqrt(dx * dx + dz * dz);
     }
+
+    /// <summary>Does this light belong to this lamp? Within <see cref="MatchRadiusMetres"/> of its bulb.</summary>
+    public static bool LightBelongsTo(string template, Vec3 lampPosition, Vec3 lampRotation, Vec3 lightPosition, float scale = 1f)
+        => DistanceToBulb(template, lampPosition, lampRotation, lightPosition, scale) < MatchRadiusMetres;
 
     /// <summary>Every placed object that looks like a lamp, as (template, position). The editor turns each into a
     /// light and a pool.</summary>

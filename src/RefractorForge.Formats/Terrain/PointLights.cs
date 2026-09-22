@@ -149,6 +149,10 @@ public sealed class PointLight
 public sealed record LightPreset(string Name, float R, float G, float B, float Intensity, float Radius, float Falloff,
                                  int Kind, float ConeDeg, float ConeSoft, float SourceSize, float GlowSize, float Height)
 {
+    // Kept at a 120-degree downward cone on purpose. Widening it to the lower hemisphere (175 degrees) was tried on
+    // al_vietnas and looked WORSE: at this intensity every wall within ~10 m of a lamp saturated, and 12.3% of all
+    // lightmap texels hit 255 (from 0.1%) - flat, blown-out orange instead of pools of light. A wider cone needs a
+    // lower intensity to go with it; see the lamp-light notes before changing either.
     public static readonly LightPreset StreetSodium = new("Street lamp - sodium", 1.00f, 0.72f, 0.36f, 1.4f, 26f, 1.6f, 1, 120f, 0.6f, 0.35f, 2.2f, 7f);
     public static readonly LightPreset StreetWhite  = new("Street lamp - white",  0.95f, 0.95f, 1.00f, 1.3f, 26f, 1.6f, 1, 120f, 0.6f, 0.35f, 2.0f, 7f);
     public static readonly LightPreset WallLamp     = new("Wall lamp",            1.00f, 0.84f, 0.60f, 0.9f, 12f, 1.8f, 0, 90f, 0.5f, 0.15f, 1.0f, 3f);

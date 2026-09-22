@@ -113,7 +113,8 @@ internal static class ProjectFlows
             Directory.CreateDirectory(dir);
             var cfg = new TerrainConfig { MaterialSize = spec.MaterialSize, WorldSize = spec.WorldSize, YScale = 1f, WaterLevel = 30f, SeaFloorLevel = 0f, WaveHeight = 1f };
             var hm = HeightmapGenerator.Flat(spec.MaterialSize, cfg.MetersToRaw(35f));
-            LevelSaver.CreateNewLevel(dir, spec.Name, cfg, hm, new EnvironmentSettings(), null, playable: true);
+            LevelSaver.CreateNewLevel(dir, spec.Name, cfg, hm, new EnvironmentSettings(), null, playable: true,
+                                      baseSub: spec.Game == "BF1942" ? "bf1942" : "BfVietnam");
             try { File.WriteAllText(Path.Combine(dir, "refractorforge.game"), spec.Game == "BF1942" ? "1942" : "vietnam"); } catch { }
         }
         catch (Exception ex) { Picker.Error("New map failed:\n" + ex.Message); return null; }

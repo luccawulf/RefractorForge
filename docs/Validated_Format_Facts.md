@@ -17,6 +17,20 @@ All multi-byte integers are little-endian unless stated otherwise.
   `materialSize`, `yScale`, `waterLevel`, `seaFloorLevel`, `waveHeight`.
 - Sample spacing in metres = `worldSize / materialSize` (e.g. `2048 / 512 = 4 m` per sample).
 
+## Terrain texture tiles: one per 64 x 64 heightmap samples
+
+- The ground texture is `Textures/txCCxRR.dds` (zero-padded, DXT1 with mips), found through
+  `GeometryTemplate.texBaseName`. **The tile grid is the heightmap side / 64 along each axis** — nothing in
+  `Terrain.con` states it. It is NOT "256 m per tile": that only holds at 4 m sample spacing.
+- Measured on 848 textured BF1942 levels (Interstate, stock, DC Final, FH, XPack1/2, FHSW, GC): 685 match exactly;
+  156 ship a smaller block inside that grid, placed by `texOffsetX/Y` (e.g. `easter`: offset 4, tiles 0..7 of a
+  16-grid; naval maps texture only the middle); 7 ship a stray extra row/column or keep the heightmap in a patch.
+- Examples: `SwimmingShores` 1024 heightmap over 4 km = 16x16 tiles of 256 m; `big_map` 1024 over 32 km = 16x16 of
+  2 km; `128_planes` 2048 over 32 km = 32x32 of 1 km; `40_thousand_feet` a 128 heightmap = 2x2.
+- Tile size is free: 256, 512, 1024, 2048, 4096 px all ship (retail `Tobruk` uses 4096 px tiles; most Interstate maps
+  1024 px on 256 m tiles = 4 px per metre). Both games load textures up to 4096 px.
+- A tile's first texel row is its SOUTH edge (world Z low), like the heightmap's first row.
+
 ## Coordinate system & rotation
 
 - `+X` = east, `+Z` = north, `+Y` = up. No axis mirroring.

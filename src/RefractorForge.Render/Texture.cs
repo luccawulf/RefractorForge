@@ -283,7 +283,19 @@ public static class DdsTexture
         return (width, dxt);
     }
 
-    public static Texture2D Decode(byte[] d)
+    public static Texture2D Decode(byte[] d) => Decode(d, int.MaxValue);
+
+    /// <summary>
+    /// Decode the largest mip level no bigger than <paramref name="maxSide"/> on either side, or the smallest level
+    /// the file has when none is that small.
+    ///
+    /// For terrain tiles, whose only job in the editor is to be baked into a preview atlas of at most 8192 px. An 8 km
+    /// map is 32 x 32 tiles, so the atlas holds 256 px of each - and decoding every 1024 px tile whole held 4 GB of
+    /// pixels to produce it (retail Tobruk's 48 tiles of 4096 px: 3 GB). The mips are already in the file, box-filtered
+    /// by whoever made it, so reading the right one is both 16x smaller and a better downsample than point-sampling
+    /// the top level. A file whose mip data is cut short falls back to the last level it fully holds.
+    /// </summary>
+    public static Texture2D Decode(byte[] d, int maxSide)
     {
         if (d.Length < 128 || d[0] != (byte)'D' || d[1] != (byte)'D' || d[2] != (byte)'S' || d[3] != (byte)' ')
             throw new InvalidDataException("Not a DDS file.");
@@ -292,6 +304,29 @@ public static class DdsTexture
         uint pfFlags = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(80));
         string fourcc = System.Text.Encoding.ASCII.GetString(d, 84, 4);
         int dataOff = 128;
+
+        if (maxSide < Math.Max(width, height))
+        {
+            uint flags = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(8));
+            int levels = (flags & 0x20000) != 0 ? Math.Max(1, BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(28))) : 1;
+            int block = fourcc == "DXT1" ? 8 : fourcc is "DXT3" or "DXT5" ? 16 : 0;
+            int bytesPerPixel = block == 0 && (pfFlags & 0x40) != 0 ? (int)BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(88)) / 8 : 0;
+            if (block > 0 || bytesPerPixel > 0)
+            {
+                int off = dataOff, w = width, h = height;
+                for (int level = 0; level < levels - 1 && Math.Max(w, h) > maxSide; level++)
+                {
+                    long size = block > 0 ? (long)Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * block
+                                          : (long)w * h * bytesPerPixel;
+                    int nw = Math.Max(1, w / 2), nh = Math.Max(1, h / 2);
+                    long nextSize = block > 0 ? (long)Math.Max(1, (nw + 3) / 4) * Math.Max(1, (nh + 3) / 4) * block
+                                              : (long)nw * nh * bytesPerPixel;
+                    if (off + size + nextSize > d.Length) break;             // the next level is not all there
+                    off += (int)size; w = nw; h = nh;
+                }
+                dataOff = off; width = w; height = h;
+            }
+        }
         var rgba = new byte[width * height * 4];
 
         bool DXT1 = fourcc == "DXT1";
@@ -686,7 +721,21 @@ public sealed class TerrainTexture
         _gridFullW = _gridW; _gridFullH = _gridH;
     }
 
-    public static TerrainTexture? Load(string texturesDir, float worldSize)
+    /// <summary>
+    /// How big to decode each tile: enough for the atlas the viewer will bake them into (the tiles' real size across
+    /// the grid, clamped to 2048..<paramref name="atlasCap"/>, exactly as the viewer sizes it), as a power of two.
+    /// </summary>
+    public static int DecodeSideFor(int maxNativeTile, int gridSide, int atlasCap = 8192)
+    {
+        gridSide = Math.Max(gridSide, 1);
+        int atlas = Math.Clamp(Math.Max(maxNativeTile, 1) * gridSide, 2048, Math.Max(2048, atlasCap));
+        int perTile = (atlas + gridSide - 1) / gridSide;
+        int side = 1;
+        while (side < perTile) side <<= 1;
+        return side;
+    }
+
+    public static TerrainTexture? Load(string texturesDir, float worldSize, int atlasCap = 8192)
     {
         if (!Directory.Exists(texturesDir)) return null;
         var paths = new Dictionary<(int col, int row), string>();
@@ -710,19 +759,29 @@ public sealed class TerrainTexture
         var names = new string?[gw, gh];
         var native = new (int W, bool Dxt)[gw, gh];
         foreach (var kv in paths) names[kv.Key.col, kv.Key.row] = Path.GetFileName(kv.Value);   // preserve the on-disk name
-        // Decode tiles in parallel (each writes its own cell; a high-res terrain texture has many large tiles).
-        System.Threading.Tasks.Parallel.ForEach(paths, kv =>
+
+        // Headers first (128 bytes each), so every tile can be decoded at the size the atlas needs - see FromTileBytes.
+        int maxNative = 0;
+        foreach (var kv in paths)
         {
             try
             {
-                var bytes = File.ReadAllBytes(kv.Value);
-                native[kv.Key.col, kv.Key.row] = DdsTexture.HeaderInfo(bytes);
-                tiles[kv.Key.col, kv.Key.row] = DdsTexture.Decode(bytes);
+                var head = new byte[128];
+                using (var fs = File.OpenRead(kv.Value)) fs.ReadAtLeast(head, 128, throwOnEndOfStream: false);
+                native[kv.Key.col, kv.Key.row] = DdsTexture.HeaderInfo(head);
+                maxNative = Math.Max(maxNative, native[kv.Key.col, kv.Key.row].W);
             }
             catch { }
+        }
+        int decodeSide = DecodeSideFor(maxNative, Math.Max(gw, gh), atlasCap);
+        // Decode tiles in parallel (each writes its own cell; a high-res terrain texture has many large tiles).
+        System.Threading.Tasks.Parallel.ForEach(paths, kv =>
+        {
+            try { tiles[kv.Key.col, kv.Key.row] = DdsTexture.Decode(File.ReadAllBytes(kv.Value), decodeSide); }
+            catch { }
         });
-        int maxTile = 0;
-        foreach (var t in tiles) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
+        int maxTile = maxNative;                                  // the REAL size - see FromTileBytes
+        if (maxTile == 0) foreach (var t in tiles) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
         var tt = new TerrainTexture(tiles, gw, gh, worldSize, maxTile, names, native);
         var detailPath = Path.Combine(texturesDir, "detail.dds");
         if (File.Exists(detailPath)) { try { tt.Detail = DdsTexture.Load(detailPath); } catch { } }
@@ -776,7 +835,12 @@ public sealed class TerrainTexture
 
     /// <summary>Build a terrain texture from in-memory tile DDS bytes (e.g. read straight from a level
     /// .rfa), keyed by the txCOLxROW.dds file name. Mirrors <see cref="Load"/> without a directory.</summary>
-    public static TerrainTexture? FromTileBytes(IEnumerable<(string fileName, byte[] dds)> tiles, float worldSize, byte[]? detailDds = null)
+    /// <param name="atlasCap">The largest atlas the viewer will bake these tiles into. Each tile is decoded at the mip
+    /// that atlas actually uses (see <see cref="DdsTexture.Decode(byte[], int)"/>) rather than whole - which is what lets
+    /// an 8 km map of 1024 px tiles open without holding 4 GB of pixels. <see cref="NativeSize"/> still reports the
+    /// tiles' real size, so the atlas the viewer picks, and the size a save writes tiles back at, are unchanged.</param>
+    public static TerrainTexture? FromTileBytes(IEnumerable<(string fileName, byte[] dds)> tiles, float worldSize, byte[]? detailDds = null,
+                                                int atlasCap = 8192)
     {
         var parsed = new Dictionary<(int col, int row), byte[]>();
         var pnames = new Dictionary<(int col, int row), string>();
@@ -801,17 +865,25 @@ public sealed class TerrainTexture
         var names = new string?[gw, gh];
         var native = new (int W, bool Dxt)[gw, gh];
         foreach (var kv in pnames) names[kv.Key.col, kv.Key.row] = kv.Value;   // the in-archive name, path and all
+
+        // Headers first: the tiles' real size decides the atlas, and the atlas decides how much of each tile to decode.
+        int maxNative = 0;
+        foreach (var kv in parsed)
+        {
+            var info = DdsTexture.HeaderInfo(kv.Value);
+            native[kv.Key.col, kv.Key.row] = info;
+            maxNative = Math.Max(maxNative, info.Width);
+        }
+        int decodeSide = DecodeSideFor(maxNative, Math.Max(gw, gh), atlasCap);
         System.Threading.Tasks.Parallel.ForEach(parsed, kv =>
         {
-            try
-            {
-                native[kv.Key.col, kv.Key.row] = DdsTexture.HeaderInfo(kv.Value);
-                grid[kv.Key.col, kv.Key.row] = DdsTexture.Decode(kv.Value);
-            }
+            try { grid[kv.Key.col, kv.Key.row] = DdsTexture.Decode(kv.Value, decodeSide); }
             catch { }
         });
-        int maxTile = 0;
-        foreach (var t in grid) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
+        // The REAL tile size, not the decoded one - NativeSize and the atlas size follow from it. Only a grid with no
+        // readable DDS header at all falls back to what was decoded.
+        int maxTile = maxNative;
+        if (maxTile == 0) foreach (var t in grid) if (t is not null) maxTile = Math.Max(maxTile, t.Width);
         var tt = new TerrainTexture(grid, gw, gh, worldSize, maxTile, names, native);
         if (detailDds is not null) { try { tt.Detail = DdsTexture.Decode(detailDds); } catch { } }
         return tt;

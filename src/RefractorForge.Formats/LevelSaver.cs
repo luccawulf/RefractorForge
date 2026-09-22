@@ -206,8 +206,12 @@ public static class LevelSaver
     /// Operation_Irving so the result loads in both this editor and the game's terrain. Returns the paths
     /// written. Verify by loading <paramref name="levelDir"/> straight back.
     /// </summary>
+    /// <param name="baseSub">The game's archive root: <c>"bf1942"</c> or <c>"BfVietnam"</c>. The two games share no
+    /// namespace, and this is written into Terrain.con's heightmap / material / texture paths - a BF1942 map that says
+    /// <c>BfVietnam\levels\...</c> (which every new map once did) cannot find its own terrain.</param>
     public static List<string> CreateNewLevel(string levelDir, string name, TerrainConfig cfg,
-        Heightmap heightmap, EnvironmentSettings env, MaterialMap? material = null, bool playable = false)
+        Heightmap heightmap, EnvironmentSettings env, MaterialMap? material = null, bool playable = false,
+        string baseSub = "BfVietnam")
     {
         var written = new List<string>();
         Directory.CreateDirectory(levelDir);
@@ -220,8 +224,8 @@ public static class LevelSaver
         var mat = material ?? new MaterialMap(cfg.MaterialSize, cfg.MaterialSize);
         var mp = Path.Combine(levelDir, "MaterialMap.raw"); mat.SaveRaw(mp); written.Add(mp);
 
-        // The game VFS base the .con refs hang off (e.g. BfVietnam\levels\MyMap).
-        string enginePath = $@"BfVietnam\levels\{name}";
+        // The game VFS base the .con refs hang off (BfVietnam\levels\MyMap, or bf1942\levels\MyMap).
+        string enginePath = $@"{baseSub}\levels\{name}";
 
         // Init/Terrain.con — GeometryTemplate block (from the config) + shadow settings (from the env).
         var terrain = cfg.ToTerrainConLines(enginePath).ToList();
