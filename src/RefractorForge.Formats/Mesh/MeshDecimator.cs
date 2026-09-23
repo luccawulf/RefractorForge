@@ -84,17 +84,17 @@ public static class MeshDecimator
 
     // ---- one submesh -------------------------------------------------------------------------------------------
 
-    private static ObjSubMesh DecimateSub(ObjSubMesh s, int target, float eps, HashSet<long> shared, bool slideSeams, ref int collapses)
+    private static ObjSubMesh DecimateSub(ObjSubMesh s, int target, float eps, HashSet<PositionKey> shared, bool slideSeams, ref int collapses)
     {
         if (s.Faces.Count <= target) return Clone(s);
 
         int nv = s.Positions.Count;
         var clusterOf = new int[nv];
         var clusters = new List<List<int>>();
-        var byKey = new Dictionary<long, int>();
+        var byKey = new Dictionary<PositionKey, int>();
         for (int i = 0; i < nv; i++)
         {
-            long key = Key(s.Positions[i], eps);
+            var key = Key(s.Positions[i], eps);
             if (!byKey.TryGetValue(key, out int c)) { c = clusters.Count; byKey[key] = c; clusters.Add(new List<int>()); }
             clusterOf[i] = c;
             clusters[c].Add(i);
@@ -168,7 +168,10 @@ public static class MeshDecimator
         int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
 
         // A lazy heap: an entry is re-checked against the live quadrics when it comes out, and dropped if either
-        // end has since moved. Cheaper than keeping a decrease-key structure honest.
+        // end has since moved. Cheaper than keeping a decrease-key structure honest. Dropping one whose far end
+        // merged loses nothing: every collapse re-offers each edge of the survivor, so the pair it now stands for is
+        // already queued at its fresh cost (1.1 million such entries on a 600k-triangle torus, every one of them
+        // re-offered; queueing them a second time changed no result and only cost time).
         var heap = new PriorityQueue<(int From, int To), float>();
         bool sliding = false;                         // the second phase: seams and borders may slide
         bool Movable(int v) => sliding ? !locked[v] : !pinned[v];
@@ -352,25 +355,30 @@ public static class MeshDecimator
         yield return (t.C, t.A);
     }
 
-    private static HashSet<long> SharedPositions(ObjMesh mesh, float eps)
+    private static HashSet<PositionKey> SharedPositions(ObjMesh mesh, float eps)
     {
-        var seenIn = new Dictionary<long, int>();
-        var shared = new HashSet<long>();
+        var seenIn = new Dictionary<PositionKey, int>();
+        var shared = new HashSet<PositionKey>();
         for (int si = 0; si < mesh.SubMeshes.Count; si++)
             foreach (var p in mesh.SubMeshes[si].Positions)
             {
-                long k = Key(p, eps);
+                var k = Key(p, eps);
                 if (seenIn.TryGetValue(k, out int owner)) { if (owner != si) shared.Add(k); }
                 else seenIn[k] = si;
             }
         return shared;
     }
 
-    private static long Key(Vec3 p, float eps)
+    /// <summary>A position snapped to the weld grid: the three cell indices themselves, compared exactly. It used to be
+    /// the three folded into one long by an XOR hash and that hash taken as the identity - and on a symmetric model,
+    /// or any centred on the origin, different corners folded to the same long (16-18% of distinct positions on a tyre
+    /// or a torus in its own frame), which welded far-apart vertices into one and stalled the whole run.</summary>
+    private readonly record struct PositionKey(long X, long Y, long Z);
+
+    private static PositionKey Key(Vec3 p, float eps)
     {
         float q = eps > 0f ? eps : 1e-5f;
-        long x = (long)MathF.Round(p.X / q), y = (long)MathF.Round(p.Y / q), z = (long)MathF.Round(p.Z / q);
-        return (x * 73856093L) ^ (y * 19349663L) ^ (z * 83492791L);
+        return new PositionKey((long)MathF.Round(p.X / q), (long)MathF.Round(p.Y / q), (long)MathF.Round(p.Z / q));
     }
 
     /// <summary>How much a border's own planes weigh against the face planes: ten times, as in meshoptimizer.</summary>
