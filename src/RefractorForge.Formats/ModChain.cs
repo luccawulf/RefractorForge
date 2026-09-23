@@ -21,6 +21,14 @@ public sealed class ModChainResult
     /// Surface these to the user: this is the difference between "your objects are missing" and a silent failure.</summary>
     public List<string> Missing { get; } = new();
 
+    /// <summary>The install the chain was resolved against (the parent of <c>Mods\</c>), when known.</summary>
+    public string? GameRoot { get; set; }
+
+    /// <summary>Which executable mounts this chain, which decides the archives it reads (<see cref="GameMounts"/>).
+    /// <see cref="ModChain.Resolve"/> fills it from the install; null means it could not be told, and archive
+    /// collection then falls back to <see cref="GameMounts.Union"/>.</summary>
+    public RefractorGame? Game { get; set; }
+
     public IEnumerable<string> Paths => Mounts.Select(m => m.Path);
 
     /// <summary>A one-line human summary, e.g. "FHSW -> FH -> bf1942" (inherited entries marked with '+').</summary>
@@ -111,6 +119,8 @@ public static class ModChain
 
         foreach (var m in missing.Distinct(StringComparer.OrdinalIgnoreCase))
             if (!result.Missing.Contains(m, StringComparer.OrdinalIgnoreCase)) result.Missing.Add(m);
+        result.GameRoot = Normalize(gameRoot);
+        result.Game = GameMounts.Detect(result);
         return result;
     }
 
@@ -193,13 +203,18 @@ public static class ModChain
         return found;
     }
 
-    /// <summary>The base-game mod folder under <paramref name="gameRoot"/> (BF1942 or BFV), or null.</summary>
+    /// <summary>The base-game mod folder under <paramref name="gameRoot"/> (BF1942 or BFV), or null. When the install
+    /// says which game it is (<see cref="GameMounts.Detect(string)"/>) that game's base mod is preferred.</summary>
     public static string? BaseGameDir(string gameRoot)
-        => new[] { "bf1942", "BfVietnam", "bfvietnam" }
+    {
+        var game = GameMounts.Detect(gameRoot);
+        return new[] { "bf1942", "BfVietnam", "bfvietnam" }
+            .OrderBy(b => game is { } g && GameMounts.For(g).BaseMod.Equals(b, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .Select(b => Path.Combine(gameRoot, "Mods", b))
             .Where(Directory.Exists)
             .Select(Normalize)
             .FirstOrDefault();
+    }
 
     /// <summary>The game install dir for a path inside <c>&lt;gameRoot&gt;\Mods\&lt;Mod&gt;\...</c> (the parent of the
     /// nearest <c>Mods</c> ancestor), or null when the path is not inside a Battlefield Mods folder.</summary>
@@ -224,32 +239,38 @@ public static class ModChain
     // ---- Archive collection over a resolved chain ----
 
     /// <summary>Split a resolved chain's archives into the mesh/object list and the texture list, in precedence
-    /// order. Level archives are excluded (levels are opened separately). <paramref name="skipNonAsset"/> drops
-    /// archives that can never contain editor-visible geometry or textures (sound/music/menu/movies), which on a
-    /// full FHSW chain removes a large amount of pointless I/O.</summary>
+    /// order: mod by mod down the chain, and within a mod the engine's own order (<see cref="GameMounts.Scan"/>) -
+    /// a mounted <c>_001</c> patch ahead of its base, so <c>texture_001.rfa</c> beats <c>texture.rfa</c> in the
+    /// first-wins libraries exactly as it does in game. Only archives the chain's executable mounts are listed
+    /// (<see cref="GameMounts.For(ModChainResult)"/>; <see cref="GameMounts.Union"/> when the game cannot be told):
+    /// <c>objects_001</c>, a BFV <c>standardMesh_001</c> or any <c>_002</c> hold nothing the game shows, so they must
+    /// not shadow what it does. Level archives are excluded (levels are opened separately).
+    /// <paramref name="skipNonAsset"/> drops archives that can never contain editor-visible geometry or textures
+    /// (sound/music/menu/animations...), which on a full FHSW chain removes a large amount of pointless I/O.</summary>
     public static (string[] mesh, string[] tex) CollectArchives(ModChainResult chain, bool skipNonAsset = true)
     {
+        var mounts = GameMounts.For(chain);
         var mesh = new List<string>();
         var tex = new List<string>();
         foreach (var mount in chain.Mounts)
-        {
-            var archivesDir = Path.Combine(mount.Path, "Archives");
-            var root = Directory.Exists(archivesDir) ? archivesDir : mount.Path;
-            if (!Directory.Exists(root)) continue;
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(root, "*.rfa", SearchOption.AllDirectories); }
-            catch { continue; }
-            foreach (var f in files)
+            foreach (var a in mounts.Scan(mount.Path, levelsToo: false).Mounted)
             {
-                var leaf = Path.GetFileName(f);
-                if (leaf.StartsWith("~")) continue;                 // ~$ lock/temp leftovers
-                if (IsLevelArchive(f)) continue;                    // levels are loaded separately
+                var leaf = Path.GetFileName(a.Path);
                 if (skipNonAsset && IsNonAssetArchive(leaf)) continue;
-                if (IsTextureArchive(leaf)) { if (!tex.Contains(f, StringComparer.OrdinalIgnoreCase)) tex.Add(f); }
-                else if (!mesh.Contains(f, StringComparer.OrdinalIgnoreCase)) mesh.Add(f);
+                if (IsTextureArchive(leaf)) { if (!tex.Contains(a.Path, StringComparer.OrdinalIgnoreCase)) tex.Add(a.Path); }
+                else if (!mesh.Contains(a.Path, StringComparer.OrdinalIgnoreCase)) mesh.Add(a.Path);
             }
-        }
         return (mesh.ToArray(), tex.ToArray());
+    }
+
+    /// <summary>The archives in a chain's mod folders that its executable never mounts (<c>objects_001</c>, a BFV
+    /// <c>standardMesh_001</c>, a <c>texture_002</c>, a backup copy in a sub-folder...). Content in them does not
+    /// exist in game; this is what to show a modder who wonders where it went.</summary>
+    public static List<string> UnmountedArchives(ModChainResult chain)
+    {
+        var mounts = GameMounts.For(chain);
+        return chain.Mounts.SelectMany(m => mounts.Scan(m.Path).Unmounted)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     public static bool IsLevelArchive(string path) => path.Replace('\\', '/').ToLowerInvariant().Contains("/levels/");
@@ -257,7 +278,8 @@ public static class ModChain
 
     /// <summary>Archives that hold no geometry/texture the editor can show: audio, music, menu art, movies, fonts,
     /// shaders, and skeletal animation data. Skipping these on a full FHSW chain avoids opening gigabytes for
-    /// nothing (FHSW's animations.rfa alone is ~9 MB of .baf/.ske/.skn with no static geometry).
+    /// nothing (FHSW's animations.rfa alone is ~9 MB of .baf/.ske/.skn with no static geometry). Patches go with
+    /// their base: BFV mounts <c>animations_001.rfa</c>, and it is as geometry-free as <c>animations.rfa</c>.
     /// NOTE: <c>aimeshes.rfa</c> is deliberately NOT filtered — despite the name it carries real BF1942 building
     /// geometry (Bocage's church and windmill), so dropping it would lose visible objects.</summary>
     public static bool IsNonAssetArchive(string leaf)
@@ -265,6 +287,6 @@ public static class ModChain
         var n = Path.GetFileNameWithoutExtension(leaf).ToLowerInvariant();
         return n is "sound" or "sounds" or "music" or "menu" or "movies" or "movie" or "font" or "fonts"
                  or "shaders" or "animations"
-            || n.StartsWith("sound_") || n.StartsWith("music_") || n.StartsWith("menu_");
+            || n.StartsWith("sound_") || n.StartsWith("music_") || n.StartsWith("menu_") || n.StartsWith("animations_");
     }
 }

@@ -9,7 +9,8 @@ namespace RefractorForge.Formats.Rfa;
 /// overrides - listed.
 ///
 /// Precedence is by position: <see cref="Layers"/>[0] wins. Callers build that order with
-/// <see cref="LayersFor"/>, which knows that within a group a numbered patch outranks its base.
+/// <see cref="LayersFor(string, bool)"/>, which knows the engine's literal mount list (<see cref="GameMounts"/>):
+/// within a group a mounted patch outranks its base, and an archive the game never reads is not a layer.
 /// </summary>
 public sealed class ModWorkspace : IDisposable
 {
@@ -66,54 +67,30 @@ public sealed class ModWorkspace : IDisposable
     }
 
     /// <summary>
-    /// The archives under one mod folder, in precedence order: for every base stem, its numbered patches
-    /// (highest first) then the base, so <c>texture_001.rfa</c> outranks <c>texture.rfa</c> exactly as the
-    /// engine layers them. Level archives are included; pass <paramref name="levelsToo"/> false to leave them out
-    /// of a global view.
+    /// The archives under one mod folder that the engine mounts, in precedence order (<see cref="GameMounts.Scan"/>):
+    /// a mounted <c>_001</c> patch ahead of its base, so <c>texture_001.rfa</c> outranks <c>texture.rfa</c> exactly
+    /// as the engine layers them, and a level's <c>_NNN</c> patches highest first. Archives the game never reads
+    /// (<c>objects_001</c>, a BFV <c>standardMesh_001</c>, any <c>_002</c>) are left out. The game is told from the
+    /// folder's install (<see cref="GameMounts.DetectFolder"/>), else <see cref="GameMounts.Union"/> is used. Level
+    /// archives are included; pass <paramref name="levelsToo"/> false to leave them out of a global view.
     /// </summary>
     public static List<string> LayersFor(string modDir, bool levelsToo = true)
-    {
-        var archives = System.IO.Directory.Exists(System.IO.Path.Combine(modDir, "Archives"))
-            ? System.IO.Path.Combine(modDir, "Archives") : modDir;
-        if (!System.IO.Directory.Exists(archives)) return new List<string>();
+        => LayersFor(modDir, GameMounts.For(GameMounts.DetectFolder(modDir)), levelsToo);
 
-        var all = System.IO.Directory.EnumerateFiles(archives, "*.rfa", System.IO.SearchOption.AllDirectories)
-            .Where(p => levelsToo || !ModChain.IsLevelArchive(p))
-            .ToList();
+    /// <summary><see cref="LayersFor(string, bool)"/> for a known game's mount list.</summary>
+    public static List<string> LayersFor(string modDir, GameMounts mounts, bool levelsToo = true)
+        => mounts.Scan(modDir, levelsToo).Mounted.Select(a => a.Path).ToList();
 
-        // Group by directory + base stem ("texture" for texture.rfa / texture_001.rfa).
-        var groups = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in all)
-        {
-            var stem = System.IO.Path.GetFileNameWithoutExtension(p);
-            var m = System.Text.RegularExpressions.Regex.Match(stem, @"^(.*?)_(\d{3})$");
-            var baseStem = m.Success ? m.Groups[1].Value : stem;
-            var key = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(p) ?? "", baseStem);
-            if (!groups.TryGetValue(key, out var list)) groups[key] = list = new List<string>();
-            list.Add(p);
-        }
-
-        var ordered = new List<string>();
-        foreach (var kv in groups.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            int Num(string p)
-            {
-                var m = System.Text.RegularExpressions.Regex.Match(System.IO.Path.GetFileNameWithoutExtension(p), @"_(\d{3})$");
-                return m.Success ? int.Parse(m.Groups[1].Value) : -1;
-            }
-            ordered.AddRange(kv.Value.OrderByDescending(Num));   // patches high-to-low, base (-1) last
-        }
-        return ordered;
-    }
-
-    /// <summary>The full stack for a mod and everything it mounts, highest precedence first.</summary>
+    /// <summary>The full stack for a mod and everything it mounts, highest precedence first, read with the chain's
+    /// own game (<see cref="GameMounts.For(ModChainResult)"/>).</summary>
     public static List<(string Path, string Mod)> LayersForChain(ModChainResult chain, bool levelsToo = true)
     {
+        var mounts = GameMounts.For(chain);
         var result = new List<(string, string)>();
         foreach (var m in chain.Mounts)
         {
             var modName = new System.IO.DirectoryInfo(m.Path).Name;
-            foreach (var p in LayersFor(m.Path, levelsToo)) result.Add((p, modName));
+            foreach (var p in LayersFor(m.Path, mounts, levelsToo)) result.Add((p, modName));
         }
         return result;
     }

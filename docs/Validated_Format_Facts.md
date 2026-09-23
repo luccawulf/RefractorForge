@@ -111,6 +111,13 @@ the reference, not the older byte-layout notes in RFA_Format_Notes.md.
 - Every entry name must start with the archive's own path under `Archives\` minus `.rfa` and `_NNN`; one violation and
   the engine rejects the whole archive ("Error loading file list").
 - The table is closed by a `u32 0` in every clean retail archive; new archives write it.
+- **Each executable mounts a LITERAL archive list** (`GameMounts.cs`, from the string tables in BF1942.exe and
+  BfVietnam.exe; `GameMountsInstallTests` re-checks it against both). A `_001` patch exists only for BF1942
+  `standardMesh`/`texture`/`sound`/`menu` and BFV `texture`/`sound`/`animations`, and outranks its base; there is no
+  `objects_001`, BFV `standardMesh_001`/`menu_001`, or any `_002`, and nothing in a sub-folder but `<base mod>\game.rfa`
+  and `<base mod>\levels\<Map>[_NNN].rfa` (a level's patches stack highest number first). `ModChain.CollectArchives`
+  and `ModWorkspace.LayersFor` follow it: BF1942 `mg42_r` resolves from `texture_001` (1024 px, not the 256 px base),
+  BF1942's 130 `StandardMesh_001` overrides win, and BFV_WW2Mod's unmounted `standardMesh_001` stays out.
 - **In-game proof (RefractorDevelopmentKit gate G0, both games, 2026-09-23):** archives written from scratch this way
   load, compressed and uncompressed, with a retail `ai.rfa` descriptor and XPack ID Default.
 

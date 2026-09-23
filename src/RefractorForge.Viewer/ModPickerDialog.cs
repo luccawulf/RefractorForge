@@ -70,6 +70,10 @@ internal static class ModPickerDialog
                         lines.Add("(+ marks a dependency inherited from another mod's init.con)");
                     if (r.Missing.Count > 0)
                         lines.Add($"WARNING: not installed -> {string.Join(", ", r.Missing)}");
+                    // objects_001, a BFV standardMesh_001, a _002: the game never reads them, so neither does the editor.
+                    var unmounted = ModChain.UnmountedArchives(r);
+                    if (unmounted.Count > 0)
+                        lines.Add($"left out, never mounted by the game -> {string.Join(", ", unmounted.Select(p => Path.GetRelativePath(root.Text.Trim(), p)))}");
                     chain.Text = string.Join(Environment.NewLine, lines);
                 }
                 catch (Exception ex) { chain.Text = Loc.T("Could not resolve: ") + ex.Message; }
