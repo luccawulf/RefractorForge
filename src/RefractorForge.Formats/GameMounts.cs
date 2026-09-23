@@ -326,8 +326,9 @@ public sealed class GameMounts
     /// shallowest at or below <paramref name="root"/>, else the nearest above it when the path below that folder runs
     /// through a base mod's folder (<c>Archives\bf1942\levels</c> picked on its own) - a folder that merely sits under
     /// some unrelated "Archives" folder is not placed by it. Null when there is none: loose, or never mounted.
+    /// Public so every tool that shows a file's mount path (RDK's archive census) places it by this same rule.
     /// </summary>
-    internal static string? ArchivesFolderOf(string file, string root)
+    public static string? ArchivesFolderOf(string file, string root)
     {
         string[] seg, rootSeg;
         try

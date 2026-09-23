@@ -75,6 +75,18 @@ public class GameMountsTests : IDisposable
     }
 
     [Theory]
+    [InlineData(@"C:\g\Mods\M\Archives\objects.rfa", @"C:\g\Mods\M\Archives", @"C:\g\Mods\M\Archives")]
+    [InlineData(@"C:\g\Mods\FHR\Archives\Archives\font.rfa", @"C:\g\Mods\FHR\Archives\Archives", @"C:\g\Mods\FHR\Archives")]
+    [InlineData(@"C:\g\Mods\M\Archives\bf1942\levels\old\Wake.rfa", @"C:\g\Mods\M\Archives\bf1942\levels\old", @"C:\g\Mods\M\Archives")]
+    [InlineData(@"C:\g\Mods\M\backup\objects.rfa", @"C:\g\Mods\M\backup", null)]
+    [InlineData(@"C:\dl\Archives\bf1942\levels\Wake.rfa", @"C:\dl\Archives\bf1942\levels", @"C:\dl\Archives")]
+    [InlineData(@"C:\dl\Archives\objects.rfa", @"C:\dl\Archives", @"C:\dl\Archives")]
+    [InlineData(@"C:\dl\Archives\maps\Wake.rfa", @"C:\dl\Archives\maps", null)]
+    [InlineData(@"C:\dl\maps\Wake.rfa", @"C:\dl\maps", null)]
+    public void A_file_is_placed_under_the_Archives_folder_it_is_mounted_from(string file, string root, string? expected)
+        => Assert.Equal(expected, GameMounts.ArchivesFolderOf(file, root));
+
+    [Theory]
     [InlineData("objects/Vehicles/Land/Jeep/Objects.con", "Objects.rfa", "objects/")]
     [InlineData("standardMesh/jeep_hull_m1.sm", "standardMesh.rfa", "standardMesh/")]
     [InlineData("texture/jeep.dds", "texture.rfa", "texture/")]
