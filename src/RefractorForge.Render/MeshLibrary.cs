@@ -1136,9 +1136,14 @@ public sealed class MeshLibrary
         bool havePending = false;
         int pendingChildIdx = -1;
 
+        bool inBlockComment = false;
         foreach (var raw in text.Split('\n'))
         {
             var line = raw.Trim();
+            // beginrem..endrem comments out whole regions, and retail uses it inside vehicles: KettenKrad's physics
+            // comments out two front wheels, the SBD a camera. Drawing them put parts on the vehicle the game never has.
+            if (inBlockComment) { if (line.StartsWith("endrem", StringComparison.OrdinalIgnoreCase)) inBlockComment = false; continue; }
+            if (line.StartsWith("beginrem", StringComparison.OrdinalIgnoreCase)) { inBlockComment = true; continue; }
             if (line.Length == 0 || line.StartsWith("rem", StringComparison.OrdinalIgnoreCase)) continue;
             if (!line.StartsWith("ObjectTemplate.", StringComparison.OrdinalIgnoreCase)) continue;
             var rest = line.Substring("ObjectTemplate.".Length);
@@ -1207,9 +1212,12 @@ public sealed class MeshLibrary
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string? curAlias = null;
+        bool inBlockComment = false;
         foreach (var raw in text.Split('\n'))
         {
             var line = raw.Trim();
+            if (inBlockComment) { if (line.StartsWith("endrem", StringComparison.OrdinalIgnoreCase)) inBlockComment = false; continue; }
+            if (line.StartsWith("beginrem", StringComparison.OrdinalIgnoreCase)) { inBlockComment = true; continue; }
             if (!line.StartsWith("GeometryTemplate.", StringComparison.OrdinalIgnoreCase)) continue;
             var rest = line.Substring("GeometryTemplate.".Length);
             var sp = rest.IndexOf(' ');
