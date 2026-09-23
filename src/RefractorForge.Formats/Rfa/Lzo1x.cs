@@ -19,8 +19,9 @@ namespace RefractorForge.Formats.Rfa;
 /// licensable, dependency-free decoder that the editor can ship in a single .exe.
 /// </para>
 /// <para>
-/// Battlefield archives use the <b>v0</b> stream form (no version marker byte). Only
-/// decompression is implemented (the editor reads meshes; it never re-LZO-packs).
+/// Battlefield archives use the <b>v0</b> stream form (no version marker byte). Besides the decoder
+/// there is a greedy <see cref="Compress"/> and <see cref="EncodeLiteral"/>, the literal-only form the
+/// archive writer falls back to for blocks that do not compress.
 /// </para>
 /// </remarks>
 public static class Lzo1x
@@ -151,6 +152,35 @@ public static class Lzo1x
         var dst = new byte[dstLen];
         Decompress(src, dst, dstLen);
         return dst;
+    }
+
+    /// <summary>Encode a block (at most one 32 KiB archive chunk, never empty) as a literal-only LZO1X v0 stream:
+    /// one literal run, then the end-of-stream marker <c>11 00 00</c>.
+    ///
+    /// This is how an incompressible block has to be stored inside a compressed archive. Retail BFV texture.rfa
+    /// holds hundreds of blocks in exactly this form, while no shipped archive stores a block (or a whole entry)
+    /// verbatim - the engine LZO-decodes everything in a compressed archive, so a verbatim block is read as a
+    /// broken stream and the file arrives corrupt. The output is always longer than the input, so it can never be
+    /// mistaken for a verbatim block by size either.</summary>
+    public static byte[] EncodeLiteral(ReadOnlySpan<byte> block)
+    {
+        int n = block.Length;
+        if (n == 0) throw new ArgumentException("An empty block has no literal encoding.", nameof(block));
+        var o = new List<byte>(n + 8);
+        if (n <= 3)
+            o.Add((byte)(n + 17));          // opening-run form: a first byte of 18+ copies (b - 17) literals
+        else if (n <= 18)
+            o.Add((byte)(n - 3));           // t = 1..15 in the literal state copies t + 3 literals
+        else
+        {
+            o.Add(0);                       // t = 0: extended run, length - 3 = 15 + 255 * zeros + last byte
+            int m = n - 18;
+            while (m > 255) { o.Add(0); m -= 255; }
+            o.Add((byte)m);                 // stays in 1..255, never a zero that would extend the run
+        }
+        for (int i = 0; i < n; i++) o.Add(block[i]);
+        o.Add(0x11); o.Add(0x00); o.Add(0x00);
+        return o.ToArray();
     }
 
     // ---- Compression --------------------------------------------------------

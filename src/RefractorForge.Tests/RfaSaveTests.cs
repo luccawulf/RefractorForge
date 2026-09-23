@@ -48,19 +48,21 @@ public class RfaSaveTests : IDisposable
     }
 
     [Fact]
-    public void Incompressible_entries_are_stored_raw_never_ambiguous()
+    public void Incompressible_entries_are_wrapped_in_literal_blocks_never_raw()
     {
-        // Random data doesn't compress; wrapping it would only add block headers. The writer must fall back to a
-        // RAW entry (BlockSize == UncompressedSize — retail compressed archives contain 276 such entries, so the
-        // engine provably accepts them). This also guarantees a wrapped region can never be confused for raw.
+        // Random data doesn't compress. It used to be stored RAW inside the compressed archive on the belief that
+        // retail does the same - it does not (those "same-size" retail entries are LZO streams that happen to add
+        // up to their own length), and the engine LZO-decodes a raw entry into garbage. It must be wrapped in
+        // literal-only LZO blocks instead, the form retail uses for incompressible blocks.
         var rng = new Random(7);
         var noise = new byte[70_000]; rng.NextBytes(noise);
         var path = P("raw.rfa");
         RefractorFlatArchive.WriteFile(path, new[] { ("a/noise.bin", noise) }, compress: true, xPackId: XPackId.Default);
         var a = new RefractorFlatArchive(path);
         var e = Assert.Single(a.Entries);
-        Assert.Equal(e.UncompressedSize, e.BlockSize);          // stored raw
+        Assert.NotEqual(e.UncompressedSize, e.BlockSize);       // wrapped, and never raw-sized
         Assert.True(a.Read(e).AsSpan().SequenceEqual(noise));   // and reads back identical
+        Assert.True(RefractorFlatArchive.Inspect(path).IsValid);
     }
 
     [Fact]
