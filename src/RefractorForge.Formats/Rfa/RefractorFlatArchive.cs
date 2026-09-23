@@ -128,10 +128,18 @@ public sealed class RefractorFlatArchive
     /// <summary>Whether the entry table is closed by the four extra bytes every retail archive carries.</summary>
     public bool HasTableTail => _tocTail is { Length: 4 };
 
+    /// <summary>Open an archive and read its header and table of contents (entries are read on demand). A file whose
+    /// header or table cannot be an archive's - too short, a table offset or entry count its length cannot hold, a
+    /// name or an entry region running past its end, sizes beyond 2 GiB - throws <see cref="InvalidDataException"/>
+    /// naming the file, before anything is allocated from the bad numbers: a renamed PNG or a truncated download
+    /// is refused in microseconds instead of asking for gigabytes.</summary>
     public RefractorFlatArchive(string path)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
-        var (isV11, isCompressed, xpackId, entries, descriptor, trailers, tail) = ReadFrom(fs);
+        (bool, bool, XPackId, List<RefractorFlatArchiveEntry>, byte[]?, Dictionary<string, byte[]>, byte[]?) read;
+        try { read = ReadFrom(fs, path); }
+        catch (EndOfStreamException ex) { throw new InvalidDataException($"'{path}' is not a readable archive: it ends inside its header or table", ex); }
+        var (isV11, isCompressed, xpackId, entries, descriptor, trailers, tail) = read;
         _path = path;
         Entries = entries;
         _descriptor = descriptor;
@@ -185,15 +193,25 @@ public sealed class RefractorFlatArchive
 
     // ── Shared header + TOC reader ────────────────────────────────────────────
 
+    /// <summary>The smallest table record: a name length, an empty name, and the 24 bytes of sizes, offset and trailer.</summary>
+    private const int MinTableRecord = 4 + 24;
+
     private static (bool IsV11, bool Compressed, XPackId XPackId, List<RefractorFlatArchiveEntry> Entries,
-                    byte[]? Descriptor, Dictionary<string, byte[]> Trailers, byte[]? Tail) ReadFrom(Stream s)
+                    byte[]? Descriptor, Dictionary<string, byte[]> Trailers, byte[]? Tail) ReadFrom(Stream s, string path)
     {
         Span<byte> u4 = stackalloc byte[4];
         Span<byte> sig = stackalloc byte[28];
 
+        // Every number the table gives is checked against the file's length before it sizes an allocation or a loop:
+        // unchecked, a garbage count or name length asked for a 2 GiB list or name and died out of memory.
+        long length = s.Length;
+        InvalidDataException Bad(string why) => new($"'{path}' is not a readable archive: {why}");
+        if (length < 28 + 8) throw Bad($"{length} bytes is too short for an archive header");
+
         s.ReadExactly(sig);
         bool isV11 = sig.SequenceEqual(V11Signature);
         if (!isV11) s.Seek(0, SeekOrigin.Begin);
+        if (!isV11 && length < 156) throw Bad($"{length} bytes is too short for an archive header");
 
         s.ReadExactly(u4); uint tocOffset = BinaryPrimitives.ReadUInt32LittleEndian(u4);
         s.ReadExactly(u4); bool compressed = BinaryPrimitives.ReadUInt32LittleEndian(u4) == 1;
@@ -214,9 +232,14 @@ public sealed class RefractorFlatArchive
             xpackId = (XPackId)(BinaryPrimitives.ReadUInt32LittleEndian(u4) - sum);
         }
 
+        if (tocOffset > length - 4) throw Bad($"its table offset {tocOffset} is past the end of the file ({length} bytes)");
         s.Seek(tocOffset, SeekOrigin.Begin);
         s.ReadExactly(u4);
-        int count = (int)BinaryPrimitives.ReadUInt32LittleEndian(u4);
+        uint rawCount = BinaryPrimitives.ReadUInt32LittleEndian(u4);
+        long room = (length - tocOffset - 4) / MinTableRecord;
+        if (rawCount > room)
+            throw Bad($"its table claims {rawCount} entries, and the {length - tocOffset - 4} bytes after the table offset hold at most {room}");
+        int count = (int)rawCount;
 
         var list = new List<RefractorFlatArchiveEntry>(count);
         var trailers = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
@@ -224,15 +247,24 @@ public sealed class RefractorFlatArchive
         for (int i = 0; i < count; i++)
         {
             s.ReadExactly(u4);
-            var nameBytes = new byte[(int)BinaryPrimitives.ReadUInt32LittleEndian(u4)];
+            uint nameLength = BinaryPrimitives.ReadUInt32LittleEndian(u4);
+            if (nameLength > length - s.Position - 24)
+                throw Bad($"entry {i} of {count} claims a {nameLength}-byte name, past the end of the file ({length} bytes)");
+            var nameBytes = new byte[nameLength];
             s.ReadExactly(nameBytes);
             s.ReadExactly(rec);
             var entryName = Encoding.Latin1.GetString(nameBytes);
+            uint blockSize = BinaryPrimitives.ReadUInt32LittleEndian(rec), unc = BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(4));
+            uint offset = BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(8));
+            if (blockSize > int.MaxValue || unc > int.MaxValue)
+                throw Bad($"entry '{entryName}' claims {blockSize} stored and {unc} unpacked bytes (over 2 GiB)");
+            if ((long)offset + blockSize > length)
+                throw Bad($"entry '{entryName}' ({blockSize} bytes at offset {offset}) runs past the end of the file ({length} bytes)");
             list.Add(new RefractorFlatArchiveEntry(
                 Name: entryName,
-                BlockSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec),
-                UncompressedSize: (int)BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(4)),
-                Offset: BinaryPrimitives.ReadUInt32LittleEndian(rec.Slice(8))));
+                BlockSize: (int)blockSize,
+                UncompressedSize: (int)unc,
+                Offset: offset));
             trailers[entryName] = rec.Slice(12).ToArray();   // the 12 bytes after the offset
         }
 
