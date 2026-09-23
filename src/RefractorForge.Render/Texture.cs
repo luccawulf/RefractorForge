@@ -263,17 +263,100 @@ public static class TgaTexture
     }
 }
 
+/// <summary>What kind of pixels a DDS holds, as far as decoding it goes.</summary>
+public enum DdsPixelFormat
+{
+    /// <summary>Anything this reader cannot decode: another FourCC (ATI1/2, a numeric D3DFMT), a DX10 format outside the
+    /// classic set (BC4-BC7, float), bump or YUV layouts.</summary>
+    Unknown,
+    Dxt1, Dxt2, Dxt3, Dxt4, Dxt5,
+    /// <summary>Uncompressed colour laid out by the four masks: A8R8G8B8, X8R8G8B8, R8G8B8, R5G6B5, A4R4G4B4...</summary>
+    Rgb,
+    /// <summary>Grey in the red mask, with or without an alpha mask: L8, A8L8, A4L4, L16.</summary>
+    Luminance,
+    /// <summary>Alpha only (A8): decodes as black with that alpha, the way Direct3D samples it.</summary>
+    Alpha,
+}
+
 /// <summary>
-/// Minimal DDS reader for the BC1/BC2/BC3 (DXT1/3/5) textures Battlefield Vietnam ships. Decodes only
-/// the top mip to RGBA — enough for previewing terrain tiles and (later) object textures — with no
-/// external image dependency, so the editor reads the game's <c>.dds</c> files directly.
+/// A DDS header, read without touching the pixels - enough for a browser to say what a texture is, and for a writer
+/// to put a replacement back in the shape the original shipped in (the games read what they shipped; a replacement in
+/// a format the original never used is the classic black texture in game).
+/// </summary>
+/// <param name="MipCount">Levels in the file, at least 1 (a header that says 0 means one).</param>
+/// <param name="BitCount">Bits per pixel of an uncompressed layout; 0 for block compression.</param>
+/// <param name="IsDx10">The file carries the 20-byte DX10 extension header; <see cref="DxgiFormat"/> says what follows.</param>
+public sealed record DdsInfo(int Width, int Height, int MipCount, DdsPixelFormat Format, int BitCount,
+                             uint RMask, uint GMask, uint BMask, uint AMask, bool IsCube, bool IsDx10)
+{
+    /// <summary>The FourCC as written ("DXT1", "DX10", "ATI2"), a numeric one as "#36"; empty for a masked layout.</summary>
+    public string FourCC { get; init; } = "";
+
+    /// <summary>The DXGI_FORMAT of a DX10 file, else 0.</summary>
+    public int DxgiFormat { get; init; }
+
+    /// <summary>Slices of a volume texture, else 1.</summary>
+    public int Depth { get; init; } = 1;
+
+    /// <summary>Where the top level's pixels start: 128, or 148 after a DX10 header.</summary>
+    public int DataOffset { get; init; } = 128;
+
+    public bool IsCompressed => Format is DdsPixelFormat.Dxt1 or DdsPixelFormat.Dxt2 or DdsPixelFormat.Dxt3
+                                          or DdsPixelFormat.Dxt4 or DdsPixelFormat.Dxt5;
+
+    /// <summary>Whether <see cref="DdsTexture.Decode(byte[], int)"/> reads it (the first face of a cube map, the first
+    /// slice of a volume).</summary>
+    public bool CanDecode => IsCompressed || (Format != DdsPixelFormat.Unknown && BitCount is 8 or 16 or 24 or 32);
+
+    /// <summary>Bytes of one block (compressed) or one pixel (uncompressed).</summary>
+    internal int UnitBytes => Format == DdsPixelFormat.Dxt1 ? 8 : IsCompressed ? 16 : BitCount / 8;
+
+    /// <summary>Bytes of one level of <paramref name="w"/> x <paramref name="h"/> (one face, one slice).</summary>
+    internal long LevelBytes(int w, int h)
+        => IsCompressed ? (long)Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * UnitBytes : (long)w * h * UnitBytes;
+
+    /// <summary>The name a texture tool would give it: DXT1, A8R8G8B8, X8R8G8B8, R5G6B5, A4R4G4B4, L8, A8L8, A8 - or,
+    /// for what this reader leaves alone, the FourCC or the DX10 format ("DX10 BC7_UNORM").</summary>
+    public string Name
+    {
+        get
+        {
+            if (IsDx10 && !CanDecode) return "DX10 " + DdsTexture.DxgiName(DxgiFormat);
+            if (IsCompressed) return Format.ToString().ToUpperInvariant();
+            if (Format == DdsPixelFormat.Unknown) return FourCC.Length > 0 ? FourCC : $"{BitCount}-bit";
+            var channels = new List<(uint Mask, char Letter)>();
+            if (Format == DdsPixelFormat.Luminance) channels.Add((RMask, 'L'));
+            else if (Format == DdsPixelFormat.Rgb) { channels.Add((RMask, 'R')); channels.Add((GMask, 'G')); channels.Add((BMask, 'B')); }
+            channels.Add((AMask, 'A'));
+            channels.RemoveAll(c => c.Mask == 0);
+            channels.Sort((a, b) => b.Mask.CompareTo(a.Mask));   // highest bits first, as the names are written
+            var sb = new System.Text.StringBuilder();
+            int position = BitCount;
+            foreach (var (mask, letter) in channels)
+            {
+                int top = 32 - BitOperations.LeadingZeroCount(mask);
+                if (top < position) sb.Append('X').Append(position - top);
+                sb.Append(letter).Append(BitOperations.PopCount(mask));
+                position = BitOperations.TrailingZeroCount(mask);
+            }
+            if (position > 0 && sb.Length > 0) sb.Append('X').Append(position);
+            return sb.ToString();
+        }
+    }
+}
+
+/// <summary>
+/// DDS reader for what the games and their mods ship: DXT1/3/5 (and the premultiplied DXT2/4) and every uncompressed
+/// layout a legacy header can describe with its bit masks - A8R8G8B8, X8R8G8B8, R8G8B8, the 16-bit R5G6B5 /
+/// A4R4G4B4 / A1R5G5B5, luminance and alpha - plus the same formats behind a DX10 header. Decodes one level to RGBA
+/// with no external image dependency, so the editor reads the game's <c>.dds</c> files directly.
 /// </summary>
 public static class DdsTexture
 {
     public static Texture2D Load(string path) => Decode(File.ReadAllBytes(path));
 
     /// <summary>What a DDS file is, without decoding it: its width and whether it is block-compressed (DXT/BC).
-    /// (0, false) for anything that is not a DDS.</summary>
+    /// (0, false) for anything that is not a DDS. <see cref="Describe(byte[])"/> says everything else.</summary>
     public static (int Width, bool Dxt) HeaderInfo(byte[] d)
     {
         if (d.Length < 128 || d[0] != (byte)'D' || d[1] != (byte)'D' || d[2] != (byte)'S' || d[3] != (byte)' ') return (0, false);
@@ -282,6 +365,103 @@ public static class DdsTexture
         bool dxt = (pfFlags & 0x4) != 0 && d[84] == (byte)'D' && d[85] == (byte)'X' && d[86] == (byte)'T';
         return (width, dxt);
     }
+
+    // DDS_PIXELFORMAT flags.
+    private const uint PfAlphaPixels = 0x1, PfAlpha = 0x2, PfFourCc = 0x4, PfRgb = 0x40, PfLuminance = 0x20000;
+
+    /// <summary>
+    /// Read a DDS header: size, levels, pixel layout and masks, cube and DX10 flags. Only the first 128 bytes (148
+    /// with a DX10 header) are looked at, so a caller can pass the head of an archive entry. Null for anything that
+    /// is not a DDS.
+    /// </summary>
+    public static DdsInfo? Describe(ReadOnlySpan<byte> d)
+    {
+        if (d.Length < 128 || d[0] != (byte)'D' || d[1] != (byte)'D' || d[2] != (byte)'S' || d[3] != (byte)' ') return null;
+        uint flags = U32(d, 8);
+        int height = (int)U32(d, 12), width = (int)U32(d, 16);
+        int depth = (flags & 0x800000) != 0 ? Math.Max(1, (int)U32(d, 24)) : 1;
+        int mips = Math.Max(1, (int)U32(d, 28));
+        uint pf = U32(d, 80), fourcc = U32(d, 84);
+        int bits = (int)U32(d, 88);
+        uint r = U32(d, 92), g = U32(d, 96), b = U32(d, 100), a = U32(d, 104);
+        uint caps2 = U32(d, 112);
+        bool cube = (caps2 & 0x200) != 0;
+        if ((caps2 & 0x200000) == 0) depth = 1;                          // a volume only when DDSCAPS2_VOLUME says so
+
+        if ((pf & PfFourCc) != 0)
+        {
+            string cc = FourCcText(fourcc);
+            if (cc == "DX10")
+            {
+                if (d.Length < 148)
+                    return new DdsInfo(width, height, mips, DdsPixelFormat.Unknown, 0, 0, 0, 0, 0, cube, true) { FourCC = cc, Depth = depth, DataOffset = 148 };
+                int dxgi = (int)U32(d, 128);
+                cube |= (U32(d, 136) & 0x4) != 0;                          // D3D11_RESOURCE_MISC_TEXTURECUBE
+                var (fmt, fBits, fr, fg, fb, fa) = FromDxgi(dxgi);
+                return new DdsInfo(width, height, mips, fmt, fBits, fr, fg, fb, fa, cube, true)
+                    { FourCC = cc, DxgiFormat = dxgi, Depth = depth, DataOffset = 148 };
+            }
+            var f = cc switch
+            {
+                "DXT1" => DdsPixelFormat.Dxt1, "DXT2" => DdsPixelFormat.Dxt2, "DXT3" => DdsPixelFormat.Dxt3,
+                "DXT4" => DdsPixelFormat.Dxt4, "DXT5" => DdsPixelFormat.Dxt5, _ => DdsPixelFormat.Unknown,
+            };
+            // A FourCC file's masks and bit count are whatever the tool left there - retail DXT headers carry garbage.
+            return new DdsInfo(width, height, mips, f, 0, 0, 0, 0, 0, cube, false) { FourCC = cc, Depth = depth };
+        }
+
+        // A legacy masked layout. The alpha mask is honoured whenever it is set - DirectXTex matches a layout by its
+        // masks, not by DDPF_ALPHAPIXELS - and a layout without one is opaque.
+        var format = (pf & PfRgb) != 0 ? DdsPixelFormat.Rgb
+                   : (pf & PfLuminance) != 0 ? DdsPixelFormat.Luminance
+                   : (pf & PfAlpha) != 0 ? DdsPixelFormat.Alpha
+                   : DdsPixelFormat.Unknown;
+        if (format == DdsPixelFormat.Alpha) { r = g = b = 0; if (a == 0 && bits == 8) a = 0xFF; }
+        if (format == DdsPixelFormat.Luminance) g = b = 0;
+        return new DdsInfo(width, height, mips, format, bits, r, g, b, a, cube, false) { Depth = depth };
+    }
+
+    /// <inheritdoc cref="Describe(ReadOnlySpan{byte})"/>
+    public static DdsInfo? Describe(byte[] d) => Describe(d.AsSpan());
+
+    private static uint U32(ReadOnlySpan<byte> d, int off) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(off));
+
+    private static string FourCcText(uint v)
+    {
+        Span<char> c = stackalloc char[4];
+        for (int i = 0; i < 4; i++)
+        {
+            byte ch = (byte)(v >> (8 * i));
+            if (ch < 32 || ch > 126) return "#" + v.ToString(System.Globalization.CultureInfo.InvariantCulture);   // a D3DFMT number
+            c[i] = (char)ch;
+        }
+        return new string(c);
+    }
+
+    /// <summary>The classic formats behind a DX10 header, as the legacy layout whose bytes they are.</summary>
+    private static (DdsPixelFormat Format, int Bits, uint R, uint G, uint B, uint A) FromDxgi(int dxgi) => dxgi switch
+    {
+        70 or 71 or 72 => (DdsPixelFormat.Dxt1, 0, 0u, 0u, 0u, 0u),                           // BC1 typeless / unorm / srgb
+        73 or 74 or 75 => (DdsPixelFormat.Dxt3, 0, 0u, 0u, 0u, 0u),                           // BC2
+        76 or 77 or 78 => (DdsPixelFormat.Dxt5, 0, 0u, 0u, 0u, 0u),                           // BC3
+        27 or 28 or 29 => (DdsPixelFormat.Rgb, 32, 0xFFu, 0xFF00u, 0xFF0000u, 0xFF000000u),   // R8G8B8A8
+        87 or 90 or 91 => (DdsPixelFormat.Rgb, 32, 0xFF0000u, 0xFF00u, 0xFFu, 0xFF000000u),   // B8G8R8A8
+        88 or 92 or 93 => (DdsPixelFormat.Rgb, 32, 0xFF0000u, 0xFF00u, 0xFFu, 0u),            // B8G8R8X8
+        85 => (DdsPixelFormat.Rgb, 16, 0xF800u, 0x07E0u, 0x001Fu, 0u),                        // B5G6R5
+        86 => (DdsPixelFormat.Rgb, 16, 0x7C00u, 0x03E0u, 0x001Fu, 0x8000u),                   // B5G5R5A1
+        115 => (DdsPixelFormat.Rgb, 16, 0x0F00u, 0x00F0u, 0x000Fu, 0xF000u),                  // B4G4R4A4
+        65 => (DdsPixelFormat.Alpha, 8, 0u, 0u, 0u, 0xFFu),                                   // A8
+        _ => (DdsPixelFormat.Unknown, 0, 0u, 0u, 0u, 0u),
+    };
+
+    /// <summary>A DXGI_FORMAT by name, for messages about the ones this reader leaves alone.</summary>
+    internal static string DxgiName(int dxgi) => dxgi switch
+    {
+        79 or 80 or 81 => "BC4", 82 or 83 or 84 => "BC5", 94 or 95 or 96 => "BC6H", 97 => "BC7_TYPELESS",
+        98 => "BC7_UNORM", 99 => "BC7_UNORM_SRGB", 2 => "R32G32B32A32_FLOAT", 10 => "R16G16B16A16_FLOAT",
+        24 => "R10G10B10A2_UNORM", 61 => "R8_UNORM", 49 => "R8G8_UNORM",
+        _ => $"DXGI format {dxgi}",
+    };
 
     public static Texture2D Decode(byte[] d) => Decode(d, int.MaxValue);
 
@@ -293,76 +473,126 @@ public static class DdsTexture
     /// map is 32 x 32 tiles, so the atlas holds 256 px of each - and decoding every 1024 px tile whole held 4 GB of
     /// pixels to produce it (retail Tobruk's 48 tiles of 4096 px: 3 GB). The mips are already in the file, box-filtered
     /// by whoever made it, so reading the right one is both 16x smaller and a better downsample than point-sampling
-    /// the top level. A file whose mip data is cut short falls back to the last level it fully holds.
+    /// the top level. A file whose mip data is cut short falls back to the last level it fully holds; one whose chosen
+    /// level is itself cut short is an <see cref="InvalidDataException"/>, never a read past the end.
     /// </summary>
     public static Texture2D Decode(byte[] d, int maxSide)
     {
-        if (d.Length < 128 || d[0] != (byte)'D' || d[1] != (byte)'D' || d[2] != (byte)'S' || d[3] != (byte)' ')
-            throw new InvalidDataException("Not a DDS file.");
-        int height = BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(12));
-        int width = BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(16));
-        uint pfFlags = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(80));
-        string fourcc = System.Text.Encoding.ASCII.GetString(d, 84, 4);
-        int dataOff = 128;
+        var info = Describe(d) ?? throw new InvalidDataException("Not a DDS file.");
+        if (!info.CanDecode) throw new InvalidDataException($"Unsupported DDS pixel format '{info.Name}'.");
+        int width = info.Width, height = info.Height, dataOff = info.DataOffset;
+        if (width <= 0 || height <= 0) throw new InvalidDataException($"DDS size {width} x {height}.");
 
-        if (maxSide < Math.Max(width, height))
+        if (maxSide < Math.Max(width, height) && info.Depth == 1)
         {
-            uint flags = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(8));
-            int levels = (flags & 0x20000) != 0 ? Math.Max(1, BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(28))) : 1;
-            int block = fourcc == "DXT1" ? 8 : fourcc is "DXT3" or "DXT5" ? 16 : 0;
-            int bytesPerPixel = block == 0 && (pfFlags & 0x40) != 0 ? (int)BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(88)) / 8 : 0;
-            if (block > 0 || bytesPerPixel > 0)
+            int off = dataOff, w = width, h = height;
+            for (int level = 0; level < info.MipCount - 1 && Math.Max(w, h) > maxSide; level++)
             {
-                int off = dataOff, w = width, h = height;
-                for (int level = 0; level < levels - 1 && Math.Max(w, h) > maxSide; level++)
-                {
-                    long size = block > 0 ? (long)Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * block
-                                          : (long)w * h * bytesPerPixel;
-                    int nw = Math.Max(1, w / 2), nh = Math.Max(1, h / 2);
-                    long nextSize = block > 0 ? (long)Math.Max(1, (nw + 3) / 4) * Math.Max(1, (nh + 3) / 4) * block
-                                              : (long)nw * nh * bytesPerPixel;
-                    if (off + size + nextSize > d.Length) break;             // the next level is not all there
-                    off += (int)size; w = nw; h = nh;
-                }
-                dataOff = off; width = w; height = h;
+                long size = info.LevelBytes(w, h);
+                int nw = Math.Max(1, w / 2), nh = Math.Max(1, h / 2);
+                if (off + size + info.LevelBytes(nw, nh) > d.Length) break;   // the next level is not all there
+                off += (int)size; w = nw; h = nh;
             }
+            dataOff = off; width = w; height = h;
         }
-        var rgba = new byte[width * height * 4];
+        long need = info.LevelBytes(width, height);
+        if (dataOff + need > d.Length)
+            throw new InvalidDataException($"DDS pixel data is cut short: {width} x {height} {info.Name} needs {need:N0} bytes, the file holds {Math.Max(0, d.Length - dataOff):N0}.");
 
-        bool DXT1 = fourcc == "DXT1";
-        bool DXT3 = fourcc == "DXT3";
-        bool DXT5 = fourcc == "DXT5";
-        if (DXT1 || DXT3 || DXT5)
+        var rgba = new byte[width * height * 4];
+        if (info.IsCompressed)
         {
-            int blockBytes = DXT1 ? 8 : 16;
+            bool dxt1 = info.Format == DdsPixelFormat.Dxt1;
+            bool explicitAlpha = info.Format is DdsPixelFormat.Dxt2 or DdsPixelFormat.Dxt3;
+            int blockBytes = info.UnitBytes;
             int bx = (width + 3) / 4, by = (height + 3) / 4;
             int p = dataOff;
             Span<byte> alpha = stackalloc byte[16];   // one 16-byte scratch buffer, reused per block
             for (int byk = 0; byk < by; byk++)
                 for (int bxk = 0; bxk < bx; bxk++)
                 {
-                    for (int k = 0; k < 16; k++) alpha[k] = 255;
                     int colorOff = p;
-                    if (DXT3) { DecodeDxt3Alpha(d, p, alpha); colorOff = p + 8; }
-                    else if (DXT5) { DecodeDxt5Alpha(d, p, alpha); colorOff = p + 8; }
-                    DecodeColorBlock(d, colorOff, DXT1, bxk * 4, byk * 4, width, height, rgba, alpha);
+                    if (dxt1) alpha.Fill(255);
+                    else if (explicitAlpha) { DecodeDxt3Alpha(d, p, alpha); colorOff = p + 8; }
+                    else { DecodeDxt5Alpha(d, p, alpha); colorOff = p + 8; }
+                    DecodeColorBlock(d, colorOff, dxt1, bxk * 4, byk * 4, width, height, rgba, alpha);
                     p += blockBytes;
                 }
         }
-        else if ((pfFlags & 0x40) != 0)   // uncompressed RGB(A)
+        else DecodeMasked(d, dataOff, width * height, info, rgba);
+        return new Texture2D(width, height, rgba);
+    }
+
+    /// <summary>Uncompressed pixels: each channel cut out by its mask and widened to 8 bits. The layout nearly every
+    /// uncompressed file uses - A8R8G8B8 or X8R8G8B8, bytes B G R A - is a straight copy.</summary>
+    private static void DecodeMasked(byte[] d, int off, int count, DdsInfo info, byte[] rgba)
+    {
+        int bpp = info.BitCount / 8;
+        if (bpp == 4 && info.Format == DdsPixelFormat.Rgb && info.RMask == 0x00FF0000 && info.GMask == 0x0000FF00
+            && info.BMask == 0x000000FF && info.AMask is 0xFF000000 or 0)
         {
-            uint rgbBits = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(88));
-            int bpp = (int)rgbBits / 8;
-            // assume B8G8R8(A8) ordering (common for DDS)
-            for (int i = 0, q = dataOff; i < width * height; i++, q += bpp)
+            bool alpha = info.AMask != 0;
+            for (int i = 0, q = off, o = 0; i < count; i++, q += 4, o += 4)
             {
-                byte b = d[q], g = d[q + 1], r = d[q + 2];
-                byte a = bpp >= 4 ? d[q + 3] : (byte)255;
-                int o = i * 4; rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = a;
+                rgba[o] = d[q + 2]; rgba[o + 1] = d[q + 1]; rgba[o + 2] = d[q];
+                rgba[o + 3] = alpha ? d[q + 3] : (byte)255;
+            }
+            return;
+        }
+
+        bool grey = info.Format == DdsPixelFormat.Luminance;
+        var r = new Channel(info.Format == DdsPixelFormat.Alpha ? 0 : info.RMask, 0);
+        var g = new Channel(info.Format == DdsPixelFormat.Rgb ? info.GMask : 0, 0);
+        var b = new Channel(info.Format == DdsPixelFormat.Rgb ? info.BMask : 0, 0);
+        var a = new Channel(info.AMask, 255);
+        for (int i = 0, q = off, o = 0; i < count; i++, q += bpp, o += 4)
+        {
+            uint px = bpp switch
+            {
+                1 => d[q],
+                2 => (uint)(d[q] | d[q + 1] << 8),
+                3 => (uint)(d[q] | d[q + 1] << 8 | d[q + 2] << 16),
+                _ => (uint)(d[q] | d[q + 1] << 8 | d[q + 2] << 16 | d[q + 3] << 24),
+            };
+            byte rv = r.Of(px);
+            rgba[o] = rv;
+            rgba[o + 1] = grey ? rv : g.Of(px);
+            rgba[o + 2] = grey ? rv : b.Of(px);
+            rgba[o + 3] = a.Of(px);
+        }
+    }
+
+    /// <summary>One channel of a masked layout: where it sits, and how it widens to 8 bits - by table up to 8 bits (4-bit
+    /// 15 is 255, 5-bit 16 is 132), wider channels by scaling. A channel the layout lacks reads as <c>missing</c>: 0
+    /// for a colour, 255 for alpha.</summary>
+    private readonly struct Channel
+    {
+        private readonly uint _mask;
+        private readonly int _shift;
+        private readonly uint _max;
+        private readonly byte[]? _widen;
+        private readonly byte _missing;
+
+        public Channel(uint mask, byte missing)
+        {
+            _mask = mask; _missing = missing;
+            _shift = mask == 0 ? 0 : BitOperations.TrailingZeroCount(mask);
+            _max = mask >> _shift;                                      // 2^bits - 1 for the contiguous masks files use
+            _widen = null;
+            if (_max is > 0 and <= 255)
+            {
+                int max = (int)_max;
+                _widen = new byte[max + 1];
+                for (int v = 0; v <= max; v++) _widen[v] = (byte)((v * 255 + max / 2) / max);
             }
         }
-        else throw new InvalidDataException($"Unsupported DDS pixel format '{fourcc}'.");
-        return new Texture2D(width, height, rgba);
+
+        public byte Of(uint px)
+        {
+            if (_mask == 0) return _missing;
+            uint v = (px & _mask) >> _shift;
+            return _widen is not null ? _widen[v] : (byte)((ulong)v * 255 / _max);
+        }
     }
 
     private static void DecodeColorBlock(byte[] d, int o, bool dxt1, int ox, int oy, int w, int h, byte[] rgba, ReadOnlySpan<byte> alpha)
@@ -381,7 +611,7 @@ public static class DdsTexture
         else
         {
             r[2] = (r[0] + r[1]) / 2; g[2] = (g[0] + g[1]) / 2; b[2] = (b[0] + b[1]) / 2;
-            r[3] = 0; g[3] = 0; b[3] = 0; // index 3 = transparent black in 3-color mode
+            r[3] = 0; g[3] = 0; b[3] = 0; // index 3 = transparent black in 3-color mode (only DXT1 has that mode)
         }
         uint bits = BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(o + 4));
         for (int py = 0; py < 4; py++)
@@ -392,7 +622,7 @@ public static class DdsTexture
                 if (x >= w || y >= h) continue;
                 int q = (y * w + x) * 4;
                 rgba[q] = (byte)r[sel]; rgba[q + 1] = (byte)g[sel]; rgba[q + 2] = (byte)b[sel];
-                rgba[q + 3] = alpha[py * 4 + px];
+                rgba[q + 3] = !fourColor && sel == 3 ? (byte)0 : alpha[py * 4 + px];
             }
     }
 
