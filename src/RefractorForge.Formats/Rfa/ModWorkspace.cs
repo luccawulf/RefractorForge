@@ -73,6 +73,11 @@ public sealed class ModWorkspace : IDisposable
     /// (<c>objects_001</c>, a BFV <c>standardMesh_001</c>, any <c>_002</c>) are left out. The game is told from the
     /// folder's install (<see cref="GameMounts.DetectFolder"/>), else <see cref="GameMounts.Union"/> is used. Level
     /// archives are included; pass <paramref name="levelsToo"/> false to leave them out of a global view.
+    ///
+    /// Any folder works: a folder inside an <c>Archives</c> tree (<c>Archives\bf1942\levels</c> picked on its own) is
+    /// placed by its real path, and a LOOSE folder - no <c>Archives</c> folder on or under it, such as a download of map
+    /// archives - lists every archive, each numbered patch ahead of the base beside it, since the engine's list cannot
+    /// place it.
     /// </summary>
     public static List<string> LayersFor(string modDir, bool levelsToo = true)
         => LayersFor(modDir, GameMounts.For(GameMounts.DetectFolder(modDir)), levelsToo);

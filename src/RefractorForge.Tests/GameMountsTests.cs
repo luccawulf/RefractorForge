@@ -302,6 +302,163 @@ public class GameMountsTests : IDisposable
         Assert.StartsWith(x, layers[3]);
         Assert.Contains("Anzio.rfa", Leaves(ModWorkspace.LayersFor(_root)));
     }
+
+    [Fact]
+    public void The_base_game_the_resolver_appends_itself_never_decides_the_game()
+    {
+        // Both base mods and no executable: the install cannot be told, so the base game Resolve appends to a mod that
+        // lists only itself is a blind pick (bf1942). It must not make this a BF1942 chain - a BFV mod would lose its
+        // effects, music and animations_001 and get a standardMesh_001 mounted - so the chain falls back to the union.
+        Mod("bf1942");
+        Mod("BfVietnam");
+        var solo = Mod("Solo", "game.addModPath Mods/Solo/");
+        foreach (var f in new[] { "effects.rfa", "music.rfa", "animations_001.rfa", "standardMesh.rfa", "standardMesh_001.rfa" })
+            Rfa(solo, f);
+
+        var chain = ModChain.Resolve(_root, solo);
+        Assert.Contains(chain.Mounts, m => m.Name == "bf1942" && m.IsBaseGameFallback);
+        Assert.Null(chain.Game);
+        Assert.Same(GameMounts.Union, GameMounts.For(chain));
+        Assert.Empty(ModChain.UnmountedArchives(chain));
+
+        // A base mod that a dependency's init.con names is no guess: Top -> Dep -> BfVietnam is a BFV chain, even with
+        // the resolver's own bf1942 appended below it.
+        Mod("Dep", "game.addModPath Mods/Dep/", "game.addModPath Mods/BfVietnam/");
+        var top = Mod("Top", "game.addModPath Mods/Top/", "game.addModPath Mods/Dep/");
+        var inherited = ModChain.Resolve(_root, top);
+        Assert.Contains(inherited.Mounts, m => m.Name == "BfVietnam" && !m.Listed && !m.IsBaseGameFallback);
+        Assert.Equal(RefractorGame.BFV, inherited.Game);
+    }
+
+    [Fact]
+    public void A_loose_folder_is_listed_whole_with_numbered_patches_ahead_of_their_base()
+    {
+        // A downloaded folder of map archives sits in no Archives tree, so the engine's list cannot place it; the
+        // Archive app still opens it, and every archive in it must show, a patch ahead of the base beside it.
+        var dl = Path.Combine(_root, "Download");
+        Directory.CreateDirectory(Path.Combine(dl, "more"));
+        foreach (var f in new[] { "Wake.rfa", "Wake_003.rfa", "MyMap.rfa", "Kursk_1943.rfa", @"more\texture.rfa", @"more\texture_002.rfa" })
+            File.WriteAllBytes(Path.Combine(dl, f), new byte[] { 0 });
+
+        var layers = ModWorkspace.LayersFor(dl);
+        Assert.Equal(new[] { "Kursk_1943.rfa", "texture_002.rfa", "texture.rfa", "MyMap.rfa", "Wake_003.rfa", "Wake.rfa" }, Leaves(layers));
+        Assert.Empty(GameMounts.Union.Scan(dl).Unmounted);
+        Assert.All(GameMounts.Union.Scan(dl).Mounted, a => Assert.True(a.Archive is null && a.Map is null));
+
+        // A folder that merely sits under some unrelated "Archives" folder is just as loose.
+        var kept = Path.Combine(_root, "Archives", "Download");
+        Directory.CreateDirectory(kept);
+        foreach (var f in new[] { "Wake.rfa", "Wake_003.rfa" }) File.WriteAllBytes(Path.Combine(kept, f), new byte[] { 0 });
+        Assert.Equal(new[] { "Wake_003.rfa", "Wake.rfa" }, Leaves(ModWorkspace.LayersFor(kept)));
+    }
+
+    [Fact]
+    public void Archives_chosen_one_by_one_get_the_patches_their_game_mounts_ahead_of_them()
+    {
+        File.WriteAllBytes(Path.Combine(_root, "BF1942.exe"), new byte[] { 0 });
+        var b = Mod("bf1942");
+        foreach (var f in new[] { "Objects.rfa", "objects_001.rfa", "standardMesh.rfa", "StandardMesh_001.rfa", "texture.rfa",
+                                  "texture_001.rfa", "texture_002.rfa", "bf1942/levels/Wake.rfa", "bf1942/levels/Wake_000.rfa",
+                                  "bf1942/levels/Wake_003.rfa" })
+            Rfa(b, f);
+        string A(string rel) => Path.Combine(b, "Archives", rel.Replace('/', Path.DirectorySeparatorChar));
+
+        // Base before patch, as a file dialog returns them; an unmounted objects_001 chosen by hand stays, but is
+        // never added for Objects.rfa; a level brings its patches, highest first.
+        var picked = new[] { A("texture.rfa"), A("texture_001.rfa"), A("standardMesh.rfa"), A("objects_001.rfa"), A("Objects.rfa"),
+                             A("bf1942/levels/Wake.rfa") };
+        Assert.Equal(new[] { "texture_001.rfa", "texture.rfa", "StandardMesh_001.rfa", "standardMesh.rfa", "objects_001.rfa",
+                             "Objects.rfa", "Wake_003.rfa", "Wake_000.rfa", "Wake.rfa" },
+                     Leaves(GameMounts.WithMountedPatches(picked)));
+        Assert.Equal(new[] { "Wake_003.rfa" }, Leaves(GameMounts.WithMountedPatches(new[] { A("bf1942/levels/Wake_003.rfa") })));
+
+        Assert.True(GameMounts.IsMountedFile(A("texture_001.rfa")));
+        Assert.False(GameMounts.IsMountedFile(A("texture_002.rfa")));
+        Assert.False(GameMounts.IsMountedFile(A("objects_001.rfa")));
+
+        // BF Vietnam mounts no standardMesh_001, so it is never pulled in beside a chosen standardMesh.rfa.
+        var other = Path.Combine(_root, "vietnam");
+        Directory.CreateDirectory(Path.Combine(other, "Mods", "BfVietnam", "Archives"));
+        File.WriteAllBytes(Path.Combine(other, "BfVietnam.exe"), new byte[] { 0 });
+        var vsm = Path.Combine(other, "Mods", "BfVietnam", "Archives", "standardMesh.rfa");
+        var vpatch = Path.Combine(other, "Mods", "BfVietnam", "Archives", "standardMesh_001.rfa");
+        File.WriteAllBytes(vsm, new byte[] { 0 });
+        File.WriteAllBytes(vpatch, new byte[] { 0 });
+        Assert.Equal(new[] { vsm }, GameMounts.WithMountedPatches(new[] { vsm }));
+        Assert.False(GameMounts.IsMountedFile(vpatch));
+
+        // A loose file takes every numbered sibling as a patch, the way a loose folder is listed.
+        var loose = Path.Combine(_root, "Picks");
+        Directory.CreateDirectory(loose);
+        foreach (var f in new[] { "texture.rfa", "texture_001.rfa", "texture_002.rfa" }) File.WriteAllBytes(Path.Combine(loose, f), new byte[] { 0 });
+        Assert.Equal(new[] { "texture_002.rfa", "texture_001.rfa", "texture.rfa" },
+                     Leaves(GameMounts.WithMountedPatches(new[] { Path.Combine(loose, "texture.rfa") })));
+        Assert.True(GameMounts.IsMountedFile(Path.Combine(loose, "texture_002.rfa")));
+    }
+
+    [Fact]
+    public void A_level_archive_leads_to_its_mods_chain()
+    {
+        Mod("bf1942");
+        var mine = Mod("MyMod", "game.addModPath Mods/MyMod/", "game.addModPath Mods/bf1942/");
+        var level = Rfa(mine, "bf1942/levels/Mine.rfa");
+        var chain = ModChain.ForLevelArchive(level)!;
+        Assert.Equal(new[] { "MyMod", "bf1942" }, chain.Mounts.Select(m => m.Name).ToArray());
+        Assert.Equal(RefractorGame.BF1942, chain.Game);
+
+        // A nested mod (Mods\Ballistik_FH\X_Flow) is its own mod, not its parent's.
+        var nested = Path.Combine(_root, "Mods", "Ballistik_FH", "X_Flow");
+        var nestedLevel = Rfa(nested, "bf1942/levels/Flow.rfa");
+        Assert.Equal(nested, ModChain.ForLevelArchive(nestedLevel)!.Mounts[0].Path);
+
+        // Outside a Mods tree: the mod alone, its game told from the folder.
+        var outside = Path.Combine(_root, "Unpacked", "SomeMod");
+        var outsideLevel = Path.Combine(outside, "Archives", "BfVietnam", "levels", "Hue.rfa");
+        Directory.CreateDirectory(Path.GetDirectoryName(outsideLevel)!);
+        File.WriteAllBytes(outsideLevel, new byte[] { 0 });
+        var alone = ModChain.ForLevelArchive(outsideLevel)!;
+        Assert.Equal(outside, Assert.Single(alone.Mounts).Path);
+        Assert.Null(alone.Game);
+
+        Assert.Null(ModChain.ForLevelArchive(Path.Combine(_root, "Download", "Wake.rfa")));
+    }
+
+    [Fact]
+    public void A_folder_inside_an_Archives_tree_is_placed_by_its_real_path()
+    {
+        // Picking Archives\bf1942\levels (or Archives\bf1942) on its own: each file is still where the engine mounts it.
+        var b = Mod("bf1942");
+        foreach (var f in new[] { "bf1942/Game.rfa", "bf1942/levels/Wake.rfa", "bf1942/levels/Wake_003.rfa", "bf1942/levels/old/Wake.rfa" })
+            Rfa(b, f);
+        var levels = Path.Combine(b, "Archives", "bf1942", "levels");
+
+        Assert.Equal(RefractorGame.BF1942, GameMounts.DetectFolder(levels));
+        Assert.Equal(new[] { "Wake_003.rfa", "Wake.rfa" }, Leaves(ModWorkspace.LayersFor(levels)));
+        Assert.Equal(new[] { "Game.rfa", "Wake_003.rfa", "Wake.rfa" }, Leaves(ModWorkspace.LayersFor(Path.GetDirectoryName(levels)!)));
+        var scan = GameMounts.Bf1942.Scan(levels);
+        Assert.Equal(@"bf1942\levels\Wake_003.rfa", scan.Mounted[0].RelativePath);
+        Assert.Equal(Path.Combine(levels, "old", "Wake.rfa"), Assert.Single(scan.Unmounted));
+    }
+
+    [Fact]
+    public void An_Archives_folder_inside_a_mods_Archives_is_a_sub_folder_in_every_view()
+    {
+        // Mods\FHR\Archives\Archives\font.rfa is Archives\font.rfa to the engine, which mounts no such name. The mod on
+        // its own, the whole game folder and the inner folder picked by itself must all say so.
+        Mod("bf1942");
+        var fhr = Mod("FHR");
+        var inner = Rfa(fhr, "Archives/font.rfa");
+        var objects = Rfa(fhr, "objects.rfa");
+
+        Assert.Contains(inner, GameMounts.Bf1942.Scan(fhr).Unmounted);
+        var whole = GameMounts.Bf1942.Scan(_root);
+        Assert.Contains(inner, whole.Unmounted);
+        Assert.DoesNotContain(inner, whole.Mounted.Select(a => a.Path));
+        Assert.Contains(objects, whole.Mounted.Select(a => a.Path));
+        var alone = GameMounts.Bf1942.Scan(Path.GetDirectoryName(inner)!);
+        Assert.Empty(alone.Mounted);
+        Assert.Equal(inner, Assert.Single(alone.Unmounted));
+    }
 }
 
 /// <summary>The mount table against the retail files: the executables' own string tables, and the three resolutions
@@ -312,8 +469,9 @@ public class GameMountsInstallTests
     private static string[] Leaves(IEnumerable<string> paths) => paths.Select(p => Path.GetFileName(p)).ToArray();
     private static string Norm(string n) => n.Replace('\\', '/');
 
-    /// <summary>The whitelist is not remembered: every archive the table says is mounted must be named in the
-    /// executable's own string table, and every patch it says is NOT mounted must be absent from it.</summary>
+    /// <summary>The whitelist is not remembered: the archive names in the executable's own string table and the
+    /// table's archives and mounted patches are the same set, both ways - an archive dropped from the table (aiMeshes,
+    /// which carries BF1942 buildings) fails here just as one the executable never names does.</summary>
     [InstallFact(Installs.Bf1942Clean)]
     public void Bf1942_table_matches_the_executable() => TableMatchesExecutable(GameMounts.Bf1942, Installs.Bf1942Clean);
 
@@ -325,7 +483,8 @@ public class GameMountsInstallTests
         Assert.Equal(game.Game, GameMounts.Detect(root));
         var exe = Path.Combine(root, game.Executables[0]);
         Assert.True(File.Exists(exe), exe);
-        var text = Encoding.Latin1.GetString(File.ReadAllBytes(exe));
+        var bytes = File.ReadAllBytes(exe);
+        var text = Encoding.Latin1.GetString(bytes);
         foreach (var a in game.Archives)
         {
             var leaf = Path.GetFileName(a.RelativePath);
@@ -335,6 +494,32 @@ public class GameMountsInstallTests
                 $"{game.Executables[0]}: {patch} named={text.Contains(patch, StringComparison.OrdinalIgnoreCase)}, table says {a.PatchMounted}");
         }
         Assert.DoesNotContain("objects_001.rfa", text, StringComparison.OrdinalIgnoreCase);
+
+        // The other way: every archive the executable names is in the table. The mount list is its null-terminated
+        // "<name>.rfa" strings; the only other .rfa strings are the Archives/objects.rfa fallback paths.
+        var named = ExeArchiveNames(bytes).Where(n => !n.Contains("Archives/", StringComparison.OrdinalIgnoreCase))
+                                          .Select(n => n.Replace('/', '\\')).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var table = game.Archives.Select(a => a.RelativePath)
+                        .Concat(game.Archives.Select(a => a.PatchRelativePath).OfType<string>())
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.Empty(named.Except(table, StringComparer.OrdinalIgnoreCase));
+        Assert.Empty(table.Except(named, StringComparer.OrdinalIgnoreCase));
+    }
+
+    /// <summary>Every null-terminated printable string in a binary that ends in <c>.rfa</c>.</summary>
+    private static List<string> ExeArchiveNames(byte[] bytes)
+    {
+        var names = new List<string>();
+        var ext = ".rfa\0"u8;
+        for (int i = 0; ;)
+        {
+            int k = bytes.AsSpan(i).IndexOf(ext);
+            if (k < 0) return names;
+            int dot = i + k, s = dot;
+            while (s > 0 && bytes[s - 1] >= 0x20 && bytes[s - 1] < 0x7F) s--;
+            if (s < dot && (s == 0 || bytes[s - 1] == 0)) names.Add(Encoding.ASCII.GetString(bytes, s, dot + 4 - s));
+            i = dot + ext.Length;
+        }
     }
 
     [InstallFact(Installs.Bf1942Clean)]
@@ -435,6 +620,12 @@ public class GameMountsInstallTests
         Assert.NotEmpty(mods);
         foreach (var modDir in mods)
         {
+            // Nothing real is dropped: the one archive in either clean install the executable never reads is
+            // BFV_WW2Mod's standardMesh_001. A table missing aiMeshes, ai, font, shaders or animations fails here.
+            var expected = Path.GetFileName(modDir).Equals("BFV_WW2Mod", StringComparison.OrdinalIgnoreCase)
+                ? new[] { Path.Combine(modDir, "Archives", "standardMesh_001.rfa") } : Array.Empty<string>();
+            Assert.Equal(expected, table.Scan(modDir).Unmounted.ToArray(), StringComparer.OrdinalIgnoreCase);
+
             var chain = ModChain.Resolve(root, modDir);
             Assert.Equal(game, chain.Game);
             var (mesh, tex) = ModChain.CollectArchives(chain, skipNonAsset: false);

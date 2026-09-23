@@ -30,10 +30,13 @@ public sealed record MountTarget(MountedArchive? Archive, string? Map, string Re
 
 /// <summary>One archive FILE of a mod folder that the engine mounts.</summary>
 /// <param name="Path">The file on disk.</param>
-/// <param name="RelativePath">Its path under <c>Archives\</c>, spelled as on disk.</param>
+/// <param name="RelativePath">Its path under <c>Archives\</c>, spelled as on disk (under the scanned folder for a loose
+/// one).</param>
 /// <param name="Archive">The mod-level archive it is, base or patch; null for a level.</param>
-/// <param name="Map">The level it belongs to; null for a mod-level archive.</param>
-/// <param name="Patch">-1 for a base; 1 for a mod-level <c>_001</c>; N for a level's <c>_NNN</c>.</param>
+/// <param name="Map">The level it belongs to; null for a mod-level archive. Both are null for a file of a loose folder,
+/// which the table cannot place (see <see cref="GameMounts.Scan"/>).</param>
+/// <param name="Patch">-1 for a base; 1 for a mod-level <c>_001</c>; N for a level's <c>_NNN</c> (or a loose
+/// <c>_NNN</c> beside its base).</param>
 public sealed record ModArchive(string Path, string RelativePath, MountedArchive? Archive, string? Map, int Patch)
 {
     public bool IsLevel => Map is not null;
@@ -170,8 +173,10 @@ public sealed class GameMounts
     }
 
     /// <summary>Which game a resolved chain runs on: <see cref="ModChainResult.Game"/> when set, else its install
-    /// (<see cref="Detect(string)"/>), else the one base mod the chain mounts - one its init.con lists first, since
-    /// the resolver's own base-game fallback is a guess. Null when none of those decides.</summary>
+    /// (<see cref="Detect(string)"/>), else the one base mod the chain mounts through an init.con - one the starting
+    /// mod lists first, then one a dependency's init.con names. The base game the resolver appends on its own
+    /// (<see cref="ModMount.IsBaseGameFallback"/>) never decides: where the install cannot be told it was picked
+    /// blind. Null when none of those decides.</summary>
     public static RefractorGame? Detect(ModChainResult chain)
     {
         if (chain.Game is { } known) return known;
@@ -179,7 +184,8 @@ public sealed class GameMounts
         if (Detect(root) is { } g) return g;
         foreach (var listedOnly in new[] { true, false })
         {
-            var byBase = Games.Where(x => chain.Mounts.Any(m => (m.Listed || !listedOnly) && m.Name.Equals(x.BaseMod, Ci))).ToList();
+            var byBase = Games.Where(x => chain.Mounts.Any(m => (m.Listed || !listedOnly) && !m.IsBaseGameFallback
+                                                               && m.Name.Equals(x.BaseMod, Ci))).ToList();
             if (byBase.Count == 1) return byBase[0].Game;
         }
         return null;
@@ -241,9 +247,13 @@ public sealed class GameMounts
     /// is by path (top-level archives, then <c>&lt;base mod&gt;\game.rfa</c>, then levels). Anything the executable
     /// never reads lands in <see cref="ModArchiveScan.Unmounted"/>.
     ///
-    /// A folder with an <c>Archives\</c> sub-folder is a mod, and paths are taken under it. Any other folder (an
-    /// <c>Archives</c> folder itself, a game root) is scanned as a tree of such folders: each file's path is taken
-    /// under the nearest enclosing <c>Archives</c> directory, or under the folder itself when there is none.
+    /// A folder with an <c>Archives\</c> sub-folder is a mod, and paths are taken under it. Any other folder - an
+    /// <c>Archives</c> folder itself, a <c>&lt;base mod&gt;\levels</c> folder inside one, a game root - has each file
+    /// placed by its own path under the <c>Archives</c> folder it is mounted from (<see cref="ArchivesFolderOf"/>), so
+    /// every view of a file agrees on whether the engine reads it. A LOOSE folder, with no such folder on or under it
+    /// (a download of map archives), is nothing the engine mounts as it stands, so the table cannot judge it: every
+    /// archive in it is listed, each numbered <c>_NNN</c> patch ahead of the base beside it, highest first
+    /// (<see cref="ModArchive.Archive"/> and <see cref="ModArchive.Map"/> both null).
     /// </summary>
     public ModArchiveScan Scan(string modDir, bool levelsToo = true)
     {
@@ -251,7 +261,9 @@ public sealed class GameMounts
         if (string.IsNullOrWhiteSpace(modDir)) return empty;
         var archivesDir = Path.Combine(modDir, "Archives");
         bool isMod = Directory.Exists(archivesDir);
-        var root = isMod ? archivesDir : modDir;
+        string root;
+        try { root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(isMod ? archivesDir : modDir)); }
+        catch { return empty; }
         if (!Directory.Exists(root)) return empty;
 
         List<string> files;
@@ -259,11 +271,15 @@ public sealed class GameMounts
         catch { return empty; }
         var present = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
 
+        var placed = files.Select(f => (File: f, Base: isMod ? root : ArchivesFolderOf(f, root))).ToList();
+        if (placed.All(p => p.Base is null)) return ScanLoose(root, files, present, levelsToo);
+
         var mounted = new List<(ModArchive A, string Base, string Group)>();
         var unmounted = new List<string>();
-        foreach (var f in files)
+        foreach (var (f, baseDir) in placed)
         {
-            var (baseDir, rel) = UnderArchives(root, f, isMod);
+            if (baseDir is null) { unmounted.Add(f); continue; }   // in a game tree but in no Archives folder: never read
+            var rel = Path.GetRelativePath(baseDir, f);
             var dir = Path.GetDirectoryName(f) ?? "";
             // "Wake_Evenings" and "Kursk_1943" are maps: a numbered suffix is a patch only beside its base level.
             var hit = Classify(rel, map => present.Contains(Path.Combine(dir, map + ".rfa")));
@@ -279,6 +295,135 @@ public sealed class GameMounts
             .ThenByDescending(m => m.A.Patch)
             .Select(m => m.A).ToList();
         return new ModArchiveScan(ordered, unmounted);
+    }
+
+    /// <summary>A loose folder (see <see cref="Scan"/>): every archive, grouped by folder and base name, a numbered
+    /// patch beside its base ahead of it and highest first - how ModWorkspace listed any folder before the mount list
+    /// existed. Without levels, any file on a <c>levels</c> path is left out, as it was then.</summary>
+    private static ModArchiveScan ScanLoose(string root, List<string> files, HashSet<string> present, bool levelsToo)
+    {
+        var list = new List<(ModArchive A, string Key)>();
+        foreach (var f in files)
+        {
+            if (!levelsToo && ModChain.IsLevelArchive(f)) continue;
+            var dir = Path.GetDirectoryName(f) ?? "";
+            var (group, patch) = (Path.GetFileNameWithoutExtension(f), -1);
+            if (LevelPatch.Match(group) is { Success: true } m && int.TryParse(m.Groups[2].Value, out int n)
+                && present.Contains(Path.Combine(dir, m.Groups[1].Value + ".rfa")))
+                (group, patch) = (m.Groups[1].Value, n);
+            list.Add((new ModArchive(f, Path.GetRelativePath(root, f), null, null, patch), Path.Combine(dir, group)));
+        }
+        var ordered = list.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase).ThenByDescending(x => x.A.Patch)
+                          .Select(x => x.A).ToList();
+        return new ModArchiveScan(ordered, Array.Empty<string>());
+    }
+
+    /// <summary>
+    /// The <c>Archives</c> folder the engine would mount a file from, read off the file's own path. Inside a
+    /// <c>Mods</c> tree it is the shallowest <c>Archives</c> below the nearest <c>Mods</c> folder: the mod's own, also
+    /// for a nested mod such as <c>Mods\Ballistik_FH\X_Flow</c>, while an <c>Archives\Archives\</c> inside it is only a
+    /// sub-folder the engine never looks in (FHR ships its font.rfa there). Outside a <c>Mods</c> tree it is the
+    /// shallowest at or below <paramref name="root"/>, else the nearest above it when the path below that folder runs
+    /// through a base mod's folder (<c>Archives\bf1942\levels</c> picked on its own) - a folder that merely sits under
+    /// some unrelated "Archives" folder is not placed by it. Null when there is none: loose, or never mounted.
+    /// </summary>
+    internal static string? ArchivesFolderOf(string file, string root)
+    {
+        string[] seg, rootSeg;
+        try
+        {
+            seg = Path.GetFullPath(file).Split('\\', '/');
+            rootSeg = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)).Split('\\', '/');
+        }
+        catch { return null; }
+        int last = seg.Length - 1;                              // the file's own name
+        string Upto(int i) => string.Join(Path.DirectorySeparatorChar, seg[..(i + 1)]);
+        bool IsArchives(int i) => seg[i].Equals("Archives", Ci);
+
+        for (int mods = last - 1; mods >= 0; mods--)
+            if (seg[mods].Equals("Mods", Ci))
+            {
+                for (int i = mods + 1; i < last; i++) if (IsArchives(i)) return Upto(i);
+                return null;
+            }
+        int top = Math.Clamp(rootSeg.Length - 1, 0, last);    // the root's own segment
+        for (int i = top; i < last; i++) if (IsArchives(i)) return Upto(i);
+        for (int i = top - 1; i >= 0; i--)
+            if (IsArchives(i))
+                return i + 1 < last && Union.BaseMods.Any(b => b.Equals(seg[i + 1], Ci)) ? Upto(i) : null;
+        return null;
+    }
+
+    // ---- Archive files picked one by one ----
+
+    /// <summary>Whether the engine mounts this archive FILE: placed under the <c>Archives</c> folder it sits in
+    /// (<see cref="ArchivesFolderOf"/>) and judged by its own install's table (<see cref="DetectFolder"/>). A file in no
+    /// Archives folder cannot be judged and counts as mounted, the way <see cref="Scan"/> lists a loose folder whole.</summary>
+    public static bool IsMountedFile(string file)
+    {
+        try { return Place(file) is not { } p || p.Table.IsMounted(p.Rel); }
+        catch { return true; }
+    }
+
+    /// <summary>
+    /// Archive files chosen one by one (a file dialog, a saved project, a list collected elsewhere) put in the order the
+    /// engine layers them: each archive gets the patches it mounts over it placed right ahead of it - its <c>_001</c>
+    /// where the table mounts one (<see cref="MountedArchive.PatchRelativePath"/>), a level's <c>_NNN</c> highest first
+    /// - added when missing and moved up when chosen after their base. A patch the game never reads (objects_001, a BFV
+    /// standardMesh_001, any <c>_002</c>) is never added, but a file chosen by hand is kept. A file in no Archives folder
+    /// takes every numbered sibling as a patch, as a loose folder does. Otherwise the order is kept; duplicates go.
+    /// </summary>
+    public static List<string> WithMountedPatches(IEnumerable<string> archives)
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string p) { if (seen.Add(Path.GetFullPath(p))) result.Add(p); }
+        foreach (var a in archives)
+        {
+            if (string.IsNullOrWhiteSpace(a)) continue;
+            try
+            {
+                foreach (var patch in PatchesOver(Path.GetFullPath(a))) Add(patch);
+                Add(a);
+            }
+            catch { /* an unusable path is skipped, as the libraries skip an archive they cannot open */ }
+        }
+        return result;
+    }
+
+    /// <summary>The patches the engine mounts over an archive file that exist beside it, highest precedence first.</summary>
+    private static IEnumerable<string> PatchesOver(string file)
+    {
+        var dir = Path.GetDirectoryName(file);
+        if (dir is null || !Directory.Exists(dir)) return Array.Empty<string>();
+        var stem = Path.GetFileNameWithoutExtension(file);
+        bool BaseBeside(string map) => File.Exists(Path.Combine(dir, map + ".rfa"));
+        if (Place(file) is not { } p)                          // loose: a numbered name beside its base is a patch
+            return LevelPatch.Match(stem) is { Success: true } m && BaseBeside(m.Groups[1].Value)
+                ? Array.Empty<string>() : NumberedSiblings(dir, stem);
+        if (p.Table.Classify(p.Rel, BaseBeside) is not { Patch: < 0 } hit) return Array.Empty<string>();   // a patch, or never read
+        if (hit.Map is not null) return NumberedSiblings(dir, stem);
+        return hit.Archive?.PatchRelativePath is { } patch
+            ? Directory.EnumerateFiles(dir, Path.GetFileName(patch)).Take(1).ToArray()   // as spelled on disk
+            : Array.Empty<string>();
+    }
+
+    private static string[] NumberedSiblings(string dir, string stem)
+    {
+        var rx = new Regex("^" + Regex.Escape(stem) + @"_(\d+)$", RegexOptions.IgnoreCase);
+        return Directory.EnumerateFiles(dir, stem + "_*.rfa")
+            .Select(s => (Path: s, M: rx.Match(Path.GetFileNameWithoutExtension(s))))
+            .Where(t => t.M.Success && long.TryParse(t.M.Groups[1].Value, out _))
+            .OrderByDescending(t => long.Parse(t.M.Groups[1].Value))
+            .Select(t => t.Path).ToArray();
+    }
+
+    /// <summary>A file's install table and its path under the Archives folder it is mounted from; null when loose.</summary>
+    private static (GameMounts Table, string Rel)? Place(string file)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(file)) ?? "";
+        if (ArchivesFolderOf(file, dir) is not { } arc) return null;
+        return (For(DetectFolder(Path.GetDirectoryName(arc) ?? arc)), Path.GetRelativePath(arc, file));
     }
 
     /// <summary>Place one path under <c>Archives\</c>: the archive (or level) it is, its patch number, and the base's
@@ -300,16 +445,5 @@ public sealed class GameMounts
             && levelBaseExists(m.Groups[1].Value))
             return (null, m.Groups[1].Value, n, $@"{seg[0]}\levels\{m.Groups[1].Value}.rfa");
         return (null, stem, -1, $@"{seg[0]}\levels\{stem}.rfa");
-    }
-
-    private static (string Base, string Rel) UnderArchives(string root, string file, bool isMod)
-    {
-        var rel = Path.GetRelativePath(root, file);
-        if (isMod) return (root, rel);
-        var seg = rel.Split('\\', '/');
-        for (int i = seg.Length - 2; i >= 0; i--)
-            if (seg[i].Equals("Archives", Ci))
-                return (Path.Combine(root, Path.Combine(seg[..(i + 1)])), Path.Combine(seg[(i + 1)..]));
-        return (root, rel);
     }
 }

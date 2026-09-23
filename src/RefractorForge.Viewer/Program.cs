@@ -1262,98 +1262,15 @@ string? scanDir = levelDir is null ? null
 // map only supplies meshes/textures it uniquely carries.
 if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaList.Length > 0))
 {
-    // AUTO-MOUNT MESH PATCH ARCHIVES: the engine mounts <stem>_NNN.rfa right after its base (StandardMesh.rfa +
-    // StandardMesh_001.rfa, Objects.rfa + Objects_001.rfa). Bocage's SuburbHouse/Ruin_suburbhouse buildings live
-    // ONLY in StandardMesh_001.rfa, so picking just standardMesh.rfa made a whole house vanish while the medic
-    // (in aiMeshes.rfa) rendered fine. For every picked mesh archive, pull in its numeric-suffix siblings from the
-    // same folder (the texture path already does this via its texture*.rfa glob). Mirrors the level _NNN auto-mount.
-    static IEnumerable<string> WithMeshSiblings(IEnumerable<string> picks)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var a in picks)
-        {
-            if (seen.Add(Path.GetFullPath(a))) yield return a;
-            string? dir; string stem;
-            try { dir = Path.GetDirectoryName(Path.GetFullPath(a)); stem = Path.GetFileNameWithoutExtension(a); } catch { continue; }
-            if (dir is null || !Directory.Exists(dir)) continue;
-            if (System.Text.RegularExpressions.Regex.IsMatch(stem, @"_\d+$")) continue;   // already a patch archive
-            foreach (var sib in Directory.EnumerateFiles(dir, stem + "_*.rfa"))
-                if (System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileNameWithoutExtension(sib),
-                        "^" + System.Text.RegularExpressions.Regex.Escape(stem) + @"_\d+$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-                    && seen.Add(Path.GetFullPath(sib)))
-                { Console.WriteLine($"Auto-mounted mesh patch archive: {Path.GetFileName(sib)}"); yield return sib; }
-        }
-    }
-    // AUTO-DISCOVER THE GAME'S BASE ARCHIVES the way the engine mounts the whole Archives folder. BF1942 spreads
-    // its meshes across MANY top-level archives - Bocage's church/windmill/lumbermill/farm/hospital/barack live in
-    // aiMeshes.rfa, its suburbhouses/ruins in StandardMesh_001.rfa, only a few in standardMesh.rfa. Picking just
-    // standardMesh.rfa (or relying on the _NNN sibling) left whole buildings missing. Walk up from each level .rfa to
-    // its "Archives" ancestor and pull in every top-level *.rfa there (texture* go to the texture lib; the bulky
-    // audio/menu/font archives are skipped - they carry no meshes). Self-contained levels just find their own folder;
-    // a level that isn't under an Archives dir discovers nothing and falls back to the picked archives.
-    static bool IsTexArc(string p) => Path.GetFileName(p).StartsWith("texture", StringComparison.OrdinalIgnoreCase);
-    static bool IsNonMeshArc(string p)
-    {
-        var n = Path.GetFileNameWithoutExtension(p).ToLowerInvariant();
-        return n.StartsWith("sound") || n.StartsWith("movie") || n.StartsWith("music") || n is "menu" or "font" or "shaders";
-    }
-    static IEnumerable<string> DiscoverArchives(IEnumerable<string> levelRfas)
-    {
-        var seenDir = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var seenFile = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        IEnumerable<string> Glob(string archivesDir)
-        {
-            if (!Directory.Exists(archivesDir) || !seenDir.Add(Path.GetFullPath(archivesDir))) yield break;
-            string[] files; try { files = Directory.EnumerateFiles(archivesDir, "*.rfa").ToArray(); } catch { yield break; }
-            foreach (var f in files)
-                if (!Path.GetFileName(f).StartsWith("~") && seenFile.Add(Path.GetFullPath(f))) yield return f;
-        }
-        foreach (var lvl in levelRfas)
-        {
-            DirectoryInfo? arc; try { arc = new FileInfo(Path.GetFullPath(lvl)).Directory; } catch { continue; }
-            for (; arc is not null; arc = arc.Parent) if (arc.Name.Equals("Archives", StringComparison.OrdinalIgnoreCase)) break;
-            if (arc is null) continue;
-            // 1) the mod's OWN archives (the Archives folder the level sits under).
-            foreach (var f in Glob(arc.FullName)) yield return f;
-            // 2) the MOD DEPENDENCY CHAIN: a custom map (e.g. interstate's Dystopia_City) embeds most of its meshes but
-            //    still references BASE-game archives (trees in treeMesh.rfa, suburbhouses in StandardMesh_001.rfa) that
-            //    live in Mods\bf1942\Archives, NOT the mod's folder. Parse the mod's init.con `game.addModPath` chain
-            //    (relative to gameRoot) + ALWAYS the base game mod, and glob each one's Archives - exactly how OpenMod
-            //    + the engine mount the chain. So opening a mod LEVEL directly resolves 100%, no manual archive picks.
-            var modDir = arc.Parent;
-            DirectoryInfo? gameRoot = null;
-            for (var pp = modDir; pp?.Parent is not null; pp = pp.Parent)
-                if (pp.Name.Equals("Mods", StringComparison.OrdinalIgnoreCase)) { gameRoot = pp.Parent; break; }
-            if (modDir is null || gameRoot is null) continue;
-            // TRANSITIVE: ModChain follows each dependency's own init.con too, so opening an FHSW-family map
-            // directly (the common case - no .rfproj involved) mounts FH as well, not just FHSW + the base game.
-            var resolved = RefractorForge.Formats.ModChain.Resolve(gameRoot.FullName, modDir.FullName, AppPrefs.ResolveInheritedMods);
-            Console.WriteLine($"Mod chain for {modDir.Name}: {resolved.Describe()}");
-            if (resolved.Missing.Count > 0)
-                Console.WriteLine($"   WARNING - init.con names {resolved.Missing.Count} mod(s) that are NOT installed: {string.Join(", ", resolved.Missing)}");
-            foreach (var mp in resolved.Paths)
-            {
-                var mpArc = Path.Combine(mp, "Archives");
-                foreach (var f in Glob(Directory.Exists(mpArc) ? mpArc : mp)) yield return f;
-            }
-        }
-    }
-    var discovered = DiscoverArchives(rfaList.Where(File.Exists)).ToList();
-    if (discovered.Count > 0)
-        Console.WriteLine($"Auto-discovered {discovered.Count} archive(s) from the level's mod + dependency chain.");
-
-    // A FOLDER level goes in too. An extracted map keeps its own objects as loose files, so a project that has no
-    // level .rfa to point at (anything opened via Open Level Folder, or extracted by hand) would otherwise show none
-    // of the map's custom content - the exact difference between opening DC Final's Basrah Nights by mod and by
-    // folder. MeshLibrary reads a directory through RefractorFlatArchive.FromFolder.
-    var levelFolder = levelDir is not null && Directory.Exists(levelDir) ? new[] { levelDir } : Array.Empty<string>();
-    var meshA = WithMeshSiblings(meshArchives
-            .Where(a => !Path.GetFileName(a).StartsWith("texture", StringComparison.OrdinalIgnoreCase)))
-        .Concat(discovered.Where(a => !IsTexArc(a) && !IsNonMeshArc(a)))   // base mesh/object archives (aiMeshes, treeMesh, _001, ...)
-        .Concat(rfaList.Where(File.Exists))
-        .Concat(levelFolder)
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
+    // WHICH ARCHIVES, IN WHICH ORDER. MeshLibrary/TextureLibrary are first-wins, so the order decides which copy of a
+    // mesh or texture is drawn. LibraryArchives puts every source through the engine's literal mount list (GameMounts):
+    // the level's own mod + dependency chain (BF1942 spreads its buildings over aiMeshes, treeMesh, StandardMesh_001...),
+    // the archives picked by hand or saved by Open Mod / a project, and texture*.rfa found beside them - a mounted _001
+    // ahead of its base (texture_001 over texture, StandardMesh_001 over standardMesh), and never an archive the game
+    // does not read (objects_001, a BFV standardMesh_001, any _002). The level's own .rfa(s) and an extracted level
+    // folder go in too, first for textures (a map retextures objects with same-named .dds) and last for meshes.
+    var (meshA, texArchives) = LibraryArchives.For(meshArchives, texPicks, rfaList, levelDir, scanDir,
+                                                   AppPrefs.ResolveInheritedMods, Console.WriteLine);
     if (meshA.Length > 0)
     {
         meshLib = MeshLibrary.Open(meshA);
@@ -1362,26 +1279,6 @@ if (levelDir is not null && so is not null && (meshArchives.Length > 0 || rfaLis
         if (smDir is not null) meshLib.AttachShaderOverrides(smDir);
         Console.WriteLine($"Opened mesh library from {meshA.Length} archive(s).");
 
-        // Object textures: combine the texture archives the user picked (e.g. texture.rfa AND
-        // texture_001.rfa) with any texture*.rfa siblings found beside the picked archives / level.
-        var texDirs = meshArchives
-            .Concat(texPicks)
-            .Select(a => string.IsNullOrEmpty(a) ? null : Path.GetDirectoryName(Path.GetFullPath(a)))
-            .Append(scanDir)
-            .Where(d => !string.IsNullOrEmpty(d) && Directory.Exists(d)).Select(d => d!)
-            .Distinct(StringComparer.OrdinalIgnoreCase);
-        // The level's OWN .rfa(s) go FIRST so a map's shipped texture OVERRIDES win — a custom map retextures objects /
-        // vehicles (e.g. the humvee skin, the galleon, hi-res skybox faces) by shipping .dds with the SAME names inside
-        // the level .rfa, and the engine searches the level's path before mod/base. TextureLibrary is first-wins. (An
-        // earlier session reverted this fearing it broke tree leaves — but the bald trees were a separate .tm cutout bug,
-        // now fixed in MeshFromTreeMesh/GlTextureFor, so level-first is safe AND engine-correct.)
-        var texArchives = rfaList.Where(File.Exists)
-            .Concat(levelFolder)                  // an extracted level's own textures (see meshA above)
-            .Concat(texPicks.Where(File.Exists))
-            .Concat(texDirs.SelectMany(d => Directory.EnumerateFiles(d, "texture*.rfa", SearchOption.TopDirectoryOnly)))
-            .Concat(discovered.Where(IsTexArc))   // texture*.rfa auto-discovered from the level's mod-chain Archives folders
-            .Select(Path.GetFullPath)
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (texArchives.Length > 0)
         {
             meshLib.AttachTextures(TextureLibrary.Open(texArchives));

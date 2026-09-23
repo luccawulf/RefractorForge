@@ -7,7 +7,13 @@ namespace RefractorForge.Formats;
 /// exactly what the game mounts); false when it was INHERITED — discovered by following a dependency's own
 /// init.con. Inherited mounts are appended at the LOWEST precedence so they can only fill gaps.</param>
 /// <param name="Depth">How many init.con hops from the starting mod (0 = the starting mod itself).</param>
-public readonly record struct ModMount(string Name, string Path, bool Listed, int Depth);
+public readonly record struct ModMount(string Name, string Path, bool Listed, int Depth)
+{
+    /// <summary>The base game <see cref="ModChain.Resolve"/> appended on its own because no init.con named it
+    /// (<c>baseGameFallback</c>). On an install that holds both base mods and no executable it is picked blind, so it
+    /// says nothing about which game the chain is.</summary>
+    public bool IsBaseGameFallback => Depth == ModChain.BaseGameFallbackDepth;
+}
 
 /// <summary>A resolved mod mount chain plus what could not be found.</summary>
 public sealed class ModChainResult
@@ -56,6 +62,7 @@ public sealed class ModChainResult
 public static class ModChain
 {
     private const int MaxDepth = 24;   // real chains reach 12 (HTroop); this is a runaway guard, not a real limit
+    internal const int BaseGameFallbackDepth = MaxDepth + 1;   // the depth the appended base game carries
 
     /// <summary>Resolve the mount chain for the mod directory <paramref name="modDir"/>.</summary>
     /// <param name="gameRoot">The game install dir (the parent of <c>Mods\</c>); mount paths are relative to it.</param>
@@ -115,7 +122,7 @@ public static class ModChain
 
         // 4) The base game, last (lowest precedence) — only if nothing above already mounted it.
         if (baseDir is not null && !seen.Contains(baseDir))
-            Add(result, seen, baseDir, listed: false, depth: MaxDepth + 1);
+            Add(result, seen, baseDir, listed: false, depth: BaseGameFallbackDepth);
 
         foreach (var m in missing.Distinct(StringComparer.OrdinalIgnoreCase))
             if (!result.Missing.Contains(m, StringComparer.OrdinalIgnoreCase)) result.Missing.Add(m);
@@ -228,6 +235,28 @@ public static class ModChain
         }
         catch { }
         return null;
+    }
+
+    /// <summary>The chain of the mod a level archive belongs to, for a level opened on its own. The level sits in its
+    /// mod's <c>Archives\</c> (<c>Mods\&lt;mod&gt;\Archives\&lt;base mod&gt;\levels\X.rfa</c>, found as
+    /// <see cref="GameMounts.ArchivesFolderOf"/> finds it), and that mod is resolved like any other. Outside a
+    /// <c>Mods</c> tree the chain is the mod folder alone, its game told from the folder. Null when the file sits in no
+    /// <c>Archives</c> folder at all.</summary>
+    public static ModChainResult? ForLevelArchive(string levelRfa, bool includeInherited = true)
+    {
+        string? modDir;
+        try
+        {
+            var full = Path.GetFullPath(levelRfa);
+            modDir = GameMounts.ArchivesFolderOf(full, Path.GetDirectoryName(full) ?? full) is { } arc ? Path.GetDirectoryName(arc) : null;
+        }
+        catch { return null; }
+        if (modDir is null || !Directory.Exists(modDir)) return null;
+        if (FindGameRoot(modDir) is { } gameRoot) return Resolve(gameRoot, modDir, includeInherited);
+        var alone = new ModChainResult();
+        alone.Mounts.Add(new ModMount(new DirectoryInfo(modDir).Name, Normalize(modDir), true, 0));
+        alone.Game = GameMounts.DetectFolder(modDir);
+        return alone;
     }
 
     private static string Normalize(string p)
