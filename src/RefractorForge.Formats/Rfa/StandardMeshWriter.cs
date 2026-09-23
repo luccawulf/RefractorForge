@@ -197,29 +197,48 @@ public static class StandardMeshWriter
     /// <param name="materialId">The engine material the surface is made of: what a bullet sounds like on it and
     /// what damage it takes. <see cref="Con.CollisionMaterials"/> lists them by name.</param>
     public static byte[] BuildCollisionSection(IReadOnlyList<Vec3> verts, IReadOnlyList<(int A, int B, int C)> tris, int materialId = DefaultCollisionMaterial)
+        => BuildCollisionSection(verts, tris, Enumerable.Repeat(materialId, tris.Count).ToArray());
+
+    /// <summary>A collision section whose faces are made of different materials - how every retail vehicle hull is
+    /// built: a tank's front plate, sides and roof carry different armour classes (Sherman_Hull_M1 50/51/52,
+    /// Tiger_Hull_M1 51/53/54), which is what makes the front harder to penetrate. A vertex records the material of
+    /// the LAST face (in face order) that uses it - the exporter wrote each face's material over its vertices in
+    /// turn. That rule reproduces every vertex of the retail multi-material hulls checked (Sherman, Tiger, T-54).</summary>
+    /// <param name="faceMaterials">One engine material id per triangle.</param>
+    public static byte[] BuildCollisionSection(IReadOnlyList<Vec3> verts, IReadOnlyList<(int A, int B, int C)> tris, IReadOnlyList<int> faceMaterials)
     {
         if (verts.Count > 32767) throw new InvalidDataException($"Collision needs <= 32767 vertices (got {verts.Count}); simplify the mesh.");
-        ushort mat = (ushort)Math.Clamp(materialId, 0, 65535);
+        if (faceMaterials.Count != tris.Count) throw new ArgumentException("One material per triangle.", nameof(faceMaterials));
+        var faceMat = faceMaterials.Select(m => (ushort)Math.Clamp(m, 0, 65535)).ToArray();
+        var vertMat = new ushort[verts.Count];
+        var seen = new bool[verts.Count];
+        for (int t = 0; t < tris.Count; t++)
+            foreach (int v in new[] { tris[t].A, tris[t].B, tris[t].C })
+            { seen[v] = true; vertMat[v] = faceMat[t]; }
+        for (int v = 0; v < verts.Count; v++) if (!seen[v]) vertMat[v] = faceMat.Length > 0 ? faceMat[0] : (ushort)DefaultCollisionMaterial;
+
         using var ms = new MemoryStream(58 + 16 * verts.Count + 44 * tris.Count);
         var w = new BinaryWriter(ms);
         w.Write(0xEB97C2FAu);                                   // u1
         w.Write((uint)5);                                       // u2
         w.Write((uint)verts.Count);
-        foreach (var v in verts)
+        for (int i = 0; i < verts.Count; i++)
         {
+            var v = verts[i];
             w.Write(v.X); w.Write(v.Y); w.Write(v.Z);
             uint xbits = (uint)BitConverter.SingleToInt32Bits(v.X);
-            w.Write((xbits & 0xFFFF0000u) | mat);               // x again, with the material in its low half
+            w.Write((xbits & 0xFFFF0000u) | vertMat[i]);        // x again, with the material in its low half
         }
         w.Write((uint)tris.Count);
-        foreach (var (a, b, c) in tris) { w.Write((ushort)a); w.Write((ushort)b); w.Write((ushort)c); w.Write(mat); }
+        for (int t = 0; t < tris.Count; t++) { var (a, b, c) = tris[t]; w.Write((ushort)a); w.Write((ushort)b); w.Write((ushort)c); w.Write(faceMat[t]); }
 
         // The SimpleBSP: one node per face.
         w.Write((uint)tris.Count);                              // node count
         w.Write((uint)0);
         w.Write((uint)tris.Count);
-        foreach (var (a, b, c) in tris)
+        for (int t = 0; t < tris.Count; t++)
         {
+            var (a, b, c) = tris[t];
             var pa = verts[a]; var pb = verts[b]; var pc = verts[c];
             float ux = pb.X - pa.X, uy = pb.Y - pa.Y, uz = pb.Z - pa.Z;
             float wx = pc.X - pa.X, wy = pc.Y - pa.Y, wz = pc.Z - pa.Z;
@@ -229,7 +248,7 @@ public static class StandardMeshWriter
             w.Write(nx); w.Write(ny); w.Write(nz);
             w.Write((uint)0);
             w.Write((uint)a); w.Write((uint)b); w.Write((uint)c);
-            w.Write((uint)mat);
+            w.Write((uint)faceMat[t]);
         }
         var marker = Encoding.ASCII.GetBytes(SimpleBspMarker);
         w.Write(marker); w.Write(new byte[24 - marker.Length]); // 23 characters + NUL
@@ -242,16 +261,22 @@ public static class StandardMeshWriter
     /// <summary>Build a collision section from a mesh (all pieces flattened into one vertex pool). Null if empty
     /// or beyond the section's vertex limit.</summary>
     public static byte[]? BuildObjCollision(ObjMesh mesh, int materialId = DefaultCollisionMaterial)
+        => BuildObjCollision(mesh, _ => materialId);
+
+    /// <summary>Build a collision section with a material per piece of the mesh - e.g. by the source material's
+    /// name, so the wood of a model is wood and its stone is stone. Null if empty or past the vertex limit.</summary>
+    public static byte[]? BuildObjCollision(ObjMesh mesh, Func<ObjSubMesh, int> materialOf)
     {
         var verts = new List<Vec3>();
         var tris = new List<(int, int, int)>();
+        var mats = new List<int>();
         foreach (var s in mesh.SubMeshes)
         {
-            int b = verts.Count;
+            int b = verts.Count, m = materialOf(s);
             verts.AddRange(s.Positions);
-            foreach (var (a, bb, c) in s.Faces) tris.Add((b + a, b + bb, b + c));
+            foreach (var (a, bb, c) in s.Faces) { tris.Add((b + a, b + bb, b + c)); mats.Add(m); }
         }
         if (tris.Count == 0 || verts.Count > 32767) return null;
-        return BuildCollisionSection(verts, tris, materialId);
+        return BuildCollisionSection(verts, tris, mats);
     }
 }

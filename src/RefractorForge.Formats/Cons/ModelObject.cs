@@ -86,7 +86,110 @@ public static class ModelObject
                               ObjMesh? shadow = null,
                               ObjMesh? bounds = null)
     {
+        var c = Core(DecalObject.Sanitize(name), mesh, materials, textures, collision, extraLods, collisionMeshes,
+                     collisionMaterial, shadow, bounds, faceMaterial: null);
+        name = c.Name;
+        var files = new List<(string, byte[])>
+        {
+            ($"StandardMesh/{name}.sm", c.Sm),
+            ($"StandardMesh/{name}.rs", c.Rs),
+        };
+        foreach (var (tn, dds) in c.Textures) files.Add(($"Texture/{tn}.dds", dds));
+        files.Add(($"Objects/{name}/Geometries.con", Utf8.GetBytes(GeometriesCon(name, $"../{baseSub}/levels/{levelName}/StandardMesh/{name}", maxDrawDistance))));
+        files.Add(($"Objects/{name}/Objects.con", Utf8.GetBytes(ObjectsCon(name, c.Collisions, c.Notes))));
+        files.Add(($"Objects/{name}/{name}.con", Utf8.GetBytes("run Objects\r\nrun Geometries\r\n")));
+        return new Built(name, files, $"run {name}/{name}", c.Mesh, c.MaterialNames, c.Collisions > 0, c.LodCount, c.HasShadow, c.Collisions);
+    }
+
+    /// <summary>
+    /// The same object for a MOD rather than a level: it ships in the mod's own archives and is on every map.
+    ///
+    ///   objects/&lt;folder&gt;/&lt;Name&gt;/Objects.con     ObjectTemplate.create SimpleObject + geometry + collision flag
+    ///   objects/&lt;folder&gt;/&lt;Name&gt;/Geometries.con  GeometryTemplate StandardMesh -> &lt;meshFile&gt; (a bare name)
+    ///   standardMesh/&lt;meshFile&gt;.sm + .rs
+    ///   texture/&lt;texture&gt;.dds
+    ///
+    /// Two differences from the level form, both from how the engine loads a mod: there is NO
+    /// <c>&lt;Name&gt;.con</c> run chain and no objects list to patch - the engine runs every file whose name contains
+    /// ".con" under <c>objects/</c> by itself, so a chain file would run Objects.con a second time and the second
+    /// create would fail and deactivate the template; and <c>GeometryTemplate.file</c> is a bare mesh name, resolved
+    /// through the flat <c>standardMesh/</c> namespace every mod shares (which is why names want a prefix).
+    /// Entry names start with the archive mount roots (<c>objects/</c>, <c>standardMesh/</c>, <c>texture/</c>).
+    /// </summary>
+    /// <param name="objectFolder">Folder under <c>objects/</c> the object's folder goes in, e.g. <c>Buildings/MyMod</c>.
+    /// Any depth works; a folder named <c>ai</c> does not (the loader skips <c>/ai/</c> outside AI levels).</param>
+    /// <param name="meshFile">The .sm base name; defaults to the template name.</param>
+    /// <param name="faceMaterial">Collision material per source material name (an OBJ <c>usemtl</c>) - wood 81, stone
+    /// 88 and so on; faces of a material not listed get <paramref name="collisionMaterial"/>.</param>
+    public static Built BuildForMod(string name, ObjMesh mesh, string objectFolder = "Buildings/Common",
+                                    IEnumerable<Material>? materials = null,
+                                    IEnumerable<Texture>? textures = null,
+                                    bool collision = false,
+                                    float maxDrawDistance = 0f,
+                                    IReadOnlyList<ObjMesh>? extraLods = null,
+                                    IReadOnlyList<ObjMesh>? collisionMeshes = null,
+                                    int collisionMaterial = StandardMeshWriter.DefaultCollisionMaterial,
+                                    ObjMesh? shadow = null,
+                                    ObjMesh? bounds = null,
+                                    string? meshFile = null,
+                                    IReadOnlyDictionary<string, int>? faceMaterial = null)
+    {
         name = DecalObject.Sanitize(name);
+        var folder = string.Join('/', objectFolder.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries));
+        if (folder.Split('/').Any(s => s.Equals("ai", StringComparison.OrdinalIgnoreCase)))
+            throw new ArgumentException("An object folder named 'ai' is skipped by the engine's loader outside AI levels.", nameof(objectFolder));
+        var file = DecalObject.Sanitize(meshFile ?? name);
+        var c = Core(name, mesh, materials, textures, collision, extraLods, collisionMeshes, collisionMaterial, shadow, bounds, faceMaterial);
+
+        var dir = folder.Length > 0 ? $"objects/{folder}/{name}" : $"objects/{name}";
+        var files = new List<(string, byte[])>
+        {
+            ($"standardMesh/{file}.sm", c.Sm),
+            ($"standardMesh/{file}.rs", c.Rs),
+        };
+        foreach (var (tn, dds) in c.Textures) files.Add(($"texture/{tn}.dds", dds));
+        files.Add(($"{dir}/Geometries.con", Utf8.GetBytes(GeometriesCon(name, file, maxDrawDistance))));
+        files.Add(($"{dir}/Objects.con", Utf8.GetBytes(ObjectsCon(name, c.Collisions, c.Notes))));
+        return new Built(name, files, RunLine: "", c.Mesh, c.MaterialNames, c.Collisions > 0, c.LodCount, c.HasShadow, c.Collisions);
+    }
+
+    private static readonly UTF8Encoding Utf8 = new(false);
+
+    private sealed record CoreResult(string Name, ObjMesh Mesh, byte[] Sm, byte[] Rs, List<(string Name, byte[] Dds)> Textures,
+                                     List<string> MaterialNames, List<string> Notes, int Collisions, int LodCount, bool HasShadow);
+
+    // The ramp retail static objects ship: six entries at 0 / 50 / 100 / 200 / 400 / 800 m — measured across
+    // BfVietnam's objects.rfa, where 362 single-LOD meshes carry exactly this shape, and the ramp's length never
+    // depends on how many LODs the mesh has. Entry i is where LOD i takes over (clamped to the last LOD the mesh
+    // actually has), and the final entry is where the object stops drawing. So a model with three LODs switches
+    // at 50 and 100 m and culls at 800 (or whatever draw distance was asked for, scaled the same way).
+    private static string GeometriesCon(string name, string file, float maxDrawDistance)
+    {
+        float far = maxDrawDistance > 0f ? maxDrawDistance : 800f;
+        string F1(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
+        var geom = new StringBuilder()
+            .Append($"GeometryTemplate.create StandardMesh {name}\r\n")
+            .Append($"GeometryTemplate.file {file}\r\n");
+        float[] ramp = { 0f, far / 16f, far / 8f, far / 4f, far / 2f, far };
+        for (int i = 0; i < ramp.Length; i++) geom.Append($"GeometryTemplate.setLodDistance {i} {F1(ramp[i])}\r\n");
+        geom.Append("\r\n");
+        return geom.ToString();
+    }
+
+    // Every collidable static object in the retail archives is exactly this — geometry plus the flag. There is
+    // no .con-level collision primitive; the solidity lives in the .sm's col section, so the flag is necessary
+    // and not sufficient (docs/SM_Collision_RE.md, "Path B — DEAD END").
+    private static string ObjectsCon(string name, int collisions, List<string> notes)
+        => $"ObjectTemplate.create SimpleObject {name}\r\n" +
+           $"ObjectTemplate.geometry {name}\r\n" +
+           $"ObjectTemplate.HasCollisionPhysics {(collisions > 0 ? 1 : 0)}\r\n" +
+           string.Concat(notes.Select(n => n + "\r\n")) +
+           "\r\n";
+
+    private static CoreResult Core(string name, ObjMesh mesh, IEnumerable<Material>? materials, IEnumerable<Texture>? textures,
+                                   bool collision, IReadOnlyList<ObjMesh>? extraLods, IReadOnlyList<ObjMesh>? collisionMeshes,
+                                   int collisionMaterial, ObjMesh? shadow, ObjMesh? bounds, IReadOnlyDictionary<string, int>? faceMaterial)
+    {
         if (mesh.SubMeshes.Count == 0) throw new InvalidOperationException("The model has no geometry to write.");
         var lods = new List<ObjMesh> { mesh };
         if (extraLods is not null) lods.AddRange(extraLods.Where(l => l.TotalFaces > 0));
@@ -126,9 +229,17 @@ public static class ModelObject
                 if (ReferenceEquals(lod, mesh)) names.Add(s.Material);
             }
 
-        var files = new List<(string, byte[])>();
-        var crlf = new UTF8Encoding(false);
         var notes = new List<string>();
+
+        // Collision material per face: by the source material a face came from (the caller's table), else the one
+        // material. Sections were renamed to <Name>_MaterialN above, so map those back to their source names.
+        var sourceOf = indexOf.ToDictionary(kv => $"{name}_Material{kv.Value}", kv => kv.Key, StringComparer.OrdinalIgnoreCase);
+        int MaterialOf(ObjSubMesh s)
+        {
+            if (faceMaterial is null) return collisionMaterial;
+            var src = sourceOf.TryGetValue(s.Material, out var orig) ? orig : s.Material;
+            return faceMaterial.TryGetValue(src, out var id) ? id : collisionMaterial;
+        }
 
         // Collision. The model's own COL01/COL02 when it has them - that is what the toolkit's exporter wrote and
         // what every retail object carries. Otherwise, on request, from the model itself: the coarsest LOD that
@@ -140,7 +251,7 @@ public static class ModelObject
             foreach (var cm in collisionMeshes)
             {
                 k++;
-                var sec = StandardMeshWriter.BuildObjCollision(cm, collisionMaterial);
+                var sec = StandardMeshWriter.BuildObjCollision(cm, MaterialOf);
                 if (sec is not null) cols.Add(sec);
                 else notes.Add($"rem COL{k:00} has {cm.TotalVertices} vertices, past the 32767 collision limit; it was left out.");
             }
@@ -149,51 +260,24 @@ public static class ModelObject
         {
             foreach (var lod in lods)
             {
-                var sec = StandardMeshWriter.BuildObjCollision(lod, collisionMaterial);
+                var sec = StandardMeshWriter.BuildObjCollision(lod, MaterialOf);
                 if (sec is not null) { cols.Add(sec); break; }
             }
             if (cols.Count == 0) notes.Add("rem Collision was requested but the mesh is past the 32767-vertex collision limit; decimate it.");
         }
 
         var box = bounds is { TotalVertices: > 0 } ? bounds.BoundingBox : null;
-        files.Add(($"StandardMesh/{name}.sm", StandardMeshWriter.Write(lods, cols, shadow, $"{name}_", box)));
-        files.Add(($"StandardMesh/{name}.rs", crlf.GetBytes(RsWriter.Write(shaders))));
+        var sm = StandardMeshWriter.Write(lods, cols, shadow, $"{name}_", box);
+        var rs = Utf8.GetBytes(RsWriter.Write(shaders));
 
+        var texFiles = new List<(string, byte[])>();
         foreach (var t in textures ?? Enumerable.Empty<Texture>())
         {
             var tn = DecalObject.Sanitize(t.Name);
-            if (t.Dds is { Length: > 0 }) files.Add(($"Texture/{tn}.dds", t.Dds));
+            if (t.Dds is { Length: > 0 }) texFiles.Add((tn, t.Dds));
         }
 
-        // The ramp retail static objects ship: six entries at 0 / 50 / 100 / 200 / 400 / 800 m — measured across
-        // BfVietnam's objects.rfa, where 362 single-LOD meshes carry exactly this shape, and the ramp's length never
-        // depends on how many LODs the mesh has. Entry i is where LOD i takes over (clamped to the last LOD the mesh
-        // actually has), and the final entry is where the object stops drawing. So a model with three LODs switches
-        // at 50 and 100 m and culls at 800 (or whatever draw distance was asked for, scaled the same way).
-        float far = maxDrawDistance > 0f ? maxDrawDistance : 800f;
-        string F1(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
-        var geom = new StringBuilder()
-            .Append($"GeometryTemplate.create StandardMesh {name}\r\n")
-            .Append($"GeometryTemplate.file ../{baseSub}/levels/{levelName}/StandardMesh/{name}\r\n");
-        float[] ramp = { 0f, far / 16f, far / 8f, far / 4f, far / 2f, far };
-        for (int i = 0; i < ramp.Length; i++) geom.Append($"GeometryTemplate.setLodDistance {i} {F1(ramp[i])}\r\n");
-        geom.Append("\r\n");
-        files.Add(($"Objects/{name}/Geometries.con", crlf.GetBytes(geom.ToString())));
-
-        // Every collidable static object in the retail archives is exactly this — geometry plus the flag. There is
-        // no .con-level collision primitive; the solidity lives in the .sm's col section, so the flag is necessary
-        // and not sufficient (docs/SM_Collision_RE.md, "Path B — DEAD END").
-        string obj =
-            $"ObjectTemplate.create SimpleObject {name}\r\n" +
-            $"ObjectTemplate.geometry {name}\r\n" +
-            $"ObjectTemplate.HasCollisionPhysics {(cols.Count > 0 ? 1 : 0)}\r\n" +
-            string.Concat(notes.Select(n => n + "\r\n")) +
-            "\r\n";
-        files.Add(($"Objects/{name}/Objects.con", crlf.GetBytes(obj)));
-
-        files.Add(($"Objects/{name}/{name}.con", crlf.GetBytes("run Objects\r\nrun Geometries\r\n")));
-
         bool hasShadow = shadow is { TotalFaces: > 0 };
-        return new Built(name, files, $"run {name}/{name}", mesh, names, cols.Count > 0, lods.Count, hasShadow, cols.Count);
+        return new CoreResult(name, mesh, sm, rs, texFiles, names, notes, cols.Count, lods.Count, hasShadow);
     }
 }
