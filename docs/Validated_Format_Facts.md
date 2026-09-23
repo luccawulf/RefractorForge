@@ -97,10 +97,30 @@ for big maps and for the uncompressed-archive code path (see RFA note below).
 
 ## RFA archives (summary)
 
-The container is fully decoded and the LZO1X-style payload is ~85% decoded; archives round-trip byte-exact.
-One quirk worth flagging here: a data block whose `blockSize == uncompressedSize` is stored **uncompressed**
-and must be returned verbatim — decoding it as compressed crashes on otherwise-valid uncompressed maps (e.g.
-BF1942's `128_planes`). Full byte layout in **[RFA_Format_Notes.md](RFA_Format_Notes.md)**.
+The container and its LZO1X payload are fully decoded (`Rfa/RefractorFlatArchive.cs`, `Rfa/Lzo1x.cs`); the code is
+the reference, not the older byte-layout notes in RFA_Format_Notes.md.
+
+- **The header flag decides the entry form.** In an uncompressed archive (flag 0, e.g. `128_planes`, BFV
+  `sound.rfa`) every entry is raw bytes. In a compressed one (flag 1) EVERY entry is a block table of LZO1X streams
+  - the engine decodes them all. An entry stored raw, or a block stored verbatim, inside a flag-1 archive is read as
+  a broken stream ("Couldn't decompress block"); a garbled `.con` then leaves templates undefined and BF Vietnam
+  crashes with a Runtime Error. A census of 9,207 archives found no shipped archive doing either. Incompressible
+  blocks are written as literal-only LZO streams, as retail does.
+- A compressed entry whose streams add up to exactly its own size exists in retail (875 of them, e.g. BFV
+  `M91Deploy.baf`): the size alone does not mean raw.
+- Every entry name must start with the archive's own path under `Archives\` minus `.rfa` and `_NNN`; one violation and
+  the engine rejects the whole archive ("Error loading file list").
+- The table is closed by a `u32 0` in every clean retail archive; new archives write it.
+- **In-game proof (RefractorDevelopmentKit gate G0, both games, 2026-09-23):** archives written from scratch this way
+  load, compressed and uncompressed, with a retail `ai.rfa` descriptor and XPack ID Default.
+
+## StandardMesh collision: COL02 is the one that stops you (in-game)
+
+A mesh may carry two collision sections, COL01 (coarse) then COL02 (detailed). In RefractorDevelopmentKit gate G0.3 a
+stone arch whose COL01 was a solid box and whose COL02 was the arch's own shape could be walked AND driven through -
+in both games. Soldier and vehicle movement collide with COL02; a coarse COL01 does not close a gap. So an object's
+real shape belongs in COL02. Still open: whether a mesh with ONLY a COL01 section (what `ModelObject.Build` writes
+from the "collision" checkbox) blocks movement at all.
 
 ## Verifying these facts
 
