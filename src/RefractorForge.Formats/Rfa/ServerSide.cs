@@ -9,14 +9,21 @@ public static class ServerSide
 {
     public sealed record Outcome(string Source, string Output, int EntriesBefore, int EntriesAfter, long BytesBefore, long BytesAfter, bool Written);
 
-    /// <summary>Write the server-side copy of one archive. Returns what was kept and how much was saved.</summary>
+    /// <summary>Write the server-side copy of one archive. Returns what was kept and how much was saved.
+    /// It is a repack of the source with the client-only entries dropped
+    /// (<see cref="RefractorFlatArchive.RepackToFile(string, RefractorFlatArchive, IReadOnlyDictionary{string, byte[]}, Func{string, bool})"/>):
+    /// the descriptor, XPack ID, table trailers and tail are the source's, and every kept entry is copied as stored,
+    /// never re-encoded. It used to write a NEW archive - our stamp in the descriptor, zero trailers, every entry
+    /// through our compressor - the kind of rebuilt container that has crashed BF Vietnam on load while validating
+    /// cleanly.</summary>
     public static Outcome Strip(string sourcePath, string outputPath)
     {
         var a = new RefractorFlatArchive(sourcePath);
-        var keep = a.ReadServerEntries();
-        RefractorFlatArchive.WriteFile(outputPath, keep, a.IsCompressed, a.XPackId);
-        long before = new FileInfo(sourcePath).Length, after = new FileInfo(outputPath).Length;
-        return new Outcome(sourcePath, outputPath, a.Entries.Count, keep.Count, before, after, true);
+        int kept = a.Entries.Count(e => !RefractorFlatArchive.IsClientOnlyEntry(e.Name));
+        long before = new FileInfo(sourcePath).Length;
+        RefractorFlatArchive.RepackToFile(outputPath, a, new Dictionary<string, byte[]>(), drop: RefractorFlatArchive.IsClientOnlyEntry);
+        long after = new FileInfo(outputPath).Length;
+        return new Outcome(sourcePath, outputPath, a.Entries.Count, kept, before, after, true);
     }
 
     /// <summary>

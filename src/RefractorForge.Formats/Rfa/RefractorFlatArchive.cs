@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 
 namespace RefractorForge.Formats.Rfa;
@@ -63,6 +64,49 @@ public sealed class RefractorFlatArchive
     private readonly byte[]? _tocTail;                           // the 4 bytes after the entry table
 
     public IReadOnlyList<RefractorFlatArchiveEntry> Entries { get; }
+
+    private Dictionary<string, RefractorFlatArchiveEntry>? _byName;   // built on the first lookup, then read-only
+
+    /// <summary>Entry names compared the way the engine's paths compare: any case, and <c>/</c> the same as
+    /// <c>\</c> - retail archives store either (BF1942's <c>objects\...</c> beside <c>texture/...</c>), and a tool
+    /// that writes the other one addresses the same file.</summary>
+    public static IEqualityComparer<string> NameComparer { get; } = new EntryNameComparer();
+
+    /// <summary>The entry stored under <paramref name="name"/>, compared by <see cref="NameComparer"/> - one
+    /// dictionary lookup, where every caller used to walk <see cref="Entries"/>. An archive that stores one name
+    /// twice answers with the first in its table. Safe to call from several threads.</summary>
+    public bool TryGetEntry(string name, [MaybeNullWhen(false)] out RefractorFlatArchiveEntry entry)
+    {
+        var byName = _byName;
+        if (byName is null)
+        {
+            byName = new Dictionary<string, RefractorFlatArchiveEntry>(Entries.Count, NameComparer);
+            foreach (var e in Entries) byName.TryAdd(e.Name, e);
+            byName = Interlocked.CompareExchange(ref _byName, byName, null) ?? byName;
+        }
+        return byName.TryGetValue(name, out entry);
+    }
+
+    private sealed class EntryNameComparer : IEqualityComparer<string>
+    {
+        private static char Fold(char c) => c == (char)92 ? '/' : char.ToUpperInvariant(c);
+
+        public bool Equals(string? a, string? b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a is null || b is null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i] && Fold(a[i]) != Fold(b[i])) return false;
+            return true;
+        }
+
+        public int GetHashCode(string s)
+        {
+            uint h = 2166136261;
+            foreach (char c in s) h = (h ^ Fold(c)) * 16777619;
+            return (int)h;
+        }
+    }
 
     /// <summary>Whether entry blocks are LZO-compressed, as recorded in the archive header.</summary>
     public bool IsCompressed { get; }
@@ -212,6 +256,73 @@ public sealed class RefractorFlatArchive
         return DecodeRegion(ReadRegionFromFile(e), e.UncompressedSize, e.Name, IsCompressed);
     }
 
+    /// <summary>
+    /// The first <paramref name="maxBytes"/> bytes of an entry - all of it when it is shorter - decoding only the
+    /// blocks those bytes lie in: a DDS or WAV header, or the first screen of a hex view, from a 90 MB entry costs
+    /// one 32 KiB block, not the file. For any entry <see cref="Read"/> reads, the result is the start of what it
+    /// returns. A damaged block past the head is never touched, so the head of a broken entry still reads.
+    /// </summary>
+    public byte[] ReadHead(RefractorFlatArchiveEntry e, int maxBytes)
+    {
+        int n = Math.Min(Math.Max(maxBytes, 0), Math.Max(e.UncompressedSize, 0));
+        if (n == 0) return Array.Empty<byte>();
+        if (_looseFiles is not null)
+        {
+            if (!_looseFiles.TryGetValue(e.Name, out var f)) return Array.Empty<byte>();
+            using var lf = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var head = new byte[(int)Math.Min(n, lf.Length)];
+            lf.ReadExactly(head);
+            return head;
+        }
+        if (n >= e.UncompressedSize) return Read(e);
+
+        using var fs = new FileStream(_path!, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        if (e.BlockSize == e.UncompressedSize)
+        {
+            // Raw bytes in an uncompressed archive. In a compressed one a region of exactly the entry's size is usually
+            // a block table that happens to add up to it, and only the whole region says which (DecodeRegion): take
+            // the head of the full read there. Such entries are rare; see DecodeRegion.
+            if (IsCompressed) return Read(e).AsSpan(0, n).ToArray();
+            fs.Seek(e.Offset, SeekOrigin.Begin);
+            var raw = new byte[n];
+            fs.ReadExactly(raw);
+            return raw;
+        }
+
+        // A block table: its descriptors, then the payload of each block up to the one the head ends in.
+        if (e.BlockSize < 4) throw new InvalidDataException($"'{e.Name}': region of {e.BlockSize} bytes has no block table");
+        fs.Seek(e.Offset, SeekOrigin.Begin);
+        Span<byte> u4 = stackalloc byte[4];
+        fs.ReadExactly(u4);
+        long numBlocks = BinaryPrimitives.ReadUInt32LittleEndian(u4);
+        long dataStart = 4 + numBlocks * 12;
+        if (dataStart > e.BlockSize) throw new InvalidDataException($"'{e.Name}': malformed block table ({numBlocks} blocks in {e.BlockSize} bytes)");
+        var table = new byte[numBlocks * 12];
+        fs.ReadExactly(table);
+
+        var result = new byte[n];
+        int written = 0;
+        for (int i = 0; i < numBlocks && written < n; i++)
+        {
+            int comp = (int)ReadU32(table, i * 12), unc = (int)ReadU32(table, i * 12 + 4), cum = (int)ReadU32(table, i * 12 + 8);
+            if (unc == 0) continue;
+            if (comp < 0 || unc < 0 || cum < 0 || dataStart + (long)cum + comp > e.BlockSize || written + (long)unc > e.UncompressedSize)
+                throw new InvalidDataException($"'{e.Name}': block {i} out of bounds");
+            var src = new byte[comp];
+            fs.Seek(e.Offset + dataStart + cum, SeekOrigin.Begin);
+            fs.ReadExactly(src);
+            int take = Math.Min(unc, n - written);
+            // A block that ends inside the head decodes straight into it; the one the head stops in, into a scratch block.
+            byte[]? partial = take < unc ? new byte[unc] : null;
+            Span<byte> dst = partial is null ? result.AsSpan(written, unc) : partial;
+            if (!TryDecodeBlock(src, dst, out var why)) throw new InvalidDataException($"'{e.Name}': block {i} {why}");
+            partial?.AsSpan(0, take).CopyTo(result.AsSpan(written));
+            written += take;
+        }
+        if (written != n) throw new InvalidDataException($"'{e.Name}': the blocks hold {written} bytes, expected at least {n}");
+        return result;
+    }
+
     private byte[] RawRegion(RefractorFlatArchiveEntry e)
     {
         return ReadRegionFromFile(e);
@@ -295,20 +406,27 @@ public sealed class RefractorFlatArchive
 
             var src = region.Slice((int)dataStart + cum, comp);
             var dst = buf.AsSpan(written, unc);
-            if (comp == unc)
-            {
-                try { Lzo1x.Decompress(src, dst, unc); }
-                catch { src.CopyTo(dst); }
-            }
-            else
-            {
-                try { MiniLZO.MiniLZO.Decompress(src.ToArray(), unc).CopyTo(dst); }
-                catch (Exception ex) { why = $"block {i} failed LZO decode ({ex.Message})"; return false; }
-            }
+            if (!TryDecodeBlock(src, dst, out var blockWhy)) { why = $"block {i} {blockWhy}"; return false; }
             written += unc;
         }
         if (written != uncompressedSize) { why = $"reassembled {written} bytes, expected {uncompressedSize}"; return false; }
         result = buf; why = "";
+        return true;
+    }
+
+    /// <summary>One block into <paramref name="dst"/> (its uncompressed size). A stored size equal to the output size
+    /// is tried as an LZO stream first and copied verbatim only when it is not one (see <see cref="TryDecodeBlocks"/>).</summary>
+    private static bool TryDecodeBlock(ReadOnlySpan<byte> src, Span<byte> dst, out string why)
+    {
+        why = "";
+        if (src.Length == dst.Length)
+        {
+            try { Lzo1x.Decompress(src, dst, dst.Length); }
+            catch { src.CopyTo(dst); }
+            return true;
+        }
+        try { MiniLZO.MiniLZO.Decompress(src.ToArray(), dst.Length).CopyTo(dst); }
+        catch (Exception ex) { why = $"failed LZO decode ({ex.Message})"; return false; }
         return true;
     }
 
@@ -509,7 +627,10 @@ public sealed class RefractorFlatArchive
     /// <summary>Stream a repack straight to a file (low memory, no array-size ceiling).
     /// Writes to a sibling temp file first so the original is never locked while being read,
     /// then atomically replaces <paramref name="path"/>. Names in <paramref name="replacements"/> that the
-    /// archive already has REPLACE those entries in place; names it does not have are appended.</summary>
+    /// archive already has REPLACE those entries in place, under the name as stored; names it does not have are
+    /// appended. Names are matched by <see cref="NameComparer"/> - <c>objects/x</c> replaces a stored
+    /// <c>objects\x</c> rather than growing a second copy beside it - and two replacements that name one entry are
+    /// refused.</summary>
     /// <param name="drop">Optional: return <c>true</c> for an entry name that should NOT be carried over. Used to
     /// retire entries an archive can never load — a name like <c>ObjectLightMaps/../standardMesh/foo.tga</c>, which
     /// normalises out of its own folder, is dead weight the engine cannot read. Kept entries are still copied as raw
@@ -520,7 +641,10 @@ public sealed class RefractorFlatArchive
         IReadOnlyDictionary<string, byte[]> replacements,
         Func<string, bool>? drop = null)
     {
-        var ci = new Dictionary<string, byte[]>(replacements, StringComparer.OrdinalIgnoreCase);
+        var ci = new Dictionary<string, byte[]>(replacements.Count, NameComparer);
+        foreach (var (name, bytes) in replacements)
+            if (!ci.TryAdd(name, bytes))
+                throw new ArgumentException($"Two replacements name the entry '{name}' (names compare in any case, with either slash).", nameof(replacements));
         IReadOnlyList<RefractorFlatArchiveEntry> ents = drop is null
             ? original.Entries
             : original.Entries.Where(e => !drop(e.Name)).ToList();
@@ -529,7 +653,7 @@ public sealed class RefractorFlatArchive
         // be able to add a file: a level-local object - a decal's mesh, shader, texture and its four .con files -
         // is nothing but new names. Dropping them silently produced an archive that validated, reported success,
         // and had a StaticObjects.con placing an object whose every file was missing.
-        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var known = new HashSet<string>(NameComparer);
         foreach (var e in ents) known.Add(e.Name);
         var added = new List<string>();
         foreach (var k in ci.Keys) if (!known.Contains(k)) added.Add(k);
@@ -579,6 +703,21 @@ public sealed class RefractorFlatArchive
         }
     }
 
+    /// <summary>The same repack, with the entries to leave out named rather than tested: each name in
+    /// <paramref name="remove"/> drops the entry stored under it, matched by <see cref="NameComparer"/> like the
+    /// replacements are - so an editor that shows <c>objects/x</c> can delete a stored <c>objects\x</c> by the
+    /// name it shows. A name that is also a replacement is removed and added back under that name.</summary>
+    public static void RepackToFile(
+        string path,
+        RefractorFlatArchive original,
+        IReadOnlyDictionary<string, byte[]> replacements,
+        IEnumerable<string> remove)
+    {
+        var gone = new HashSet<string>(remove, NameComparer);
+        Func<string, bool>? drop = gone.Count == 0 ? null : gone.Contains;
+        RepackToFile(path, original, replacements, drop: drop);
+    }
+
     // ── Entry filtering ──────────────────────────────────────────────────────
 
     private static readonly HashSet<string> ClientOnlyExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -596,8 +735,8 @@ public sealed class RefractorFlatArchive
         return ClientOnlyExtensions.Contains(ext) || ClientOnlyFileNames.Contains(file);
     }
 
-    /// <summary>Decompress and return all entries that are <b>not</b> client-only, ready to pass to
-    /// <see cref="Build"/> or <see cref="WriteFile"/> for producing a dedicated-server archive.</summary>
+    /// <summary>Decompress and return all entries that are <b>not</b> client-only. For a dedicated-server archive
+    /// use <see cref="ServerSide.Strip"/>, which keeps the source's container instead of writing a new one.</summary>
     public List<(string Name, byte[] Data)> ReadServerEntries()
         => Entries
             .Where(e => !IsClientOnlyEntry(e.Name))
