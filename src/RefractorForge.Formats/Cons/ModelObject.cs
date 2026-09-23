@@ -99,16 +99,17 @@ public static class ModelObject
     /// <param name="baseSub">The game's archive mount root: "bf1942" or "BfVietnam". The two games share no
     /// namespace, so a BF1942 path resolves to nothing in Vietnam and the object silently gets no mesh.</param>
     /// <param name="collision">Bake a collision section from the model itself (the first LOD that fits the
-    /// section's vertex limit, else boxes round its parts) so the object is solid. Ignored when
-    /// <paramref name="collisionMeshes"/> names the collision explicitly.</param>
+    /// section's vertex limit as exported; else a lower LOD, then the model, with its corners welded; else boxes
+    /// round its parts) so the object is solid. Ignored when <paramref name="collisionMeshes"/> names the collision
+    /// explicitly.</param>
     /// <param name="maxDrawDistance">How far away the object still draws; 0 = retail's 800 m for a static object.</param>
     /// <param name="extraLods">Coarser copies of <paramref name="mesh"/>, coarsest last, sharing its materials by
     /// source name (what <c>MeshDecimator</c> produces, or what the file's own LOD02.. objects hold). Written into
     /// the same .sm after it and switched in by distance. Mutated the same way the model is.</param>
     /// <param name="collisionMeshes">The model's own collision meshes - COL01 then COL02 - written as sections in
     /// that order. One that is past the section's vertex limit is never left out: it is written welded, else from
-    /// the first LOD that fits, else as boxes round its parts, with a note in Objects.con and in
-    /// <see cref="Built.CollisionSources"/>.</param>
+    /// the first lower LOD that fits, then from the model itself, else as boxes round its parts, with a note in
+    /// Objects.con and in <see cref="Built.CollisionSources"/>.</param>
     /// <param name="collisionMaterial">The engine material every collision face is made of; see
     /// <see cref="CollisionMaterials"/>.</param>
     /// <param name="shadow">The model's shadow mesh, or null for none.</param>
@@ -289,7 +290,8 @@ public static class ModelObject
         //
         // A section that was asked for is never left out. COL02 is what blocks movement (gate G0), and leaving COL01
         // out would move COL02 up into its slot; either way players walk through the object. So a mesh past the
-        // limit is tried welded, then each LOD, then as boxes round its parts - and the note and the source say which.
+        // limit is tried welded, then each lower LOD, then the model, then as boxes round its parts - and the note and
+        // the source say which (see Collision).
         var cols = new List<byte[]>();
         var sources = new List<CollisionSource>();
         if (collisionMeshes is { Count: > 0 })
@@ -302,7 +304,8 @@ public static class ModelObject
                 if (sec is null) { notes.Add($"rem COL{k:00} has no faces, and neither has the model; there is nothing to build it from."); continue; }
                 cols.Add(sec); sources.Add(src);
                 string why = cm.TotalFaces == 0 ? $"rem COL{k:00} has no faces" : $"rem COL{k:00} has {cm.TotalVertices} vertices, past the 32767 collision limit";
-                if (src.Origin == CollisionOrigin.Lod) notes.Add($"{why}; it was built from LOD {src.Lod} ({src.Vertices} vertices) instead.");
+                if (src.Origin == CollisionOrigin.Lod)
+                    notes.Add($"{why}; it was built from LOD {src.Lod}{(src.Welded ? " with its corners welded" : "")} ({src.Vertices} vertices) instead.");
                 else if (src.Origin == CollisionOrigin.Boxes)
                     notes.Add($"{why}, and no LOD fits the limit either; it was built as {src.Boxes} boxes round {(cm.TotalFaces == 0 ? "the model's" : "its")} parts instead.");
             }
@@ -313,8 +316,10 @@ public static class ModelObject
             if (sec is not null)
             {
                 cols.Add(sec); sources.Add(src);
-                if (src.Origin == CollisionOrigin.Boxes)
-                    notes.Add($"rem Collision was requested but every LOD is past the 32767-vertex collision limit; it was built as {src.Boxes} boxes round the model's parts.");
+                if (src.Welded)
+                    notes.Add($"rem Collision was requested but every LOD is past the 32767-vertex collision limit as exported; it was built from LOD {src.Lod} with its corners welded ({src.Vertices} vertices).");
+                else if (src.Origin == CollisionOrigin.Boxes)
+                    notes.Add($"rem Collision was requested but every LOD is past the 32767-vertex collision limit, even welded; it was built as {src.Boxes} boxes round the model's parts.");
             }
             else notes.Add("rem Collision was requested but the model has no faces to build it from.");
         }
@@ -335,26 +340,34 @@ public static class ModelObject
     }
 
     /// <summary>
-    /// One collision section, from the first source that fits the limit: the <paramref name="given"/> mesh as it is,
-    /// then welded; each level of detail the same two ways (the model first); and last, boxes round the connected
-    /// parts of the given mesh (of the model when none was given or it is empty). Null only when there is nothing
-    /// with a face to build from.
+    /// One collision section, from the first source that fits the limit. First what was asked for: the
+    /// <paramref name="given"/> mesh as it is, then welded - or, with none given (<c>collision: true</c>), each level
+    /// of detail as exported, the model first, which is what that always wrote. Then the stand-ins: the lower LODs
+    /// (LOD 1 first) and the model itself last, each as it is and then welded (with none given, welded only - as it is
+    /// was tried already). The model comes last because it is the densest shape there is: welded, a 45,000-triangle
+    /// model fits the limit, and a collision of that many faces - one BSP node each - in place of a light LOD 1 is not
+    /// a stand-in. Last of all, boxes round the connected parts of the given mesh (of the model when none was given or
+    /// it is empty). Null only when there is nothing with a face to build from.
     /// </summary>
     private static (byte[]? Section, CollisionSource Source) Collision(int section, ObjMesh? given, List<ObjMesh> lods,
                                                                       Func<ObjSubMesh, int> materialOf)
     {
-        var candidates = new List<(ObjMesh Mesh, CollisionOrigin Origin, int Lod)>();
-        if (given is not null) candidates.Add((given, CollisionOrigin.Given, -1));
-        for (int i = 0; i < lods.Count; i++) candidates.Add((lods[i], CollisionOrigin.Lod, i));
-        foreach (var (m, origin, lod) in candidates)
-            foreach (bool weld in new[] { false, true })
-            {
-                var sec = StandardMeshWriter.BuildObjCollision(m, materialOf, weld);
-                if (sec is null) continue;
-                StandardMesh.TryParseCollision(sec, out var v, out var t);
-                bool substitute = given is not null && origin != CollisionOrigin.Given;
-                return (sec, new CollisionSource(section, origin, lod, weld, substitute, v.Length, t.Length / 3));
-            }
+        var candidates = new List<(ObjMesh Mesh, CollisionOrigin Origin, int Lod, bool Weld)>();
+        if (given is not null) { candidates.Add((given, CollisionOrigin.Given, -1, false)); candidates.Add((given, CollisionOrigin.Given, -1, true)); }
+        else for (int i = 0; i < lods.Count; i++) candidates.Add((lods[i], CollisionOrigin.Lod, i, false));
+        foreach (int i in Enumerable.Range(1, lods.Count - 1).Append(0))
+        {
+            if (given is not null) candidates.Add((lods[i], CollisionOrigin.Lod, i, false));
+            candidates.Add((lods[i], CollisionOrigin.Lod, i, true));
+        }
+        foreach (var (m, origin, lod, weld) in candidates)
+        {
+            var sec = StandardMeshWriter.BuildObjCollision(m, materialOf, weld);
+            if (sec is null) continue;
+            StandardMesh.TryParseCollision(sec, out var v, out var t);
+            bool substitute = given is not null && origin != CollisionOrigin.Given;
+            return (sec, new CollisionSource(section, origin, lod, weld, substitute, v.Length, t.Length / 3));
+        }
 
         var shape = given is { TotalFaces: > 0 } ? given : lods[0];
         var boxes = ComponentBoxes.Build(shape);

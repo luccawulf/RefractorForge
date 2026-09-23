@@ -12,7 +12,8 @@ namespace RefractorForge.Tests;
 /// (proven in game, gate G0): a dense model whose fine collision would not fit the section's 32,767-vertex limit used
 /// to get a <c>rem ... left out</c> line and no COL02, and players walked through it while the import reported
 /// success. Now the section is built from the next source that fits - the same shape with its shared corners
-/// welded, then each level of detail, then boxes round the model's connected parts - and the build says which.
+/// welded, then each lower level of detail, then the model itself, then boxes round the model's connected parts - and
+/// the build says which. A <c>collision: true</c> request still gets what it always did while a LOD fits as exported.
 /// </summary>
 public class ModelObjectCollisionFallbackTests
 {
@@ -81,7 +82,7 @@ public class ModelObjectCollisionFallbackTests
     }
 
     [Fact]
-    public void A_col02_past_the_limit_is_built_from_the_first_lod_that_fits()
+    public void A_col02_past_the_limit_is_built_from_the_first_lower_lod_that_fits()
     {
         var lod0 = Grid(200, Vec3.Zero);                       // 40,401 vertices, shared already: welding cannot help
         var lod1 = Grid(20, Vec3.Zero);
@@ -104,6 +105,54 @@ public class ModelObjectCollisionFallbackTests
         Assert.Contains("rem COL02 has 40401 vertices", con);
         Assert.Contains("LOD 1", con);
         Assert.Contains("HasCollisionPhysics 1", con);
+    }
+
+    /// <summary>A dense model as an exporter writes it: 24,200 triangles with three vertices each (72,600, past the
+    /// limit), 12,321 once welded - so only welding lets the model itself carry the collision.</summary>
+    private static ObjMesh DenseSoup() => Grid(110, Vec3.Zero, soup: true);
+
+    [Fact]
+    public void Requested_collision_still_takes_the_first_lod_that_fits_as_exported()
+    {
+        // What collision: true always wrote (the Viewer's level-local importer asks for it): the model past the limit,
+        // so LOD 1. Welding would let the model in, but at 24,200 faces - the stand-in for a light LOD 1 is not a
+        // collision twenty-five times heavier.
+        var lod1 = Grid(30, Vec3.Zero);
+        var b = ModelObject.BuildForMod("dense", DenseSoup(), extraLods: new[] { lod1 }, collision: true);
+
+        Assert.Equal(lod1.TotalVertices, Col(Sm(b), 0).V.Length);
+        var src = b.CollisionSources.Single();
+        Assert.Equal((ModelObject.CollisionOrigin.Lod, 1, false, false), (src.Origin, src.Lod, src.Welded, src.Substitute));
+        Assert.DoesNotContain("rem Collision", ObjectsCon(b));
+    }
+
+    [Fact]
+    public void Requested_collision_with_no_lod_that_fits_as_exported_welds_a_lower_lod_before_the_model()
+    {
+        var lod1 = Grid(75, Vec3.Zero, soup: true);             // 33,750 vertices as written, 5,776 welded
+        Assert.True(lod1.TotalVertices > 32767);
+        var b = ModelObject.BuildForMod("dense", DenseSoup(), extraLods: new[] { lod1 }, collision: true);
+
+        Assert.Equal(76 * 76, Col(Sm(b), 0).V.Length);
+        var src = b.CollisionSources.Single();
+        Assert.Equal((ModelObject.CollisionOrigin.Lod, 1, true, false), (src.Origin, src.Lod, src.Welded, src.Substitute));
+        Assert.Contains("rem Collision was requested but every LOD is past the 32767-vertex collision limit as exported; it was built from LOD 1 with its corners welded", ObjectsCon(b));
+    }
+
+    [Fact]
+    public void A_stand_in_for_a_given_col02_is_a_lower_lod_before_the_model_itself()
+    {
+        // COL02 past the limit however it is welded. The model welded would fit, but the stand-in is the lower LOD:
+        // the model is the densest shape there is, so it is tried last, just before boxes.
+        var lod1 = Grid(30, Vec3.Zero);
+        var model = DenseSoup();
+        var b = ModelObject.BuildForMod("dense", model, extraLods: new[] { lod1 },
+            collisionMeshes: new[] { Box(model.BoundingBox), Grid(200, Vec3.Zero) });
+
+        Assert.Equal(lod1.TotalVertices, Col(Sm(b), 1).V.Length);
+        var src = b.CollisionSources[1];
+        Assert.Equal((ModelObject.CollisionOrigin.Lod, 1, false, true), (src.Origin, src.Lod, src.Welded, src.Substitute));
+        Assert.Contains("built from LOD 1", ObjectsCon(b));
     }
 
     [Fact]
