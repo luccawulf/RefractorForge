@@ -157,6 +157,23 @@ public class LevelToolsTests
         Assert.Contains(r.Issues, i => i.Message.Contains("'sunk'") && i.Message.Contains("under the ground"));
     }
 
+    [Fact]
+    public void A_spawn_on_a_hillside_is_judged_against_the_ground_between_the_samples()
+    {
+        // 4 m cells, each 4 m higher than the last. A spawn snapped to the ground between two samples sits up to 2 m
+        // off either of them, and judging it by the nearest one alone called it buried.
+        var cfg = new TerrainConfig { MaterialSize = 64, WorldSize = 256, YScale = 1f };
+        var hm = new Heightmap(64, 64);
+        for (int z = 0; z < 64; z++)
+            for (int x = 0; x < 64; x++) hm[x, z] = cfg.MetersToRaw(x * 4f);
+        var gp = new EditableGameplay(GameplayObjects.Empty);
+        gp.Add(GpKind.Soldier, new SoldierSpawnDef("hillside", new Vec3(42.1f, 42.1f, 100), Vec3.Zero));
+        gp.Add(GpKind.Soldier, new SoldierSpawnDef("dug_in", new Vec3(42.1f, 39f, 100), Vec3.Zero));
+        var r = LevelValidator.Run(new LevelValidator.Inputs { Gameplay = gp, Heightmap = hm, Config = cfg });
+        Assert.DoesNotContain(r.Issues, i => i.Message.Contains("'hillside'"));
+        Assert.Contains(r.Issues, i => i.Message.Contains("'dug_in'") && i.Message.Contains("3.1 m under the ground"));
+    }
+
     // ---- reachability ----
 
     [Fact]

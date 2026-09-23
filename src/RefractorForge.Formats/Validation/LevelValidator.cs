@@ -51,14 +51,21 @@ public static class LevelValidator
         return r;
     }
 
+    // Interpolated between the four samples around the point, the way the editor snaps objects to the ground
+    // (LevelScene.HeightAtWorld). The nearest sample alone is off by up to half a cell times the slope - two metres on
+    // a BFV hillside with its 4 m cells - so a spawn snapped to the ground there was reported under it.
     private static float? GroundAt(Inputs inp, float wx, float wz)
     {
         if (inp.Heightmap is null || inp.Config is null) return null;
         var hm = inp.Heightmap; var cfg = inp.Config;
-        float sp = cfg.HorizontalSpacing <= 0 ? 1f : cfg.HorizontalSpacing;
-        int x = Math.Clamp((int)MathF.Round(wx / sp), 0, hm.Width - 1);
-        int y = Math.Clamp((int)MathF.Round(wz / sp), 0, hm.Height - 1);
-        return cfg.HeightToMeters(hm[x, y]);
+        float sp = cfg.HorizontalSpacing is > 0 and < float.PositiveInfinity ? cfg.HorizontalSpacing : 1f;
+        float gx = Math.Clamp(wx / sp, 0f, hm.Width - 1.0001f);
+        float gz = Math.Clamp(wz / sp, 0f, hm.Height - 1.0001f);
+        int x0 = (int)gx, z0 = (int)gz, x1 = Math.Min(x0 + 1, hm.Width - 1), z1 = Math.Min(z0 + 1, hm.Height - 1);
+        float tx = gx - x0, tz = gz - z0;
+        float h00 = cfg.HeightToMeters(hm[x0, z0]), h10 = cfg.HeightToMeters(hm[x1, z0]);
+        float h01 = cfg.HeightToMeters(hm[x0, z1]), h11 = cfg.HeightToMeters(hm[x1, z1]);
+        return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
     }
 
     private static void CheckObjects(Inputs inp, LevelReport r)
