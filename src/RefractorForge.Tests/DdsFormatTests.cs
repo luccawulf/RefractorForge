@@ -139,6 +139,23 @@ public class DdsFormatTests
         var dxt = DxtEncoder.EncodeDxt1Flat(new Texture2D(8, 8, new byte[8 * 8 * 4]));
         Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(dxt[..^1]));
         Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(new byte[10]));
+
+        // A header claiming a size whose byte count overflows: w x h x 4 wrapped past long for 2e9 square, so the
+        // check passed and a 2 GB buffer was allocated for a 192-byte file; the int size of int.MaxValue square
+        // wrapped to 4 bytes, and a DXT1 of that size wrapped (w + 3) / 4 to one block.
+        foreach (int side in new[] { 2_000_000_000, int.MaxValue, 65536 })
+        {
+            var argb = Dds(side, side, Rgb | AlphaPixels, 32, 0xFF0000, 0xFF00, 0xFF, 0xFF000000, new byte[64]);
+            Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(argb));
+            Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(argb, 256));
+            var dxt1 = Dds(side, side, FourCc, 0, 0, 0, 0, 0, new byte[64], fourcc: "DXT1");
+            Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(dxt1));
+            Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(dxt1, 256));
+        }
+        // The limit is a side of DdsTexture.MaxSide, inclusive: a strip that long decodes, one pixel more does not.
+        var strip = DdsTexture.Decode(Dds(DdsTexture.MaxSide, 1, Luminance, 8, 0xFF, 0, 0, 0, new byte[DdsTexture.MaxSide]));
+        Assert.Equal((DdsTexture.MaxSide, 1), (strip.Width, strip.Height));
+        Assert.Throws<InvalidDataException>(() => DdsTexture.Decode(Dds(DdsTexture.MaxSide + 1, 1, Luminance, 8, 0xFF, 0, 0, 0, new byte[DdsTexture.MaxSide + 1])));
     }
 
     [Fact]

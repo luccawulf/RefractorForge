@@ -140,6 +140,11 @@ public static class TgaTexture
             pos += cmBytes;
         }
         if (kind == 3 && cmap is null) return null;                  // colour-mapped but no palette present
+        // The header's size is believed only as far as the file can hold it: raw pixels byte for byte, RLE at best
+        // 128 per packet of 1 + bypp bytes. Past that it is corrupt, and w x h (up to 65535 square) sized buffers of
+        // gigabytes for a file of a few bytes, or wrapped int to a negative length.
+        long room = b.Length - pos, most = rle ? room / (1 + bypp) * 128 : room / bypp;
+        if ((long)w * h > most || (long)w * h * 4 > Array.MaxLength) return null;
         int npix = w * h;
         var pix = new byte[npix * bypp];
         if (!rle)
@@ -463,6 +468,11 @@ public static class DdsTexture
         _ => $"DXGI format {dxgi}",
     };
 
+    /// <summary>The widest or tallest texture <see cref="Decode(byte[], int)"/> reads: 16,384, the most Direct3D 11
+    /// accepts (the games' Direct3D 8/9 cards took 2,048-4,096). A header claiming more is corrupt or not a texture.
+    /// At this bound no size sum can overflow, and even the largest level's RGBA (1 GB) fits in one array.</summary>
+    public const int MaxSide = 16384;
+
     public static Texture2D Decode(byte[] d) => Decode(d, int.MaxValue);
 
     /// <summary>
@@ -474,14 +484,18 @@ public static class DdsTexture
     /// pixels to produce it (retail Tobruk's 48 tiles of 4096 px: 3 GB). The mips are already in the file, box-filtered
     /// by whoever made it, so reading the right one is both 16x smaller and a better downsample than point-sampling
     /// the top level. A file whose mip data is cut short falls back to the last level it fully holds; one whose chosen
-    /// level is itself cut short is an <see cref="InvalidDataException"/>, never a read past the end.
+    /// level is itself cut short, or whose header claims a side past <see cref="MaxSide"/>, is an
+    /// <see cref="InvalidDataException"/> - never a read past the end, and never a buffer sized by a wrapped product.
     /// </summary>
     public static Texture2D Decode(byte[] d, int maxSide)
     {
         var info = Describe(d) ?? throw new InvalidDataException("Not a DDS file.");
         if (!info.CanDecode) throw new InvalidDataException($"Unsupported DDS pixel format '{info.Name}'.");
         int width = info.Width, height = info.Height, dataOff = info.DataOffset;
-        if (width <= 0 || height <= 0) throw new InvalidDataException($"DDS size {width} x {height}.");
+        // Checked before any size is worked out: past this, w x h x 4 wrapped (a 192-byte file claiming 2e9 square
+        // passed the cut-short check and allocated 2 GB), and so did a DXT1's (w + 3) / 4 near int.MaxValue.
+        if (width <= 0 || height <= 0 || width > MaxSide || height > MaxSide)
+            throw new InvalidDataException($"DDS size {info.Width} x {info.Height} (sides of 1 to {MaxSide} are read).");
 
         if (maxSide < Math.Max(width, height) && info.Depth == 1)
         {

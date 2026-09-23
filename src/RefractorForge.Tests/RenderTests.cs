@@ -74,6 +74,24 @@ public class RenderTests
     }
 
     [Fact]
+    public void Tga_header_sizes_the_file_cannot_hold_are_refused_before_allocating()
+    {
+        static byte[] Header(byte type, int w, int h, byte bits, params byte[] data)
+            => new byte[] { 0, 0, type, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            (byte)(w & 0xFF), (byte)(w >> 8), (byte)(h & 0xFF), (byte)(h >> 8), bits, 0 }.Concat(data).ToArray();
+
+        // 65535 square: w x h x 3 wrapped int to a negative length (OverflowException from a decoder that returns null).
+        Assert.Null(TgaTexture.Decode(Header(2, 65535, 65535, 24)));
+        // One RLE packet (128 pixels at most) claiming 4096 square: 64 MB of pixels and 64 MB of RGBA were allocated
+        // and a black texture came back.
+        Assert.Null(TgaTexture.Decode(Header(10, 4096, 4096, 32, 0xFF, 1, 2, 3, 4)));
+        // What one packet can carry still decodes: 128 pixels of one colour.
+        var run = TgaTexture.Decode(Header(10, 16, 8, 24, 0xFF, 10, 20, 30));
+        Assert.NotNull(run);
+        Assert.Equal((byte)30, run!.Rgba[127 * 4]);
+    }
+
+    [Fact]
     public void BadArchive_survives_corrupt_files()
     {
         string tmp = Path.Combine(Path.GetTempPath(), "rf_bad_" + Guid.NewGuid().ToString("N")[..6] + ".rfa");
