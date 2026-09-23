@@ -279,4 +279,41 @@ public static class StandardMeshWriter
         if (tris.Count == 0 || verts.Count > 32767) return null;
         return BuildCollisionSection(verts, tris, mats);
     }
+
+    /// <summary>The same section with <paramref name="weld"/>: corners at one position - bit for bit, across pieces
+    /// too - become one vertex. Collision carries no UVs or normals, so an exporter's per-UV and per-normal splits
+    /// are only vertices spent against the 32,767 limit; welding them keeps every triangle, corner for corner, and a
+    /// mesh three times over the limit as written often fits. A triangle whose corners weld together had no area and
+    /// is left out. Without <paramref name="weld"/> this is exactly <see cref="BuildObjCollision(ObjMesh, Func{ObjSubMesh, int})"/>.</summary>
+    public static byte[]? BuildObjCollision(ObjMesh mesh, Func<ObjSubMesh, int> materialOf, bool weld)
+    {
+        if (!weld) return BuildObjCollision(mesh, materialOf);
+        var verts = new List<Vec3>();
+        var index = new Dictionary<(int, int, int), int>();
+        var tris = new List<(int, int, int)>();
+        var mats = new List<int>();
+        static int Bits(float f) => f == 0f ? 0 : BitConverter.SingleToInt32Bits(f);   // +0 and -0 are one point
+        foreach (var s in mesh.SubMeshes)
+        {
+            int m = materialOf(s);
+            var at = new int[s.Positions.Count];
+            for (int i = 0; i < at.Length; i++) at[i] = -1;
+            int Id(int v)
+            {
+                if (at[v] >= 0) return at[v];
+                var p = s.Positions[v];
+                var key = (Bits(p.X), Bits(p.Y), Bits(p.Z));
+                if (!index.TryGetValue(key, out int id)) { id = verts.Count; index[key] = id; verts.Add(p); }
+                return at[v] = id;
+            }
+            foreach (var (a, b, c) in s.Faces)
+            {
+                int ia = Id(a), ib = Id(b), ic = Id(c);
+                if (ia == ib || ib == ic || ia == ic) continue;
+                tris.Add((ia, ib, ic)); mats.Add(m);
+            }
+        }
+        if (tris.Count == 0 || verts.Count > 32767) return null;
+        return BuildCollisionSection(verts, tris, mats);
+    }
 }
