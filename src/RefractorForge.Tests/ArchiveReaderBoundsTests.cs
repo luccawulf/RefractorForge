@@ -184,9 +184,12 @@ public class ArchiveReaderBoundsTests
     [Fact]
     public void Garbage_in_the_table_is_refused_or_read_never_crashes()
     {
+        // The unpacked size is the one number the file's length cannot bound, so reading is part of the check: an
+        // entry either reads or is refused, and neither costs more than the file is worth.
         var full = SmallArchive();
         long toc = U32(full, 0);
         var rng = new Random(1942);
+        int reads = 0, refusedReads = 0;
         for (int round = 0; round < 400; round++)
         {
             var b = (byte[])full.Clone();
@@ -201,11 +204,50 @@ public class ArchiveReaderBoundsTests
                     Assert.InRange(e.BlockSize, 0, b.Length);
                     Assert.True(e.Offset + (long)e.BlockSize <= b.Length);
                     Assert.True(e.UncompressedSize >= 0);
+                    long before = GC.GetAllocatedBytesForCurrentThread();
+                    try { a.Read(e); reads++; }
+                    catch (InvalidDataException) { refusedReads++; }
+                    long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                    Assert.True(allocated < 1 << 20, $"round {round}: reading '{e.Name}' (unpacked {e.UncompressedSize}) allocated {allocated} bytes");
                 }
             }
             catch (InvalidDataException) { }
             finally { if (path is not null) Directory.Delete(Path.GetDirectoryName(path)!, true); }
         }
+        Assert.True(reads > 0 && refusedReads > 0, $"{reads} reads, {refusedReads} refused");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void An_unpacked_size_its_blocks_cannot_hold_is_refused_before_it_is_allocated(bool compress)
+    {
+        // The table's unpacked size is bounded only by 2 GiB, so it is checked against the entry's own block table:
+        // a 1.5 GB claim for a 37-byte entry used to allocate 1.5 GB on the first read, and Inspect called the archive
+        // valid because it skips decoding anything over its size limit.
+        var b = SmallArchive(compress);
+        long rec = FirstRecord(b);
+        long sizes = rec + 4 + U32(b, rec);
+        Put(b, sizes + 4, 1_500_000_000);
+        var a = Open(b, "liar.rfa", out var path);
+        try
+        {
+            var e = a.Entries[0];
+            Assert.Equal(1_500_000_000, e.UncompressedSize);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var ex = Assert.Throws<InvalidDataException>(() => a.Read(e));
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.True(allocated < 1 << 20, $"the refused read allocated {allocated} bytes");
+            Assert.Contains("objects/a/Objects.con", ex.Message);
+            Assert.Contains("1500000000", ex.Message);
+
+            var report = RefractorFlatArchive.Inspect(path);
+            Assert.False(report.IsValid);
+            Assert.Contains(report.Errors, x => x.Contains("objects/a/Objects.con") && x.Contains("1500000000"));
+            // The other entries still read.
+            Assert.StartsWith("GeometryTemplate", Encoding.Latin1.GetString(a.Read(a.Entries[1])));
+        }
+        finally { Directory.Delete(Path.GetDirectoryName(path)!, true); }
     }
 
     [InstallFact(Installs.Bf1942Clean, Installs.BfvOriginal)]

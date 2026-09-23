@@ -386,7 +386,7 @@ public sealed class RefractorFlatArchive
         }
 
         if (!TryDecodeBlocks(region, uncompressedSize, out var result, out var why))
-            throw new InvalidDataException($"'{name}': {why}");
+            throw new InvalidDataException($"'{name}': {why} ({region.Length} stored bytes, {uncompressedSize} unpacked)");
         return result;
     }
 
@@ -415,15 +415,19 @@ public sealed class RefractorFlatArchive
 
     /// <summary>Decode a block-wrapped region. A block whose stored size equals its uncompressed size is tried as
     /// LZO first (retail has streams that land on exactly their output size, e.g. four in BFV menu.rfa) and only
-    /// copied verbatim when it is not a valid stream - the form older writers produced.</summary>
+    /// copied verbatim when it is not a valid stream - the form older writers produced.
+    ///
+    /// The whole block table is checked before anything is allocated: the entry's unpacked size comes from the
+    /// archive's table, which nothing but 2 GiB bounds, and only the blocks say what the region really holds. A
+    /// 37-byte entry whose table claimed 1.5 GB used to allocate 1.5 GB here before failing.</summary>
     private static bool TryDecodeBlocks(ReadOnlySpan<byte> region, int uncompressedSize, out byte[] result, out string why)
     {
         result = Array.Empty<byte>();
-        if (region.Length < 4) { why = $"region of {region.Length} bytes has no block table"; return false; }
+        if (BlockTableTotal(region, region.Length, out why) is not { } total) return false;
+        if (total != uncompressedSize) { why = $"its blocks hold {total} bytes, not the {uncompressedSize} the archive's table claims"; return false; }
+
         int numBlocks = (int)ReadU32(region, 0);
         long dataStart = 4 + (long)numBlocks * 12;
-        if (numBlocks < 0 || dataStart > region.Length) { why = $"malformed block table ({numBlocks} blocks in {region.Length} bytes)"; return false; }
-
         var buf = new byte[uncompressedSize];
         int written = 0;
         for (int i = 0; i < numBlocks; i++)
@@ -433,8 +437,6 @@ public sealed class RefractorFlatArchive
             int unc = (int)ReadU32(region, b + 4);
             int cum = (int)ReadU32(region, b + 8);
             if (unc == 0) continue;
-            if (comp < 0 || unc < 0 || cum < 0 || dataStart + (long)cum + comp > region.Length || written + (long)unc > uncompressedSize)
-            { why = $"block {i} out of bounds"; return false; }
 
             var src = region.Slice((int)dataStart + cum, comp);
             var dst = buf.AsSpan(written, unc);
@@ -444,6 +446,46 @@ public sealed class RefractorFlatArchive
         if (written != uncompressedSize) { why = $"reassembled {written} bytes, expected {uncompressedSize}"; return false; }
         result = buf; why = "";
         return true;
+    }
+
+    /// <summary>What a block table says its region unpacks to: the sum of its blocks' sizes, each block checked to lie
+    /// inside the region. <paramref name="table"/> holds at least the descriptors (the whole region, or only its head);
+    /// <paramref name="regionLength"/> is the region's full size. Null, with the reason, when it is no block table.</summary>
+    private static long? BlockTableTotal(ReadOnlySpan<byte> table, long regionLength, out string why)
+    {
+        if (table.Length < 4 || regionLength < 4) { why = $"region of {regionLength} bytes has no block table"; return null; }
+        long numBlocks = ReadU32(table, 0);
+        long dataStart = 4 + numBlocks * 12;
+        if (dataStart > regionLength || dataStart > table.Length || numBlocks > int.MaxValue / 12)
+        { why = $"malformed block table ({numBlocks} blocks in {regionLength} bytes)"; return null; }
+        long total = 0;
+        for (int i = 0; i < numBlocks; i++)
+        {
+            int b = 4 + i * 12;
+            long comp = ReadU32(table, b), unc = ReadU32(table, b + 4), cum = ReadU32(table, b + 8);
+            if (unc == 0) continue;
+            if (comp > int.MaxValue || unc > int.MaxValue || cum > int.MaxValue || dataStart + cum + comp > regionLength)
+            { why = $"block {i} out of bounds"; return null; }
+            total += unc;
+        }
+        why = "";
+        return total;
+    }
+
+    /// <summary><see cref="BlockTableTotal"/> for an entry read from <paramref name="fs"/>: only its descriptors are
+    /// read, so an entry too large to decode can still be told honest or not.</summary>
+    private static long? BlockTableTotal(Stream fs, RefractorFlatArchiveEntry e, out string why)
+    {
+        if (e.BlockSize < 4) { why = $"region of {e.BlockSize} bytes has no block table"; return null; }
+        Span<byte> u4 = stackalloc byte[4];
+        fs.Seek(e.Offset, SeekOrigin.Begin);
+        fs.ReadExactly(u4);
+        long dataStart = 4 + (long)BinaryPrimitives.ReadUInt32LittleEndian(u4) * 12;
+        if (dataStart > e.BlockSize) return BlockTableTotal(u4, e.BlockSize, out why);
+        var table = new byte[dataStart];
+        u4.CopyTo(table);
+        fs.ReadExactly(table.AsSpan(4));
+        return BlockTableTotal(table, e.BlockSize, out why);
     }
 
     /// <summary>One block into <paramref name="dst"/> (its uncompressed size). A stored size equal to the output size
@@ -838,6 +880,16 @@ public sealed class RefractorFlatArchive
                     continue;
                 }
                 if (e.UncompressedSize == 0) { empty++; continue; }
+                // An entry whose region is not its own size is a block table, and the table's unpacked size must be
+                // what its blocks add up to - or every read fails (and, before the reader checked, first allocated the
+                // claimed size). Only the descriptors are read, so this holds for entries too large to decode here.
+                if (e.BlockSize != e.UncompressedSize && BlockTableTotal(fs, e, out var why) is var total && total != e.UncompressedSize)
+                {
+                    errors.Add(total is null
+                        ? $"{e.Name}: {e.BlockSize} stored bytes for {e.UncompressedSize} unpacked, and no block table ({why}) - it cannot be read"
+                        : $"{e.Name}: its blocks hold {total} bytes, not the {e.UncompressedSize} the archive's table claims - it cannot be read");
+                    continue;
+                }
                 if (e.UncompressedSize > maxEntryBytes) continue;   // skip pathological sizes, keep saves fast
 
                 fs.Seek(e.Offset, SeekOrigin.Begin);
