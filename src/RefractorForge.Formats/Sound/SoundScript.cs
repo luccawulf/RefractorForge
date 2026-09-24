@@ -1,8 +1,16 @@
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace RefractorForge.Formats.Sound;
+
+/// <summary>One wave of a sound script as written: its place (the wave's index, the patch and detail tier it is in, its
+/// 1-based source line), its source (<c>load</c>/<c>stream</c> and the path) and its properties - null where the script
+/// leaves one to the engine; <see cref="MaxDistance"/> is its Distance -&gt; Volume ramp's far end.</summary>
+public sealed record SoundWave(int Index, int Patch, string? Tier, string Mode, string Wav, int Line,
+                               float? Volume, float? MinDistance, float? MaxDistance, int? Priority,
+                               bool Loop, bool Stereo, bool DopplerOff, int Effects);
 
 /// <summary>
 /// Parses and surgically edits a Refractor sound script (<c>.ssc</c>) — the format the BFV Sound SSC Editor
@@ -160,6 +168,155 @@ public sealed class SoundScript
                 _lines[i] = LeadingWs(_lines[i]) + t[0] + " " + path;
             }
         }
+    }
+
+    // ---- one wave at a time (a vehicle's script has many: engine start, idle, rev, stop...) ----
+
+    /// <summary>Every wave of the script in file order: where its source line is, which patch and tier it is in, and
+    /// its properties as written (null where the script leaves one to the engine). A wave runs from its source line to
+    /// the next source line, <c>newPatch</c>, <c>#templateLevel</c> or <c>#include</c>.</summary>
+    public IReadOnlyList<SoundWave> Waves
+    {
+        get
+        {
+            var waves = new List<SoundWave>();
+            int patch = -1;
+            string? tier = null;
+            var blocks = WaveBlocks();
+            int b = 0;
+            for (int i = 0; i < _lines.Count && b < blocks.Count; i++)
+            {
+                var k = KeyOf(_lines[i]);
+                if (k == "newpatch") patch++;
+                else if (k == "#templatelevel") { var t = Tokens(_lines[i]); tier = t.Length >= 2 ? t[1] : null; }
+                if (i != blocks[b].start) continue;
+                var (start, end) = blocks[b];
+                var src = Tokens(_lines[start]);
+                float? Scalar(string keyLow)
+                {
+                    for (int j = start + 1; j < end; j++)
+                        if (KeyOf(_lines[j]) == keyLow && Tokens(_lines[j]) is { Length: >= 2 } t
+                            && float.TryParse(t[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v)) return v;
+                    return null;
+                }
+                bool Flag(string keyLow)
+                {
+                    for (int j = start + 1; j < end; j++) if (KeyOf(_lines[j]) == keyLow && Tokens(_lines[j]).Length == 1) return true;
+                    return false;
+                }
+                int effects = 0;
+                for (int j = start + 1; j < end; j++) if (KeyOf(_lines[j]) == "begineffect") effects++;
+                waves.Add(new SoundWave(b, System.Math.Max(0, patch), tier, src[0].ToLowerInvariant(), src.Length >= 2 ? src[1] : "", start + 1,
+                                        Scalar("volume"), Scalar("mindistance"), DistanceRamp(start, end)?.Far, Scalar("priority") is { } p ? (int)p : null,
+                                        Flag("loop"), Flag("stereo"), Flag("doppleroff"), effects));
+                b++;
+            }
+            return waves;
+        }
+    }
+
+    /// <summary>The scripts this one includes (<c>#include High/WillyEngine.ssc</c>), as written - a vehicle's top script
+    /// includes one per detail tier.</summary>
+    public IReadOnlyList<string> Includes
+        => _lines.Where(l => KeyOf(l) == "#include" && Tokens(l).Length >= 2).Select(l => Tokens(l)[1]).ToList();
+
+    public void SetVolume(int wave, float v) => SetWaveScalar(wave, "volume", v.ToString("0.######", CultureInfo.InvariantCulture));
+    public void SetMinDistance(int wave, float d) => SetWaveScalar(wave, "minDistance", System.MathF.Max(0f, d).ToString("0.###", CultureInfo.InvariantCulture));
+    public void SetPriority(int wave, int p) => SetWaveScalar(wave, "priority", p.ToString(CultureInfo.InvariantCulture));
+    public void SetLoop(int wave, bool on) => SetWaveFlag(wave, "loop", on);
+
+    /// <summary>Where one wave falls silent: the far distance of its own Distance -&gt; Volume ramp (see
+    /// <see cref="SetMaxDistance(float)"/>); a wave with no such ramp is left alone.</summary>
+    public void SetMaxDistance(int wave, float d)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count || DistanceRamp(blocks[wave].start, blocks[wave].end) is not { } ramp) return;
+        var indent = LeadingWs(_lines[ramp.FarLine]);
+        _lines[ramp.FarLine] = indent + Tokens(_lines[ramp.FarLine])[0] + " " + System.MathF.Max(1f, d).ToString("0.###", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Point one wave at another sound file, keeping its <c>stream</c>/<c>load</c> keyword.</summary>
+    public void SetWav(int wave, string path)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count) return;
+        int at = blocks[wave].start;
+        _lines[at] = LeadingWs(_lines[at]) + Tokens(_lines[at])[0] + " " + path;
+    }
+
+    private void SetWaveScalar(int wave, string key, string value)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count) return;
+        var (start, end) = blocks[wave];
+        string keyLow = key.ToLowerInvariant();
+        for (int j = start + 1; j < end; j++)
+            if (KeyOf(_lines[j]) == keyLow) { _lines[j] = LeadingWs(_lines[j]) + Tokens(_lines[j])[0] + " " + value; return; }
+        _lines.Insert(start + 1, LeadingWs(_lines[start]) + key + " " + value);
+    }
+
+    private void SetWaveFlag(int wave, string key, bool on)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count) return;
+        var (start, end) = blocks[wave];
+        string keyLow = key.ToLowerInvariant();
+        for (int j = end - 1; j > start; j--)
+            if (KeyOf(_lines[j]) == keyLow && Tokens(_lines[j]).Length == 1)
+            {
+                if (on) return;
+                _lines.RemoveAt(j);
+                return;
+            }
+        if (on) _lines.Insert(start + 1, LeadingWs(_lines[start]) + key);
+    }
+
+    /// <summary>The Distance -&gt; Volume ramp inside [start, end): its far distance and the line that holds it.</summary>
+    private (float Far, int FarLine)? DistanceRamp(int start, int end)
+    {
+        bool inEffect = false, toVolume = false, fromDistance = false;
+        var paramLines = new List<int>();
+        for (int i = start; i < end; i++)
+        {
+            var k = KeyOf(_lines[i]);
+            if (k == "begineffect") { inEffect = true; toVolume = fromDistance = false; paramLines.Clear(); continue; }
+            if (!inEffect) continue;
+            if (k == "endeffect")
+            {
+                if (toVolume && fromDistance && paramLines.Count >= 2
+                    && float.TryParse(Tokens(_lines[paramLines[1]]).ElementAtOrDefault(1), NumberStyles.Float, CultureInfo.InvariantCulture, out var far))
+                    return (far, paramLines[1]);
+                inEffect = false; continue;
+            }
+            var t = Tokens(_lines[i]);
+            if (t.Length >= 2)
+            {
+                if (k == "controldestination") toVolume = t[1].Equals("Volume", System.StringComparison.OrdinalIgnoreCase);
+                else if (k == "controlsource") fromDistance = t[1].Equals("Distance", System.StringComparison.OrdinalIgnoreCase);
+            }
+            if (k == "param") paramLines.Add(i);
+        }
+        return null;
+    }
+
+    /// <summary>Each wave's lines: its source line up to the next source line, <c>newPatch</c>, <c>#templateLevel</c> or
+    /// <c>#include</c>.</summary>
+    private List<(int start, int end)> WaveBlocks()
+    {
+        var blocks = new List<(int, int)>();
+        int cur = -1;
+        for (int i = 0; i < _lines.Count; i++)
+        {
+            var k = KeyOf(_lines[i]);
+            bool source = k == "stream" || k == "load";
+            if (source || k == "newpatch" || k == "#templatelevel" || k == "#include")
+            {
+                if (cur >= 0) blocks.Add((cur, i));
+                cur = source ? i : -1;
+            }
+        }
+        if (cur >= 0) blocks.Add((cur, _lines.Count));
+        return blocks;
     }
 
     // ---- internals ----
