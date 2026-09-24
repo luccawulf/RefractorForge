@@ -111,9 +111,11 @@ public static class SoftwareRenderer
     /// <summary>Instanced draw of a mesh part sampling a real texture via per-vertex UVs (perspective
     /// correct), modulated by face-normal diffuse lighting and an optional per-instance tint. Optional
     /// alpha test discards transparent texels (foliage cutouts).</summary>
+    /// <param name="opacity">Below 1: the part is see-through (glass) - blended over what is drawn already, without
+    /// writing depth, as the game draws a transparent shader. Draw such parts after the solid ones.</param>
     public static void DrawModelsTextured(ImageBuffer img, Camera cam, Vector3 lightDir,
                                           Vector3[] modelPos, Vector2[] modelUv, int[] modelIdx,
-                                          Texture2D tex, bool alphaTest, IReadOnlyList<ModelInstance> instances)
+                                          Texture2D tex, bool alphaTest, IReadOnlyList<ModelInstance> instances, float opacity = 1f)
     {
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
@@ -140,7 +142,7 @@ public static class SoftwareRenderer
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
                 float diff = 0.45f + 0.55f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff,
+                RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity,
                     sx[a], sy[a], sz[a], iwArr[a], modelUv[a],
                     sx[b], sy[b], sz[b], iwArr[b], modelUv[b],
                     sx[c2], sy[c2], sz[c2], iwArr[c2], modelUv[c2]);
@@ -148,7 +150,7 @@ public static class SoftwareRenderer
         }
     }
 
-    private static void RasterTriangleTextured(ImageBuffer img, Texture2D tex, bool alphaTest, Vector3 tint, float diff,
+    private static void RasterTriangleTextured(ImageBuffer img, Texture2D tex, bool alphaTest, Vector3 tint, float diff, float opacity,
         float x0, float y0, float z0, float w0i, Vector2 t0,
         float x1, float y1, float z1, float w1i, Vector2 t1,
         float x2, float y2, float z2, float w2i, Vector2 t2)
@@ -180,6 +182,15 @@ public static class SoftwareRenderer
                 float v = (b0 * v0 + b1 * v1 + b2 * v2) / iw;
                 var rgba = tex.SampleRGBA(u, v);
                 if (alphaTest && rgba.W < 0.5f) continue;     // discard transparent cutout texels
+                if (opacity < 1f)
+                {
+                    // see-through: blended over what is there, depth left alone
+                    float a = opacity * (alphaTest ? 1f : rgba.W);
+                    img.Rgb[pi * 3] = ImageBuffer.ToByte(rgba.X * tint.X * diff * a + img.Rgb[pi * 3] / 255f * (1f - a));
+                    img.Rgb[pi * 3 + 1] = ImageBuffer.ToByte(rgba.Y * tint.Y * diff * a + img.Rgb[pi * 3 + 1] / 255f * (1f - a));
+                    img.Rgb[pi * 3 + 2] = ImageBuffer.ToByte(rgba.Z * tint.Z * diff * a + img.Rgb[pi * 3 + 2] / 255f * (1f - a));
+                    continue;
+                }
                 img.Depth[pi] = z;
                 img.Rgb[pi * 3] = ImageBuffer.ToByte(rgba.X * tint.X * diff);
                 img.Rgb[pi * 3 + 1] = ImageBuffer.ToByte(rgba.Y * tint.Y * diff);
@@ -188,7 +199,7 @@ public static class SoftwareRenderer
     }
 
     public static void DrawModels(ImageBuffer img, Camera cam, Vector3 lightDir,
-                                  Vector3[] modelPos, int[] modelIdx, IReadOnlyList<ModelInstance> instances)
+                                  Vector3[] modelPos, int[] modelIdx, IReadOnlyList<ModelInstance> instances, float opacity = 1f)
     {
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
@@ -217,7 +228,7 @@ public static class SoftwareRenderer
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
                 float diff = 0.35f + 0.65f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff);
+                RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff, opacity);
             }
         }
     }
@@ -466,7 +477,7 @@ public static class SoftwareRenderer
     }
 
     private static void RasterTriangle(ImageBuffer img,
-        float x0, float y0, float z0, float x1, float y1, float z1, float x2, float y2, float z2, Vector3 col)
+        float x0, float y0, float z0, float x1, float y1, float z1, float x2, float y2, float z2, Vector3 col, float opacity = 1f)
     {
         int minX = Math.Max(0, (int)MathF.Floor(Math.Min(x0, Math.Min(x1, x2))));
         int maxX = Math.Min(img.W - 1, (int)MathF.Ceiling(Math.Max(x0, Math.Max(x1, x2))));
@@ -491,6 +502,13 @@ public static class SoftwareRenderer
                 int pi = y * img.W + x;
                 if (z < img.Depth[pi])
                 {
+                    if (opacity < 1f)
+                    {
+                        img.Rgb[pi * 3] = (byte)(cr * opacity + img.Rgb[pi * 3] * (1f - opacity) + 0.5f);
+                        img.Rgb[pi * 3 + 1] = (byte)(cg * opacity + img.Rgb[pi * 3 + 1] * (1f - opacity) + 0.5f);
+                        img.Rgb[pi * 3 + 2] = (byte)(cb * opacity + img.Rgb[pi * 3 + 2] * (1f - opacity) + 0.5f);
+                        continue;
+                    }
                     img.Depth[pi] = z;
                     img.Rgb[pi * 3] = cr; img.Rgb[pi * 3 + 1] = cg; img.Rgb[pi * 3 + 2] = cb;
                 }
