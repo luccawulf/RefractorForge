@@ -43,6 +43,28 @@ public class SoundScriptWaveTests
         Assert.True(s.Waves[1].Loop);
     }
 
+    /// <summary>A wave copied or taken out with its own lines only: the "### Main ###" header between two waves stays with
+    /// the second.</summary>
+    [Fact]
+    public void A_wave_is_copied_and_removed_with_its_own_lines()
+    {
+        var s = SoundScript.Parse(Willy);
+        Assert.Equal(1, s.CopyWave(0));
+        Assert.Equal(new[] { "@ROOT/Sound/@RTD/start1.wav", "@ROOT/Sound/@RTD/start1.wav", "@ROOT/Sound/@RTD/Willyengine3.wav" }, s.Waves.Select(w => w.Wav));
+        s.SetWav(1, "@ROOT/Sound/@RTD/start2.wav");
+        Assert.Equal((100f, -2), (s.Waves[1].MaxDistance!.Value, s.Waves[1].Priority!.Value));   // the effects came along
+        Assert.Equal(1, s.ToText().Split("### Main ###").Length - 1);                            // the header did not
+
+        Assert.True(s.RemoveWave(0));
+        Assert.Equal(new[] { "@ROOT/Sound/@RTD/start2.wav", "@ROOT/Sound/@RTD/Willyengine3.wav" }, s.Waves.Select(w => w.Wav));
+        Assert.Contains("endEffect\r\n\r\n############\r\n### Main ###", s.ToText());
+        Assert.True(s.RemoveWave(1));
+        Assert.Single(s.Waves);
+        Assert.StartsWith("newPatch\r\n####################\r\n### Engine Start ###\r\n####################\r\nload @ROOT/Sound/@RTD/start2.wav\r\n", s.ToText());
+        Assert.False(s.RemoveWave(5));
+        Assert.Equal(-1, s.CopyWave(-1));
+    }
+
     [Fact]
     public void Tiers_and_includes_are_kept_apart()
     {

@@ -244,6 +244,38 @@ public sealed class SoundScript
         _lines[at] = LeadingWs(_lines[at]) + Tokens(_lines[at])[0] + " " + path;
     }
 
+    /// <summary>A copy of wave <paramref name="wave"/> - its source line and properties, effects included - put right after
+    /// it; the new wave's index (<paramref name="wave"/> + 1), or -1 when there is no such wave.</summary>
+    public int CopyWave(int wave)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count) return -1;
+        var (start, end) = OwnLines(blocks[wave]);
+        var copy = _lines.GetRange(start, end - start);
+        _lines.InsertRange(end, copy);
+        return wave + 1;
+    }
+
+    /// <summary>Take wave <paramref name="wave"/> out: its source line, properties and effects. The comments and blank
+    /// lines after it stay - they head the next wave.</summary>
+    public bool RemoveWave(int wave)
+    {
+        var blocks = WaveBlocks();
+        if (wave < 0 || wave >= blocks.Count) return false;
+        var (start, end) = OwnLines(blocks[wave]);
+        _lines.RemoveRange(start, end - start);
+        return true;
+    }
+
+    /// <summary>A wave's own lines: its block without the blank and comment lines at its end, which head what follows
+    /// (<c>### Main ###</c> between two waves belongs to the second).</summary>
+    private (int start, int end) OwnLines((int start, int end) block)
+    {
+        int end = block.end;
+        while (end - 1 > block.start && (_lines[end - 1].Trim() is var t && (t.Length == 0 || t.StartsWith('#') || t.StartsWith('*')))) end--;
+        return (block.start, end);
+    }
+
     private void SetWaveScalar(int wave, string key, string value)
     {
         var blocks = WaveBlocks();
