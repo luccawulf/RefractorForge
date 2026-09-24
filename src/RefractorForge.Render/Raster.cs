@@ -113,9 +113,13 @@ public static class SoftwareRenderer
     /// alpha test discards transparent texels (foliage cutouts).</summary>
     /// <param name="opacity">Below 1: the part is see-through (glass) - blended over what is drawn already, without
     /// writing depth, as the game draws a transparent shader. Draw such parts after the solid ones.</param>
+    /// <param name="additive">Added onto what is drawn already (a shader's <c>blendDest one</c>: a light's glow), without
+    /// writing depth - black adds nothing. Draw such parts after the solid ones.</param>
+    /// <param name="unlit">Full bright whatever way it faces (a shader's <c>lighting false</c>).</param>
     public static void DrawModelsTextured(ImageBuffer img, Camera cam, Vector3 lightDir,
                                           Vector3[] modelPos, Vector2[] modelUv, int[] modelIdx,
-                                          Texture2D tex, bool alphaTest, IReadOnlyList<ModelInstance> instances, float opacity = 1f)
+                                          Texture2D tex, bool alphaTest, IReadOnlyList<ModelInstance> instances, float opacity = 1f,
+                                          bool additive = false, bool unlit = false)
     {
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
@@ -141,8 +145,8 @@ public static class SoftwareRenderer
                 var fn = Vector3.Cross(wp[b] - wp[a], wp[c2] - wp[a]);
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
-                float diff = 0.45f + 0.55f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity,
+                float diff = unlit ? 1f : 0.45f + 0.55f * MathF.Abs(Vector3.Dot(fn, ld));
+                RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity, additive,
                     sx[a], sy[a], sz[a], iwArr[a], modelUv[a],
                     sx[b], sy[b], sz[b], iwArr[b], modelUv[b],
                     sx[c2], sy[c2], sz[c2], iwArr[c2], modelUv[c2]);
@@ -150,7 +154,7 @@ public static class SoftwareRenderer
         }
     }
 
-    private static void RasterTriangleTextured(ImageBuffer img, Texture2D tex, bool alphaTest, Vector3 tint, float diff, float opacity,
+    private static void RasterTriangleTextured(ImageBuffer img, Texture2D tex, bool alphaTest, Vector3 tint, float diff, float opacity, bool additive,
         float x0, float y0, float z0, float w0i, Vector2 t0,
         float x1, float y1, float z1, float w1i, Vector2 t1,
         float x2, float y2, float z2, float w2i, Vector2 t2)
@@ -182,6 +186,15 @@ public static class SoftwareRenderer
                 float v = (b0 * v0 + b1 * v1 + b2 * v2) / iw;
                 var rgba = tex.SampleRGBA(u, v);
                 if (alphaTest && rgba.W < 0.5f) continue;     // discard transparent cutout texels
+                if (additive)
+                {
+                    // a glow: added onto what is there, depth left alone
+                    float g = opacity * (alphaTest ? 1f : rgba.W) * diff;
+                    img.Rgb[pi * 3] = ImageBuffer.ToByte(img.Rgb[pi * 3] / 255f + rgba.X * tint.X * g);
+                    img.Rgb[pi * 3 + 1] = ImageBuffer.ToByte(img.Rgb[pi * 3 + 1] / 255f + rgba.Y * tint.Y * g);
+                    img.Rgb[pi * 3 + 2] = ImageBuffer.ToByte(img.Rgb[pi * 3 + 2] / 255f + rgba.Z * tint.Z * g);
+                    continue;
+                }
                 if (opacity < 1f)
                 {
                     // see-through: blended over what is there, depth left alone
@@ -199,7 +212,8 @@ public static class SoftwareRenderer
     }
 
     public static void DrawModels(ImageBuffer img, Camera cam, Vector3 lightDir,
-                                  Vector3[] modelPos, int[] modelIdx, IReadOnlyList<ModelInstance> instances, float opacity = 1f)
+                                  Vector3[] modelPos, int[] modelIdx, IReadOnlyList<ModelInstance> instances, float opacity = 1f,
+                                  bool additive = false, bool unlit = false)
     {
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
@@ -227,8 +241,8 @@ public static class SoftwareRenderer
                 var fn = Vector3.Cross(wp[b] - wp[a], wp[c2] - wp[a]);
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
-                float diff = 0.35f + 0.65f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff, opacity);
+                float diff = unlit ? 1f : 0.35f + 0.65f * MathF.Abs(Vector3.Dot(fn, ld));
+                RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff, opacity, additive);
             }
         }
     }
@@ -477,7 +491,7 @@ public static class SoftwareRenderer
     }
 
     private static void RasterTriangle(ImageBuffer img,
-        float x0, float y0, float z0, float x1, float y1, float z1, float x2, float y2, float z2, Vector3 col, float opacity = 1f)
+        float x0, float y0, float z0, float x1, float y1, float z1, float x2, float y2, float z2, Vector3 col, float opacity = 1f, bool additive = false)
     {
         int minX = Math.Max(0, (int)MathF.Floor(Math.Min(x0, Math.Min(x1, x2))));
         int maxX = Math.Min(img.W - 1, (int)MathF.Ceiling(Math.Max(x0, Math.Max(x1, x2))));
@@ -502,6 +516,13 @@ public static class SoftwareRenderer
                 int pi = y * img.W + x;
                 if (z < img.Depth[pi])
                 {
+                    if (additive)
+                    {
+                        img.Rgb[pi * 3] = (byte)Math.Min(255f, img.Rgb[pi * 3] + cr * opacity + 0.5f);
+                        img.Rgb[pi * 3 + 1] = (byte)Math.Min(255f, img.Rgb[pi * 3 + 1] + cg * opacity + 0.5f);
+                        img.Rgb[pi * 3 + 2] = (byte)Math.Min(255f, img.Rgb[pi * 3 + 2] + cb * opacity + 0.5f);
+                        continue;
+                    }
                     if (opacity < 1f)
                     {
                         img.Rgb[pi * 3] = (byte)(cr * opacity + img.Rgb[pi * 3] * (1f - opacity) + 0.5f);

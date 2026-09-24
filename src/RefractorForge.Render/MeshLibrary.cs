@@ -54,7 +54,12 @@ public sealed class MeshLibrary
     /// diffuse shading turns a canopy near-black). It is tracked separately from <paramref name="AlphaRef"/> because
     /// foliage now carries a threshold of its own, worked out from the texture; before that, "has a ref" was used as
     /// a stand-in for "is a hard surface", and reusing it here would have made every tree dark.</summary>
-    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false, float? Opacity = null, bool DepthWrite = true);
+    /// <param name="TwoSided">Drawn from both sides (its shader says <c>twosided true</c>); the engine culls a face seen
+    /// from behind otherwise.</param>
+    /// <param name="Unlit">Full bright (<c>lighting false</c>).</param>
+    /// <param name="Additive">Added onto what is behind it (<c>blendDest one</c>): a glow.</param>
+    public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false, float? Opacity = null, bool DepthWrite = true,
+                                      bool TwoSided = false, bool Unlit = false, bool Additive = false);
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -1756,7 +1761,8 @@ public sealed class MeshLibrary
                                        // glass that says depthWrite false must not stamp depth: the viewport draws
                                        // objects unsorted, so a pane that wrote depth erased whatever came after it.
                                        Opacity: blend ? sh?.Opacity : null,
-                                       DepthWrite: sh?.DepthWrite != false));
+                                       DepthWrite: sh?.DepthWrite != false,
+                                       TwoSided: sh?.TwoSided == true, Unlit: sh?.Unlit == true, Additive: sh?.Additive == true));
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())

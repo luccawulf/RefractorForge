@@ -27,9 +27,13 @@ public sealed class RsShaderSet
     /// <c>reflectivity</c> the viewport cannot show, so the pane reads far emptier here than in game.</param>
     /// <param name="DepthWrite">False when the material declares <c>depthWrite false</c> - blended glass must not
     /// stamp the depth buffer, or whatever is drawn after it never appears through the pane.</param>
+    /// <param name="TwoSided"><c>twosided true</c>: drawn from both sides (the engine culls a face seen from behind otherwise).</param>
+    /// <param name="Unlit"><c>lighting false</c>: full bright whatever way it faces - a lamp's lens, a glow.</param>
+    /// <param name="Additive"><c>blendDest one</c>: added onto what is behind it - a glow, a flare.</param>
     public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade,
                                         bool Transparent = false, float? AlphaTestRef = null,
-                                        bool GlossInAlpha = false, float? Opacity = null, bool DepthWrite = true);
+                                        bool GlossInAlpha = false, float? Opacity = null, bool DepthWrite = true,
+                                        bool TwoSided = false, bool Unlit = false, bool Additive = false);
 
     private readonly Dictionary<string, MaterialShader> _byName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -71,12 +75,21 @@ public sealed class RsShaderSet
         }
     }
 
+    /// <summary>A statement's first word (<c>lighting</c> of <c>lighting false</c>).</summary>
+    private static string Keyword(string line)
+    {
+        int end = 0;
+        while (end < line.Length && !char.IsWhiteSpace(line[end])) end++;
+        return line[..end];
+    }
+
     public static RsShaderSet Parse(string text)
     {
         var set = new RsShaderSet();
         string? curName = null, curTex = null;
         Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
         float? alphaRef = null; bool gloss = false; float? opacity = null; bool depthWrite = true;
+        bool twoSided = false, unlit = false, additive = false;
 
         foreach (var line in Statements(text))
         {
@@ -87,13 +100,14 @@ public sealed class RsShaderSet
                 curName = q.Count > 0 ? q[0] : null;
                 curTex = null; diffuse = Vector3.One; fade = false; transp = false; alphaRef = null;
                 gloss = false; opacity = null; depthWrite = true;
+                twoSided = false; unlit = false; additive = false;
             }
             else if (line.StartsWith("{")) inBlock = true;
             else if (line.StartsWith("}"))
             {
                 if (curName is not null)
                     set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp, alphaRef,
-                                                             gloss, opacity, depthWrite);
+                                                             gloss, opacity, depthWrite, twoSided, unlit, additive);
                 inBlock = false; curName = null;
             }
             else if (inBlock && curName is not null)
@@ -120,6 +134,12 @@ public sealed class RsShaderSet
                     gloss = line.Contains("true", StringComparison.OrdinalIgnoreCase);
                 else if (line.StartsWith("depthWrite", StringComparison.OrdinalIgnoreCase))
                     depthWrite = !line.Contains("false", StringComparison.OrdinalIgnoreCase);
+                else if (line.StartsWith("twosided", StringComparison.OrdinalIgnoreCase))
+                    twoSided = line.Contains("true", StringComparison.OrdinalIgnoreCase);
+                else if (Keyword(line).Equals("lighting", StringComparison.OrdinalIgnoreCase))      // not lightingSpecular
+                    unlit = line.Contains("false", StringComparison.OrdinalIgnoreCase);
+                else if (Keyword(line).Equals("blendDest", StringComparison.OrdinalIgnoreCase))
+                    additive = line[Keyword(line).Length..].Split("//")[0].Trim().TrimEnd(';').Trim().Equals("one", StringComparison.OrdinalIgnoreCase);
                 else if (line.StartsWith("opacity", StringComparison.OrdinalIgnoreCase))
                 {
                     // "Opacity .2;//minimun opacity" - a trailing comment is normal here, so cut at the ';' or '//'.
