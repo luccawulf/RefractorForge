@@ -31,7 +31,7 @@ namespace RefractorForge.Formats.Mesh;
 /// a whole multi-part vehicle 2,000-6,000. Ten times that will load; it just costs frames on the hardware these
 /// games were built for.
 /// </summary>
-public static class MeshDecimator
+public static partial class MeshDecimator
 {
     /// <summary>What a run did, so a caller can report it honestly — asking for 500 triangles on a mesh whose seams
     /// pin most of its vertices gives you what the constraints allow, not the number you asked for.</summary>
