@@ -39,19 +39,26 @@ public static partial class MeshDecimator
 
     /// <summary>
     /// Simplify to roughly <paramref name="targetTriangles"/> triangles, returning a NEW mesh (the source is not
-    /// touched). Submeshes are decimated independently — they are separate vertex arrays with separate shaders —
-    /// with the budget split in proportion to their triangle counts, so one dense material does not eat a small
-    /// one's triangles.
+    /// touched). Submeshes keep their own vertex arrays and shaders, but the collapses of all of them are taken in ONE
+    /// order, cheapest first: the budget goes where it costs the shape least, whichever material that is. Splitting it
+    /// in proportion to each material's triangle count cut a downloaded car's smooth body panels fourteenfold (they were
+    /// what could still give) while its bolts and badges, pinned by their borders, kept the total high anyway - and the
+    /// panels came out as shards.
     /// </summary>
     /// <param name="weldEpsilon">Positions closer than this are one vertex for the purpose of collapsing. An
     /// exported OBJ splits a vertex per UV and per normal, so without welding a "closed" mesh looks like a pile of
     /// disconnected triangles and nothing can collapse at all.</param>
     /// <param name="slideSeams">Once the interior is spent, let seam and border vertices slide along their lines
     /// (see the class notes). Off: they stay pinned, and a seamed model stops where its seams stop it.</param>
-    public static ObjMesh Decimate(ObjMesh source, int targetTriangles, float weldEpsilon = 1e-5f, bool slideSeams = true)
-        => Decimate(source, targetTriangles, out _, weldEpsilon, slideSeams);
+    /// <param name="importance">How much each submesh's shape counts, 0 to 1 (1 when null): its collapses cost that
+    /// share of what they would. A part mostly hidden inside the model (<see cref="MeshVisibility.Exposure"/>) gives its
+    /// triangles up before the ones anyone sees.</param>
+    public static ObjMesh Decimate(ObjMesh source, int targetTriangles, float weldEpsilon = 1e-5f, bool slideSeams = true,
+                                  Func<ObjSubMesh, float>? importance = null)
+        => Decimate(source, targetTriangles, out _, weldEpsilon, slideSeams, importance);
 
-    public static ObjMesh Decimate(ObjMesh source, int targetTriangles, out Result result, float weldEpsilon = 1e-5f, bool slideSeams = true)
+    public static ObjMesh Decimate(ObjMesh source, int targetTriangles, out Result result, float weldEpsilon = 1e-5f, bool slideSeams = true,
+                                   Func<ObjSubMesh, float>? importance = null)
     {
         int total = source.TotalFaces;
         var outMesh = new ObjMesh();
@@ -67,16 +74,42 @@ public static partial class MeshDecimator
         // A position used by more than one submesh is where two materials meet. Moving it opens a visible gap
         // between them, so it is pinned in both.
         var shared = SharedPositions(source, weldEpsilon);
+        var runs = source.SubMeshes.Select(s => new SubRun(s, weldEpsilon, shared, importance?.Invoke(s) ?? 1f)).ToList();
 
-        int collapses = 0;
-        foreach (var s in source.SubMeshes)
+        // A lazy heap over every submesh: an entry is re-checked against the live quadrics when it comes out, and
+        // dropped if either end has since moved. Cheaper than keeping a decrease-key structure honest. Dropping one
+        // whose far end merged loses nothing: every collapse re-offers each edge of the survivor, so the pair it now
+        // stands for is already queued at its fresh cost.
+        var heap = new PriorityQueue<(int Sub, int From, int To), float>();
+        for (int i = 0; i < runs.Count; i++)
         {
-            // Proportional budget, but never below a tetrahedron's worth: a material reduced to nothing would
-            // leave a shader bound to no geometry.
-            int want = s.Faces.Count == 0 ? 0
-                     : Math.Max(4, (int)Math.Round(targetTriangles * (double)s.Faces.Count / total));
-            outMesh.SubMeshes.Add(DecimateSub(s, want, weldEpsilon, shared, slideSeams, ref collapses));
+            int si = i;
+            runs[i].Offered = (a, b, cost) => heap.Enqueue((si, a, b), cost);
+            runs[i].OfferAll();
         }
+        int live = runs.Sum(r => r.Live);
+        int collapses = 0;
+        bool sliding = false;
+        while (live > targetTriangles)
+        {
+            if (heap.Count == 0)
+            {
+                // The interior is spent everywhere. Seams and borders may slide from here on.
+                if (sliding || !slideSeams) break;
+                sliding = true;
+                foreach (var r in runs) { r.Sliding = true; r.OfferAll(); }
+                if (heap.Count == 0) break;
+                continue;
+            }
+            var (sub, from, to) = heap.Dequeue();
+            var run = runs[sub];
+            int before = run.Live;
+            if (!run.TryCollapse(from, to)) continue;
+            collapses++;
+            live -= before - run.Live;
+        }
+
+        foreach (var r in runs) outMesh.SubMeshes.Add(r.Rebuild());
         RecomputeBounds(outMesh);
         result = new Result(total, outMesh.TotalFaces, outMesh.TotalVertices, collapses);
         return outMesh;
@@ -84,113 +117,150 @@ public static partial class MeshDecimator
 
     // ---- one submesh -------------------------------------------------------------------------------------------
 
-    private static ObjSubMesh DecimateSub(ObjSubMesh s, int target, float eps, HashSet<PositionKey> shared, bool slideSeams, ref int collapses)
+    /// <summary>One submesh being simplified: its welded vertices (clusters), its triangles in cluster space, what is
+    /// pinned, the quadrics - and the collapses the shared queue hands it.</summary>
+    private sealed class SubRun
     {
-        if (s.Faces.Count <= target) return Clone(s);
+        /// <summary>Fewer triangles than this a material is never taken to: a material reduced to nothing would leave a
+        /// shader bound to no geometry.</summary>
+        private const int Floor = 4;
 
-        int nv = s.Positions.Count;
-        var clusterOf = new int[nv];
-        var clusters = new List<List<int>>();
-        var byKey = new Dictionary<PositionKey, int>();
-        for (int i = 0; i < nv; i++)
-        {
-            var key = Key(s.Positions[i], eps);
-            if (!byKey.TryGetValue(key, out int c)) { c = clusters.Count; byKey[key] = c; clusters.Add(new List<int>()); }
-            clusterOf[i] = c;
-            clusters[c].Add(i);
-        }
-        int nc = clusters.Count;
+        private readonly ObjSubMesh s;
+        private readonly int[] clusterOf;
+        private readonly List<List<int>> clusters = new();
+        private readonly List<(int A, int B, int C, int OA, int OB, int OC)> tri = new();
+        private readonly bool[] pinned, locked, dead;
+        private readonly Quadric[] q;
+        private readonly List<int>[] triList;
+        private readonly Vec3[] pos;
+        private readonly int[] parent;
+        private readonly Dictionary<(int, int), int> edgeUse = new();
+        private readonly bool passThrough;
 
-        // Triangles in cluster space; a triangle whose corners weld together was already degenerate.
-        var tri = new List<(int A, int B, int C, int OA, int OB, int OC)>(s.Faces.Count);
-        foreach (var (a, b, c) in s.Faces)
-        {
-            int ca = clusterOf[a], cb = clusterOf[b], cc = clusterOf[c];
-            if (ca == cb || cb == cc || ca == cc) continue;
-            tri.Add((ca, cb, cc, a, b, c));
-        }
-        if (tri.Count <= target) return Clone(s);
+        /// <summary>Where this run's candidate collapses go (the shared queue).</summary>
+        public Action<int, int, float> Offered { get; set; } = (_, _, _) => { };
+        /// <summary>The second phase: seams and borders may slide.</summary>
+        public bool Sliding { get; set; }
+        public int Live { get; private set; }
 
-        // Pin the places a collapse would damage: a UV split, an open border, a material boundary. `locked` is the
-        // subset that never moves, even when seams are allowed to slide: a material boundary, a non-manifold edge.
-        var pinned = new bool[nc];
-        var locked = new bool[nc];
-        for (int c = 0; c < nc; c++)
+        public SubRun(ObjSubMesh sub, float eps, HashSet<PositionKey> shared, float importance = 1f)
         {
-            var members = clusters[c];
-            if (shared.Contains(Key(s.Positions[members[0]], eps))) { pinned[c] = locked[c] = true; continue; }
-            var uv0 = s.Uvs[members[0]];
-            foreach (var m in members)
-                if (MathF.Abs(s.Uvs[m].U - uv0.U) > 1e-5f || MathF.Abs(s.Uvs[m].V - uv0.V) > 1e-5f) { pinned[c] = true; break; }
-        }
-        var edgeUse = new Dictionary<(int, int), int>();
-        var edgeTri = new Dictionary<(int, int), int>();
-        for (int i = 0; i < tri.Count; i++)
-            foreach (var e in Edges(tri[i]))
+            s = sub;
+            int nv = s.Positions.Count;
+            clusterOf = new int[nv];
+            var byKey = new Dictionary<PositionKey, int>();
+            for (int i = 0; i < nv; i++)
             {
-                var k = e.A < e.B ? (e.A, e.B) : (e.B, e.A);
-                edgeUse[k] = edgeUse.GetValueOrDefault(k) + 1;
-                edgeTri.TryAdd(k, i);
+                var key = Key(s.Positions[i], eps);
+                if (!byKey.TryGetValue(key, out int c)) { c = clusters.Count; byKey[key] = c; clusters.Add(new List<int>()); }
+                clusterOf[i] = c;
+                clusters[c].Add(i);
             }
-        foreach (var kv in edgeUse)
-        {
-            if (kv.Value == 1) { pinned[kv.Key.Item1] = true; pinned[kv.Key.Item2] = true; }   // open border
-            if (kv.Value > 2) { pinned[kv.Key.Item1] = locked[kv.Key.Item1] = true; pinned[kv.Key.Item2] = locked[kv.Key.Item2] = true; }
+            int nc = clusters.Count;
+
+            // Triangles in cluster space; a triangle whose corners weld together was already degenerate.
+            foreach (var (a, b, c) in s.Faces)
+            {
+                int ca = clusterOf[a], cb = clusterOf[b], cc = clusterOf[c];
+                if (ca == cb || cb == cc || ca == cc) continue;
+                tri.Add((ca, cb, cc, a, b, c));
+            }
+            dead = new bool[tri.Count];
+            Live = tri.Count;
+            pinned = new bool[nc];
+            locked = new bool[nc];
+            q = new Quadric[nc];
+            triList = new List<int>[nc];
+            pos = new Vec3[nc];
+            parent = new int[nc];
+            for (int i = 0; i < nc; i++) parent[i] = i;
+            // A submesh already at the floor is written back as it was, untouched.
+            passThrough = tri.Count <= Floor;
+            if (passThrough) { Live = s.Faces.Count; return; }
+
+            // Pin the places a collapse would damage: a UV split, an open border, a material boundary. `locked` is the
+            // subset that never moves, even when seams are allowed to slide: a material boundary, a non-manifold edge.
+            for (int c = 0; c < nc; c++)
+            {
+                var members = clusters[c];
+                if (shared.Contains(Key(s.Positions[members[0]], eps))) { pinned[c] = locked[c] = true; continue; }
+                var uv0 = s.Uvs[members[0]];
+                foreach (var m in members)
+                    if (MathF.Abs(s.Uvs[m].U - uv0.U) > 1e-5f || MathF.Abs(s.Uvs[m].V - uv0.V) > 1e-5f) { pinned[c] = true; break; }
+            }
+            var edgeTri = new Dictionary<(int, int), int>();
+            for (int i = 0; i < tri.Count; i++)
+                foreach (var e in Edges(tri[i]))
+                {
+                    var k = e.A < e.B ? (e.A, e.B) : (e.B, e.A);
+                    edgeUse[k] = edgeUse.GetValueOrDefault(k) + 1;
+                    edgeTri.TryAdd(k, i);
+                }
+            foreach (var kv in edgeUse)
+            {
+                if (kv.Value == 1) { pinned[kv.Key.Item1] = true; pinned[kv.Key.Item2] = true; }   // open border
+                if (kv.Value > 2) { pinned[kv.Key.Item1] = locked[kv.Key.Item1] = true; pinned[kv.Key.Item2] = locked[kv.Key.Item2] = true; }
+            }
+
+            // Face quadrics summed onto their corners. Weighting by area is what stops a swarm of tiny triangles from
+            // out-voting the one big plane they sit on - and what makes costs in one material comparable with another's.
+            for (int c = 0; c < nc; c++) triList[c] = new List<int>();
+            for (int c = 0; c < nc; c++) pos[c] = s.Positions[clusters[c][0]];
+            for (int i = 0; i < tri.Count; i++)
+            {
+                var t = tri[i];
+                var qq = Quadric.FromTriangle(pos[t.A], pos[t.B], pos[t.C]);
+                q[t.A] = q[t.A].Add(qq); q[t.B] = q[t.B].Add(qq); q[t.C] = q[t.C].Add(qq);
+                triList[t.A].Add(i); triList[t.B].Add(i); triList[t.C].Add(i);
+            }
+            // An open border also gets the plane that stands on it, square to its face: sliding a border vertex along a
+            // straight border costs nothing, pulling it off the line costs as much as the face planes would.
+            foreach (var kv in edgeUse)
+            {
+                if (kv.Value != 1) continue;
+                var (a0, b0) = kv.Key;
+                var t = tri[edgeTri[kv.Key]];
+                var qb = Quadric.BorderPlane(pos[a0], pos[b0], Normal(pos[t.A], pos[t.B], pos[t.C]), BorderWeight);
+                q[a0] = q[a0].Add(qb); q[b0] = q[b0].Add(qb);
+            }
+            // A part that counts for less costs less to change: its collapses come out of the queue sooner.
+            double weight = Math.Clamp(float.IsFinite(importance) ? importance : 1f, 1e-4f, 1f);
+            if (weight < 1.0)
+                for (int c = 0; c < nc; c++) q[c] = q[c].Scale(weight);
         }
 
-        // Face quadrics summed onto their corners. Weighting by area is what stops a swarm of tiny triangles from
-        // out-voting the one big plane they sit on.
-        var q = new Quadric[nc];
-        var triList = new List<int>[nc];
-        for (int c = 0; c < nc; c++) triList[c] = new List<int>();
-        var pos = new Vec3[nc];
-        for (int c = 0; c < nc; c++) pos[c] = s.Positions[clusters[c][0]];
-        for (int i = 0; i < tri.Count; i++)
-        {
-            var t = tri[i];
-            var qq = Quadric.FromTriangle(pos[t.A], pos[t.B], pos[t.C]);
-            q[t.A] = q[t.A].Add(qq); q[t.B] = q[t.B].Add(qq); q[t.C] = q[t.C].Add(qq);
-            triList[t.A].Add(i); triList[t.B].Add(i); triList[t.C].Add(i);
-        }
-        // An open border also gets the plane that stands on it, square to its face: sliding a border vertex along a
-        // straight border costs nothing, pulling it off the line costs as much as the face planes would.
-        foreach (var kv in edgeUse)
-        {
-            if (kv.Value != 1) continue;
-            var (a0, b0) = kv.Key;
-            var t = tri[edgeTri[kv.Key]];
-            var qb = Quadric.BorderPlane(pos[a0], pos[b0], Normal(pos[t.A], pos[t.B], pos[t.C]), BorderWeight);
-            q[a0] = q[a0].Add(qb); q[b0] = q[b0].Add(qb);
-        }
+        private int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
 
-        var parent = new int[nc];
-        for (int i = 0; i < nc; i++) parent[i] = i;
-        int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+        private bool Movable(int v) => Sliding ? !locked[v] : !pinned[v];
 
-        // A lazy heap: an entry is re-checked against the live quadrics when it comes out, and dropped if either
-        // end has since moved. Cheaper than keeping a decrease-key structure honest. Dropping one whose far end
-        // merged loses nothing: every collapse re-offers each edge of the survivor, so the pair it now stands for is
-        // already queued at its fresh cost (1.1 million such entries on a 600k-triangle torus, every one of them
-        // re-offered; queueing them a second time changed no result and only cost time).
-        var heap = new PriorityQueue<(int From, int To), float>();
-        bool sliding = false;                         // the second phase: seams and borders may slide
-        bool Movable(int v) => sliding ? !locked[v] : !pinned[v];
-        void Offer(int a, int b)
+        private void Offer(int a, int b)
         {
             if (a == b) return;
-            if (Movable(a)) heap.Enqueue((a, b), q[a].Add(q[b]).Evaluate(pos[b]));
-            if (Movable(b)) heap.Enqueue((b, a), q[a].Add(q[b]).Evaluate(pos[a]));
+            if (Movable(a)) Offered(a, b, q[a].Add(q[b]).Evaluate(pos[b]));
+            if (Movable(b)) Offered(b, a, q[a].Add(q[b]).Evaluate(pos[a]));
         }
-        foreach (var kv in edgeUse) Offer(kv.Key.Item1, kv.Key.Item2);
 
-        var dead = new bool[tri.Count];
-        int live = tri.Count;
-        var vmap = new int[nv];                       // original vertex -> surviving cluster
-        for (int i = 0; i < nv; i++) vmap[i] = clusterOf[i];
+        /// <summary>Every live edge, at its cost now: the start, and the start of the sliding phase.</summary>
+        public void OfferAll()
+        {
+            if (passThrough) return;
+            if (!Sliding)
+            {
+                foreach (var kv in edgeUse) Offer(kv.Key.Item1, kv.Key.Item2);
+                return;
+            }
+            for (int i = 0; i < tri.Count; i++)
+            {
+                if (dead[i]) continue;
+                var t = tri[i];
+                int a = Find(t.A), b = Find(t.B), c = Find(t.C);
+                Offer(a, b); Offer(b, c); Offer(c, a);
+            }
+        }
 
         // The split vertex of a cluster whose UV is closest to a corner's own: how a corner that moved keeps to its
         // side of a seam, both while deciding what may slide and when the mesh is rebuilt.
-        int Pick(int origCorner)
+        private int Pick(int origCorner)
         {
             int target2 = Find(clusterOf[origCorner]);
             var members = clusters[target2];
@@ -205,7 +275,8 @@ public static partial class MeshDecimator
             }
             return best;
         }
-        int CornerAt(int ti, int v)
+
+        private int CornerAt(int ti, int v)
         {
             var t = tri[ti];
             return Find(t.A) == v ? t.OA : Find(t.B) == v ? t.OB : t.OC;
@@ -214,7 +285,7 @@ public static partial class MeshDecimator
         // May seam/border vertex `from` slide onto `to`? Only along a line of its own kind that runs straight on
         // through it: exactly two border edges (and no seam), or exactly two seam edges (and no border), `to` at the
         // far end of one of them.
-        bool MaySlide(int from, int to)
+        private bool MaySlide(int from, int to)
         {
             if (!pinned[from]) return true;
             if (locked[from]) return false;
@@ -250,40 +321,46 @@ public static partial class MeshDecimator
             return d1.X * d2.X + d1.Y * d2.Y + d1.Z * d2.Z > 0.9f;
         }
 
-        while (live > target)
+        // Refuse a collapse that folds a triangle over on itself. A LOD that turns inside out reads as a hole.
+        private bool WouldFlip(int from, int to)
         {
-            if (heap.Count == 0)
-            {
-                // The interior is spent. Seams and borders may slide from here on.
-                if (sliding || !slideSeams) break;
-                sliding = true;
-                for (int i = 0; i < tri.Count; i++)
-                {
-                    if (dead[i]) continue;
-                    var t = tri[i];
-                    int a = Find(t.A), b = Find(t.B), c = Find(t.C);
-                    Offer(a, b); Offer(b, c); Offer(c, a);
-                }
-                if (heap.Count == 0) break;
-                continue;
-            }
-            var (from, to) = heap.Dequeue();
-            if (Find(from) != from || Find(to) != to || from == to || !Movable(from)) continue;
-            if (sliding && !MaySlide(from, to)) continue;
-
-            // Refuse a collapse that folds a triangle over on itself. A LOD that turns inside out reads as a hole.
-            if (WouldFlip(from, to)) continue;
-
-            parent[from] = to;
-            q[to] = q[to].Add(q[from]);
-            collapses++;
-
             foreach (int ti in triList[from])
             {
                 if (dead[ti]) continue;
                 var t = tri[ti];
                 int a = Find(t.A), b = Find(t.B), c = Find(t.C);
-                if (a == b || b == c || a == c) { dead[ti] = true; live--; }
+                if (a == to || b == to || c == to) continue;              // this one disappears in the collapse
+                var before = Normal(pos[a], pos[b], pos[c]);
+                int na = a == from ? to : a, nb = b == from ? to : b, ncc = c == from ? to : c;
+                if (na == nb || nb == ncc || na == ncc) continue;
+                var after = Normal(pos[na], pos[nb], pos[ncc]);
+                // Not over, and not far off it either: a face swung past MaxTurn folds a curved panel into a shard -
+                // the smooth car body a download is mostly made of was cut into facets that way.
+                float dot = before.X * after.X + before.Y * after.Y + before.Z * after.Z;
+                if (dot < 0f) return true;
+                float lb = before.X * before.X + before.Y * before.Y + before.Z * before.Z, la = after.X * after.X + after.Y * after.Y + after.Z * after.Z;
+                if (dot * dot < MaxTurnCos * MaxTurnCos * lb * la) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Merge <paramref name="from"/> onto <paramref name="to"/> if it is still a live, allowed collapse that
+        /// folds nothing over and leaves the material above its floor; false when it was dropped.</summary>
+        public bool TryCollapse(int from, int to)
+        {
+            if (passThrough || Live <= Floor) return false;
+            if (Find(from) != from || Find(to) != to || from == to || !Movable(from)) return false;
+            if (Sliding && !MaySlide(from, to)) return false;
+            if (WouldFlip(from, to)) return false;
+
+            parent[from] = to;
+            q[to] = q[to].Add(q[from]);
+            foreach (int ti in triList[from])
+            {
+                if (dead[ti]) continue;
+                var t = tri[ti];
+                int a = Find(t.A), b = Find(t.B), c = Find(t.C);
+                if (a == b || b == c || a == c) { dead[ti] = true; Live--; }
                 else triList[to].Add(ti);
             }
             triList[from].Clear();
@@ -301,49 +378,37 @@ public static partial class MeshDecimator
                     if (c != to) Offer(to, c);
                 }
             }
+            return true;
         }
 
-        bool WouldFlip(int from, int to)
+        /// <summary>The submesh as it stands. Each surviving corner picks, from its target cluster, the split vertex whose
+        /// UV is closest to the one it had (Pick) — which is the identity for anything that never moved, and the right
+        /// side of the seam for anything that collapsed onto a seam vertex or slid along a seam.</summary>
+        public ObjSubMesh Rebuild()
         {
-            foreach (int ti in triList[from])
+            if (passThrough || Live == tri.Count) return Clone(s);
+            var outSub = new ObjSubMesh { Material = s.Material };
+            var emitted = new Dictionary<int, int>();
+            int Emit(int orig)
             {
-                if (dead[ti]) continue;
-                var t = tri[ti];
-                int a = Find(t.A), b = Find(t.B), c = Find(t.C);
-                if (a == to || b == to || c == to) continue;              // this one disappears in the collapse
-                var before = Normal(pos[a], pos[b], pos[c]);
-                int na = a == from ? to : a, nb = b == from ? to : b, ncc = c == from ? to : c;
-                if (na == nb || nb == ncc || na == ncc) continue;
-                var after = Normal(pos[na], pos[nb], pos[ncc]);
-                if (before.X * after.X + before.Y * after.Y + before.Z * after.Z < 0f) return true;
+                if (emitted.TryGetValue(orig, out int idx)) return idx;
+                idx = outSub.Positions.Count;
+                outSub.Positions.Add(s.Positions[orig]);
+                outSub.Normals.Add(s.Normals[orig]);
+                outSub.Uvs.Add(s.Uvs[orig]);
+                emitted[orig] = idx;
+                return idx;
             }
-            return false;
+            for (int i = 0; i < tri.Count; i++)
+            {
+                if (dead[i]) continue;
+                var t = tri[i];
+                int a = Find(t.A), b = Find(t.B), c = Find(t.C);
+                if (a == b || b == c || a == c) continue;
+                outSub.Faces.Add((Emit(Pick(t.OA)), Emit(Pick(t.OB)), Emit(Pick(t.OC))));
+            }
+            return outSub.Faces.Count > 0 ? outSub : Clone(s);
         }
-
-        // Rebuild. Each surviving corner picks, from its target cluster, the split vertex whose UV is closest to
-        // the one it had (Pick) — which is the identity for anything that never moved, and the right side of the seam
-        // for anything that collapsed onto a seam vertex or slid along a seam.
-        var outSub = new ObjSubMesh { Material = s.Material };
-        var emitted = new Dictionary<int, int>();
-        int Emit(int orig)
-        {
-            if (emitted.TryGetValue(orig, out int idx)) return idx;
-            idx = outSub.Positions.Count;
-            outSub.Positions.Add(s.Positions[orig]);
-            outSub.Normals.Add(s.Normals[orig]);
-            outSub.Uvs.Add(s.Uvs[orig]);
-            emitted[orig] = idx;
-            return idx;
-        }
-        for (int i = 0; i < tri.Count; i++)
-        {
-            if (dead[i]) continue;
-            var t = tri[i];
-            int a = Find(t.A), b = Find(t.B), c = Find(t.C);
-            if (a == b || b == c || a == c) continue;
-            outSub.Faces.Add((Emit(Pick(t.OA)), Emit(Pick(t.OB)), Emit(Pick(t.OC))));
-        }
-        return outSub.Faces.Count > 0 ? outSub : Clone(s);
     }
 
     // ---- helpers -----------------------------------------------------------------------------------------------
@@ -380,6 +445,9 @@ public static partial class MeshDecimator
         float q = eps > 0f ? eps : 1e-5f;
         return new PositionKey((long)MathF.Round(p.X / q), (long)MathF.Round(p.Y / q), (long)MathF.Round(p.Z / q));
     }
+
+    /// <summary>How far a collapse may swing a face that stays: the cosine of the largest turn (about 60 degrees).</summary>
+    internal static float MaxTurnCos = 0.5f;
 
     /// <summary>How much a border's own planes weigh against the face planes: ten times, as in meshoptimizer.</summary>
     private const double BorderWeight = 10.0;
@@ -461,6 +529,8 @@ public static partial class MeshDecimator
 
         public Quadric Add(Quadric o) => new(A + o.A, B + o.B, C + o.C, D + o.D, E + o.E, F + o.F,
                                              G + o.G, H + o.H, I + o.I, J + o.J);
+
+        public Quadric Scale(double k) => new(A * k, B * k, C * k, D * k, E * k, F * k, G * k, H * k, I * k, J * k);
 
         public float Evaluate(Vec3 p)
         {
