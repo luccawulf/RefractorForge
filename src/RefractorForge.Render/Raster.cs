@@ -124,15 +124,16 @@ public static class SoftwareRenderer
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
         int vn = modelPos.Length;
-        var wp = new Vector3[vn];
+        var wp = new Vector3[vn]; var cp = new Vector4[vn];
         var sx = new float[vn]; var sy = new float[vn]; var sz = new float[vn]; var iwArr = new float[vn]; var ok = new bool[vn];
+        Span<Vector4> polyP = stackalloc Vector4[4]; Span<Vector2> polyT = stackalloc Vector2[4];
         foreach (var inst in instances)
         {
             for (int i = 0; i < vn; i++)
             {
                 wp[i] = Vector3.Transform(modelPos[i], inst.World);
-                var c = Vector4.Transform(new Vector4(wp[i], 1f), vpCam);
-                if (c.W <= 1e-4f) { ok[i] = false; continue; }
+                var c = cp[i] = Vector4.Transform(new Vector4(wp[i], 1f), vpCam);
+                if (c.Z < 0f) { ok[i] = false; continue; }   // nearer than the near plane: clipped per triangle
                 float iw = 1f / c.W;
                 sx[i] = (c.X * iw * 0.5f + 0.5f) * img.W;
                 sy[i] = (1f - (c.Y * iw * 0.5f + 0.5f)) * img.H;
@@ -141,17 +142,61 @@ public static class SoftwareRenderer
             for (int t = 0; t < modelIdx.Length; t += 3)
             {
                 int a = modelIdx[t], b = modelIdx[t + 1], c2 = modelIdx[t + 2];
-                if (!ok[a] || !ok[b] || !ok[c2]) continue;
+                if (!ok[a] && !ok[b] && !ok[c2]) continue;
                 var fn = Vector3.Cross(wp[b] - wp[a], wp[c2] - wp[a]);
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
                 float diff = unlit ? 1f : 0.45f + 0.55f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity, additive,
-                    sx[a], sy[a], sz[a], iwArr[a], modelUv[a],
-                    sx[b], sy[b], sz[b], iwArr[b], modelUv[b],
-                    sx[c2], sy[c2], sz[c2], iwArr[c2], modelUv[c2]);
+                if (ok[a] && ok[b] && ok[c2])
+                {
+                    RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity, additive,
+                        sx[a], sy[a], sz[a], iwArr[a], modelUv[a],
+                        sx[b], sy[b], sz[b], iwArr[b], modelUv[b],
+                        sx[c2], sy[c2], sz[c2], iwArr[c2], modelUv[c2]);
+                    continue;
+                }
+                // Part of it is behind the near plane (a long face running past the camera): draw the part in front.
+                int n = ClipNear(cp[a], cp[b], cp[c2], modelUv[a], modelUv[b], modelUv[c2], polyP, polyT);
+                for (int k = 1; k + 1 < n; k++)
+                {
+                    var (p0, p1, p2) = (Screen(img, polyP[0]), Screen(img, polyP[k]), Screen(img, polyP[k + 1]));
+                    RasterTriangleTextured(img, tex, alphaTest, inst.Color, diff, opacity, additive,
+                        p0.X, p0.Y, p0.Z, p0.W, polyT[0],
+                        p1.X, p1.Y, p1.Z, p1.W, polyT[k],
+                        p2.X, p2.Y, p2.Z, p2.W, polyT[k + 1]);
+                }
             }
         }
+    }
+
+    /// <summary>The part of a triangle (clip-space corners, with their UVs) in front of the near plane - clip Z 0 for
+    /// <see cref="Matrix4x4.CreatePerspectiveFieldOfView"/> - as a polygon of up to four corners; its count is returned.
+    /// Clip space interpolates linearly, so a cut corner's UV is the plain blend.</summary>
+    internal static int ClipNear(Vector4 a, Vector4 b, Vector4 c, Vector2 ta, Vector2 tb, Vector2 tc,
+                                 Span<Vector4> outP, Span<Vector2> outT)
+    {
+        Span<Vector4> p = stackalloc Vector4[3] { a, b, c };
+        Span<Vector2> uv = stackalloc Vector2[3] { ta, tb, tc };
+        int n = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            int j = i == 2 ? 0 : i + 1;
+            bool inI = p[i].Z >= 0f, inJ = p[j].Z >= 0f;
+            if (inI) { outP[n] = p[i]; outT[n] = uv[i]; n++; }
+            if (inI != inJ)
+            {
+                float s = p[i].Z / (p[i].Z - p[j].Z);
+                outP[n] = Vector4.Lerp(p[i], p[j], s); outT[n] = Vector2.Lerp(uv[i], uv[j], s); n++;
+            }
+        }
+        return n;
+    }
+
+    /// <summary>A clip-space point on the picture: pixel X/Y, depth, and 1/w.</summary>
+    private static Vector4 Screen(ImageBuffer img, Vector4 c)
+    {
+        float iw = 1f / MathF.Max(c.W, 1e-6f);
+        return new Vector4((c.X * iw * 0.5f + 0.5f) * img.W, (1f - (c.Y * iw * 0.5f + 0.5f)) * img.H, c.Z * iw, iw);
     }
 
     private static void RasterTriangleTextured(ImageBuffer img, Texture2D tex, bool alphaTest, Vector3 tint, float diff, float opacity, bool additive,
@@ -218,16 +263,17 @@ public static class SoftwareRenderer
         var ld = Vector3.Normalize(lightDir);
         var vpCam = cam.ViewProjection;
         int vn = modelPos.Length;
-        var wp = new Vector3[vn];                  // world positions (reused per instance)
+        var wp = new Vector3[vn]; var cp = new Vector4[vn];   // world and clip positions (reused per instance)
         var sx = new float[vn]; var sy = new float[vn]; var sz = new float[vn]; var ok = new bool[vn];
+        Span<Vector4> polyP = stackalloc Vector4[4]; Span<Vector2> polyT = stackalloc Vector2[4];
 
         foreach (var inst in instances)
         {
             for (int i = 0; i < vn; i++)
             {
                 wp[i] = Vector3.Transform(modelPos[i], inst.World);
-                var c = Vector4.Transform(new Vector4(wp[i], 1f), vpCam);
-                if (c.W <= 1e-4f) { ok[i] = false; continue; }
+                var c = cp[i] = Vector4.Transform(new Vector4(wp[i], 1f), vpCam);
+                if (c.Z < 0f) { ok[i] = false; continue; }   // nearer than the near plane: clipped per triangle
                 float iw = 1f / c.W;
                 sx[i] = (c.X * iw * 0.5f + 0.5f) * img.W;
                 sy[i] = (1f - (c.Y * iw * 0.5f + 0.5f)) * img.H;
@@ -237,12 +283,22 @@ public static class SoftwareRenderer
             for (int t = 0; t < modelIdx.Length; t += 3)
             {
                 int a = modelIdx[t], b = modelIdx[t + 1], c2 = modelIdx[t + 2];
-                if (!ok[a] || !ok[b] || !ok[c2]) continue;
+                if (!ok[a] && !ok[b] && !ok[c2]) continue;
                 var fn = Vector3.Cross(wp[b] - wp[a], wp[c2] - wp[a]);
                 if (fn.LengthSquared() < 1e-12f) continue;
                 fn = Vector3.Normalize(fn);
                 float diff = unlit ? 1f : 0.35f + 0.65f * MathF.Abs(Vector3.Dot(fn, ld));
-                RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff, opacity, additive);
+                if (ok[a] && ok[b] && ok[c2])
+                {
+                    RasterTriangle(img, sx[a], sy[a], sz[a], sx[b], sy[b], sz[b], sx[c2], sy[c2], sz[c2], inst.Color * diff, opacity, additive);
+                    continue;
+                }
+                int n = ClipNear(cp[a], cp[b], cp[c2], default, default, default, polyP, polyT);
+                for (int k = 1; k + 1 < n; k++)
+                {
+                    var (p0, p1, p2) = (Screen(img, polyP[0]), Screen(img, polyP[k]), Screen(img, polyP[k + 1]));
+                    RasterTriangle(img, p0.X, p0.Y, p0.Z, p1.X, p1.Y, p1.Z, p2.X, p2.Y, p2.Z, inst.Color * diff, opacity, additive);
+                }
             }
         }
     }
