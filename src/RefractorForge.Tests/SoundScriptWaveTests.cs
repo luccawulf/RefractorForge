@@ -18,6 +18,17 @@ public class SoundScriptWaveTests
         + "beginEffect\r\n\tcontrolDestination Volume\r\n\tcontrolSource Distance\r\n\tenvelope Ramp\r\n\tparam 220\r\n\tparam 300\r\n\tparam 1\r\n\tparam -1\t\r\nendEffect\r\n";
 
     [Fact]
+    public void A_source_path_is_the_rest_of_its_line_spaces_and_all()
+    {
+        // Retail BFV: objects/Effects/Common/Sounds/impact_High.ssc loads "explosion - 1.wav", which the archive holds.
+        var s = SoundScript.Parse("newPatch\r\nload @ROOT/Sound/@RTD/explosion - 1.wav\t\r\nminDistance 5\r\nstream  @ROOT/Music/US/music01.wav\r\n");
+        Assert.Equal("@ROOT/Sound/@RTD/explosion - 1.wav", s.Wav);
+        Assert.Equal(new[] { "@ROOT/Sound/@RTD/explosion - 1.wav", "@ROOT/Music/US/music01.wav" }, s.Waves.Select(w => w.Wav));
+        Assert.Equal("", SoundScript.SourcePath("load"));
+        Assert.Equal("a b.wav", SoundScript.SourcePath("\tload\ta b.wav  "));
+    }
+
+    [Fact]
     public void Each_wave_reads_and_edits_on_its_own()
     {
         var s = SoundScript.Parse(Willy);

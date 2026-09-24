@@ -65,7 +65,17 @@ public sealed class SoundScript
     /// <summary>The wav path of the first source line (after the <c>stream</c>/<c>load</c> keyword), or null.</summary>
     public string? Wav
     {
-        get { foreach (var ln in _lines) { var k = KeyOf(ln); if (k == "stream" || k == "load") { var t = Tokens(ln); return t.Length >= 2 ? t[1] : null; } } return null; }
+        get { foreach (var ln in _lines) { var k = KeyOf(ln); if (k == "stream" || k == "load") return SourcePath(ln) is { Length: > 0 } p ? p : null; } return null; }
+    }
+
+    /// <summary>The path a source line names: the whole rest of the line after its <c>load</c>/<c>stream</c> keyword. Retail
+    /// BF Vietnam names files with spaces (<c>load @ROOT/Sound/@RTD/explosion - 1.wav</c>, and the archive holds
+    /// <c>sound/44kHz/explosion - 1.wav</c>), so the engine reads the path whole, not up to the first space.</summary>
+    public static string SourcePath(string line)
+    {
+        var t = line.Trim();
+        int sp = t.IndexOfAny(new[] { ' ', '\t' });
+        return sp < 0 ? "" : t[(sp + 1)..].Trim();
     }
 
     /// <summary><c>stream</c> (streamed from disk) or <c>load</c> (held in memory). Defaults to "load".</summary>
@@ -206,7 +216,7 @@ public sealed class SoundScript
                 }
                 int effects = 0;
                 for (int j = start + 1; j < end; j++) if (KeyOf(_lines[j]) == "begineffect") effects++;
-                waves.Add(new SoundWave(b, System.Math.Max(0, patch), tier, src[0].ToLowerInvariant(), src.Length >= 2 ? src[1] : "", start + 1,
+                waves.Add(new SoundWave(b, System.Math.Max(0, patch), tier, src[0].ToLowerInvariant(), SourcePath(_lines[start]), start + 1,
                                         Scalar("volume"), Scalar("mindistance"), DistanceRamp(start, end)?.Far, Scalar("priority") is { } p ? (int)p : null,
                                         Flag("loop"), Flag("stereo"), Flag("doppleroff"), effects));
                 b++;
