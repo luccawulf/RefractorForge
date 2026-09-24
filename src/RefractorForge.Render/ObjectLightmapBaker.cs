@@ -102,7 +102,7 @@ public static class ObjectLightmapBaker
             }
         }
         if (tris.Count == 0) return 1f;
-        var occ = MeshOccluder.Build(tris);
+        var occ = MeshOccluder.Build(tris)!;                  // null only for no triangles, returned above
 
         // Walk the list with a stride rather than taking the first N: the first triangles of a mesh are all one
         // part, and a stride spreads the samples over the whole object.
