@@ -21,8 +21,13 @@ namespace RefractorForge.Formats.Rfa;
 ///   collision: u32 colflag (0, or retail's one tag); if != 0 the <see cref="TreeCollision"/> section.
 ///   geometry : u32 vertnum, vert[44B] (float3 pos, float3 normal, u32 extra, float2 uv0, float2 uv1),
 ///              u32 indexnum, u16 index[].
-/// Render each material group as a triangle list over index[start .. start + count*3). Retail's per-vertex extra is
-/// 0x80808080 on leaves and trunks and 0 on sprites, whatever the tree.
+/// A trunk (and extra) material is a triangle list over index[start .. start + count*3). A leaf or sprite material holds
+/// its count triangles once per view (the header's 8): copy k, at start + k*count*3, sorted back to front as seen from
+/// <see cref="ViewDirection"/> k - the engine draws the copy for the side the camera is on (TreeMesh::realDraw,
+/// getAngleIndex), so count is the triangles of ONE copy. Every retail leaf (99) and sprite (57) block is 8 such copies.
+/// A sprite is 4 vertices at its centre (uv1 the corner's offset in view space, +-its size) that the engine turns to the
+/// camera. Triangles run clockwise seen from their front ((b-a)x(c-a) along the normal), as Direct3D draws them; culling
+/// is off for the leaves only. Retail's per-vertex extra is 0x80808080 on leaves and trunks and 0 on sprites.
 /// </summary>
 public sealed class TreeMesh
 {
@@ -37,9 +42,14 @@ public sealed class TreeMesh
 
     public uint Version = 3;
     public uint Reserved0;
+    /// <summary>The header's third word: the views a leaf or sprite block is sorted for and a billboard is made of (8 in
+    /// every file; <see cref="Views"/>).</summary>
     public uint Reserved8 = 8;
+    /// <summary>The first box: round the leaf, trunk and extra vertices and each sprite's cube (see <see cref="RecomputeBounds"/>).
+    /// The engine frames the billboard with it (<see cref="BillboardRadius"/>, <see cref="BillboardHalfHeight"/>).</summary>
     public Vec3 Min, Max;
-    /// <summary>The header's second box (equal to the first on 3 retail files; kept as read).</summary>
+    /// <summary>The second box: round the sprites' cubes and the origin, zeros for a tree without sprites (the sprite
+    /// shader's scale).</summary>
     public Vec3 Min2, Max2;
     public List<Material>[] Groups = { new(), new(), new(), new() };   // 0 leaf, 1 trunk, 2 sprite, 3 extra
     public Vertex[] Vertices = Array.Empty<Vertex>();
@@ -152,28 +162,117 @@ public sealed class TreeMesh
         return ms.ToArray();
     }
 
-    /// <summary>The box round the visible vertices (leaf, trunk and sprite groups), for <see cref="Min"/>/<see cref="Max"/>
-    /// after the geometry changed; the second box follows the first.</summary>
+    /// <summary>The views a leaf or sprite block is sorted for (the header's third word, 8 in every file).</summary>
+    public int Views => Reserved8 is > 0 and <= 64 ? (int)Reserved8 : 8;
+
+    /// <summary>
+    /// Where the camera stands for view <paramref name="k"/> of <paramref name="views"/>: the direction from the tree,
+    /// (sin a, 0, cos a) at a = 360/views x (k + 1/2) degrees - from +Z (north) round towards +X (east), view 0 half a step
+    /// east of north. Copy k of a leaf or sprite block is sorted back to front as seen from there (every retail block agrees)
+    /// and cell k of the tree's billboard is the tree seen from there (TreeRenderer::createBillboard: the camera 2 x the
+    /// radius out along this, level with the first box's middle, looking at the tree's axis).
+    /// </summary>
+    public static Vec3 ViewDirection(int k, int views = 8)
+    {
+        double a = 2.0 * Math.PI * (k + 0.5) / views;
+        return new Vec3((float)Math.Sin(a), 0f, (float)Math.Cos(a));
+    }
+
+    /// <summary>
+    /// Triangles laid out as a leaf or sprite block is: once per view, copy k sorted back to front as seen from
+    /// <see cref="ViewDirection"/> k (by each triangle's middle, the farthest first; ties keep their order). The material's
+    /// count is the triangles of one copy.
+    /// </summary>
+    public static ushort[] ViewSorted(IReadOnlyList<(int A, int B, int C)> triangles, Func<int, Vec3> position, int views = 8)
+    {
+        var middles = triangles.Select(t =>
+        {
+            Vec3 a = position(t.A), b = position(t.B), c = position(t.C);
+            return new Vec3((a.X + b.X + c.X) / 3f, (a.Y + b.Y + c.Y) / 3f, (a.Z + b.Z + c.Z) / 3f);
+        }).ToArray();
+        var list = new List<ushort>(triangles.Count * 3 * views);
+        for (int k = 0; k < views; k++)
+        {
+            var d = ViewDirection(k, views);
+            foreach (int i in Enumerable.Range(0, triangles.Count).OrderBy(i => middles[i].X * d.X + middles[i].Z * d.Z))
+            {
+                var t = triangles[i];
+                list.Add((ushort)t.A); list.Add((ushort)t.B); list.Add((ushort)t.C);
+            }
+        }
+        return list.ToArray();
+    }
+
+    /// <summary>Each material's index range: [Start, the next material's Start) in the order they lie in the buffer (all four
+    /// groups together partition it), the last to the end.</summary>
+    public IReadOnlyList<(int Group, Material Material, int End)> Blocks()
+    {
+        var all = new List<(int Group, Material Material)>();
+        for (int g = 0; g < Groups.Length; g++) foreach (var m in Groups[g]) all.Add((g, m));
+        all.Sort((x, y) => x.Material.Start.CompareTo(y.Material.Start));
+        var list = new List<(int, Material, int)>(all.Count);
+        for (int i = 0; i < all.Count; i++)
+            list.Add((all[i].Group, all[i].Material, Math.Clamp(i + 1 < all.Count ? all[i + 1].Material.Start : Indices.Length, 0, Indices.Length)));
+        return list;
+    }
+
+    /// <summary>The vertices the sprite group draws (each sprite four of them at its centre).</summary>
+    public bool[] SpriteVertices()
+    {
+        var sprite = new bool[Vertices.Length];
+        foreach (var (g, m, end) in Blocks())
+            if (g == 2)
+                for (int q = Math.Max(0, m.Start); q < end; q++)
+                    if (Indices[q] < sprite.Length) sprite[Indices[q]] = true;
+        return sprite;
+    }
+
+    /// <summary>A sprite vertex's size: half its square's side, the largest of its uv1 offsets.</summary>
+    public static float SpriteSize(Vertex v) => Math.Max(Math.Abs(v.U1), Math.Abs(v.V1));
+
+    /// <summary>
+    /// The header's two boxes from the geometry, by the rule every retail file keeps (111 of 111, to 2e-6): the first round
+    /// the leaf, trunk and extra vertices and every sprite's cube (its centre +- <see cref="SpriteSize"/>), the second round
+    /// the sprites' cubes and the origin - all zeros for a tree without sprites.
+    /// </summary>
     public void RecomputeBounds()
     {
         if (Vertices.Length == 0) return;
+        var sprite = SpriteVertices();
         float x0 = float.MaxValue, y0 = float.MaxValue, z0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue, z1 = float.MinValue;
-        foreach (var v in Vertices)
-        {
-            x0 = Math.Min(x0, v.Px); y0 = Math.Min(y0, v.Py); z0 = Math.Min(z0, v.Pz);
-            x1 = Math.Max(x1, v.Px); y1 = Math.Max(y1, v.Py); z1 = Math.Max(z1, v.Pz);
-        }
-        Min = new Vec3(x0, y0, z0); Max = new Vec3(x1, y1, z1);
-        Min2 = Min; Max2 = Max;
-    }
-
-    /// <summary>The whole tree made bigger or smaller about its base: vertices, both boxes and the collision hull.</summary>
-    public void Scale(float s)
-    {
+        float sx0 = 0, sy0 = 0, sz0 = 0, sx1 = 0, sy1 = 0, sz1 = 0;
         for (int i = 0; i < Vertices.Length; i++)
         {
             var v = Vertices[i];
-            Vertices[i] = v with { Px = v.Px * s, Py = v.Py * s, Pz = v.Pz * s };
+            float r = sprite[i] ? SpriteSize(v) : 0f;
+            x0 = Math.Min(x0, v.Px - r); y0 = Math.Min(y0, v.Py - r); z0 = Math.Min(z0, v.Pz - r);
+            x1 = Math.Max(x1, v.Px + r); y1 = Math.Max(y1, v.Py + r); z1 = Math.Max(z1, v.Pz + r);
+            if (!sprite[i]) continue;
+            sx0 = Math.Min(sx0, v.Px - r); sy0 = Math.Min(sy0, v.Py - r); sz0 = Math.Min(sz0, v.Pz - r);
+            sx1 = Math.Max(sx1, v.Px + r); sy1 = Math.Max(sy1, v.Py + r); sz1 = Math.Max(sz1, v.Pz + r);
+        }
+        Min = new Vec3(x0, y0, z0); Max = new Vec3(x1, y1, z1);
+        Min2 = new Vec3(sx0, sy0, sz0); Max2 = new Vec3(sx1, sy1, sz1);
+    }
+
+    /// <summary>The billboard's half width, as the engine takes it from the first box: the farthest its X or Z reaches from
+    /// the tree's axis (TreeMeshTemplate::load). A billboard cell is 2 x this across, about the axis.</summary>
+    public float BillboardRadius => Math.Max(Math.Max(Math.Abs(Min.X), Math.Abs(Max.X)), Math.Max(Math.Abs(Min.Z), Math.Abs(Max.Z)));
+
+    /// <summary>The billboard's half height: half the first box's height, about its middle.</summary>
+    public float BillboardHalfHeight => (Max.Y - Min.Y) * 0.5f;
+
+    /// <summary>The whole tree made bigger or smaller about its base: vertices (a sprite's size with it), both boxes and the
+    /// collision hull.</summary>
+    public void Scale(float s)
+    {
+        var sprite = SpriteVertices();
+        for (int i = 0; i < Vertices.Length; i++)
+        {
+            var v = Vertices[i];
+            Vertices[i] = sprite[i]
+                ? v with { Px = v.Px * s, Py = v.Py * s, Pz = v.Pz * s, U1 = v.U1 * s, V1 = v.V1 * s }
+                : v with { Px = v.Px * s, Py = v.Py * s, Pz = v.Pz * s };
         }
         Vec3 S(Vec3 v) => new(v.X * s, v.Y * s, v.Z * s);
         Min = S(Min); Max = S(Max); Min2 = S(Min2); Max2 = S(Max2);
@@ -294,8 +393,30 @@ public sealed class TreeCollision
     }
 
     /// <summary>
+    /// A static mesh's collision section (<c>.sm</c>) read as a tree's: it IS one - the same SimpleCollisionMesh (class
+    /// 0xEB97C2FA, the tree's collision flag), version, vertices, faces, plane records and BSP, every retail section read
+    /// whole this way (BF1942's 747) - so a tree made of a static mesh can keep the mesh's own hull and its BSP. Null when
+    /// the section is not one, or does not end where it should.
+    /// </summary>
+    public static TreeCollision? FromMeshSection(byte[] section)
+    {
+        if (section.Length < 8 || BinaryPrimitives.ReadUInt32LittleEndian(section) != TreeMesh.CollisionTag) return null;
+        try
+        {
+            int p = 4;
+            var c = Read(section, ref p);
+            return p == section.Length ? c : null;
+        }
+        catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException or ArgumentException) { return null; }
+    }
+
+    /// <summary>
     /// A collision hull from triangles, laid out as retail's one-node bushes are: every face in the root box, the first
     /// count the face count, the second 0, a plane record per face (its normal, 0, its vertex indices, its material).
+    /// The faces are wound as the game's collision faces are - (b-a)x(c-a) points INTO the solid, the reverse of a drawn
+    /// triangle - and the plane's normal is its opposite, out of the solid: -normalize((b-a)x(c-a)), as every retail tree
+    /// face (1306 of 1306) and every static mesh collision face stores it. The engine keeps the faces whose normal meets a
+    /// movement head on and pushes back along it, so an inward normal lets everything through.
     /// </summary>
     public static TreeCollision Build(IReadOnlyList<Vec3> positions, IReadOnlyList<(int A, int B, int C)> faces, ushort material = 82)
     {
@@ -307,7 +428,7 @@ public sealed class TreeCollision
             c.Faces.Add(new CollisionFace((ushort)a, (ushort)b, (ushort)d, material));
             var pa = positions[a]; var pb = positions[b]; var pc = positions[d];
             float ux = pb.X - pa.X, uy = pb.Y - pa.Y, uz = pb.Z - pa.Z, vx = pc.X - pa.X, vy = pc.Y - pa.Y, vz = pc.Z - pa.Z;
-            float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            float nx = -(uy * vz - uz * vy), ny = -(uz * vx - ux * vz), nz = -(ux * vy - uy * vx);
             float len = MathF.Sqrt(nx * nx + ny * ny + nz * nz);
             if (len > 1e-12f) { nx /= len; ny /= len; nz /= len; }
             var rec = new byte[32];

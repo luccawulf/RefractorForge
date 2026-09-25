@@ -178,8 +178,11 @@ public sealed class MeshLibrary
     /// <summary>Flatten a Battlefield 1942 TreeMesh (.tm, from treeMesh.rfa) into a render-ready <see cref="Mesh"/>:
     /// one combined vertex array + one material part per group/material. Trunk (group 1) is opaque; leaf/sprite/extra
     /// groups render alpha-tested (cutout). <paramref name="resolve"/> supplies each material's colour + texture
-    /// (its texname into texture.rfa); without it, parts get a foliage-green tint so the tree still reads.</summary>
-    public static Mesh MeshFromTreeMesh(RefractorForge.Formats.Rfa.TreeMesh tm, System.Func<string, (Vector3 Color, Texture2D? Tex)>? resolve = null)
+    /// (its texname into texture.rfa); without it, parts get a foliage-green tint so the tree still reads.
+    /// <paramref name="spriteView"/>, the direction from the tree to a camera, turns the sprites to face it at their own
+    /// size as the engine draws them (a billboard's view); without it each sprite is a still cross.</summary>
+    public static Mesh MeshFromTreeMesh(RefractorForge.Formats.Rfa.TreeMesh tm, System.Func<string, (Vector3 Color, Texture2D? Tex)>? resolve = null,
+                                        Vector3? spriteView = null)
     {
         var pos = new List<Vector3>(tm.Vertices.Length);
         var uvs = new List<System.Numerics.Vector2>(tm.Vertices.Length);
@@ -189,36 +192,54 @@ public sealed class MeshLibrary
             uvs.Add(new System.Numerics.Vector2(v.U, v.V));
         }
         var parts = new List<MaterialPart>();
-        // Partition the index buffer by ASCENDING material Start. A BF1942 .tm material's true triangle range is
-        // [Start, nextMaterialStart) (the last runs to Indices.Length). The per-material Count is correct ONLY for the
-        // opaque TRUNK groups and badly UNDER-reports the leaf/sprite groups, so the old Count*3 range dropped most of
-        // the canopy and trees rendered as bare trunks. Materials across all 4 groups are stored ascending and together
-        // partition the whole buffer, so this draws every leaf/trunk triangle exactly once. (THE bald-tree fix.)
-        var mats = new List<(int Group, RefractorForge.Formats.Rfa.TreeMesh.Material M)>();
-        for (int g = 0; g < tm.Groups.Length; g++) foreach (var m in tm.Groups[g]) mats.Add((g, m));
-        mats.Sort((x, y) => x.M.Start.CompareTo(y.M.Start));
-        // SPRITE billboard half-size: the .tm stores sprites as zero-size points (no size field), so derive a plausible
-        // leaf-cluster size from the tree's footprint.
+        // Each material's range is [Start, next Start) (the four groups together partition the buffer). A leaf or sprite
+        // block holds its Count triangles once per view, each copy sorted for its side (TreeMesh.ViewSorted); the engine
+        // draws one copy, so this draws the first - every leaf once (the whole range drew each eight times over).
+        var blocks = tm.Blocks();
+        // A sprite's half size is its uv1 (the corner's offset in view space); a file without one gets a size from the
+        // tree's footprint.
         float spriteH = Math.Clamp(MathF.Max(tm.Max.X - tm.Min.X, tm.Max.Z - tm.Min.Z) * 0.12f, 1.5f, 4f);
-        for (int i = 0; i < mats.Count; i++)
+        Vector3 right = Vector3.Zero;
+        if (spriteView is { } sv && new Vector3(sv.X, 0f, sv.Z) is var flat && flat.LengthSquared() > 1e-12f)
         {
-            var m = mats[i].M;
+            flat = Vector3.Normalize(flat);
+            right = new Vector3(-flat.Z, 0f, flat.X);          // the camera's right, looking at the tree from there
+        }
+        foreach (var (group, m, end) in blocks)
+        {
             int s = m.Start;
-            int e = (i + 1 < mats.Count) ? mats[i + 1].M.Start : tm.Indices.Length;
+            int e = end;
+            if ((group == 0 || group == 2) && m.Count > 0 && s + m.Count * 3 <= e) e = s + m.Count * 3;
             if (s < 0 || e > tm.Indices.Length || e <= s) continue;
             var (color, tex) = resolve?.Invoke(m.TexName) ?? (new Vector3(0.36f, 0.55f, 0.30f), (Texture2D?)null);
-            if (mats[i].Group == 2)
+            if (group == 2)
             {
-                // SPRITE group: BF1942 stores each leaf-cluster billboard as a collapsed quad (4 coincident verts with
-                // corner UVs) that the engine expands camera-facing at runtime — the editor saw zero-area triangles and
-                // drew nothing (bald crown). Bake a static 3-quad "cross" (XY+ZY+XZ planes) of the cluster texture at each
-                // sprite centre so the canopy reads full from any angle (not camera-facing, but a cheap static preview).
+                // SPRITE group: each leaf cluster is a collapsed quad (4 coincident verts, uv1 the corners' offsets) that
+                // the engine turns to the camera. Facing a given view, the quad is opened out along its right and up; else
+                // a still cross of the cluster at its size, so the canopy reads from any angle.
                 var sidx = new List<int>();
                 for (int q = s; q + 5 < e; q += 6)   // one sprite per quad (2 collapsed triangles)
                 {
                     int vi = tm.Indices[q];
-                    if ((uint)vi >= (uint)pos.Count) continue;
-                    AppendSpriteCross(pos, uvs, sidx, pos[vi], spriteH);
+                    if ((uint)vi >= (uint)tm.Vertices.Length) continue;
+                    if (right != Vector3.Zero)
+                    {
+                        // Each corner moved out from the centre by its own offset: the quad the engine draws facing there.
+                        bool whole = true;
+                        for (int k = 0; k < 6; k++) whole &= tm.Indices[q + k] < tm.Vertices.Length;
+                        if (!whole) continue;
+                        var centre = pos[vi];
+                        for (int k = 0; k < 6; k++)
+                        {
+                            var cv = tm.Vertices[tm.Indices[q + k]];
+                            sidx.Add(pos.Count);
+                            pos.Add(centre + right * cv.U1 + Vector3.UnitY * cv.V1);
+                            uvs.Add(new System.Numerics.Vector2(cv.U, cv.V));
+                        }
+                        continue;
+                    }
+                    float size = RefractorForge.Formats.Rfa.TreeMesh.SpriteSize(tm.Vertices[vi]);
+                    AppendSpriteCross(pos, uvs, sidx, pos[vi], size > 1e-4f ? size : spriteH);
                 }
                 if (sidx.Count > 0) parts.Add(new MaterialPart(sidx.ToArray(), color, tex, AlphaTest: true,
                                                                AlphaRef: ProfileAlpha(tex) is { Cutout: true } sp ? sp.Ref : null, Foliage: true));
