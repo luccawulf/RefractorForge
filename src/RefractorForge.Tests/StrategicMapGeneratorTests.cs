@@ -131,6 +131,86 @@ public class StrategicMapGeneratorTests
     }
 
     [Fact]
+    public void Links_join_the_regions_that_touch_across_each_north_and_east_edge()
+    {
+        // 2x2 blocks, all open: every cell links its one region to its northern and eastern neighbour's (bits 0 and 16).
+        int fineSide = 128;
+        var open = StrategicMapGenerator.Generate(AllPassable(fineSide), fineSide, Land);
+        Assert.Equal((1u << 0) | (1u << 16), open.Table.Links(0, 0));
+        Assert.Equal(1u << 16, open.Table.Links(0, 1));                 // top row: nothing to the north
+        Assert.Equal(1u << 0, open.Table.Links(1, 0));                  // right column: nothing to the east
+        Assert.Equal(0u, open.Table.Links(1, 1));
+        Assert.True(open.Table.LinkedNorth(0, 0, 0, 0) && open.Table.LinkedEast(0, 0, 0, 0));
+
+        // A wall along the top row of the bottom blocks: no north links there, east links untouched.
+        var walled = AllPassable(fineSide);
+        for (int x = 0; x < fineSide; x++) walled[63 * fineSide + x] = CompressedSearchMap.Blocked;
+        var w = StrategicMapGenerator.Generate(walled, fineSide, Land);
+        Assert.Equal(1u << 16, w.Table.Links(0, 0));
+        Assert.Equal(0u, w.Table.Links(1, 0));
+
+        // Block (0,0) split by a wall at x = 32: its larger left region (slot 0) and its right region (slot 1) both reach
+        // the open block to the north (region 0 there); only the right one touches the east edge.
+        var split = AllPassable(fineSide);
+        for (int y = 0; y < 64; y++) split[y * fineSide + 32] = CompressedSearchMap.Blocked;
+        var sp = StrategicMapGenerator.Generate(split, fineSide, Land);
+        Assert.Equal(2, sp.Table.UsedPortals(0, 0));
+        Assert.True(sp.Table.LinkedNorth(0, 0, 0, 0) && sp.Table.LinkedNorth(0, 0, 1, 0));
+        Assert.True(sp.Table.LinkedEast(0, 0, 1, 0));
+        Assert.False(sp.Table.LinkedEast(0, 0, 0, 0));
+    }
+
+    [Fact]
+    public void Companions_are_named_after_the_search_type_at_its_level_plus_one()
+    {
+        // Wake's infantry map Infantry1 is pathed by the type "Infantery" at level 0; its boats by "Boat" at level 2.
+        int fineSide = 256;
+        var files = SearchMapGenerator.EncodeVehicleLevels(SearchMapParams.Standard[1], AllPassable(fineSide), fineSide,
+                                                           new[] { ("Infantery", 0) });
+        Assert.Contains(files, f => f.FileName == "Infantery.raw");
+        var info = files.Single(f => f.FileName == "InfanteryInfo.raw");
+        StrategicInfoMap.Decode(info.Data, out _, out int level);
+        Assert.Equal(1, level);
+        Assert.DoesNotContain(files, f => f.FileName == "Infantry.raw");
+
+        var boat = SearchMapGenerator.EncodeVehicleLevels(Water, AllPassable(fineSide), fineSide, new[] { ("Boat", 2) });
+        StrategicInfoMap.Decode(boat.Single(f => f.FileName == "BoatInfo.raw").Data, out _, out int boatLevel);
+        Assert.Equal(3, boatLevel);
+    }
+
+    [Fact]
+    public void The_engines_map_size_comes_from_the_ai_world_size()
+    {
+        Assert.Equal(2048, SearchMapGenerator.FinestSideForWorld(2048));
+        Assert.Equal(4096, SearchMapGenerator.FinestSideForWorld(4096));    // Tobruk, GuadalCanal, Midway (FinestSide caps at 2048)
+        Assert.Equal(2048, SearchMapGenerator.FinestSideForWorld(2000));    // within 0.1 of a power of two rounds up
+        Assert.Equal(1024, SearchMapGenerator.FinestSideForWorld(1800));
+    }
+
+    [InstallFact(Installs.Bf1942CleanArchives)]
+    public void Regenerated_links_agree_with_the_shipped_table_on_wake()
+    {
+        // Wake's tank map regenerated from its own shipped level-0 map: which cell edges link (in either region
+        // numbering) must agree with the shipped Tank.raw on nearly every edge (the engine's own table matches the real
+        // region contacts on ~1980 of Wake's 1984 edges).
+        var a = new RefractorForge.Formats.Rfa.RefractorFlatArchive(Path.Combine(Installs.Bf1942CleanArchives, "bf1942", "levels", "Wake.rfa"));
+        Assert.True(a.TryGetEntry("bf1942/levels/Wake/Pathfinding/Tank0Level0Map.raw", out var l0));
+        Assert.True(a.TryGetEntry("bf1942/levels/Wake/Pathfinding/Tank.raw", out var tank));
+        var fine = CompressedSearchMap.Decode(a.Read(l0), out int side, out _);
+        var shipped = StrategicMap.Load(a.Read(tank));
+        var made = StrategicMapGenerator.Generate(fine, side, Land, infoLevel: 1).Table;
+        Assert.Equal(shipped.Width, made.Width);
+        int edges = 0, agree = 0;
+        for (int y = 0; y < made.Height; y++)
+            for (int x = 0; x < made.Width; x++)
+            {
+                if (y + 1 < made.Height) { edges++; if ((shipped.Links(x, y) & 0xFFFF) != 0 == ((made.Links(x, y) & 0xFFFF) != 0)) agree++; }
+                if (x + 1 < made.Width) { edges++; if ((shipped.Links(x, y) >> 16) != 0 == ((made.Links(x, y) >> 16) != 0)) agree++; }
+            }
+        Assert.True(agree >= edges * 0.95, $"{agree} of {edges} edges agree");
+    }
+
+    [Fact]
     public void Encoded_companions_are_named_and_shaped_like_the_shipped_pair()
     {
         int fineSide = 256;

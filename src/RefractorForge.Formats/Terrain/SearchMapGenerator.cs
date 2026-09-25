@@ -70,6 +70,19 @@ public static class SearchMapGenerator
     /// Maps to the small/medium/large convention (ms 256/512/1024 -> 1024/2048/4096).</summary>
     public static int FinestSide(int materialSize) => Math.Min(materialSize * 4, MaxLevelSide);
 
+    /// <summary>
+    /// The finest side the ENGINE builds its search maps at, from the level's <c>aiSettings.setWorldMapSize</c>:
+    /// 2^(int)(log2(size) + 0.1) - one metre per cell at level 0 (AIMain::reset in both games). A map file whose header
+    /// does not match is rejected, and the first rejected map stops every later map and the strategic pairs from loading,
+    /// so this - not <see cref="FinestSide"/>, which caps at 2048 for the editor - is the size a map written for the game
+    /// must have: 4096 on BF1942's 4 km levels (GuadalCanal, Midway, Tobruk).
+    /// </summary>
+    public static int FinestSideForWorld(float worldMapSize)
+    {
+        if (!(worldMapSize >= 64f)) return 64;
+        return 1 << (int)Math.Floor(Math.Log2(worldMapSize) + 0.1);
+    }
+
     /// <summary>Side (cells) of a vehicle map at the given level = FinestSide >> level (L0 finest, each level
     /// halves). At least 64 (one 64x64 block) for a valid compressed map; smaller would be invalid.</summary>
     public static int LevelSide(int materialSize, int level) => FinestSide(materialSize) >> level;
@@ -103,9 +116,14 @@ public static class SearchMapGenerator
     /// </summary>
     public static byte[] GenerateGrid(TerrainConfig cfg, Heightmap hm, SearchMapParams p, int level,
                                       IReadOnlyList<ObjectFootprint>? objs = null)
+        => GenerateGridSide(cfg, hm, p, LevelSide(cfg.MaterialSize, level), objs);
+
+    /// <summary><see cref="GenerateGrid"/> at an explicit side (the engine's size from <see cref="FinestSideForWorld"/>
+    /// shifted by the level) over <paramref name="worldSize"/> metres (the AI's world; the terrain's when null).</summary>
+    public static byte[] GenerateGridSide(TerrainConfig cfg, Heightmap hm, SearchMapParams p, int side,
+                                          IReadOnlyList<ObjectFootprint>? objs = null, float? worldSize = null)
     {
-        int side = LevelSide(cfg.MaterialSize, level);
-        float mpc = (float)cfg.WorldSize / side;          // metres per nav cell at this level
+        float mpc = (worldSize ?? (float)cfg.WorldSize) / side;   // metres per nav cell at this level
         float water = cfg.WaterLevel;
 
         // sampled height per world-aligned cell (gx -> +X / column, gy -> +Z / row).
@@ -223,7 +241,11 @@ public static class SearchMapGenerator
     /// <c>&lt;Veh&gt;.raw</c> before running a local A*, so writing new level maps without rebuilding
     /// <c>&lt;Veh&gt;.raw</c> / <c>&lt;Veh&gt;Info.raw</c> leaves the coarse layer describing the terrain as it was
     /// BEFORE the edit. Emitting them here means every path that writes a navmap keeps the pair consistent.</summary>
-    public static IReadOnlyList<(string FileName, byte[] Data)> EncodeVehicleLevels(SearchMapParams p, byte[] gridFinest, int finestSide)
+    /// <param name="types">The search types that path on this map (<c>ai.addSearchType Name map level</c>): one companion
+    /// pair each, named after the type, its info map at the type's level + 1 - as the engine reads them. Null writes one
+    /// pair named after the map (the editor's older convention).</param>
+    public static IReadOnlyList<(string FileName, byte[] Data)> EncodeVehicleLevels(SearchMapParams p, byte[] gridFinest, int finestSide,
+                                                                                   IReadOnlyList<(string Type, int Level)>? types = null)
     {
         var list = new List<(string, byte[])>();
         foreach (int lvl in p.LevelSet)
@@ -238,8 +260,15 @@ public static class SearchMapGenerator
         // The companions are derived from the world-grid map (the painter's own orientation), not from a
         // nav-oriented level map, so they describe the same world the level files do.
         if (finestSide >= StrategicMapGenerator.BlockFine && finestSide % StrategicMapGenerator.BlockFine == 0)
-            foreach (var f in StrategicMapGenerator.EncodeCompanions(p, gridFinest, finestSide))
-                list.Add((f.FileName, f.Data));
+        {
+            if (types is null)
+                foreach (var f in StrategicMapGenerator.EncodeCompanions(p, gridFinest, finestSide))
+                    list.Add((f.FileName, f.Data));
+            else
+                foreach (var (type, level) in types)
+                    foreach (var f in StrategicMapGenerator.EncodeCompanions(p, gridFinest, finestSide, type, level))
+                        list.Add((f.FileName, f.Data));
+        }
         return list;
     }
 

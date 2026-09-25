@@ -9,10 +9,12 @@ namespace RefractorForge.Formats.Terrain;
 /// CONNECTED passable areas - two halves of a block separated by a wall are different regions even though they
 /// share a cell - and every cell must know which region it is in (<c>&lt;Veh&gt;Info.raw</c>).
 ///
-/// This is a faithful reimplementation, not a byte-identical clone: DICE's own labelling order and their use of
-/// the not-fully-decoded link bytes are unknown, so a regenerated pair will not match a shipped one byte for byte.
-/// What it does guarantee is internal consistency - every portal sits on a passable cell of the region it names,
-/// and every passable cell's info value indexes a used portal slot - which is what the search actually relies on.
+/// This is a faithful reimplementation, not a byte-identical clone: DICE's own labelling order is unknown, so a
+/// regenerated pair will not match a shipped one byte for byte. What it does guarantee is internal consistency - every
+/// portal sits on a passable cell of the region it names, every passable cell's info value indexes a used portal slot,
+/// and each cell's link table (<see cref="StrategicMap.Links"/>) holds exactly the region contacts across its north and
+/// east edges - which is what the strategic search walks: a region pair with no link bit is not a route, however open
+/// the ground between them.
 /// </summary>
 public static class StrategicMapGenerator
 {
@@ -30,7 +32,9 @@ public static class StrategicMapGenerator
     /// Decompose <paramref name="fine"/> (one byte per cell, <c>0x00</c> passable / <c>0xFF</c> blocked, side
     /// <paramref name="fineSide"/>) into the strategic pair for vehicle <paramref name="p"/>.
     /// </summary>
-    public static Result Generate(byte[] fine, int fineSide, SearchMapParams p)
+    /// <param name="infoLevel">The level of the info map: the search type's level + 1 (<c>ai.addSearchType Name map level</c>).
+    /// Null takes <see cref="CompanionLevel"/> (the second level of the map's set).</param>
+    public static Result Generate(byte[] fine, int fineSide, SearchMapParams p, int? infoLevel = null)
     {
         if (fine is null) throw new ArgumentNullException(nameof(fine));
         if (fine.Length != fineSide * fineSide)
@@ -38,7 +42,7 @@ public static class StrategicMapGenerator
         if (fineSide % BlockFine != 0)
             throw new ArgumentException($"fine side {fineSide} is not a multiple of {BlockFine}.");
 
-        int level = CompanionLevel(p);
+        int level = infoLevel ?? CompanionLevel(p);
         int strategicSide = fineSide / BlockFine;
         int blockSide = StrategicInfoMap.BlockSideFor(StrategicInfoMap.BaseCellBits, level);
         int infoSide = strategicSide * blockSide;
@@ -51,6 +55,8 @@ public static class StrategicMapGenerator
         var label = new int[BlockFine * BlockFine];   // per-block scratch, reused
         var queue = new int[BlockFine * BlockFine];
         var regionCells = new List<List<int>>();
+        // Each block's cells by portal slot (-1: blocked or in a region too small for a slot), kept for the links.
+        var slots = new sbyte[strategicSide * strategicSide][];
 
         for (int by = 0; by < strategicSide; by++)
             for (int bx = 0; bx < strategicSide; bx++)
@@ -122,6 +128,10 @@ public static class StrategicMapGenerator
                     table.SetPortal(bx, by, s, best % BlockFine, best / BlockFine);
                 }
 
+                var slotMap = new sbyte[BlockFine * BlockFine];
+                for (int i = 0; i < slotMap.Length; i++) slotMap[i] = (sbyte)(label[i] >= 0 ? slotOf[label[i]] : -1);
+                slots[by * strategicSide + bx] = slotMap;
+
                 // Info cells: each covers scale x scale fine cells; take the most common region among them.
                 var tally = new int[StrategicMap.PortalSlots];
                 for (int iy = 0; iy < blockSide; iy++)
@@ -140,19 +150,52 @@ public static class StrategicMapGenerator
                     }
             }
 
+        // Links: region s of a cell touches region t of its northern (y+1) neighbour where a passable cell of s on the
+        // block's top row faces a passable cell of t on the neighbour's bottom row (bit 4s+t); the same on the east
+        // edge (bit 16+4s+t). South and west links live in the neighbour's table.
+        for (int by = 0; by < strategicSide; by++)
+            for (int bx = 0; bx < strategicSide; bx++)
+            {
+                var here = slots[by * strategicSide + bx];
+                uint links = 0;
+                if (by + 1 < strategicSide)
+                {
+                    var north = slots[(by + 1) * strategicSide + bx];
+                    for (int x = 0; x < BlockFine; x++)
+                    {
+                        int s = here[(BlockFine - 1) * BlockFine + x], t = north[x];
+                        if (s >= 0 && t >= 0) links |= 1u << (4 * s + t);
+                    }
+                }
+                if (bx + 1 < strategicSide)
+                {
+                    var east = slots[by * strategicSide + bx + 1];
+                    for (int y = 0; y < BlockFine; y++)
+                    {
+                        int s = here[y * BlockFine + BlockFine - 1], t = east[y * BlockFine];
+                        if (s >= 0 && t >= 0) links |= 1u << (16 + 4 * s + t);
+                    }
+                }
+                table.SetLinks(bx, by, links);
+            }
+
         return new Result(table, info, infoSide, level);
     }
 
-    /// <summary>The companion pair as writable files, named the way the level ships them
-    /// (<c>&lt;Base&gt;.raw</c> and <c>&lt;Base&gt;Info.raw</c>).</summary>
+    /// <summary>The companion pair as writable files. The engine names the pair after the SEARCH TYPE that paths on the
+    /// map (<c>ai.addSearchType Infantery 1 0</c> reads <c>Infantery.raw</c> / <c>InfanteryInfo.raw</c>, whatever the
+    /// map is called) and reads the info map at that type's level + 1: pass <paramref name="typeName"/> and
+    /// <paramref name="typeLevel"/> from the level's AIpathFinding.con. Without them the pair is named after the map
+    /// (<c>&lt;Base&gt;.raw</c>) at <see cref="CompanionLevel"/> - right for retail's usual spellings only.</summary>
     public static IReadOnlyList<(string FileName, byte[] Data)> EncodeCompanions(
-        SearchMapParams p, byte[] fine, int fineSide)
+        SearchMapParams p, byte[] fine, int fineSide, string? typeName = null, int? typeLevel = null)
     {
-        var r = Generate(fine, fineSide, p);
+        var r = Generate(fine, fineSide, p, typeLevel is { } tl ? tl + 1 : null);
+        var name = string.IsNullOrWhiteSpace(typeName) ? p.BaseName : typeName;
         return new[]
         {
-            (p.BaseName + ".raw", r.Table.Save()),
-            (p.BaseName + "Info.raw", StrategicInfoMap.Encode(r.InfoCells, r.InfoSide, r.Level)),
+            (name + ".raw", r.Table.Save()),
+            (name + "Info.raw", StrategicInfoMap.Encode(r.InfoCells, r.InfoSide, r.Level)),
         };
     }
 }

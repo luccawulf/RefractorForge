@@ -18,7 +18,10 @@ namespace RefractorForge.Formats.Terrain;
 /// </code>
 /// and one <c>StrategicCell</c>, from the accessors in the same binary:
 /// <code>
-///   [0x00..0x03]  one byte per portal slot - link/direction bits (2 bits per slot: 0x55, 0x11, 0x01, 0x03 seen)
+///   [0x00..0x03]  ONE little-endian 32-bit LINK TABLE (the strategic search, dice::bf::ai newPositionAndCost, reads it
+///                 whole): bit 4*s+t = this cell's region s touches region t of its NORTHERN (+Z, y+1) neighbour, bit
+///                 16+4*s+t = the same toward its EASTERN (+X, x+1) neighbour; south and west links are read from the
+///                 neighbour's own table. Retail's links match the real region contacts on ~1980 of ~1984 cell edges.
 ///   [0x04..0x0B]  four (x, z) portal positions, ONE BYTE EACH, masked 0x3F -> 0..63 inside the cell's 64x64 block
 ///                 getPositionX(i) = cell[4 + i*2] &amp; 0x3F ; getPositionZ(i) = cell[5 + i*2] &amp; 0x3F
 ///   [0x0C]        flags: HIGH nibble = "portal slot i is used" (isUsed(i) = flags &amp; (0x10 &lt;&lt; i)).
@@ -136,23 +139,36 @@ public sealed class StrategicMap
         return (x * BlockSide + px, y * BlockSide + pz);
     }
 
-    /// <summary>The raw link/direction byte for a slot (<c>cell[0x00 + slot]</c>). Not fully decoded: it holds two
-    /// bits per slot in the real files. Exposed so callers can preserve or inspect it.</summary>
+    /// <summary>One raw byte of the link table (<c>cell[0x00 + i]</c>), for inspection; <see cref="Links"/> reads it whole.</summary>
     public byte LinkBits(int x, int y, int slot)
     {
         if ((uint)slot >= PortalSlots) throw new ArgumentOutOfRangeException(nameof(slot));
         return _cells[Base(x, y) + slot];
     }
 
-    /// <summary>Populate a portal slot: position within the block, plus the link byte to carry.
-    /// Only the low 6 bits of each coordinate are stored, matching the engine's masks.</summary>
-    public void SetPortal(int x, int y, int slot, int px, int pz, byte linkBits = 1)
+    /// <summary>The cell's link table as the engine reads it: bytes 0..3 as one little-endian 32-bit word.</summary>
+    public uint Links(int x, int y) => BitConverter.ToUInt32(_cells, Base(x, y));
+
+    public void SetLinks(int x, int y, uint links) => BitConverter.GetBytes(links).CopyTo(_cells, Base(x, y));
+
+    /// <summary>Whether region <paramref name="s"/> of cell (x, y) touches region <paramref name="t"/> of the cell to its
+    /// north (y+1).</summary>
+    public bool LinkedNorth(int x, int y, int s, int t) => (Links(x, y) & (1u << (4 * s + t))) != 0;
+
+    /// <summary>Whether region <paramref name="s"/> of cell (x, y) touches region <paramref name="t"/> of the cell to its
+    /// east (x+1).</summary>
+    public bool LinkedEast(int x, int y, int s, int t) => (Links(x, y) & (1u << (16 + 4 * s + t))) != 0;
+
+    /// <summary>Populate a portal slot's position within the block. Only the low 6 bits of each coordinate are stored,
+    /// matching the engine's masks. The link table is left alone unless <paramref name="linkBits"/> is given (a raw
+    /// byte of it, for callers that copy one): links are a property of the cell, written by <see cref="SetLinks"/>.</summary>
+    public void SetPortal(int x, int y, int slot, int px, int pz, byte? linkBits = null)
     {
         if ((uint)slot >= PortalSlots) throw new ArgumentOutOfRangeException(nameof(slot));
         if ((uint)px >= BlockSide || (uint)pz >= BlockSide)
             throw new ArgumentOutOfRangeException(nameof(px), "portal position must be 0..63 inside the block.");
         int b = Base(x, y);
-        _cells[b + slot] = linkBits;
+        if (linkBits is { } lb) _cells[b + slot] = lb;
         _cells[b + 4 + slot * 2] = (byte)(px & 0x3F);
         _cells[b + 5 + slot * 2] = (byte)(pz & 0x3F);
         _cells[b + 0x0C] |= (byte)(0x10 << slot);
