@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 
@@ -32,7 +33,18 @@ public static class BinkEncoder
     }
 
     /// <summary>How the wait ended - the part worth asserting on.</summary>
-    public enum Result { Ok, NoTools, SourceUnreadable, CompressorStalled, Failed }
+    public enum Result { Ok, NoTools, SourceUnreadable, CompressorStalled, Failed, Cancelled }
+
+    /// <summary>The compressor's command line: <c>Binkc "&lt;input&gt;" "&lt;output&gt;"</c> and the switches as given
+    /// (RAD's own spelling: <c>/V100</c> Bink 1, <c>/F25</c> the frame rate, <c>/D200000</c> bytes a second, <c>/L-1</c>
+    /// no sound, <c>/O</c> overwrite). The input may be a numbered picture series in RAD's form,
+    /// <c>"frame?????.png*1-750"</c>. Its own function so the line can be checked without running anything.</summary>
+    public static string CompressArgs(string input, string dstBik, IReadOnlyList<string>? switches = null)
+    {
+        var line = $"Binkc \"{input}\" \"{dstBik}\"";
+        if (switches is { Count: > 0 }) line += " " + string.Join(" ", switches);
+        return line;
+    }
 
     /// <param name="progress">Called with the bytes written so far, a few times a second. Never on the caller's thread.</param>
     /// <param name="maxWidth">Scale the video down to at most this wide, keeping its shape (0 = leave it alone).
@@ -66,22 +78,44 @@ public static class BinkEncoder
         if (!File.Exists(src)) { error = "The source video is gone."; return Result.SourceUnreadable; }
 
         var avi = Path.Combine(Path.GetTempPath(), "rf_bik_" + Guid.NewGuid().ToString("N") + ".avi");
-        var tmp = dstBik + ".tmp";
         try
         {
             // MJPEG + PCM in an AVI: RAD reads it, it is faithful enough as an intermediate, and the audio survives
             // into the .bik at the rate and channel count chosen.
             RunQuiet(ffmpegExe, FfmpegArgs(src, avi, maxWidth, audioRate, audioChannels, withAudio), 30 * 60 * 1000);
             if (!File.Exists(avi) || new FileInfo(avi).Length < 1024) { error = "FFmpeg could not read that video."; return Result.SourceUnreadable; }
+            return Compress(radExe, avi, dstBik, null, progress, out error, maxMinutes);
+        }
+        catch (Exception ex) { error = ex.Message; return Result.Failed; }
+        finally { Del(avi); }
+    }
 
+    /// <summary>
+    /// RAD's Bink compressor run on something it reads - an AVI, a QuickTime movie, a numbered picture series
+    /// (<c>"frame?????.png*1-750"</c>), a list file - and waited for as the class summary describes: done when the
+    /// <c>.tmp</c> is gone, the real file is there and both the file and the CPU have gone quiet; then its window,
+    /// which never closes itself, is closed. A cancel kills it and leaves neither file behind.
+    /// </summary>
+    /// <param name="switches">RAD's switches as its help spells them (see <see cref="CompressArgs"/>).</param>
+    public static Result Compress(string radExe, string input, string dstBik, IReadOnlyList<string>? switches,
+                                  Action<long>? progress, out string error, int maxMinutes = 30,
+                                  System.Threading.CancellationToken cancel = default)
+    {
+        error = "";
+        if (!File.Exists(radExe)) { error = "RAD Video Tools is missing."; return Result.NoTools; }
+        var tmp = dstBik + ".tmp";
+        try
+        {
             Del(dstBik); Del(tmp);
-            var psi = new ProcessStartInfo(radExe, $"Binkc \"{avi}\" \"{dstBik}\"") { UseShellExecute = false };
+            var psi = new ProcessStartInfo(radExe, CompressArgs(input, dstBik, switches)) { UseShellExecute = false };
             using var proc = Process.Start(psi)!;
 
             long lastSeen = -2; double lastCpu = -1; int stall = 0, done = 0;
+            bool cancelled = false;
             var work = Stopwatch.StartNew();
             while (!proc.HasExited && work.Elapsed.TotalMinutes < maxMinutes)
             {
+                if (cancel.IsCancellationRequested) { cancelled = true; break; }
                 System.Threading.Thread.Sleep(250);
                 long outSize = Size(dstBik), tmpSize = Size(tmp);
                 long seen = outSize >= 0 ? outSize : tmpSize;
@@ -97,6 +131,13 @@ public static class BinkEncoder
             bool stalled = !proc.HasExited && Size(dstBik) < 64;
             try { if (!proc.HasExited) proc.Kill(); } catch { }
             Del(tmp);                        // never leave a half-written file behind
+            if (cancelled)
+            {
+                try { proc.WaitForExit(5000); } catch { }
+                Del(dstBik);
+                error = "Cancelled.";
+                return Result.Cancelled;
+            }
 
             long final = Size(dstBik);
             if (final < 64)
@@ -110,7 +151,6 @@ public static class BinkEncoder
             return Result.Ok;
         }
         catch (Exception ex) { error = ex.Message; return Result.Failed; }
-        finally { Del(avi); }
     }
 
     private static long Size(string f) { try { return File.Exists(f) ? new FileInfo(f).Length : -1; } catch { return -1; } }

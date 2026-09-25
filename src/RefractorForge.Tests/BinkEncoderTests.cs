@@ -37,6 +37,25 @@ public class BinkEncoderTests
     }
 
     [Fact]
+    public void The_compressor_line_carries_a_picture_series_and_the_switches_as_RAD_spells_them()
+    {
+        var line = BinkEncoder.CompressArgs(@"C:\w\frame?????.png*1-750", @"C:\m\Movies\background.bik",
+                                            new[] { "/V100", "/F25", "/L-1", "/O" });
+        Assert.Equal("Binkc \"C:\\w\\frame?????.png*1-750\" \"C:\\m\\Movies\\background.bik\" /V100 /F25 /L-1 /O", line);
+        Assert.Equal("Binkc \"a.avi\" \"b.bik\"", BinkEncoder.CompressArgs("a.avi", "b.bik"));
+    }
+
+    [Fact]
+    public void Compressing_without_RAD_says_so_and_writes_nothing()
+    {
+        var dst = Missing + ".bik";
+        var r = BinkEncoder.Compress(Missing + ".exe", Missing + ".avi", dst, null, null, out var error);
+        Assert.Equal(BinkEncoder.Result.NoTools, r);
+        Assert.Contains("RAD", error);
+        Assert.False(File.Exists(dst));
+    }
+
+    [Fact]
     public void The_installed_tools_are_found_where_RAD_puts_them()
     {
         var rad = BinkEncoder.FindRadVideo();
