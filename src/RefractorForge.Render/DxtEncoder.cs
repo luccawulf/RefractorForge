@@ -10,6 +10,9 @@ namespace RefractorForge.Render;
 /// write came up black in the game. Header written field for field as the shipped files have it.
 /// The encoder is a range fit: each 4x4 block's two endpoints are the block's extreme colours along its principal
 /// spread, quantised to 565; texels take the nearest of the four palette colours. Good enough for ground.
+/// A block with any texel under half alpha is written in DXT1's three-colour mode, whose fourth index is transparent -
+/// the 1-bit alpha BF1942's cut-out DXT1 textures (fences, grilles, foliage) carry, which an encode ignoring alpha
+/// turned solid. An opaque texture encodes as it always did.
 /// </summary>
 public static class DxtEncoder
 {
@@ -148,20 +151,81 @@ public static class DxtEncoder
         int w = t.Width, h = t.Height, bw = Math.Max(1, (w + 3) / 4), bh = Math.Max(1, (h + 3) / 4);
         var px = t.Rgba;
         Span<byte> r = stackalloc byte[16], g = stackalloc byte[16], b = stackalloc byte[16];
+        Span<bool> clear = stackalloc bool[16];
         int o = at;
         for (int by = 0; by < bh; by++)
             for (int bx = 0; bx < bw; bx++)
             {
+                bool anyClear = false;
                 for (int i = 0; i < 16; i++)
                 {
                     int x = Math.Min(w - 1, bx * 4 + (i & 3)), y = Math.Min(h - 1, by * 4 + (i >> 2));   // clamp = edge repeat
                     int p = (y * w + x) * 4;
                     r[i] = px[p]; g[i] = px[p + 1]; b[i] = px[p + 2];
+                    clear[i] = px[p + 3] < 128;
+                    anyClear |= clear[i];
                 }
-                EncodeBlock(r, g, b, dst, o);
+                if (anyClear) EncodeBlockCutout(r, g, b, clear, dst, o);
+                else EncodeBlock(r, g, b, dst, o);
                 o += 8;
             }
         return o - at;
+    }
+
+    /// <summary>A block with transparent texels in DXT1's three-colour mode (c0 &lt;= c1): the endpoints from its solid
+    /// texels, index 2 their midpoint, index 3 transparent.</summary>
+    private static void EncodeBlockCutout(ReadOnlySpan<byte> r, ReadOnlySpan<byte> g, ReadOnlySpan<byte> b, ReadOnlySpan<bool> clear, byte[] dst, int o)
+    {
+        int minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0, solid = 0;
+        for (int i = 0; i < 16; i++)
+        {
+            if (clear[i]) continue;
+            solid++;
+            if (r[i] < minR) minR = r[i]; if (r[i] > maxR) maxR = r[i];
+            if (g[i] < minG) minG = g[i]; if (g[i] > maxG) maxG = g[i];
+            if (b[i] < minB) minB = b[i]; if (b[i] > maxB) maxB = b[i];
+        }
+        if (solid == 0)
+        {
+            // Nothing to see: both endpoints black (c0 == c1 is three-colour mode), every texel transparent.
+            BinaryPrimitives.WriteUInt32LittleEndian(dst.AsSpan(o), 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(dst.AsSpan(o + 4), 0xFFFFFFFFu);
+            return;
+        }
+        float dr = maxR - minR, dg = maxG - minG, db = maxB - minB;
+        int lo = -1, hi = -1; float loD = float.MaxValue, hiD = float.MinValue;
+        for (int i = 0; i < 16; i++)
+        {
+            if (clear[i]) continue;
+            float d = (r[i] - minR) * dr + (g[i] - minG) * dg + (b[i] - minB) * db;
+            if (d < loD) { loD = d; lo = i; }
+            if (d > hiD) { hiD = d; hi = i; }
+        }
+        ushort c0 = To565(r[lo], g[lo], b[lo]), c1 = To565(r[hi], g[hi], b[hi]);
+        if (c0 > c1) (c0, c1) = (c1, c0);                     // c0 <= c1 selects the three-colour palette with transparency
+        Span<int> pr = stackalloc int[3], pg = stackalloc int[3], pb = stackalloc int[3];
+        From565(c0, out pr[0], out pg[0], out pb[0]);
+        From565(c1, out pr[1], out pg[1], out pb[1]);
+        pr[2] = (pr[0] + pr[1]) / 2; pg[2] = (pg[0] + pg[1]) / 2; pb[2] = (pb[0] + pb[1]) / 2;
+        uint idx = 0;
+        for (int i = 0; i < 16; i++)
+        {
+            int best = 3;
+            if (!clear[i])
+            {
+                int bestD = int.MaxValue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int er = r[i] - pr[k], eg = g[i] - pg[k], eb = b[i] - pb[k];
+                    int d = er * er + eg * eg + eb * eb;
+                    if (d < bestD) { bestD = d; best = k; }
+                }
+            }
+            idx |= (uint)best << (2 * i);
+        }
+        BinaryPrimitives.WriteUInt16LittleEndian(dst.AsSpan(o), c0);
+        BinaryPrimitives.WriteUInt16LittleEndian(dst.AsSpan(o + 2), c1);
+        BinaryPrimitives.WriteUInt32LittleEndian(dst.AsSpan(o + 4), idx);
     }
 
     private static void EncodeBlock(ReadOnlySpan<byte> r, ReadOnlySpan<byte> g, ReadOnlySpan<byte> b, byte[] dst, int o)
