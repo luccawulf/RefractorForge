@@ -91,6 +91,18 @@ public class AnimationFormatsTests
     }
 
     [Fact]
+    public void A_clip_holds_as_many_bones_and_as_long_names_as_the_games_read()
+    {
+        // The loader keeps the bone count in a byte and reads a name into 272 bytes: 255 bones, 271 characters.
+        BoneTrack Track(string name) => new(name, new[] { Quaternion.Identity }, new[] { Vector3.Zero });
+        var most = Enumerable.Range(0, BoneAnimation.MaxBones).Select(i => Track("bone" + i)).ToList();
+        Assert.Equal(255, BoneAnimation.Load(BoneAnimation.Create(most, 1).Write()).Bones.Count);
+        Assert.Throws<ArgumentException>(() => BoneAnimation.Create(most.Append(Track("one too many")).ToList(), 1));
+        Assert.Equal(271, BoneAnimation.Load(BoneAnimation.Create(new[] { Track(new string('b', 271)) }, 1).Write()).Bones[0].Name.Length);
+        Assert.Throws<ArgumentException>(() => BoneAnimation.Create(new[] { Track(new string('b', 272)) }, 1));
+    }
+
+    [Fact]
     public void The_engine_keeps_the_two_heaviest_influences_and_reweights_the_first()
     {
         SkinInfluence I(int bone, float w) => new(bone, w, bone, 0, 0);

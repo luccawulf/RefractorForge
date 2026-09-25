@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Text;
 
@@ -60,6 +61,10 @@ public sealed class BoneAnimation
     /// <summary>Run limits of DICE's encoder, never exceeded by a retail clip: constant runs cover 6..126 frames,
     /// literal runs 1..125 (the header's span has 7 bits).</summary>
     public const int MinConstantRun = 6, MaxConstantRun = 126, MaxLiteralRun = 125;
+
+    /// <summary>The most bones, and the longest bone name, a clip the games play can have: the loader keeps the count in
+    /// a byte and reads a name into a 272-byte buffer.</summary>
+    public const int MaxBones = 255, MaxNameLength = 271;
 
     public int Version { get; }
     public int FrameCount { get; }
@@ -226,7 +231,11 @@ public sealed class BoneAnimation
     /// </summary>
     public static BoneAnimation Create(IReadOnlyList<BoneTrack> tracks, int frameCount, int? quantBits = null)
     {
-        if (tracks.Count is 0 or > 4096) throw new ArgumentException($"{tracks.Count} bones: a clip holds 1..4096.");
+        // The engine's loader (BoneAnimation::BoneAnimation) keeps the count in a byte and reads each name into a 272-byte
+        // buffer: a clip it can play has 1..255 bones named in 271 characters or fewer.
+        if (tracks.Count is 0 or > MaxBones) throw new ArgumentException($"{tracks.Count} bones: the games play a clip of 1..{MaxBones}.");
+        if (tracks.FirstOrDefault(t => t.Name.Length > MaxNameLength) is { } longName)
+            throw new ArgumentException($"bone '{longName.Name[..20]}...' is named in {longName.Name.Length} characters: the games read {MaxNameLength} at most.");
         if (frameCount is < 1 or > 0xFFFF) throw new ArgumentOutOfRangeException(nameof(frameCount), frameCount, "a clip holds 1..65535 frames");
         float furthest = 0f;
         foreach (var t in tracks)
