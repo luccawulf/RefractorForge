@@ -79,6 +79,7 @@ public class GroundOriginalTests
     [InlineData("RF_GroundOriginal.dds")]                 // a folder level's copy
     [InlineData("al_vietnas.RF_GroundOriginal.dds")]      // a packed level's, beside the archive
     [InlineData("Textures/RF_GroundOriginal.dds")]
+    [InlineData("Textures/TerrainShadow.dds")]           // the sun-shadow bake's picture: the engine reads the .lsb
     public void The_kept_ground_is_never_packed(string rel)
     {
         // It is a whole second copy of the terrain art. Packed, it would bloat the level and put a file the engine

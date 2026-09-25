@@ -309,6 +309,9 @@ public static class LevelSaver
             // Object groups and review notes are editor-side too: the engine has no notion of either.
             || LevelSidecar.IsNamed(leaf, Editing.ObjectGroups.FileName)
             || LevelSidecar.IsNamed(leaf, Editing.Annotations.FileName)
+            // The sun-shadow bake's picture is the editor's view of it: the engine reads the lightmap's
+            // LightmapShadowBits.lsb, never this, so a level would only carry it as dead weight.
+            || leaf.Equals("TerrainShadow.dds", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("sound_debug.log", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("imgui.ini", System.StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("Thumbs.db", System.StringComparison.OrdinalIgnoreCase)

@@ -5163,6 +5163,8 @@ void MarkAllTilesDirty()
 // the user picks this map from the in-game list. Closes the loop on everything that's editor-only-verified.
 void DoTestLevel()
 {
+    // The games' own mods: a test pack never replaces one of their level archives.
+    string[] retailMods = { "bf1942", "XPack1", "XPack2", "BfVietnam", "BFV_WW2Mod" };
     if (so is null || levelDir is null) { Toast(Loc.T("Load a level first.")); return; }
     DoSave();   // write the edits back so the game reads them
     string? gameRoot = null, modName = null;
@@ -5181,8 +5183,15 @@ void DoTestLevel()
             string map = proj.EffectiveMapName;
             string rfaName = map + (string.IsNullOrEmpty(proj.PatchNumber) ? "" : "_" + proj.PatchNumber) + ".rfa";
             string destDir = Path.Combine(gameRoot, "Mods", modName, "Archives", baseSub, "levels");
-            Directory.CreateDirectory(destDir);
             string outRfa = Path.Combine(destDir, rfaName);
+            // Never over a game's own level archive: a retail mod's <Map>.rfa is the stock level (a project without a
+            // GameTestDir or a patch number would replace it with this folder's pack).
+            if (retailMods.Contains(modName, StringComparer.OrdinalIgnoreCase) && File.Exists(outRfa) && string.IsNullOrEmpty(proj.PatchNumber))
+            {
+                Toast($"Test This Level would overwrite {modName}'s own {rfaName}: set the project's GameTestDir or a patch number.");
+                return;
+            }
+            Directory.CreateDirectory(destDir);
             int n = RefractorForge.Formats.LevelSaver.PackFolder(levelDir, outRfa, $"{baseSub}/levels/{map}/");
             Console.WriteLine($"Test This Level: packed {n} file(s) -> {outRfa}");
         }
