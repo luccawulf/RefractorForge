@@ -244,6 +244,23 @@ public static class TgaTexture
         return buf;
     }
 
+    /// <summary>An 8-bit greyscale TGA, one byte per pixel given top row first - the menu font atlas format DICE's
+    /// FontMakerEx writes and every retail <c>font/*.tga</c> but one is in: image type 3, no colour map, 8 bits,
+    /// descriptor 0x20 (top-left origin, no alpha bits).</summary>
+    public static byte[] EncodeGray8(int width, int height, ReadOnlySpan<byte> grey)
+    {
+        if (width is < 1 or > 65535 || height is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(width), $"{width} x {height}");
+        if (grey.Length != width * height) throw new ArgumentException($"{grey.Length} pixels for {width} x {height}", nameof(grey));
+        var buf = new byte[18 + grey.Length];
+        buf[2] = 3;                                   // image type 3 = greyscale, uncompressed
+        buf[12] = (byte)(width & 0xFF); buf[13] = (byte)(width >> 8);
+        buf[14] = (byte)(height & 0xFF); buf[15] = (byte)(height >> 8);
+        buf[16] = 8;
+        buf[17] = 0x20;                               // top-left origin: rows as given
+        grey.CopyTo(buf.AsSpan(18));
+        return buf;
+    }
+
     public static byte[] EncodeGrayColormapped(Texture2D t)
     {
         int w = t.Width, h = t.Height;

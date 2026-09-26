@@ -33,11 +33,23 @@ public sealed record DifGlyph(int Code, float A, float B, float C, int Top, int 
 /// </list>
 /// A repeated glyph code or kerning pair keeps its first entry (the engine inserts into a std::map). Every
 /// <c>.dif</c> in both games' <c>font.rfa</c>, every language, reads.
+/// <para>DICE's FontMakerEx 1.2 (the MDT's font tool) writes one layout, which <see cref="ToBytes"/> writes again byte
+/// for byte: CRLF lines, the header's fields one to a line, then <c>glyphs</c>, its count and one tab-separated line per
+/// glyph in code order, then <c>kerning</c>, its count and one tab-separated pair per line. The retail files in any
+/// other layout are FontMakerEx files re-saved from a spreadsheet (header lines padded with tabs).</para>
 /// </summary>
 public sealed class DifFont
 {
+    /// <summary>The longest name the header holds: the engine reads it with getline into a 33-byte buffer.</summary>
+    public const int MaxNameLength = 32;
+
     private readonly Dictionary<int, DifGlyph> _glyphs = new();
+    private readonly List<DifGlyph> _order = new();
     private readonly Dictionary<(int, int), float> _kerning = new();
+    // Every entry as the file lists it, repeats included, so a file writes back as it was (FontMakerEx wrote the pair
+    // v . twice into every Trebuchet kerning table); the dictionaries keep the first, as the engine does.
+    private readonly List<DifGlyph> _glyphLines = new();
+    private readonly List<(int First, int Second, float Amount)> _kerningLines = new();
 
     public int Version { get; private set; }
     public string Name { get; private set; } = "";
@@ -47,9 +59,78 @@ public sealed class DifFont
     public int Height { get; private set; }
     public float LineHeight { get; private set; }
     public IReadOnlyDictionary<int, DifGlyph> Glyphs => _glyphs;
+    /// <summary>The glyphs the engine keeps, in the order the file lists them.</summary>
+    public IReadOnlyList<DifGlyph> GlyphList => _order;
     public IReadOnlyDictionary<(int First, int Second), float> Kerning => _kerning;
 
     public DifGlyph? Glyph(int code) => _glyphs.GetValueOrDefault(code);
+
+    /// <summary>A new font: version 2, the glyphs in code order, the kerning pairs in the order given (a repeat keeps the
+    /// first, as the engine does). Throws <see cref="ArgumentException"/> for a name the header cannot hold (empty,
+    /// longer than <see cref="MaxNameLength"/>, starting with white space or holding a line break or a character
+    /// outside Latin-1), a glyph code outside a UTF-16 unit, or an atlas size below 1.</summary>
+    public static DifFont Create(string name, int width, int height, float lineHeight, IEnumerable<DifGlyph> glyphs,
+                                 IEnumerable<(int First, int Second, float Amount)>? kerning = null)
+    {
+        CheckName(name);
+        if (width < 1 || height < 1) throw new ArgumentException($"atlas size {width} x {height}");
+        var f = new DifFont { Version = 2, Name = name, Width = width, Height = height, LineHeight = lineHeight };
+        foreach (var g in glyphs.OrderBy(g => g.Code))
+        {
+            if (g.Code is < 0 or > 0xFFFF) throw new ArgumentException($"glyph code {g.Code} does not fit a UTF-16 unit");
+            if (f._glyphs.TryAdd(g.Code, g)) { f._order.Add(g); f._glyphLines.Add(g); }
+        }
+        foreach (var (a, b, amount) in kerning ?? Array.Empty<(int, int, float)>())
+            if (f._kerning.TryAdd((a, b), amount)) f._kerningLines.Add((a, b, amount));
+        return f;
+    }
+
+    /// <summary>Why a name cannot go in a header, or null when it can.</summary>
+    public static string? NameProblem(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return "a font needs a name";
+        if (name.Length > MaxNameLength) return $"the header holds at most {MaxNameLength} characters of the name";
+        if (char.IsWhiteSpace(name[0])) return "the name cannot start with a space (the engine skips it and reads the next line)";
+        foreach (var c in name)
+            if (c is '\r' or '\n' || c > 0xFF || char.IsControl(c)) return $"the name cannot hold '{(c < 32 ? "\\x" + ((int)c).ToString("X2") : c.ToString())}'";
+        return null;
+    }
+
+    private static void CheckName(string name)
+    {
+        if (NameProblem(name) is { } why) throw new ArgumentException(why, nameof(name));
+    }
+
+    /// <summary>The file in FontMakerEx's layout (see the class notes): what the engine reads back as this font. A read
+    /// file's entries are written as it listed them, repeats included.</summary>
+    public byte[] ToBytes()
+    {
+        CheckName(Name);
+        var s = new StringBuilder();
+        s.Append("header\r\n").Append(Version.ToString(CultureInfo.InvariantCulture)).Append("\r\n")
+         .Append(Name).Append("\r\n")
+         .Append(Width.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+        if (Version > 1) s.Append(Height.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+        s.Append(Num(LineHeight)).Append("\r\n");
+        s.Append("glyphs\r\n").Append(_glyphLines.Count.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+        foreach (var g in _glyphLines)
+            s.Append(g.Code.ToString(CultureInfo.InvariantCulture)).Append('\t')
+             .Append(Num(g.A)).Append('\t').Append(Num(g.B)).Append('\t').Append(Num(g.C)).Append('\t')
+             .Append(g.Top.ToString(CultureInfo.InvariantCulture)).Append('\t')
+             .Append(g.X0.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(g.Y0.ToString(CultureInfo.InvariantCulture)).Append('\t')
+             .Append(g.X1.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(g.Y1.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+        if (_kerningLines.Count > 0)
+        {
+            s.Append("kerning\r\n").Append(_kerningLines.Count.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+            foreach (var (a, b, amount) in _kerningLines)
+                s.Append(a.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(b.ToString(CultureInfo.InvariantCulture)).Append('\t')
+                 .Append(Num(amount)).Append("\r\n");
+        }
+        return Encoding.Latin1.GetBytes(s.ToString());
+    }
+
+    /// <summary>A number as the tool writes it: whole numbers without a point, others in the shortest form that reads back.</summary>
+    private static string Num(float v) => v.ToString("R", CultureInfo.InvariantCulture);
 
     /// <summary>Read a <c>.dif</c>. Throws <see cref="InvalidDataException"/> when it has no header or a section's
     /// numbers do not read.</summary>
@@ -64,7 +145,7 @@ public sealed class DifFont
             {
                 case "header":
                     f.Version = w.UInt();
-                    f.Name = w.RestOfLine(32).TrimEnd('\r', '\t', ' ');
+                    f.Name = w.RestOfLine(MaxNameLength).TrimEnd('\r', '\t', ' ');
                     f.Width = w.UInt();
                     f.Height = f.Version > 1 ? w.UInt() : f.Width;
                     f.LineHeight = w.Float();
@@ -78,6 +159,7 @@ public sealed class DifFont
                         int a = w.UInt(), b = w.UInt();
                         float amount = w.Float();
                         f._kerning.TryAdd((a, b), amount);
+                        f._kerningLines.Add((a, b, amount));
                     }
                     break;
                 }
@@ -91,7 +173,9 @@ public sealed class DifFont
                         float a = w.Float(), b = w.Float(), c = w.Float();
                         int top = w.Int();
                         int x0 = w.UInt(), y0 = w.UInt(), x1 = w.UInt(), y1 = w.UInt();
-                        f._glyphs.TryAdd(code, new DifGlyph(code, a, b, c, top, x0, y0, x1, y1));
+                        var g = new DifGlyph(code, a, b, c, top, x0, y0, x1, y1);
+                        if (f._glyphs.TryAdd(code, g)) f._order.Add(g);
+                        f._glyphLines.Add(g);
                     }
                     break;
                 }
