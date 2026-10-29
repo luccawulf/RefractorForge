@@ -65,6 +65,10 @@ for big maps and for the uncompressed-archive code path (see RFA note below).
   same-cell spacing by the `_m2` mesh's radius. See `docs/BFV_Growth_Placement.md` (summary, conflicts with
   the `OvergrowthFoliage` notes, validation) and `docs/BFV_Overgrowth_RE.md` (addresses); reference
   implementation `tools/bfv_growth/overgrowth_place.py`.
+- **Undergrowth placement too:** the same generator per display patch of `256 / floor(256 / (vd / 4))` m
+  around the camera (Irving's `viewdistance="60"`: 15.0588 m), a 1024-vertex / 4096-index budget (at most 64
+  instances), never stored; drawn unlit as `saturate(4 * atlas * terrain colour)`, fading out over the last
+  30 % of viewDistance. `docs/BFV_Undergrowth_RE.md`, `tools/bfv_growth/undergrowth_place.py`.
 - The `.wst` palette (XML) describes the available growth types. RefractorForge parses it for display and
   copies it through **verbatim** on save; painting mutates only the `.raw` index maps.
 - Gotcha: `overGrowth.wst` ships with a stray leading space before `<?xml` — trim it before parsing.

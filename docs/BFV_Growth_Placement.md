@@ -5,11 +5,10 @@
 against an in-game screenshot of Operation Irving's US base: with the level's own `_M1` meshes placed at the
 generated positions, the palms land where the game puts them (the row along the shore west of the hangar,
 the cluster on the slope to its north-east). It has **not** yet been compared tree for tree with a capture.
-Undergrowth: the shared code is identified (below); its own details are being verified
-(`docs/BFV_Undergrowth_RE.md` when done).
+Undergrowth is reversed the same way (section below); no in-game comparison yet.
 
 The full evidence, every claim tagged verified / inferred / unknown with its address, is
-`docs/BFV_Overgrowth_RE.md`. This page is the editor-facing summary.
+`docs/BFV_Overgrowth_RE.md` and `docs/BFV_Undergrowth_RE.md`. This page is the editor-facing summary.
 
 ## What it means for RefractorForge
 
@@ -80,18 +79,49 @@ positions equal to float precision. Operation Irving is the level this pass was 
 was full). Around the US base hangar (world 805, 502): 19 generated within 120 m, the nearest a palm 63 m
 west; nothing within about 50 m, where the hangar stands on dirt road and default material.
 
-## Undergrowth (status)
+## Undergrowth
 
-From the code it shares with overgrowth: the same loop, RNG, roulette, budget and spacing. It generates
-**lazily per display patch** around the camera (`GrowthManager::vf11` 0x75e140), seeded
-`(pz*4711 + px*13 + 23)`; the budget comes from the patch buffer `RaStreamDataEditable(0x400, 0x1000,
-0x1c)` (0x71f987): 1024 x densityScale vertices and 4096 indices (which getter is which is inferred);
-viewDistance defaults to 70 and `ps = 256 / floor(256 / (vd / 4))` (0x71fe20, 0x71fda0); no import and no
-close-range objects. Being verified; this section will be replaced by `docs/BFV_Undergrowth_RE.md`.
+Overgrowth's generator (the same RNG, roulette, budget stop and same-patch spacing), but per small
+**display patch around the camera**, generated on demand and never stored (`GrowthManager::vf11`
+0x75e140). Full report: `docs/BFV_Undergrowth_RE.md`.
+
+- **Patches:** squares of `ps = 256 / floor(256 / (viewDistance / 4))` metres anchored at the world origin.
+  Irving's `underGrowth.wst` writes `viewdistance="60"` (lower case; property names match case-insensitively),
+  so `ps` = 256 / 17 = 15.0588 m: 17 per 256 m terrain colour tile, 136 x 136 over the map. Without it the
+  default 70 m gives 18.29 m.
+- **Map:** `UnderGrowthMap.raw` 1024 x 1024 over 2048 m, 2 m cells, row = z and column = x.
+- **Seed** `(pz*4711 + px*13 + 23) & 0x7fffffff`; **budget** 1024 vertices and 4096 indices (the patch
+  buffer's capacity), so 128 iterations and at most 64 instances a patch. No static-object import and no
+  spacing across patches.
+- **Which patches exist:** a 10 x 10 ring of slots around the camera's patch (cx-4 to cx+5); a slot is
+  generated and drawn while its nearest corner is within viewDistance (vertical distance weighted 0.2). A
+  patch that leaves and comes back regenerates identically, so a cache keyed (px, pz) is exact.
+- **`.wst`:** the same six per-type attributes as overgrowth plus an optional `rotation` (Irving uses none);
+  no colour, alpha or wind. The root sets only `materialMapSideSize` and `viewdistance`; the fade settings
+  keep their defaults (fadeRange 0.3; close-to-ground 1.0 / 0.4 / 12).
+- **`Game.hidableUndergrowthMaterials 2,3`** is read only by bot visibility (the undergrowth material under a
+  position tested against the list), never by rendering.
+- **Drawing:** each type's `.sm`, first LOD and first material, no LOD switching, wind or collision. Vertices
+  are 28 bytes: position, the mesh uv, and a second uv over the 256 m terrain colour tile under the patch.
+  Fixed-function and unlit: colour `saturate(4 * atlas.rgb * terrainColour.rgb)` (Irving's atlas
+  `texture/F_undergrowthOI`, from the level's `underGrowth.rs`), alpha `atlas.a * patchAlpha`, blended
+  SrcAlpha / InvSrcAlpha with depth writes, alpha-test reference `min(patchAlpha * 255, 100)`. Opaque to 70 %
+  of viewDistance (42 m), then linear to nothing at viewDistance; near patches dim further only with the eye
+  within 1 m of the ground. Drawn after terrain, overgrowth, objects and water, back to front.
+- **Irving:** around the hangar 69 patches, 772 instances (mostly sand, sand road and default there); the
+  grass west of it at (760, 520) 69 patches, 1165 instances, 35-49 a patch, held by the vertex budget; a 1-in-16
+  sample of the map 1156 patches, 30,289 instances (about 485k map-wide), juicyGrass averaging 43.6 a patch
+  and 98 % of them stopping on the budget.
+- **Open:** how `run growth/underGrowth` reaches the `.wst` loader (inferred); cull mode and fog are inherited
+  (draw double-sided); the far cull and terrain occlusion at draw time are unidentified (they do not change
+  what is generated); the terrain-uv scale hard-codes 4 m height posts (right for Irving).
 
 ## Files
 
 - `docs/BFV_Overgrowth_RE.md`: the full report (layouts, addresses, confidence tags, open questions).
+- `docs/BFV_Undergrowth_RE.md` and `tools/bfv_growth/undergrowth_place.py` (imports `overgrowth_place.py`
+  from the same folder): "game" mode reproduces the camera ring around a point, "radius" mode every patch
+  within N metres; `--json` writes each instance with its patch alpha.
 - `tools/bfv_growth/overgrowth_place.py`: the reference implementation (Python 3 + numpy).
   `python -I tools/bfv_growth/overgrowth_place.py --level <level dir> --meshes <standardMesh dir>
   --objects <objects dir> [--cx 805 --cz 502 --radius 120] [--json out.json]` prints the count per type and
