@@ -56,7 +56,15 @@ for big maps and for the uncompressed-archive code path (see RFA note below).
 
 - `UnderGrowthMap.raw` is 1024²; `OverGrowthMap.raw` is 512².
 - These are **discrete index maps** — each byte is a palette index in the range **0–14**, *not* a 0–255
-  density. Indices correlate with the terrain material.
+  density. Indices correlate with the terrain material: the index is a terrain material id, the `.wst`'s
+  `<materials>` children following the engine's material table (0 default, 1 water, 2 dryGrass, ...,
+  7 deathMaterial, ... 15 pavelRoad).
+- **Overgrowth placement is reversed exactly for the stock exe** (2026-10-29): whole map at load in cells
+  of viewDistance/4 rounded to fit, per-cell seed `(23 + 13i + 4711j) & 0x7fffffff`, a mod 2^31 - 1 RNG,
+  256 candidates a cell, a per-cell budget of 2048 vertices / 8192 indices as the real density limit, and
+  same-cell spacing by the `_m2` mesh's radius. See `docs/BFV_Growth_Placement.md` (summary, conflicts with
+  the `OvergrowthFoliage` notes, validation) and `docs/BFV_Overgrowth_RE.md` (addresses); reference
+  implementation `tools/bfv_growth/overgrowth_place.py`.
 - The `.wst` palette (XML) describes the available growth types. RefractorForge parses it for display and
   copies it through **verbatim** on save; painting mutates only the `.raw` index maps.
 - Gotcha: `overGrowth.wst` ships with a stray leading space before `<?xml` — trim it before parsing.
