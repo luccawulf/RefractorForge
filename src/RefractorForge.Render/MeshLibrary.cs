@@ -68,6 +68,10 @@ public sealed class MeshLibrary
         /// <summary>Per-vertex 2nd UV (baked-object-lightmap UV), parallel to <see cref="Positions"/>; null when the
         /// mesh carries no lightmap channel. The editor samples the level's ObjectLightMaps/*.tga with these.</summary>
         public System.Numerics.Vector2[]? LightmapUvs { get; init; }
+        /// <summary>The mesh's vertices carry no tangent frame (32- or 40-byte, not the 64-byte planar layout), so
+        /// BfVietnam draws it through its fixed-function shaders and not the per-pixel ones. The two light it
+        /// differently - see <see cref="EngineLight.Material.VertexLit"/>.</summary>
+        public bool VertexLit { get; init; }
         public int Triangles { get { int n = 0; foreach (var p in Parts) n += p.Indices.Length / 3; return n; } }
     }
 
@@ -944,7 +948,12 @@ public sealed class MeshLibrary
             }
         }
         return mats.Count > 0
-            ? new Mesh(pos.ToArray(), uvs.ToArray(), mats.ToArray()) { LightmapUvs = anyLm ? lmuvs.ToArray() : null }
+            ? new Mesh(pos.ToArray(), uvs.ToArray(), mats.ToArray())
+              {
+                  LightmapUvs = anyLm ? lmuvs.ToArray() : null,
+                  // An assembly is vertex-lit when its lightmapped parts are (mixed ones go by the first that has an unwrap).
+                  VertexLit = (parts.FirstOrDefault(vp => vp.Mesh.LightmapUvs is not null)?.Mesh ?? parts[0].Mesh).VertexLit,
+              }
             : null;
     }
 
@@ -1909,6 +1918,7 @@ public sealed class MeshLibrary
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())
         {
             LightmapUvs = anyLm ? lmuvs.ToArray() : null,   // only carry a 2nd UV set when the mesh actually has one
+            VertexLit = sm.Lods[0].All(x => x.VertexByteSize < 64),
         };
     }
 

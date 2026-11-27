@@ -883,6 +883,18 @@ public sealed class TerrainTexture
     /// <summary>Representative tile resolution (largest tile width) — for reporting.</summary>
     public int AtlasSize => _maxTile;
 
+    /// <summary>
+    /// Write every tile at this size instead of the size it shipped at. A lighting bake puts detail into the ground
+    /// that the shipped size cannot hold - a retail tile is 256 px over 256 m, one texel a metre, and a shadow's edge
+    /// is finer than that - so the bake asks for the tiles to be cut at the resolution it worked at. Null keeps each
+    /// tile's own size, which is right for everything else: re-cutting a painted tile larger adds bytes, not detail.
+    /// </summary>
+    public int? SaveTileSize { get; set; }
+
+    /// <summary>The largest tile any shipped level uses and the game is known to draw: Saigon68's and PoE El
+    /// Alamein's 1024 px DXT1 tiles.</summary>
+    public const int MaxSaveTileSize = 1024;
+
     /// <summary>True when this level's terrain tiles are in a form the game cannot draw: not block-compressed. Only
     /// one thing ever wrote those - an older RefractorForge, which saved 1024x1024 uncompressed mip-less tiles and
     /// left the ground BLACK in game. The editor re-encodes them on the next save. SIZE is not a fault: retail BFV
@@ -1293,6 +1305,7 @@ public sealed class TerrainTexture
                     var nt = _tileNative[col, row];
                     tw = th = nt.Dxt ? nt.W : Math.Min(nt.W, 256);
                 }
+                if (SaveTileSize is int st && st >= 64) tw = th = Math.Min(st, MaxSaveTileSize);
                 var rgba = new byte[tw * th * 4];
                 for (int ty = 0; ty < th; ty++)
                 {

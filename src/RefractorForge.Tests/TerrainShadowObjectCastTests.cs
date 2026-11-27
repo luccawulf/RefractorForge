@@ -105,7 +105,7 @@ public class TerrainShadowObjectCastTests
         // The .lsb stores the OPPOSITE sense of "lit", so a flagged texel is a shadowed one.
         int Flagged(LightmapShadowBits l)
         {
-            var vis = l.ToVisibility(out _);
+            var vis = l.ToShadowMask(out _);
             int n = 0; foreach (var v in vis) if (v != 0) n++;
             return n;
         }

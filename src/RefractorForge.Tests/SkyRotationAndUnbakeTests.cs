@@ -73,7 +73,7 @@ public class UnbakeTests
     public void An_unshadowed_map_has_no_shadow_anywhere()
     {
         var lsb = TerrainShadow.UnshadowedLsb(gridDim: 2, tilePx: 64);
-        var vis = lsb.ToVisibility(out int side);
+        var vis = lsb.ToShadowMask(out int side);
         Assert.Equal(128, side);
         Assert.Equal(128 * 128, vis.Length);
         Assert.All(vis, b => Assert.Equal(0, b));
@@ -87,7 +87,7 @@ public class UnbakeTests
         var bytes = lsb.Encode();
         var back = LightmapShadowBits.Decode(bytes);
         Assert.Equal(lsb.GridDim, back.GridDim);
-        Assert.All(back.ToVisibility(out _), b => Assert.Equal(0, b));
+        Assert.All(back.ToShadowMask(out _), b => Assert.Equal(0, b));
         Assert.Equal(bytes, back.Encode());
     }
 
@@ -102,7 +102,7 @@ public class UnbakeTests
         var cfg = new TerrainConfig { MaterialSize = 64, WorldSize = 256, YScale = 1f, WaterLevel = 0 };
         var baked = TerrainShadow.BakeToLsb(hm, cfg, new RefractorForge.Formats.Geometry.Vec3(1f, 0.15f, 0f),
                                             gridDim: 1, tilePx: 64);
-        Assert.Contains(baked.ToVisibility(out _), b => b != 0);
-        Assert.All(TerrainShadow.UnshadowedLsb(1, 64).ToVisibility(out _), b => Assert.Equal(0, b));
+        Assert.Contains(baked.ToShadowMask(out _), b => b != 0);
+        Assert.All(TerrainShadow.UnshadowedLsb(1, 64).ToShadowMask(out _), b => Assert.Equal(0, b));
     }
 }

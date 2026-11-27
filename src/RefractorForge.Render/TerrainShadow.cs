@@ -173,7 +173,7 @@ public static class TerrainShadow
                 full[dstRow + x] = lit ? (byte)255 : (byte)0;
             }
         }
-        return LightmapShadowBits.FromVisibility(full, fullSide, gridDim, tilePx);
+        return LightmapShadowBits.FromShadowMask(full, fullSide, gridDim, tilePx);
     }
 
     /// <summary>A shadow map with NOTHING in shadow, for undoing a bake. The engine stores the OPPOSITE sense of
@@ -184,7 +184,7 @@ public static class TerrainShadow
     {
         if (gridDim < 1) throw new ArgumentOutOfRangeException(nameof(gridDim));
         int fullSide = gridDim * tilePx;
-        return LightmapShadowBits.FromVisibility(new byte[fullSide * fullSide], fullSide, gridDim, tilePx);
+        return LightmapShadowBits.FromShadowMask(new byte[fullSide * fullSide], fullSide, gridDim, tilePx);
     }
 
     /// <summary>The terrain height span in metres (min, max) — precompute once and pass to <see cref="PointLit"/>.</summary>

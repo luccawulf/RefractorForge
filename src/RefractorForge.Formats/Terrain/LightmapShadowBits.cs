@@ -19,7 +19,7 @@ namespace RefractorForge.Formats.Terrain
     //   u32 rowCounts[numRows]             // span count per row
     //   for r in 0..numRows:
     //     u16 head                         // one head value per row
-    //     u16 span[rowCounts[r]]           // each span: bits 0..12 = run length, bit 13 (0x2000) = lit flag
+    //     u16 span[rowCounts[r]]           // each span: bits 0..12 = run length, bit 13 (0x2000) = SHADOW flag
     //
     // We retain the exact parsed values so Encode() reproduces the original bytes verbatim — the
     // RFA/DDS "round-trip the real file byte-exact first" discipline. Pixel semantics (expanding the
@@ -27,9 +27,17 @@ namespace RefractorForge.Formats.Terrain
     // shadow-bake write-back step, which is a separate concern.
     public sealed class LightmapShadowBits
     {
-        // Bit 13 (0x2000) of a span token is the "lit" flag; the low 13 bits are the run length. A row is a
-        // run-length-encoded scanline of LIT_RUN_MAX-wide visibility, runs strictly alternating lit/shadow.
-        public const int LitFlag = 0x2000;
+        // Bit 13 (0x2000) of a span token says the run is IN SHADOW; the low 13 bits are the run length. A row
+        // is a run-length-encoded scanline, runs strictly alternating shadow / not.
+        //
+        // That it means shadow and not light is measured twice over (2026-11-27). In the game: on the calibration
+        // level, objects with no lightmap standing where the flag was set were dimmed toward Terrain.ShadowAmbient
+        // and the same objects where it was clear got the full light. In the retail files: on every level tried
+        // the ground texture under a set flag is about half as bright as under a clear one (Hue 50 against 94,
+        // Fall of Saigon 28 against 52), and only with the raster read row 0 = south, column 0 = west - every
+        // other orientation shows no difference at all. This constant used to be called ShadowFlag, and the rasters
+        // below "visibility, lit = 255"; the bakes knew better and inverted before calling, but the name was a trap.
+        public const int ShadowFlag = 0x2000;
         public const int RunMask = 0x1FFF;
 
         public sealed class Row
@@ -49,19 +57,19 @@ namespace RefractorForge.Formats.Terrain
                 get { int w = Head & RunMask; foreach (var s in Spans) w += s & RunMask; return w; }
             }
 
-            /// <summary>Expand this RLE row into per-pixel visibility (lit=255, shadow=0) at <paramref name="dst"/>[off..].</summary>
+            /// <summary>Expand this RLE row into a per-pixel shadow mask (255 = in shadow, 0 = not) at <paramref name="dst"/>[off..].</summary>
             public void ToPixels(byte[] dst, int off)
             {
                 foreach (ushort t in Tokens)
                 {
-                    byte v = (t & LitFlag) != 0 ? (byte)255 : (byte)0;
+                    byte v = (t & ShadowFlag) != 0 ? (byte)255 : (byte)0;   // 255 = in shadow
                     int run = t & RunMask;
                     for (int i = 0; i < run; i++) dst[off++] = v;
                 }
             }
 
             /// <summary>
-            /// Canonical RLE of a visibility scanline (any non-zero pixel = lit): maximal alternating runs.
+            /// Canonical RLE of a shadow-mask scanline (any non-zero pixel = in shadow): maximal alternating runs.
             /// This is the exact form the engine writes — re-encoding a real row reproduces its bytes.
             /// </summary>
             public static Row FromPixels(ReadOnlySpan<byte> line)
@@ -101,7 +109,7 @@ namespace RefractorForge.Formats.Terrain
             public int Width => Rows.Length == 0 ? 0 : Rows[0].PixelWidth;
             public int Height => Rows.Length;
 
-            /// <summary>Decode the tile to a row-major visibility raster (lit=255, shadow=0), Height*Width bytes.</summary>
+            /// <summary>Decode the tile to a row-major shadow mask (255 = in shadow, 0 = not), Height*Width bytes.</summary>
             public byte[] ToRaster()
             {
                 int w = Width, h = Height;
@@ -110,7 +118,7 @@ namespace RefractorForge.Formats.Terrain
                 return px;
             }
 
-            /// <summary>Build a tile by canonically RLE-encoding a row-major visibility raster (non-zero = lit).</summary>
+            /// <summary>Build a tile by canonically RLE-encoding a row-major shadow mask (non-zero = in shadow).</summary>
             public static Tile FromRaster(ReadOnlySpan<byte> raster, int width, int height)
             {
                 var rows = new Row[height];
@@ -142,11 +150,11 @@ namespace RefractorForge.Formats.Terrain
         // together they form a (GridDim*TilePixels) square visibility image of the whole world. Column 0 is
         // world -X edge, row 0 is world -Z edge — the SAME orientation TerrainShadow.Bake/BakeAtlas already use
         // (texel (x,y) -> world (x/size*ws, y/size*ws)), so a bake slots straight in. NOTE: the absolute world
-        // orientation (which corner the engine treats as (0,0), and row +Z vs -Z) is the one thing NOT yet
-        // confirmed in-game; if a generated map's shadows come out mirrored/rotated, flip here, not in the codec.
+        // Orientation: row 0 is the south edge and column 0 the west edge, the same way the ground atlas runs.
+        // Settled against the retail ground textures (see ShadowFlag above), not by eye.
 
-        /// <summary>Stitch all tiles into one row-major visibility raster (lit=255, shadow=0); side = GridDim*TilePixels.</summary>
-        public byte[] ToVisibility(out int side)
+        /// <summary>Stitch all tiles into one row-major shadow mask (255 = in shadow, 0 = not; row 0 = south, column 0 = west); side = GridDim*TilePixels.</summary>
+        public byte[] ToShadowMask(out int side)
         {
             int g = GridDim, tp = TilePixels;
             side = g * tp;
@@ -155,7 +163,7 @@ namespace RefractorForge.Formats.Terrain
                 for (int gx = 0; gx < g; gx++)
                 {
                     var tile = Tiles[gy * g + gx];
-                    if (tile.IsEmpty) continue;                 // empty tile = all shadow (0), already zero-filled
+                    if (tile.IsEmpty) continue;                 // an empty tile has nothing in shadow: already zero
                     var raster = tile.ToRaster();               // tp*tp, row-major
                     for (int r = 0; r < tp; r++)
                         Array.Copy(raster, r * tp, full, (gy * tp + r) * side + gx * tp, tp);
@@ -164,10 +172,10 @@ namespace RefractorForge.Formats.Terrain
         }
 
         /// <summary>
-        /// Build a full .lsb from a whole-world visibility raster (non-zero = lit), slicing it into a
-        /// gridDim x gridDim grid of tilePx-square tiles. Inverse of <see cref="ToVisibility"/>.
+        /// Build a full .lsb from a whole-world shadow mask (non-zero = in shadow), slicing it into a
+        /// gridDim x gridDim grid of tilePx-square tiles. Inverse of <see cref="ToShadowMask"/>.
         /// </summary>
-        public static LightmapShadowBits FromVisibility(ReadOnlySpan<byte> visibility, int side, int gridDim, int tilePx = 1024)
+        public static LightmapShadowBits FromShadowMask(ReadOnlySpan<byte> visibility, int side, int gridDim, int tilePx = 1024)
         {
             if (gridDim < 1) throw new ArgumentOutOfRangeException(nameof(gridDim));
             if (side != gridDim * tilePx) throw new ArgumentException($"side {side} must equal gridDim*tilePx ({gridDim * tilePx}).");

@@ -178,6 +178,42 @@ public sealed record LightPreset(string Name, float R, float G, float B, float I
 }
 
 /// <summary>
+/// A level's outdoor light as the realistic bake's settings: a sun and a sky, described as light rather than as the
+/// engine's colours. The sun's DIRECTION is not here - it is the level's own, in SkyAndSun.con. Plain numbers so the
+/// sidecar stays a small readable file; the renderer turns them into its own model.
+/// </summary>
+public sealed class DaylightSettings
+{
+    /// <summary>The sun's colour (the moon's, on a night level). Only its hue is used.</summary>
+    public float SunR { get; set; } = 1f;
+    public float SunG { get; set; } = 0.95f;
+    public float SunB { get; set; } = 0.86f;
+    /// <summary>The sky's colour straight up.</summary>
+    public float ZenithR { get; set; } = 0.34f;
+    public float ZenithG { get; set; } = 0.52f;
+    public float ZenithB { get; set; } = 0.92f;
+    /// <summary>The sky's colour at the horizon.</summary>
+    public float HorizonR { get; set; } = 0.76f;
+    public float HorizonG { get; set; } = 0.84f;
+    public float HorizonB { get; set; } = 0.96f;
+    /// <summary>How much light the open sky gives level ground, against what the sun gives a surface facing it:
+    /// about 0.2 clear, 0.45 hazy, above 1 overcast.</summary>
+    public float SkyStrength { get; set; } = 0.2f;
+    /// <summary>How bright a surface facing the sun is drawn: 1 is its texture at full brightness. About 1.05 by
+    /// day, 0.3 by night.</summary>
+    public float Brightness { get; set; } = 1.05f;
+    /// <summary>Scales bounced light; 1 is physical.</summary>
+    public float Bounce { get; set; } = 1f;
+    /// <summary>How bright interiors are allowed to be: sets the engine's ambient floor.</summary>
+    public float Interior { get; set; } = 0.3f;
+    /// <summary>On a level lit by lamps: how bright a lamp-lit wall can get. The engine's two lights are kept at
+    /// least this strong so the lightmap has room for a lamp, which also makes soldiers and vehicles that bright.</summary>
+    public float LampHeadroom { get; set; } = 0.55f;
+    /// <summary>A realistic bake has been run on this level with these settings.</summary>
+    public bool Baked { get; set; }
+}
+
+/// <summary>
 /// The lights placed on one level, and their night-preview setting.
 ///
 /// Stored as a sidecar in the level folder rather than in a <c>.con</c>: the engine has no concept of these, and
@@ -199,6 +235,10 @@ public sealed class LightRig
     public float NightR { get; set; } = 0.10f;
     public float NightG { get; set; } = 0.13f;
     public float NightB { get; set; } = 0.22f;
+
+    /// <summary>The sun and the sky the realistic bake traces (Window > Realistic Lighting). Null until someone
+    /// opens that window on this level; an older editor that does not know the field simply ignores it.</summary>
+    public DaylightSettings? Daylight { get; set; }
 
     /// <summary>Where the rig lives for this level. A folder level keeps it in the folder; a packed level keeps
     /// it beside the archive, since you cannot write a file inside a .rfa - see <see cref="LevelSidecar"/>.</summary>
@@ -261,7 +301,7 @@ public sealed class LightRig
     public void Save(string levelDir)
     {
         var p = PathFor(levelDir);
-        if (Lights.Count == 0 && NightAmount <= 0f)
+        if (Lights.Count == 0 && NightAmount <= 0f && Daylight is null)
         {
             // Nothing to remember: do not litter the level folder with an empty file.
             try { if (File.Exists(p)) File.Delete(p); } catch { }

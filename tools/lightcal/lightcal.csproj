@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Builds and reads the lighting calibration level (docs/Realistic_Lighting.md, "Checking it in the game").
+       Not part of the solution. Usage is at the top of Program.cs. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/RefractorForge.Formats/RefractorForge.Formats.csproj" />
+    <ProjectReference Include="../../src/RefractorForge.Render/RefractorForge.Render.csproj" />
+  </ItemGroup>
+</Project>

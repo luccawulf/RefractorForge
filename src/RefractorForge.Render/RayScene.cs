@@ -29,6 +29,11 @@ public sealed class RayScene
     // Triangles in Moller-Trumbore form, matching MeshOccluder so the two agree about what a hit is.
     private readonly Vector3[] _a, _e1, _e2;
     private readonly Vector3[]? _albedo;          // per triangle, linear 0..1; null when nothing shades
+    // Cut-out triangles - leaves, fences, window grilles. _cutOf[tri] is -1 for a solid triangle, else an index
+    // into the two parallel arrays below. Null when the scene has none, so a solid scene pays nothing.
+    private readonly int[]? _cutOf;
+    private readonly AlphaMask[]? _cutMask;
+    private readonly Vector2[]? _cutUv;           // three per cut-out triangle
     private readonly int[] _index;                // triangle ids, permuted so each leaf is contiguous
     private readonly Node[] _nodes;
     private readonly int _root;
@@ -49,7 +54,80 @@ public sealed class RayScene
     /// <param name="Point">The hit position.</param>
     /// <param name="Normal">The geometric normal, flipped to face the incoming ray.</param>
     /// <param name="Albedo">The surface's diffuse colour, or 0.5 grey when the scene carries none.</param>
-    public readonly record struct Hit(int Triangle, float Distance, Vector3 Point, Vector3 Normal, Vector3 Albedo);
+    /// <param name="BackFace">The ray met the side the engine does not draw. Refractor meshes are wound clockwise
+    /// seen from outside, so this is "the ray came from inside the object" - which is how a sample point that has
+    /// ended up inside a wall can tell.</param>
+    public readonly record struct Hit(int Triangle, float Distance, Vector3 Point, Vector3 Normal, Vector3 Albedo,
+                                      bool BackFace = false);
+
+    /// <summary>
+    /// A texture's alpha channel reduced to "is there surface here", for a material the engine alpha-tests.
+    ///
+    /// <para>A leaf card is two triangles and mostly holes. Traced as the two triangles it casts a rectangular slab
+    /// of shadow and blocks the sky like a sheet of plywood; traced through this it casts the shadow of the leaves.
+    /// The mask is kept small - a shadow cannot show detail finer than the texels of the map it lands in - and each
+    /// cell holds the AVERAGE coverage of the texels it stands for, compared against the material's own threshold,
+    /// so a canopy keeps the right overall density however far it was reduced.</para>
+    /// </summary>
+    public sealed class AlphaMask
+    {
+        public int Width { get; }
+        public int Height { get; }
+        private readonly byte[] _alpha;
+        private readonly byte _threshold;
+
+        private AlphaMask(int w, int h, byte[] alpha, byte threshold) { Width = w; Height = h; _alpha = alpha; _threshold = threshold; }
+
+        /// <summary>Build from RGBA pixels. Returns null when the texture has no alpha below the threshold at all -
+        /// the material is solid in practice and needs no test.</summary>
+        /// <param name="alphaRef">The engine's discard threshold, 0..1: a texel below it is a hole.</param>
+        public static AlphaMask? From(int width, int height, byte[] rgba, float alphaRef, int maxSize = 128)
+        {
+            if (width <= 0 || height <= 0 || rgba.Length < width * height * 4) return null;
+            int step = 1;
+            while (width / step > maxSize || height / step > maxSize) step *= 2;
+            int w = Math.Max(1, width / step), h = Math.Max(1, height / step);
+            var a = new byte[w * h];
+            byte thr = (byte)Math.Clamp((int)MathF.Round(Math.Clamp(alphaRef, 0.01f, 0.99f) * 255f), 1, 254);
+            bool anyHole = false;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    int sum = 0, n = 0;
+                    for (int dy = 0; dy < step && y * step + dy < height; dy++)
+                        for (int dx = 0; dx < step && x * step + dx < width; dx++)
+                        {
+                            sum += rgba[((y * step + dy) * width + x * step + dx) * 4 + 3]; n++;
+                        }
+                    byte v = (byte)(n > 0 ? sum / n : 255);
+                    a[y * w + x] = v;
+                    if (v < thr) anyHole = true;
+                }
+            return anyHole ? new AlphaMask(w, h, a, thr) : null;
+        }
+
+        /// <summary>Is there surface at this texture coordinate? Coordinates wrap, as the engine's sampler does.</summary>
+        public bool Solid(Vector2 uv)
+        {
+            float u = uv.X - MathF.Floor(uv.X), v = uv.Y - MathF.Floor(uv.Y);
+            int x = Math.Min(Width - 1, (int)(u * Width)), y = Math.Min(Height - 1, (int)(v * Height));
+            return _alpha[y * Width + x] >= _threshold;
+        }
+
+        /// <summary>The share of the mask that is surface, 0..1 - how dense a canopy this is.</summary>
+        public float Coverage
+        {
+            get
+            {
+                int n = 0;
+                foreach (var v in _alpha) if (v >= _threshold) n++;
+                return _alpha.Length == 0 ? 1f : n / (float)_alpha.Length;
+            }
+        }
+    }
+
+    /// <summary>One cut-out triangle's texture coordinates and the mask they index.</summary>
+    public readonly record struct Cutout(AlphaMask Mask, Vector2 Uv0, Vector2 Uv1, Vector2 Uv2);
 
     public int TriangleCount => _a.Length;
     public int NodeCount => _nodes.Length;
@@ -77,12 +155,40 @@ public sealed class RayScene
 
     /// <summary>Build over a triangle soup. <paramref name="albedo"/>, when given, is one linear colour per
     /// triangle - what an indirect bounce off it should pick up.</summary>
+    /// <param name="cutouts">Parallel to <paramref name="tris"/>: the alpha test for a cut-out triangle, null for a
+    /// solid one. Omit it and every triangle is solid.</param>
     public static RayScene? Build(IReadOnlyList<(Vector3 A, Vector3 B, Vector3 C)> tris,
-                                  IReadOnlyList<Vector3>? albedo = null)
-        => tris is null || tris.Count == 0 ? null : new RayScene(tris, albedo);
+                                  IReadOnlyList<Vector3>? albedo = null,
+                                  IReadOnlyList<Cutout?>? cutouts = null)
+        => tris is null || tris.Count == 0 ? null : new RayScene(tris, albedo, cutouts);
 
-    private RayScene(IReadOnlyList<(Vector3 a, Vector3 b, Vector3 c)> tris, IReadOnlyList<Vector3>? albedo)
+    /// <summary>True when the scene alpha-tests any triangle. A GPU kernel written against <see cref="ExportFlat"/>
+    /// does not carry the masks, so it must not be handed such a scene.</summary>
+    public bool HasCutouts => _cutOf is not null;
+
+    private RayScene(IReadOnlyList<(Vector3 a, Vector3 b, Vector3 c)> tris, IReadOnlyList<Vector3>? albedo,
+                     IReadOnlyList<Cutout?>? cutouts)
     {
+        if (cutouts is not null)
+        {
+            int nc = 0;
+            for (int i = 0; i < cutouts.Count && i < tris.Count; i++) if (cutouts[i] is not null) nc++;
+            if (nc > 0)
+            {
+                _cutOf = new int[tris.Count];
+                Array.Fill(_cutOf, -1);
+                _cutMask = new AlphaMask[nc]; _cutUv = new Vector2[nc * 3];
+                int k = 0;
+                for (int i = 0; i < cutouts.Count && i < tris.Count; i++)
+                    if (cutouts[i] is { } c)
+                    {
+                        _cutOf[i] = k; _cutMask[k] = c.Mask;
+                        _cutUv[k * 3] = c.Uv0; _cutUv[k * 3 + 1] = c.Uv1; _cutUv[k * 3 + 2] = c.Uv2;
+                        k++;
+                    }
+            }
+        }
+
         int n = tris.Count;
         _a = new Vector3[n]; _e1 = new Vector3[n]; _e2 = new Vector3[n];
         var bmin = new Vector3[n]; var bmax = new Vector3[n]; var centroid = new Vector3[n];
@@ -325,9 +431,12 @@ public sealed class RayScene
         var nrm = Vector3.Cross(_e1[bestTri], _e2[bestTri]);
         float len = nrm.Length();
         nrm = len > 1e-12f ? nrm / len : Vector3.UnitY;
-        if (Vector3.Dot(nrm, dir) > 0f) nrm = -nrm;          // face the ray, whichever way the mesh is wound
+        // cross(e1, e2) points INTO a Refractor mesh (clockwise seen from outside), so a ray travelling with it
+        // has met the outside of the surface and one travelling against it has come from within.
+        bool back = Vector3.Dot(nrm, dir) < 0f;
+        if (!back) nrm = -nrm;                               // face the ray, whichever way the mesh is wound
         hit = new Hit(bestTri, best + skip, origin + dir * best, nrm,
-                      _albedo is null ? new Vector3(0.5f) : _albedo[bestTri]);
+                      _albedo is null ? new Vector3(0.5f) : _albedo[bestTri], back);
         return true;
     }
 
@@ -366,6 +475,17 @@ public sealed class RayScene
         var qvec = Vector3.Cross(tvec, _e1[i]);
         float v = Vector3.Dot(d, qvec) * inv;
         if (v < 0f || u + v > 1f) return -1f;
-        return Vector3.Dot(_e2[i], qvec) * inv;
+        float t = Vector3.Dot(_e2[i], qvec) * inv;
+        // A cut-out triangle is only there where its texture says so: a hole lets the ray carry on.
+        if (_cutOf is not null && t > 0f)
+        {
+            int c = _cutOf[i];
+            if (c >= 0)
+            {
+                var uv = _cutUv![c * 3] * (1f - u - v) + _cutUv[c * 3 + 1] * u + _cutUv[c * 3 + 2] * v;
+                if (!_cutMask![c].Solid(uv)) return -1f;
+            }
+        }
+        return t;
     }
 }

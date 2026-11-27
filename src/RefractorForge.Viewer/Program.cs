@@ -117,6 +117,9 @@ uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpac
 // The level's lighting (Init.con renderer.ambientColor / diffuseColor), balanced so the pair sums to the editor's
 // old flat 0.4/0.6 exposure - the level tints the light, it does not change how bright the editor is.
 uniform vec3 uAmbLight; uniform vec3 uDifLight;
+// 1 = draw the ground as the game does: the tile and its detail texture and NOTHING else. BfVietnam's terrain shader
+// has no light in it at all (effects/RaShaderTerrain.fx) - whatever lighting the ground has is in its tiles.
+uniform int uGame;
 // ---- Placed lights -------------------------------------------------------------------------------
 // Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
 // DIRECTIONAL lights and zero point lights), so these exist to AIM a rig that is then baked into the
@@ -195,6 +198,7 @@ void main(){
     // A texel cannot hold more than white, so a pool can never be brighter than the scene light itself. Showing
     // the same ceiling live is what makes a bake look like the preview instead of a surprise.
     vec3 c = min(baseCol * (d + placedLights(vWorld, n)), d);
+    if (uGame == 1) c = baseCol;
     if (uShowMat==1) {                              // material-paint mode: tint by material index
         int idx = int(texture(uMat, vUv).r * 255.0 + 0.5);
         c = mix(c, matColor(idx), 0.55);
@@ -517,6 +521,13 @@ uniform int uHasLightmap; uniform sampler2D uLightmap;   // baked per-object lig
 uniform int uLmColour;                                   // 1 = the map carries colour (BF1942 24-bit), 0 = .b only (BFV)
 uniform vec3 uLmAmbient;                                  // renderer.LMambientColor: added to every lightmapped surface, as the engine does
 uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/diffuse light colour (see the terrain shader)
+// 1 = light objects exactly as BfVietnam does (Render/EngineLight.cs has the derivation):
+//   texture * saturate( lightmap * (sun * sat(N.L) + back * sat(N.B)) + ambient )
+// with B the sun mirrored to the opposite compass bearing, the lightmap taken as 1 where there is none, and the
+// ambient LMambientColor for a lightmapped surface, ambientColor otherwise.
+uniform int uGame; uniform vec3 uGSun; uniform vec3 uGBack; uniform vec3 uGAmb;
+uniform int uVertexLit;                                   // the mesh has no tangent frame: the game draws it fixed-function
+uniform float uLightCut;                                  // how much of the two lights an unlightmapped object LOSES in terrain shadow (0 = none)
 // ---- Placed lights -------------------------------------------------------------------------------
 // Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
 // DIRECTIONAL lights and zero point lights), so these exist to AIM a rig that is then baked into the
@@ -616,6 +627,18 @@ void main(){
         float ndl = abs(dot(ln, normalize(uLightDir)));
         vec3 d = lmv * uDifLight * ndl + min(2.0 * uLmAmbient, vec3(0.6));
         c = base * uTint * min(d, vec3(1.0));
+        if (uGame == 1) {
+            // The mesh's own normals here are cross(b-a, c-a), which points INTO a Refractor mesh; the engine's are
+            // the outward ones.
+            vec3 gn = -ln; vec3 sunL = normalize(uLightDir); vec3 backL = vec3(-sunL.x, sunL.y, -sunL.z);
+            vec3 two = uGSun * max(dot(gn, sunL), 0.0) + uGBack * max(dot(gn, backL), 0.0);
+            // Measured in the game (the calibration level): a mesh with a tangent frame is lit per pixel, the map's
+            // blue channel scaling both lights; one without is lit per vertex, the lights' sum clamped to 1 first
+            // and the map applied channel by channel.
+            vec3 lmg = vec3(lmt.b);
+            if (uVertexLit == 1) { two = min(two, vec3(1.0)); lmg = lmt.rgb; }
+            c = base * uTint * min(lmg * two + uLmAmbient, vec3(1.0));
+        }
     } else {
         vec3 n = normalize(vN);
         float vis = shadowVis(vWorld, n);                 // real-time sun cast-shadow
@@ -628,6 +651,17 @@ void main(){
         vec3 d = (uAlphaTest==1) ? (uAmbLight + uDifLight) * (0.78 + 0.22*ndl*vis)
                                  : uAmbLight + uDifLight*ndl*vis;
         c = base * uTint * d;
+        if (uGame == 1) {
+            vec3 gn = -n; vec3 sunL = normalize(uLightDir); vec3 backL = vec3(-sunL.x, sunL.y, -sunL.z);
+            vec3 two = uGSun * max(dot(gn, sunL), 0.0) + uGBack * max(dot(gn, backL), 0.0);
+            // Vegetation: leaf cards face every way and every BfVietnam vegetation material carries selfillum, so it
+            // sits near the mean of the two lights plus that glow rather than following any one normal.
+            // In terrain shadow the game leaves an object with no lightmap only a share of the two lights - the
+            // ambient whole (EngineLight.StaticShare).
+            two *= 1.0 - uLightCut;
+            if (uAlphaTest==1) two = (uGSun + uGBack) * 0.3 * (1.0 - uLightCut) + vec3(0.35);
+            c = base * uTint * min(two + uGAmb, vec3(1.0));
+        }
     }
     if (uFogEnable==1) {
         float fog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
@@ -875,6 +909,12 @@ RefractorForge.Formats.Terrain.LightmapShadowBits? sbLsb = null;     // what the
 // and so what the game gets is exactly what the viewport showed.
 RefractorForge.Formats.Terrain.LightmapShadowBits? bakedShadowLsb = null;
 bool sbThenObjects = false;             // "Bake Both": run the object lightmaps once the shadow bake finishes
+// What the game leaves each unlightmapped static of the sun and back light (EngineLight.StaticShare), by object
+// index; rebuilt when anything it reads moves. The shadow tiles are decoded as they are first asked for.
+Dictionary<int, float> staticShares = new();
+long staticSharesSig = long.MinValue;
+RefractorForge.Formats.Terrain.LightmapShadowBits? staticSharesLsb = null;
+Dictionary<int, byte[]?> staticSharesTiles = new();
 // A bake always darkens the shadow into the ground texture. That is the ONLY thing that makes a terrain sun-shadow
 // visible in game: retail paints the shadow into the tx tiles (measured on Fall_of_Saigon - see
 // LightBake.MultiplyShadowIntoAtlas), and a .lsb on its own changes nothing on screen, proven with a 50%
@@ -1552,6 +1592,30 @@ float ogStaticKeep = 1f;                                     // fraction of the 
 bool showBrightenDialog = false;
 // ---- Night Lighting window + bake ---------------------------------------------------------------------------
 bool showNightWindow = false;
+// ---- Realistic lighting (Window > Realistic Lighting) ---------------------------------------------------------
+// A traced bake: the sun, the sky and the lamps as light, solved into what the engine draws with (Render/Daylight,
+// LightTracer, EngineLight). Its settings ride the lights sidecar (LightRig.Daylight), so they are never packed.
+bool showRealLight = false;
+bool gameLighting = false;                 // the viewport draws ground and objects with the game's own formula
+RefractorForge.Render.ObjectLightmapBaker.Physical? lmPhysical = null;   // set while a traced object bake runs
+RefractorForge.Formats.Terrain.LightRig? rlRig = null;                   // the lamps as they were when it started
+bool rlBaking = false;                     // the GROUND stage; the object stage reuses the lightmap bake's state
+System.Threading.Tasks.Task? rlTask = null;
+System.Threading.CancellationTokenSource? rlCancel = null;
+int rlDone = 0, rlTotal = 1;
+double rlStarted = 0, rlShadowShare = 0;
+RefractorForge.Render.GroundLightBake.Result? rlGround = null;
+Texture2D? rlLitGround = null;
+RefractorForge.Render.DaylightModel? rlDay = null;
+RefractorForge.Render.DaylightModel.Fitted? rlFit = null;
+string rlSummary = "";
+object rlStatLock = new();
+int rlMaps = 0; double rlMapFloor = 0, rlMapCeil = 0, rlMapErr = 0;      // how far the engine fell short of the trace
+byte[]? rlPrevPx = null; int rlPrevW = 0, rlPrevH = 0; uint rlPrevTex = 0; int rlPrevStage = 0, rlPrevShown = -1;
+System.Threading.Tasks.Task? rlPrevTask = null; System.Threading.CancellationTokenSource? rlPrevCancel = null;
+double rlPrevSeconds = 0;
+RefractorForge.Render.LightPreview.Prepared? rlPrevScene = null; string rlPrevSceneSig = "";
+string? rlLevelSeen = null;                // the level the game-lighting switch was last set for
 bool nightColourLightmaps = true;      // BF1942 keeps a lamp's colour in a 24-bit object lightmap; BFV reads .b only
 int nightQuality = 1;                  // 0 draft (hard shadows), 1 good, 2 high (soft, many samples)
 bool nightBakeGround = true, nightBakeObjects = true, nightBakeGlows = true;
@@ -5480,6 +5544,63 @@ void DrawGizmos()
 
 void DoUndo() { if (hist is null || so is null) return; hist.Undo(); selected = -1; multi.Clear(); gpIndex = -1; gpDragging = false; gpRotDragging = false; SyncMarkers(); RebuildObjects(); UploadMarkers(); UploadActivePaintTexture(); }
 void DoRedo() { if (hist is null || so is null) return; hist.Redo(); selected = -1; multi.Clear(); gpIndex = -1; gpDragging = false; gpRotDragging = false; SyncMarkers(); RebuildObjects(); UploadMarkers(); UploadActivePaintTexture(); }
+// The share of the sun and back light the game leaves each static that has no lightmap: five terrain samples
+// toward the sun, each the ground texture's brightness where the shadow bits say shadow (EngineLight has the rule,
+// read from the exe). It reads what a save would write - this session's bake, else the level's own .lsb, nothing
+// after an unbake - and the ground as it is drawn. Objects in the open are left out: no entry is the whole light.
+Dictionary<int, float> StaticLightShares(Vector3 toSun)
+{
+    var lsb = unbakeLighting ? null : bakedShadowLsb ?? loadedShadowBits;
+    if (glObjects is null || lsb is null || atlasCpu is null || lsb.GridDim <= 0 || lsb.TilePixels <= 0)
+    {
+        staticShares.Clear(); staticSharesSig = long.MinValue;
+        return staticShares;
+    }
+    float minI = env?.StandardMeshMinIntensity ?? RefractorForge.Render.EngineLight.DefaultMinIntensity;
+    var h = new HashCode();
+    h.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(lsb)); h.Add(groundAtlasVersion);
+    h.Add(toSun); h.Add(minI); h.Add(glObjects.Placements.Count);
+    foreach (var (_, world, _) in glObjects.Placements) h.Add(world.Translation);
+    long sig = h.ToHashCode();
+    if (sig == staticSharesSig) return staticShares;
+    staticSharesSig = sig;
+    if (!ReferenceEquals(lsb, staticSharesLsb)) { staticSharesLsb = lsb; staticSharesTiles.Clear(); }
+
+    int g = lsb.GridDim, tp = lsb.TilePixels;
+    float wsz2 = cfg.WorldSize;
+    var atlasNow = atlasCpu;
+    bool InShadow(Vector3 p)
+    {
+        // Row 0 is the south edge, column 0 the west one; off the map the game takes the point as lit.
+        float fx = p.X / wsz2 * g * tp, fz = p.Z / wsz2 * g * tp;
+        if (fx < 0f || fz < 0f || fx >= g * tp || fz >= g * tp) return false;
+        int px = (int)fx, pz = (int)fz, ti = (pz / tp) * g + px / tp;
+        if (!staticSharesTiles.TryGetValue(ti, out var raster))
+        {
+            var tile = lsb.Tiles[ti];
+            raster = tile.IsEmpty || tile.Width != tp || tile.Height != tp ? null : tile.ToRaster();
+            staticSharesTiles[ti] = raster;
+        }
+        return raster is not null && raster[(pz % tp) * tp + px % tp] != 0;
+    }
+    Vector3 Ground(Vector3 p)
+    {
+        int ax = Math.Clamp((int)(p.X / wsz2 * atlasNow.Width), 0, atlasNow.Width - 1);
+        int ay = Math.Clamp((int)(p.Z / wsz2 * atlasNow.Height), 0, atlasNow.Height - 1);
+        int o = (ay * atlasNow.Width + ax) * 4;
+        return RefractorForge.Render.EngineLight.TileColour(atlasNow.Rgba[o], atlasNow.Rgba[o + 1], atlasNow.Rgba[o + 2]);
+    }
+    staticShares.Clear();
+    foreach (var (tmpl, world, objIndex) in glObjects.Placements)
+    {
+        float r = glObjects.StaticRadius(tmpl);
+        if (r <= 0f) continue;
+        float share = RefractorForge.Render.EngineLight.StaticShare(world.Translation, r, toSun, minI, InShadow, Ground);
+        if (share < 0.999f) staticShares[objIndex] = share;
+    }
+    return staticShares;
+}
+
 // The LightmapShadowBits.lsb a save writes: what this session's Bake Sun Shadows made, or a fully lit one after an
 // Unbake. Nothing to switch on - a switch here once let a bake reach the viewport and never the save. With neither
 // this session, the level's own .lsb is left exactly as it is. Shared by DoSave + DoSavePatch.
@@ -8805,6 +8926,14 @@ void LightmapBakeProgress()
         {
             lmBaking = false; lmJobs = null; lmResults = null; lmFallbackLit = null;
             lmCancel?.Dispose(); lmCancel = null; lmTask = null;
+            if (lmPhysical is not null)
+            {
+                // The ground stage had already gone in. Say so: the ground now carries the new light and the
+                // objects the old, and one undo puts the ground back.
+                lmPhysical = null; rlRig = null;
+                Toast(Loc.T("Lighting bake cancelled after the ground was done. The objects keep their old lightmaps; undo (Z) puts the ground back."));
+                return;
+            }
             Toast(Loc.T("Lightmap bake cancelled - the level keeps the lightmaps it had."));
             return;
         }
@@ -8877,13 +9006,13 @@ void BakeObjectLightmaps()
     // Placed lights are shadowed by the whole level (every building and prop as an occluder), softened over each
     // lamp's source size, and keep their colour on BF1942. The occluder is shared with the night bake when one is
     // running; otherwise it is built here, on this thread, from meshes that are already resolved.
-    if (rigRef is not null && lmNightScene is null && so is not null && meshLib is not null)
+    if (lmPhysical is null && rigRef is not null && lmNightScene is null && so is not null && meshLib is not null)
         lmNightScene = NightBake.Build(heightmap, cfg, LevelScene.ObjectTriangles(so, meshLib));
     // The whole level as a BVH, with each triangle's albedo, so the advanced terms can see one building shadow
     // another and can carry the colour of what a bounce came off. Built once per bake on this thread (the mesh
     // library is not thread-safe) and then shared, unlocked, by every worker - the BVH is read-only in use.
     lmRayScene = null;
-    if (lmAdvanced && so is not null && meshLib is not null)
+    if (lmAdvanced && lmPhysical is null && so is not null && meshLib is not null)
     {
         var shaded = LevelScene.ObjectTrianglesShaded(so, meshLib);
         lmRayScene = RayScene.Build(shaded.Tris, shaded.Albedo);
@@ -8908,6 +9037,9 @@ void BakeObjectLightmaps()
     lmCancel = new System.Threading.CancellationTokenSource();
     var token = lmCancel.Token;
     var jobMeshes = jobs.Select(j => j.Mesh).ToArray();
+    // The traced bake (Realistic Lighting): one scene for everything, so no self-occluder, no night scene, no tiers.
+    var physRef = lmPhysical; var physRig = rlRig;
+    var jobPrimary = jobs.Select(j => j.Primary).ToArray();
     lmTask = System.Threading.Tasks.Task.Run(() =>
     {
         try
@@ -8919,6 +9051,22 @@ void BakeObjectLightmaps()
                 // renderer.LMambientColor is what lifts it - in the game and in this viewport alike. Baking a
                 // floor in as well lit everything twice.
                 if (token.IsCancellationRequested) return;
+                if (physRef is not null)
+                {
+                    // A far LOD's surface does not lie exactly on the near LOD the scene holds, so its samples
+                    // start a little further out; otherwise half of them begin inside the wall.
+                    var ph = (jobPrimary[i] ? physRef : physRef with { SurfaceOffset = 0.08f }) with { VertexLit = jobMeshes[i].VertexLit };
+                    var pm = ObjectLightmapBaker.BakePhysical(jobMeshes[i], worlds[i], sizes[i], samplesRef, ph, physRig, 2, token);
+                    results[i] = pm?.Map;
+                    if (pm is not null)
+                        lock (rlStatLock) { rlMaps++; rlMapFloor += pm.AtFloor; rlMapCeil += pm.AtCeiling; rlMapErr += pm.MeanError; }
+                    // No unwrap: nothing is written. A flat one-value map was tried for these - and measured in the
+                    // game on the calibration level, where a mesh with no unwrap ignored the file beside it and was
+                    // lit exactly as if it had none.
+                    System.Threading.Interlocked.Increment(ref lmDone);
+                    System.Threading.Interlocked.Add(ref lmWorkDone, (long)sizes[i] * sizes[i]);
+                    return;
+                }
                 results[i] = ObjectLightmapBaker.Bake(jobMeshes[i], worlds[i], hmRef, cfgRef, sunV,
                     sizes[i], ambient: 0f, rig: rigRef, samples: samplesRef,
                     night: nightRef, colour: colourRef, lampSamples: lampRef, sunLevel: moonRef,
@@ -8945,6 +9093,14 @@ void FinishObjectLightmapBake()
     // and a level that loses lightmaps renders wrong, which is a failure this project has already shipped once.
     var olm = lmSelectedOnly && objectLightmaps is not null ? objectLightmaps : new ObjectLightmaps();
     if (!lmSelectedOnly) bakedObjectLightmaps.Clear();
+    // The palette the game will read these maps through (BfVietnam looks an 8-bit map up in the level's
+    // Palette.pal - measured). A level with none gets the plain ramp. One whose palette cannot say what a bake
+    // means - Battlecraft's tinted one stops at about 0.73 - gets the plain ramp too, but only on a whole-level
+    // bake, which rewrites every map that was written against the old one.
+    var lmPalette = LightmapPalette.Linear; bool lmPaletteReplaced;
+    if (gameIsBf1942) lmPaletteReplaced = !LevelHasLightmapPalette();
+    else if (LevelLightmapPalette() is { } levelPal && (levelPal.Usable || lmSelectedOnly)) { lmPalette = levelPal; lmPaletteReplaced = false; }
+    else lmPaletteReplaced = true;
     int baked = 0, noUnwrap = 0, lodMaps = 0, uniform = 0;
     for (int i = 0; i < jobs.Count; i++)
     {
@@ -8966,7 +9122,8 @@ void FinishObjectLightmapBake()
         {
             // A mesh with the slot but no unwrap can still carry ONE value - the average of what its surface gets.
             // Every texel is that value, so it reads the same whatever texel the (0,0) vertices land on.
-            if (lmFallbackRgb is { } fb && i < fb.Length && fb[i] is { } uni)
+            // Battlefield 1942 only: BfVietnam ignores a lightmap file on a mesh with no unwrap (measured).
+            if (gameIsBf1942 && lmFallbackRgb is { } fb && i < fb.Length && fb[i] is { } uni)
             {
                 var flat = UniformLightmapTexture(uni, lmColour);
                 if (primary) { olm.AddBaked(o.Template, x, y, z, flat); uniform++; }
@@ -8979,11 +9136,9 @@ void FinishObjectLightmapBake()
         if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
         // A 24-bit map keeps the lamps' colour (BF1942 reads it - GC_Bespin_Night ships exactly this); the grey
         // palette form is what BfVietnam's .b-only shader wants and what every retail map is.
-        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = lmColour ? TgaTexture.EncodeRgb24(tex) : TgaTexture.EncodeGrayColormapped(tex);
+        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = lmColour ? TgaTexture.EncodeRgb24(tex) : EncodeGreyLightmap(tex, lmPalette);
     }
-    // The palette the engine loads before the maps: every lightmapped retail level ships one, so a level that
-    // never had lightmaps gets one with its first bake (an existing one - Battlecraft's is a colour palette - is kept).
-    if (!LevelHasLightmapPalette()) bakedObjectLightmaps["Palette.pal"] = TgaTexture.GreyPalettePal();
+    if (lmPaletteReplaced) bakedObjectLightmaps["Palette.pal"] = lmPalette.ToRiff();
     objectLightmaps = olm; objectLightmapsLoaded = true;
     sunOverride = false; showObjectLightmaps = true;     // turn off the dynamic-sun preview so the baked result shows
     glObjects?.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
@@ -8997,6 +9152,7 @@ void FinishObjectLightmapBake()
     lmCancel?.Dispose(); lmCancel = null; lmTask = null;
     if (uniform > 0) Console.WriteLine($"   {uniform} object(s) without a lightmap unwrap got a UNIFORM lamp level (the engine reads one texel for those).");
     if (nbStage == 2) { NightBakeContinue(); return; }
+    if (lmPhysical is not null) { FinishRealisticBake(baked, noUnwrap); return; }
     Toast(noUnwrap + noSlot > 0
         ? string.Format(Loc.T("Baked {0} object lightmap(s). {1} object(s) have no lightmap UVs (props, sandbags, small walls) - the game lights those by the sun only, so a placed light cannot reach them; their pool still shows on the ground."), baked, noUnwrap + noSlot)
         : string.Format(Loc.T("Baked {0} object lightmap(s) from the current sun. Save (Ctrl+S) writes them to the level."), baked));
@@ -9072,6 +9228,37 @@ HashSet<string> ExistingLightmapNames()
     return set;
 }
 
+// The palette the game will read this level's 8-bit lightmaps through: the one a bake in this session is about to
+// write, else the level's own Objectlightmaps/Palette.pal (a patch archive's wins over the base's). Null = none.
+LightmapPalette? LevelLightmapPalette()
+{
+    if (bakedObjectLightmaps.TryGetValue("Palette.pal", out var pending)) return LightmapPalette.Parse(pending);
+    try
+    {
+        if (levelDir is not null && Directory.Exists(levelDir))
+        {
+            var f = Directory.EnumerateFiles(levelDir, "Palette.pal", SearchOption.AllDirectories)
+                             .FirstOrDefault(x => (Path.GetDirectoryName(x) ?? "").Contains("lightmap", StringComparison.OrdinalIgnoreCase));
+            return f is null ? null : LightmapPalette.Parse(File.ReadAllBytes(f));
+        }
+        LightmapPalette? found = null;
+        foreach (var rp in rfaList)
+        {
+            if (!File.Exists(rp)) continue;
+            var arch = new RefractorForge.Formats.Rfa.RefractorFlatArchive(rp);
+            foreach (var e in arch.Entries)
+                if (e.Name.Replace((char)92, '/').EndsWith("lightmaps/palette.pal", StringComparison.OrdinalIgnoreCase))
+                    found = LightmapPalette.Parse(arch.Read(e)) ?? found;
+        }
+        return found;
+    }
+    catch { return null; }
+}
+
+// A grey lightmap as the file the game reads. BfVietnam: every index chosen so the level's palette SHOWS the value
+// meant (LightmapPalette). Battlefield 1942 is left exactly as it was - index = value - until it is measured too.
+byte[] EncodeGreyLightmap(Texture2D tex, LightmapPalette pal) => gameIsBf1942 ? TgaTexture.EncodeGrayColormapped(tex) : pal.Encode(tex);
+
 bool LevelHasLightmapPalette()
 {
     try
@@ -9112,8 +9299,10 @@ void EnsureObjectLightmaps()
 {
     if (objectLightmapsLoaded || glObjects is null || so is null) return;
     objectLightmapsLoaded = true;
-    objectLightmaps = rfaList.Length > 0 ? ObjectLightmaps.FromRfaPaths(rfaList)
-                    : (levelDir is not null && Directory.Exists(levelDir) ? ObjectLightmaps.FromFolder(levelDir) : null);
+    // BfVietnam looks an 8-bit map's indices up in the level's Palette.pal, not in the file's own colour map
+    // (measured in the game), so that is how they are read here too.
+    objectLightmaps = rfaList.Length > 0 ? ObjectLightmaps.FromRfaPaths(rfaList, throughLevelPalette: !gameIsBf1942)
+                    : (levelDir is not null && Directory.Exists(levelDir) ? ObjectLightmaps.FromFolder(levelDir, throughLevelPalette: !gameIsBf1942) : null);
     glObjects.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
     if (glObjects.LightmapInstanceCount > 0)
         Console.WriteLine($"Object lightmaps: {objectLightmaps?.Count ?? 0} baked tga(s), {glObjects.LightmapInstanceCount} object(s) lit.");
@@ -9312,6 +9501,7 @@ void OnRender(double dt)
         glObjects.ShowLightmaps = wantLm;
         glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
         glObjects.HiddenIndices = HiddenIndexSet();
+        glObjects.LightShares = gameLighting && !gameIsBf1942 ? StaticLightShares(ld) : null;
         glObjects.Draw(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
                        cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f), LockedIndices());
 
@@ -11000,6 +11190,7 @@ void WindowMenu()
     ImGui.MenuItem(Loc.TL("AI Pathmap Preview"), null, ref pathmapPreviewOpen);
     ImGui.MenuItem(Loc.TL("Import Sound"), null, ref showSoundImport);
     ImGui.MenuItem(Loc.TL("Night Lighting"), null, ref showNightWindow);
+    ImGui.MenuItem(Loc.TL("Realistic Lighting"), null, ref showRealLight);
     ImGui.Separator();
     ImGui.MenuItem(Loc.TL("User Guide / Controls"), null, ref showHelp);
     ImGui.EndMenu();
@@ -11714,6 +11905,491 @@ void AddNightLight(Vector3 at, bool onGround)
 }
 
 // The Night Lighting window: night look -> lights -> bake, top to bottom.
+// ================================================================================================================
+// Realistic lighting (Window > Realistic Lighting): the sun, the sky and the lamps traced as LIGHT, then solved into
+// what the engine draws with - the ground tiles in colour, every object's lightmap, and the four Init.con light
+// colours the maps were solved against. The maths lives in Render (Daylight, LightTracer, EngineLight,
+// GroundLightBake, ObjectLightmapBaker.BakePhysical); this is the window, the two background stages and the hand-off.
+// ================================================================================================================
+
+RefractorForge.Formats.Terrain.DaylightSettings RlSettings()
+    => lightRig.Daylight ??= new RefractorForge.Formats.Terrain.DaylightSettings();
+
+// The ground as painted - what the terrain reflects, and what the traced light is multiplied onto. The copy kept
+// before the first bake when there is one. A level baked before the editor kept such a copy has none, and its tiles
+// already carry the older bakes' shadows and light pools: those are taken back out by the records the older bakes
+// left (GroundLightBake.Unbaked), or this bake would light them a second time.
+Texture2D? RlGroundSource()
+{
+    if (atlasCpu is null) return null;
+    var kept = PreBakeGround();
+    if (kept is not null && kept.Width == atlasCpu.Width && kept.Height == atlasCpu.Height) return kept;
+    return RefractorForge.Render.GroundLightBake.Unbaked(atlasCpu, CurrentGroundMerge(), CurrentPoolMerge());
+}
+
+// Keep that ground beside the level, once, as the copy every later bake starts from and Revert restores.
+void RlKeepGround(Texture2D? ground)
+{
+    if (ground is null || string.IsNullOrEmpty(levelDir) || PreBakeGround() is not null) return;
+    try
+    {
+        var p = RefractorForge.Formats.Terrain.GroundOriginal.PathFor(levelDir);
+        var dir = Path.GetDirectoryName(Path.GetFullPath(p));      // the sidecar's FOLDER - never the level itself
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        DdsTexture.Save(ground, p);
+        groundOriginal = new Texture2D(ground.Width, ground.Height, (byte[])ground.Rgba.Clone());
+        groundOriginalLoaded = true;
+        Console.WriteLine($"Kept the ground as painted ({ground.Width}x{ground.Height}) -> {p}");
+    }
+    catch (Exception ex) { Console.WriteLine("Could not keep a copy of the painted ground: " + ex.Message); }
+}
+
+// The ground's mean reflectance, linear - what open ground bounces back at the walls around it.
+Vector3 RlMeanAlbedo(Texture2D? ground)
+{
+    if (ground is null) return RefractorForge.Render.LightScene.DefaultGround;
+    static float Lin(byte v) { float c = v / 255f; return c <= 0.04045f ? c / 12.92f : MathF.Pow((c + 0.055f) / 1.055f, 2.4f); }
+    double r = 0, g = 0, b = 0; int n = 0;
+    var px = ground.Rgba;
+    for (int i = 0; i + 3 < px.Length; i += 4 * 61) { r += Lin(px[i]); g += Lin(px[i + 1]); b += Lin(px[i + 2]); n++; }
+    if (n == 0) return RefractorForge.Render.LightScene.DefaultGround;
+    return Vector3.Clamp(new Vector3((float)(r / n), (float)(g / n), (float)(b / n)), new Vector3(0.02f), new Vector3(0.8f));
+}
+
+RefractorForge.Render.DaylightModel RlModel(Texture2D? ground)
+{
+    var st = RlSettings();
+    return new RefractorForge.Render.Daylight
+    {
+        ToSun = EffectiveSun(),
+        SunColour = new Vector3(st.SunR, st.SunG, st.SunB),
+        SkyZenith = new Vector3(st.ZenithR, st.ZenithG, st.ZenithB),
+        SkyHorizon = new Vector3(st.HorizonR, st.HorizonG, st.HorizonB),
+        SkyStrength = MathF.Max(st.SkyStrength, 0.01f),
+        GroundAlbedo = RlMeanAlbedo(ground),
+        BounceStrength = st.Bounce,
+        Peak = Math.Clamp(st.Brightness, 0.05f, 1.5f),
+        InteriorFill = st.Interior,
+    }.Build();
+}
+
+// The engine colours for this light. On a level lit by lamps the two lights are kept strong enough for a lamp to
+// show and take the lamps' own colour (see DaylightModel.Fit) - but only when the light itself is dim. By day the
+// sun is already brighter than any lamp needs, and raising the back light would only flatten everything unlit.
+RefractorForge.Render.DaylightModel.Fitted RlFitFor(RefractorForge.Render.DaylightModel day)
+{
+    var st = RlSettings();
+    var plain = day.Fit();
+    var lit = lightRig.Lights.Where(l => l.Enabled && l.Intensity > 0f).ToList();
+    if (lit.Count == 0 || st.LampHeadroom <= 0.01f) return plain;
+    if (RefractorForge.Render.EngineLight.Luma(plain.Colours.Sun) >= st.LampHeadroom) return plain;
+    var tint = Vector3.Zero;
+    foreach (var l in lit) tint += new Vector3(l.ColorR, l.ColorG, l.ColorB) * l.Intensity;
+    return day.Fit(minSun: st.LampHeadroom, minBack: st.LampHeadroom, tint: tint);
+}
+
+// A copy of the lamps for a worker thread: the rig in the editor can be edited while a bake runs.
+RefractorForge.Formats.Terrain.LightRig? RlLampSnapshot()
+    => lightRig.Lights.Any(l => l.Enabled && l.Intensity > 0f)
+        ? RefractorForge.Formats.Terrain.LightRig.FromJson(lightRig.ToJson())
+        : null;
+
+// Rays per texel for each lightmap quality. The sun's rays buy the shadow's soft edge; the hemisphere's buy smooth
+// sky and bounce light, and a denoiser stands in for most of what more of them would.
+RefractorForge.Render.LightTracer.Budget RlObjectBudget() => lmQuality switch
+{
+    0 => new RefractorForge.Render.LightTracer.Budget(4, 16, 1),
+    1 => new RefractorForge.Render.LightTracer.Budget(8, 32, 2),
+    _ => new RefractorForge.Render.LightTracer.Budget(16, 64, 2),
+};
+
+// The tile size that holds what the ground picture holds: the editor's ground is at least 2048 across, and a level
+// that ships 256 px tiles on a 4x4 grid would throw half of a bake's detail away on the way back out.
+int? RlTileSize()
+{
+    if (atlasCpu is null || terrainTex is null) return null;
+    int per = atlasCpu.Width / Math.Max(terrainTex.GridW, 1), pot = 256;
+    while (pot < per && pot < RefractorForge.Render.TerrainTexture.MaxSaveTileSize) pot <<= 1;
+    return pot > terrainTex.AtlasSize ? pot : null;
+}
+
+void BakeRealisticLighting()
+{
+    if (heightmap is null || so is null || meshLib is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    if (gameIsBf1942) { Toast(Loc.T("Realistic lighting is solved against Battlefield Vietnam's own shaders. It is not available for a Battlefield 1942 level yet.")); return; }
+    if (rlBaking || lmBaking || sbBaking) { Toast(Loc.T("A lighting bake is already running.")); return; }
+
+    var ground = RlGroundSource();
+    RlKeepGround(ground);                        // the ground as painted, kept once, before anything goes into it
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    // On this thread: the mesh library's cache is not thread-safe, and the scene is read-only once built.
+    var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground, so, meshLib, holes: env?.IsTunnelMap == true);
+    if (built.Scene is null) { Toast(Loc.T("Nothing to trace: this level has no terrain or objects.")); return; }
+    var day = RlModel(ground);
+    var fit = RlFitFor(day);
+    var rigSnap = RlLampSnapshot();
+    rlDay = day; rlFit = fit; rlRig = rigSnap;
+    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget());
+    Console.WriteLine($"Realistic lighting: scene of {built.Stats.TerrainTriangles:N0} terrain + {built.Stats.ObjectTriangles:N0} object triangle(s), "
+                      + $"{built.Stats.CutoutTriangles:N0} cut-out over {built.Stats.Masks} texture(s), built in {sw.Elapsed.TotalSeconds:0.0} s; "
+                      + $"{rigSnap?.Lights.Count ?? 0} lamp(s).");
+    Console.WriteLine($"   Light colours it is solved against: diffuse {RlV(fit.Colours.Sun)}, secondary {RlV(fit.Colours.Back)}, "
+                      + $"ambient {RlV(fit.Colours.Ambient)}, LMambient {RlV(fit.Colours.LmAmbient)}; open shade {fit.OpenShade:0.00} of sunlit.");
+
+    rlGround = null; rlLitGround = null;
+    var hmRef = heightmap; var cfgRef = cfg; int stride = built.TerrainStride;
+    int size = Math.Clamp(atlasCpu?.Width ?? 2048, 1024, 4096);
+    var target = ground is null ? null : new Texture2D(ground.Width, ground.Height, new byte[ground.Rgba.Length]);
+    var budget = lmQuality == 0 ? new RefractorForge.Render.LightTracer.Budget(4, 24, 1) : new RefractorForge.Render.LightTracer.Budget(8, 48, 2);
+    var scene = built.Scene; var floor = fit.Colours.LmAmbient;
+    rlDone = 0; rlTotal = 1; rlBaking = true; rlStarted = appClock;
+    rlCancel = new System.Threading.CancellationTokenSource();
+    var token = rlCancel.Token;
+    rlTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        try
+        {
+            var res = RefractorForge.Render.GroundLightBake.Bake(scene, day, hmRef, cfgRef, stride, size, budget, 2, 2,
+                (d, t) => { System.Threading.Volatile.Write(ref rlDone, d); System.Threading.Volatile.Write(ref rlTotal, t); }, token, rigSnap);
+            if (res is null || token.IsCancellationRequested) return;
+            if (target is not null && ground is not null)
+                RefractorForge.Render.GroundLightBake.Apply(target, ground, res, day, hmRef, cfgRef, 1f,
+                    rigSnap is null ? null : new RefractorForge.Render.GroundLightBake.Lamps(scene, rigSnap, stride, 4), floor, token);
+            if (token.IsCancellationRequested) return;
+            rlLitGround = target; rlGround = res;
+        }
+        catch (OperationCanceledException) { }
+    }, token);
+}
+
+string RlV(Vector3 v) => string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:0.00}/{1:0.00}/{2:0.00}", v.X, v.Y, v.Z);
+
+// The ground stage's progress, and the hand-off to the object stage when it is done.
+void RealLightProgress()
+{
+    // A level that was baked this way opens showing what the game shows; any other opens in the editor's own light.
+    if (rlLevelSeen != levelDir)
+    {
+        rlLevelSeen = levelDir;
+        gameLighting = !gameIsBf1942 && lightRig.Daylight?.Baked == true;
+        if (gameLighting) showObjectLightmaps = true;   // the game's picture includes the lightmaps: load and show them
+        rlSummary = ""; rlPrevScene = null; rlPrevSceneSig = "";
+    }
+    if (!rlBaking) return;
+    if (rlTask is { IsCompleted: true })
+    {
+        bool cancelled = rlCancel?.IsCancellationRequested == true;
+        var fault = rlTask.Exception?.GetBaseException();
+        rlBaking = false; rlCancel?.Dispose(); rlCancel = null; rlTask = null;
+        if (fault is not null)
+        {
+            lmPhysical = null; rlGround = null; rlLitGround = null;
+            Console.WriteLine("Realistic lighting bake failed: " + fault);
+            Toast(Loc.T("Lighting bake failed: ") + fault.Message);
+            return;
+        }
+        if (cancelled || rlGround is null)
+        {
+            lmPhysical = null; rlGround = null; rlLitGround = null;
+            Toast(Loc.T("Lighting bake cancelled - the level is unchanged."));
+            return;
+        }
+        FinishRealGround();
+        return;
+    }
+    var fbR = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbR.X * 0.5f, fbR.Y * 0.5f), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(440f * uiScale, 0f), ImGuiCond.Always);
+    if (ImGui.Begin("###rlbakeprogress", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                    | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking))
+    {
+        Theme.Heading(Loc.T("Tracing the light on the ground"));
+        int done = System.Threading.Volatile.Read(ref rlDone), total = Math.Max(1, System.Threading.Volatile.Read(ref rlTotal));
+        float frac = Math.Clamp(done / (float)total, 0f, 1f);
+        ImGui.ProgressBar(frac, new Vector2(-1f, 0f), $"{frac * 100f:0}%");
+        double el = appClock - rlStarted;
+        Theme.Muted(frac > 0.05f
+            ? string.Format(Loc.T("{0:0} s elapsed, about {1:0} s left"), el, Math.Max(0d, el / frac - el))
+            : string.Format(Loc.T("{0:0} s elapsed"), el));
+        Theme.Muted(Loc.T("Step 1 of 2. The object lightmaps follow. The editor stays usable while this runs."));
+        ImGui.Spacing();
+        if (ImGui.Button(Loc.TL("Cancel##rlbake"), new Vector2(120f * uiScale, 0f))) rlCancel?.Cancel();
+    }
+    ImGui.End();
+}
+
+// The ground stage is done: put the lit ground in the atlas, pack the shadow bits, start the objects.
+void FinishRealGround()
+{
+    var res = rlGround!; var lit = rlLitGround;
+    rlGround = null; rlLitGround = null;
+    rlShadowShare = res.ShadowShare;
+
+    if (atlasCpu is not null && lit is not null && lit.Width == atlasCpu.Width && lit.Height == atlasCpu.Height)
+    {
+        // This REPLACES whatever an earlier bake put in the ground - it was made from the ground as painted - so
+        // the older bakes' records come off with it. One undo step, and they go back with it too.
+        var merged = CurrentGroundMerge();
+        var pooled = CurrentPoolMerge();
+        var px = lit.Rgba;
+        AtlasFullEdit(() => Array.Copy(px, atlasCpu!.Rgba, Math.Min(px.Length, atlasCpu!.Rgba.Length)),
+                      onApply: () => { SetGroundMerge(null); SetPoolMerge(null); },
+                      onUndo: () => { SetGroundMerge(merged); SetPoolMerge(pooled); });
+        MarkAllTilesDirty();
+        groundLightsLive = false;                  // the pools are in the ground now; live ones would show twice
+        if (terrainTex is not null && RlTileSize() is int tile)
+        {
+            terrainTex.SaveTileSize = tile;
+            Console.WriteLine($"   Ground tiles will be saved at {tile} px so they keep the bake's detail.");
+        }
+    }
+    else Console.WriteLine("   No terrain texture atlas on this level, so the light could not be written into the ground.");
+
+    // The shadow bits the engine keeps for things that move: the same sun, the same scene, trees and fences included.
+    int gridDim = Math.Clamp(cfg.MaterialSize / 64, 1, 16);
+    if (loadedShadowBits is { GridDim: > 0 } lb) gridDim = lb.GridDim;
+    try
+    {
+        bakedShadowLsb = RefractorForge.Render.GroundLightBake.ToShadowBits(res, gridDim);
+        bakedLsb = true; unbakeLighting = false;
+    }
+    catch (Exception ex) { Console.WriteLine("   Shadow bits could not be packed: " + ex.Message); }
+    if (showShadows) { showShadows = false; shadowMapDirty = true; }   // the real-time preview would show every shadow twice
+    Console.WriteLine($"   Ground traced in {appClock - rlStarted:0.0} s: {res.ShadowShare * 100.0:0.0}% of it in the sun's shadow.");
+
+    rlMaps = 0; rlMapFloor = 0; rlMapCeil = 0; rlMapErr = 0;
+    lmSelectedOnly = false;                        // this bake is the whole level: the ground already is
+    BakeObjectLightmaps();
+    bakedObjects = true;
+    if (!lmBaking) FinishRealisticBake(0, 0);      // nothing on this map can carry a lightmap
+}
+
+// Both stages are done: the level's light colours become the ones the maps were solved against, and the viewport
+// switches to drawing the level the way the game will.
+void FinishRealisticBake(int baked, int unwrapless)
+{
+    lmPhysical = null; rlRig = null;
+    if (rlFit is not { } fit) return;
+    var c = fit.Colours;
+    lightDiffuse = c.Sun; lightAmb = c.Ambient;
+    if (env is not null)
+    {
+        env.SecondaryDiffuseColor = new Vec3(c.Back.X, c.Back.Y, c.Back.Z); env.HasSecondaryDiffuse = true;
+        env.LMAmbientColor = new Vec3(c.LmAmbient.X, c.LmAmbient.Y, c.LmAmbient.Z); env.HasLMAmbient = true;
+        env.WriteLightColours = true;
+        env.ShadowAlpha = fit.ShadowAlpha; env.HasShadowColor = true; env.WriteShadowColor = true;
+    }
+    lightingDirty = true;                          // Init.con is patched on the next save
+    BroadcastLight();
+    gameLighting = true; lightPreview = true;
+    RlSettings().Baked = true;
+
+    double floorPct = rlMaps > 0 ? rlMapFloor / rlMaps * 100.0 : 0, ceilPct = rlMaps > 0 ? rlMapCeil / rlMaps * 100.0 : 0;
+    double err = rlMaps > 0 ? rlMapErr / rlMaps : 0;
+    rlSummary = string.Format(Loc.T("Baked: {0} lightmap(s), {1} object(s) with no unwrap left to the game's own light, {2:0}% of the ground in shadow.\nLight colours written to the level: diffuse {3}, secondary {4}, ambient {5}, LMambient {6}.\nWhere the engine cannot follow the traced light: {7:0}% of lightmap texels are darker than its ambient floor and {8:0}% brighter than both its lights can reach; on average the result is {9:0.000} away (0 = identical, 1 = black against white)."),
+        baked, unwrapless, rlShadowShare * 100.0, RlV(c.Sun), RlV(c.Back), RlV(c.Ambient), RlV(c.LmAmbient), floorPct, ceilPct, err);
+    Console.WriteLine("Realistic lighting baked. " + rlSummary.Replace("\n", " "));
+    Toast(string.Format(Loc.T("Realistic lighting baked: {0} lightmap(s) and the ground. The viewport now shows the level as the game will draw it. Save writes it all."), baked));
+}
+
+// ---- the ray-traced preview of the current view ------------------------------------------------------------------
+
+void RlCancelPreview()
+{
+    rlPrevCancel?.Cancel();
+    try { rlPrevTask?.Wait(2000); } catch { }
+    rlPrevCancel?.Dispose(); rlPrevCancel = null; rlPrevTask = null;
+}
+
+void RlStartPreview()
+{
+    if (heightmap is null || so is null || meshLib is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
+    RlCancelPreview();
+    // The scene is rebuilt only when something in the level changed since the last preview.
+    string sig = SaveSignature() + "|" + so.Objects.Count + "|" + groundAtlasVersion;
+    if (rlPrevScene is null || sig != rlPrevSceneSig)
+    {
+        var ground0 = RlGroundSource();
+        var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground0, so, meshLib, holes: env?.IsTunnelMap == true, keepSources: true);
+        rlPrevScene = RefractorForge.Render.LightPreview.Prepare(built, so, meshLib, ground0, cfg, cfg.WaterLevel);
+        rlPrevSceneSig = sig;
+    }
+    if (rlPrevScene is null) { Toast(Loc.T("Nothing to trace: this level has no terrain or objects.")); return; }
+
+    var day = RlModel(rlPrevScene.Ground);
+    var fb = window.FramebufferSize;
+    int w = 800, h = Math.Clamp((int)(w * (fb.Y / (float)Math.Max(fb.X, 1))) & ~1, 200, 800);
+    var px = new byte[w * h * 4];
+    rlPrevPx = px; rlPrevW = w; rlPrevH = h; rlPrevSeconds = 0;
+    System.Threading.Volatile.Write(ref rlPrevStage, 0);
+    var view = new RefractorForge.Render.LightPreview.Camera(cam.Position, cam.Forward, Vector3.UnitY, cam.FovY * 180f / MathF.PI, w, h);
+    var rigSnap = RlLampSnapshot();
+    var prep = rlPrevScene;
+    rlPrevCancel = new System.Threading.CancellationTokenSource();
+    var token = rlPrevCancel.Token;
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    rlPrevTask = System.Threading.Tasks.Task.Run(() =>
+    {
+        // A rough picture at once, then the real one over it.
+        RefractorForge.Render.LightPreview.Render(prep, day, view, px, new RefractorForge.Render.LightTracer.Budget(1, 8, 1), 4, rigSnap, null, token);
+        if (token.IsCancellationRequested) return;
+        System.Threading.Volatile.Write(ref rlPrevStage, 1);
+        RefractorForge.Render.LightPreview.Render(prep, day, view, px, new RefractorForge.Render.LightTracer.Budget(8, 48, 2), 1, rigSnap, null, token);
+        if (token.IsCancellationRequested) return;
+        rlPrevSeconds = clock.Elapsed.TotalSeconds;
+        System.Threading.Volatile.Write(ref rlPrevStage, 2);
+    }, token);
+}
+
+unsafe void RlUploadPreview()
+{
+    if (rlPrevPx is null || rlPrevW <= 0 || rlPrevH <= 0) return;
+    if (rlPrevTex == 0)
+    {
+        rlPrevTex = gl.GenTexture();
+        gl.BindTexture(TextureTarget.Texture2D, rlPrevTex);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
+    }
+    gl.BindTexture(TextureTarget.Texture2D, rlPrevTex);
+    fixed (byte* p = rlPrevPx)
+        gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)rlPrevW, (uint)rlPrevH, 0,
+                      PixelFormat.Rgba, PixelType.UnsignedByte, p);
+}
+
+// ---- the window --------------------------------------------------------------------------------------------------
+
+void RlPreset(float sr, float sg, float sb, float zr, float zg, float zb, float hr, float hg, float hb, float sky, float bright)
+{
+    var st = RlSettings();
+    st.SunR = sr; st.SunG = sg; st.SunB = sb;
+    st.ZenithR = zr; st.ZenithG = zg; st.ZenithB = zb;
+    st.HorizonR = hr; st.HorizonG = hg; st.HorizonB = hb;
+    st.SkyStrength = sky; st.Brightness = bright;
+}
+
+void RealLightWindow()
+{
+    if (!showRealLight) return;
+    ImGui.SetNextWindowSize(new Vector2(580f * uiScale, 800f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(440f * uiScale, 360f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
+    if (!ImGui.Begin(Loc.TL("Realistic Lighting") + "###reallight", ref showRealLight)) { ImGui.End(); return; }
+    ImGui.PushTextWrapPos(0f);
+    var st = RlSettings();
+    bool busy = rlBaking || lmBaking || sbBaking;
+
+    if (gameIsBf1942)
+        ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("This level is Battlefield 1942. The bake is solved against Battlefield Vietnam's shaders, so only the preview works here for now."));
+
+    // ---- 1. the light ------------------------------------------------------------------------------------------
+    Theme.Section(Loc.T("1. THE LIGHT"));
+    Theme.Muted(Loc.T("Describe the light as it is - a sun and a sky. The bake traces it, writes it into the ground and the lightmaps, and works out the level's own light colours from it."));
+    if (ImGui.SmallButton(Loc.TL("Clear day##rl"))) RlPreset(1f, 0.95f, 0.86f, 0.34f, 0.52f, 0.92f, 0.76f, 0.84f, 0.96f, 0.20f, 1.05f);
+    ImGui.SameLine();
+    if (ImGui.SmallButton(Loc.TL("Hazy day##rl"))) RlPreset(1f, 0.96f, 0.90f, 0.55f, 0.66f, 0.85f, 0.85f, 0.88f, 0.92f, 0.45f, 1.0f);
+    ImGui.SameLine();
+    if (ImGui.SmallButton(Loc.TL("Overcast##rl"))) RlPreset(1f, 1f, 1f, 0.72f, 0.75f, 0.80f, 0.80f, 0.82f, 0.85f, 1.3f, 0.9f);
+    ImGui.SameLine();
+    if (ImGui.SmallButton(Loc.TL("Golden hour##rl"))) RlPreset(1f, 0.72f, 0.42f, 0.38f, 0.48f, 0.80f, 0.95f, 0.75f, 0.60f, 0.35f, 1.0f);
+    ImGui.SameLine();
+    if (ImGui.SmallButton(Loc.TL("Moonlit night##rl"))) RlPreset(0.72f, 0.84f, 1f, 0.30f, 0.42f, 0.75f, 0.40f, 0.50f, 0.78f, 0.5f, 0.30f);
+    Theme.Tip(Loc.T("Starting points. They set the colours, the sky's strength and the brightness - not where the sun is."));
+
+    {
+        var es = EffectiveSun();
+        float az = sunOverride ? sunAzimuthDeg : MathF.Atan2(es.X, es.Z) * 180f / MathF.PI;
+        float el = sunOverride ? sunElevationDeg : MathF.Asin(Math.Clamp(es.Y, -1f, 1f)) * 180f / MathF.PI;
+        bool moved = false;
+        if (SldF(Loc.TL("Sun bearing"), ref az, -180f, 180f, "%.0f deg")) moved = true;
+        if (SldF(Loc.TL("Sun height"), ref el, 2f, 89f, "%.0f deg")) moved = true;
+        Theme.Tip(Loc.T("Where the sun (or the moon) stands. Low is long shadows and warm walls; high is short shadows and bright ground.\nOn a level lit by lamps, 35-45 degrees lets walls and ground both carry lamp light.\nMoving it is an edit to the level: save writes it to SkyAndSun.con."));
+        if (moved) { sunOverride = true; sunAzimuthDeg = az; sunElevationDeg = el; shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
+    }
+
+    var sunC = new Vector3(st.SunR, st.SunG, st.SunB);
+    if (Col3(Loc.TL("Sun colour"), ref sunC)) { st.SunR = sunC.X; st.SunG = sunC.Y; st.SunB = sunC.Z; }
+    var zen = new Vector3(st.ZenithR, st.ZenithG, st.ZenithB);
+    if (Col3(Loc.TL("Sky colour, overhead"), ref zen)) { st.ZenithR = zen.X; st.ZenithG = zen.Y; st.ZenithB = zen.Z; }
+    var hor = new Vector3(st.HorizonR, st.HorizonG, st.HorizonB);
+    if (Col3(Loc.TL("Sky colour, horizon"), ref hor)) { st.HorizonR = hor.X; st.HorizonG = hor.Y; st.HorizonB = hor.Z; }
+    Theme.Tip(Loc.T("The sky's colour is the colour of shade: everything the sun does not reach is lit by it."));
+
+    float sky = st.SkyStrength;
+    if (SldF(Loc.TL("Sky strength"), ref sky, 0.05f, 2f, "%.2f")) st.SkyStrength = sky;
+    Theme.Tip(Loc.T("How much light the open sky gives, against the sun. About 0.2 is a clear day with dark, crisp shadows;\n0.45 is haze; above 1 is overcast, where shadows almost vanish."));
+    float bright = st.Brightness;
+    if (SldF(Loc.TL("Brightness"), ref bright, 0.1f, 1.3f, "%.2f")) st.Brightness = bright;
+    Theme.Tip(Loc.T("How bright a surface facing the sun is drawn: 1 is its texture at full brightness.\nAbout 1.05 by day. A night level wants 0.25-0.35, so the moon is dim and the lamps are what you see."));
+    float bounce = st.Bounce;
+    if (SldF(Loc.TL("Bounced light"), ref bounce, 0f, 1.5f, "%.2f")) st.Bounce = bounce;
+    Theme.Tip(Loc.T("Light that has bounced off the ground and the walls - what lifts the underside of an awning\nand the shaded foot of a wall. 1 is what the textures' own colours give."));
+    float interior = st.Interior;
+    if (SldF(Loc.TL("Interior brightness"), ref interior, 0.05f, 1f, "%.2f")) st.Interior = interior;
+    Theme.Tip(Loc.T("The engine draws every ceiling at one fixed level and can draw nothing darker than it.\nLower gives deeper interiors and darker ceilings; higher the reverse."));
+
+    int lampCount = lightRig.Lights.Count(l => l.Enabled && l.Intensity > 0f);
+    if (lampCount > 0)
+    {
+        float head = st.LampHeadroom;
+        if (SldF(Loc.TL("Lamp headroom"), ref head, 0f, 1f, "%.2f")) st.LampHeadroom = head;
+        Theme.Tip(Loc.T("Only matters when the light is dim (night). A lightmap can only take the level's own light away,\nso for a lamp to show on a wall that light has to be kept bright and the moon written low in the map.\nHigher lets lamps light buildings fully - and makes soldiers and vehicles that bright too,\nbecause nothing takes the light away from them."));
+        Theme.Muted(string.Format(Loc.T("{0} lamp(s) on this level are traced with the sun and the sky: their pools, their shadows and their bounce."), lampCount));
+    }
+
+    // ---- 2. preview --------------------------------------------------------------------------------------------
+    ImGui.Spacing();
+    Theme.Section(Loc.T("2. PREVIEW"));
+    Theme.Muted(Loc.T("A ray-traced picture of what the camera sees now, with this light. Nothing is baked or changed: it is here to tune the light by looking."));
+    if (ImGui.Button(Loc.TL("Render preview"))) RlStartPreview();
+    int stage = System.Threading.Volatile.Read(ref rlPrevStage);
+    bool rendering = rlPrevTask is { IsCompleted: false };
+    if (rendering) { ImGui.SameLine(); if (ImGui.Button(Loc.TL("Stop##rlprev"))) RlCancelPreview(); }
+    if (rlPrevPx is not null)
+    {
+        // While it renders the picture fills in row by row, so it is uploaded again every few frames.
+        if (rendering ? (int)(appClock * 4) != rlPrevShown : stage != rlPrevShown)
+        {
+            RlUploadPreview();
+            rlPrevShown = rendering ? (int)(appClock * 4) : stage;
+        }
+        if (rlPrevTex != 0)
+        {
+            float availW = MathF.Max(ImGui.GetContentRegionAvail().X, 120f);
+            ImGui.Image((IntPtr)rlPrevTex, new Vector2(availW, availW * rlPrevH / Math.Max(rlPrevW, 1)));
+        }
+        Theme.Muted(rendering ? Loc.T("Rendering...")
+                              : stage >= 2 ? string.Format(Loc.T("Rendered in {0:0.0} s."), rlPrevSeconds) : Loc.T("Stopped."));
+    }
+    Theme.Muted(Loc.T("This is the light the bake aims for. The game has no ray tracer: after a bake the main viewport shows what the game will actually draw, and where the engine cannot follow, the two differ."));
+
+    // ---- 3. bake -----------------------------------------------------------------------------------------------
+    ImGui.Spacing();
+    Theme.Section(Loc.T("3. BAKE"));
+    {
+        int q = Math.Min(lmQuality, 2);
+        string[] names = { Loc.T("Draft - fast, coarse"), Loc.T("Good"), Loc.T("High - final") };
+        if (Cbo(Loc.TL("Quality"), ref q, names, names.Length)) { lmQuality = q; ApplyLightmapQuality(); }
+        Theme.Tip(Loc.T("Lightmap size and rays per texel. Draft is for checking the light on the whole map quickly;\nHigh is the final bake and takes far longer."));
+    }
+    ImGui.BeginDisabled(busy || gameIsBf1942);
+    if (ImGui.Button(Loc.TL("Bake realistic lighting"), new Vector2(260f * uiScale, 0f))) BakeRealisticLighting();
+    ImGui.EndDisabled();
+    Theme.Tip(Loc.T("Traces the light and writes all of it: the ground tiles in colour, every object's lightmap,\nthe shadow bits, and the level's four light colours in Init.con.\nIt replaces what earlier lighting bakes put in the ground. Save writes it to the level."));
+    if (busy) Theme.Muted(Loc.T("A bake is running."));
+
+    if (!gameIsBf1942)
+    {
+        ImGui.Checkbox(Loc.TL("Viewport shows the game's lighting"), ref gameLighting);
+        Theme.Tip(Loc.T("Draw the level with the game's own formula: its sun, its second light from the opposite side,\nits ambient, the lightmaps and the ground exactly as baked. Off is the editor's always-readable light."));
+    }
+    if (rlSummary.Length > 0) { ImGui.Spacing(); Theme.Muted(rlSummary); }
+
+    ImGui.PopTextWrapPos();
+    ImGui.End();
+}
+
 void NightLightingWindow()
 {
     if (!showNightWindow) return;
@@ -13492,6 +14168,10 @@ void UploadPlacedLights(uint prog)
             gl.GetUniformLocation(prog, "uNight"),
             gl.GetUniformLocation(prog, "uNightAmb"),
             gl.GetUniformLocation(prog, "uLmAmbient"),
+            gl.GetUniformLocation(prog, "uGame"),
+            gl.GetUniformLocation(prog, "uGSun"),
+            gl.GetUniformLocation(prog, "uGBack"),
+            gl.GetUniformLocation(prog, "uGAmb"),
         };
         plLocs[prog] = loc;
     }
@@ -13528,6 +14208,11 @@ void UploadPlacedLights(uint prog)
     if (loc[4] >= 0) gl.Uniform1(loc[4], lightRig.NightAmount);
     if (loc[5] >= 0) { var na = NightSceneLight(); gl.Uniform3(loc[5], na.X, na.Y, na.Z); }
     if (loc[6] >= 0) { var la = env?.LMAmbientColor ?? new Vec3(0.25f, 0.25f, 0.25f); gl.Uniform3(loc[6], la.X, la.Y, la.Z); }
+    // The game's own lighting (see the object shader): the level's four light colours exactly as Init.con has them.
+    if (loc[7] >= 0) gl.Uniform1(loc[7], gameLighting && !gameIsBf1942 ? 1 : 0);
+    if (loc[8] >= 0) gl.Uniform3(loc[8], lightDiffuse.X, lightDiffuse.Y, lightDiffuse.Z);
+    if (loc[9] >= 0) { var sb = env?.SecondaryDiffuseColor ?? new Vec3(0f, 0f, 0f); gl.Uniform3(loc[9], sb.X, sb.Y, sb.Z); }
+    if (loc[10] >= 0) gl.Uniform3(loc[10], lightAmb.X, lightAmb.Y, lightAmb.Z);
 }
 
 // Copy the edited lighting back onto the EnvironmentSettings, flagging each key as declared so the patcher writes it.
@@ -13620,7 +14305,7 @@ void UnbakeObjectLightmaps()
     int maps = 0;
     bakedObjectLightmaps.Clear();
     var white = new Texture2D(128, 128, System.Linq.Enumerable.Repeat((byte)255, 128 * 128 * 4).ToArray());   // 128 is retail's smallest observed lightmap
-    var encoded = TgaTexture.EncodeGrayColormapped(white);
+    var encoded = EncodeGreyLightmap(white, LevelLightmapPalette() ?? LightmapPalette.Linear);
     foreach (var o in so.Objects)
         foreach (var meshName in meshLib.LodGeometryNames(o.Template))
         {
@@ -17635,6 +18320,8 @@ void BuildUi()
     BrightenDialog();
     NightLightingWindow();
     NightBakeProgress();
+    RealLightWindow();
+    RealLightProgress();
     HeightmapImportWindow();
     TerrainImportWindow();
     CollabAutoFetchMap();
@@ -20757,6 +21444,8 @@ void LightsPanel()
     Theme.Section(Loc.T("NIGHT LIGHTING"));
     Theme.Muted(string.Format(Loc.T("{0} placed light(s)"), lightRig.Lights.Count));
     if (ImGui.Button(Loc.TL("Open Night Lighting..."))) showNightWindow = true;
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Open Realistic Lighting..."))) showRealLight = true;
     Theme.Tip(Loc.T("Lamps and spots, the night look, and the bake that puts them into the game - all in one window."));
     ImGui.SameLine();
     ImGui.Checkbox(Loc.TL("Show light markers"), ref showLightGizmos);

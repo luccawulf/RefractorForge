@@ -39,6 +39,30 @@ public sealed class EnvironmentSettings
     /// Cedar Falls .25, Saigon68 .2. Accepts the single-float form as well as a triple.</summary>
     public Vec3 LMAmbientColor { get; set; } = new(0.25f, 0.25f, 0.25f);
     public bool HasLMAmbient { get; set; }
+    /// <summary><c>renderer.standardMeshMinIntensity</c>: the least of the sun and back light an object with no
+    /// lightmap keeps in terrain shadow. Null when the level does not set it (the exe then uses 0.2).</summary>
+    public float? StandardMeshMinIntensity { get; set; }
+
+    /// <summary><c>renderer.SecondaryDiffuseColor</c>: BfVietnam's SECOND directional light. The engine aims it
+    /// itself - the sun's direction with x and z negated, so the opposite compass bearing at the same height - and
+    /// every retail level sets its colour (0.25-0.55). It lights the side of everything the sun does not, and a
+    /// lightmap scales it exactly as it scales the sun. Accepts the single-float form as well as a triple.</summary>
+    public Vec3 SecondaryDiffuseColor { get; set; } = new(0f, 0f, 0f);
+    public bool HasSecondaryDiffuse { get; set; }
+
+    /// <summary><c>shadow.shadowColor r/g/b/alpha</c>: the colour and opacity of the moving shadows soldiers and
+    /// vehicles cast. The alpha is how dark they are, and it only looks right when it matches the shade baked into
+    /// the ground they fall on.</summary>
+    public Vec3 ShadowColor { get; set; } = new(0f, 0f, 0f);
+    public float ShadowAlpha { get; set; } = 0.5f;
+    public bool HasShadowColor { get; set; }
+
+    /// <summary>The editor worked the light colours out (a lighting bake's fit, or the user set them), so
+    /// <c>SecondaryDiffuseColor</c> and <c>LMambientColor</c> are written to Init.con - added if the level never
+    /// had them. <c>diffuseColor</c> and <c>ambientColor</c> go by their own <c>Has</c> flags, as before.</summary>
+    public bool WriteLightColours { get; set; }
+    /// <summary>Write <c>shadow.shadowColor</c>.</summary>
+    public bool WriteShadowColor { get; set; }
 
     /// <summary>The colour block of the second, below-terrain water (<c>waterBelowTerrain.*</c>, the console object
     /// BfVietnam registers beside <c>water</c>). Saigon68 copies its surface water's block wholesale, so that is what
@@ -322,6 +346,9 @@ public sealed class EnvironmentSettings
                 {
                     case "renderer.globalambientcolor": if (TryVec(val, out var gac)) { e.GlobalAmbientColor = gac; e.HasGlobalAmbient = true; } break;
                     case "renderer.ambientcolor": if (TryVec(val, out var amc)) { e.AmbientColor = amc; e.HasAmbient = true; } break;
+                    case "renderer.standardmeshminintensity":
+                        if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var smi)) e.StandardMeshMinIntensity = smi;
+                        break;
                     case "renderer.lmambientcolor":
                         if (TryVec(val, out var lma)) { e.LMAmbientColor = lma; e.HasLMAmbient = true; }
                         else if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var lm1)) { e.LMAmbientColor = new Vec3(lm1, lm1, lm1); e.HasLMAmbient = true; }
@@ -341,6 +368,22 @@ public sealed class EnvironmentSettings
                     case "water.wateralphadepth": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var sad)) surfAlphaDepth = sad; break;
                     case "water.watercolordepth": if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var scd)) surfColorDepth = scd; break;
                     case "renderer.diffusecolor": if (TryVec(val, out var dfc)) { e.DiffuseColor = dfc; e.HasDiffuse = true; } break;
+                    case "renderer.secondarydiffusecolor":
+                        if (TryVec(val, out var sdc)) { e.SecondaryDiffuseColor = sdc; e.HasSecondaryDiffuse = true; }
+                        else if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var sd1)) { e.SecondaryDiffuseColor = new Vec3(sd1, sd1, sd1); e.HasSecondaryDiffuse = true; }
+                        break;
+                    case "shadow.shadowcolor":
+                    {
+                        // r/g/b/alpha - four parts, where every other colour here has three.
+                        var sp4 = val.Split('/');
+                        if (sp4.Length >= 4
+                            && float.TryParse(sp4[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var s0)
+                            && float.TryParse(sp4[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var s1)
+                            && float.TryParse(sp4[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s2)
+                            && float.TryParse(sp4[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var s3))
+                        { e.ShadowColor = new Vec3(s0, s1, s2); e.ShadowAlpha = s3; e.HasShadowColor = true; }
+                        break;
+                    }
                     case "renderer.specularcolor": if (TryVec(val, out var spc)) { e.SpecularColor = spc; e.HasSpecular = true; } break;
                     case "renderer.vertexfogenable": e.FogEnabled = val.StartsWith("1"); break;
                     case "renderer.fogcolorvec": if (TryVec(val, out var fc)) e.FogColor = fc; break;
@@ -606,6 +649,9 @@ public sealed class EnvironmentSettings
             ("renderer.globalambientcolor", $"renderer.globalAmbientColor {V(GlobalAmbientColor)}", HasGlobalAmbient),
             ("renderer.ambientcolor",       $"renderer.ambientColor {V(AmbientColor)}",             HasAmbient),
             ("renderer.diffusecolor",       $"renderer.diffuseColor {V(DiffuseColor)}",             HasDiffuse),
+            ("renderer.secondarydiffusecolor", $"renderer.SecondaryDiffuseColor {V(SecondaryDiffuseColor)}", WriteLightColours),
+            ("renderer.lmambientcolor",     $"renderer.LMambientColor {V(LMAmbientColor)}",         WriteLightColours),
+            ("shadow.shadowcolor",          $"shadow.shadowColor {V(ShadowColor)}/{F(ShadowAlpha)}", WriteShadowColor),
             ("renderer.specularcolor",      $"renderer.specularColor {V(SpecularColor)}",           HasSpecular),
             ("renderer.vertexfogenable",    $"renderer.vertexFogEnable {(FogEnabled ? 1 : 0)}",     WriteFog),
             ("renderer.fogcolorvec",        $"renderer.fogColorVec {V(FogColor)}",                  WriteFog),

@@ -150,6 +150,143 @@ public static class StandardMeshWriter
         for (int i = 0; i < tris.Count * 3; i++) w.Write((ushort)i);
     }
 
+    /// <summary>How a lit section's vertices are laid out. The engine picks its shader from this: a vertex with a
+    /// tangent frame goes down the per-pixel path (<c>RaShaderPPLSTs1Dif[Lmp].fx</c>), one without goes down the
+    /// fixed-function one (<c>RaShaderPVLS1Dif[Lmp].fx</c>).</summary>
+    public enum LitLayout
+    {
+        /// <summary>32 bytes, vertexFormat 1041: position, normal, uv. No lightmap channel.</summary>
+        Plain32,
+        /// <summary>40 bytes, vertexFormat 9233, interleaved: + the lightmap uv. What ControlTower_M1 and
+        /// O_Citadel_M1 ship as, and what <see cref="StandardMeshRewriter.StridePromotion.To40"/> produces.</summary>
+        Lightmap40,
+        /// <summary>64 bytes, vertexFormat 1041, PLANAR: every vertex's position/normal/uv first, then every
+        /// vertex's lightmap uv + tangent + binormal. What most BfVietnam buildings ship as (O_HueHouse_B_M1).</summary>
+        Tangent64,
+    }
+
+    /// <summary>One material section with everything a lit vertex can carry. <paramref name="LightmapUvs"/> may be
+    /// empty, which writes zeros - the "slot is there, nothing is in it" state three quarters of BfVietnam's
+    /// meshes ship in.</summary>
+    public sealed record LitSection(string Material, IReadOnlyList<Vec3> Positions, IReadOnlyList<Vec3> Normals,
+                                    IReadOnlyList<(float U, float V)> Uvs, IReadOnlyList<(float U, float V)> LightmapUvs,
+                                    IReadOnlyList<(int A, int B, int C)> Faces);
+
+    /// <summary>
+    /// Write a single-LOD mesh whose vertices carry a lightmap channel, in either layout the engine reads one from.
+    /// The normals are written exactly as given - they are what the engine lights with, and they do not have to
+    /// agree with the triangles they sit on.
+    ///
+    /// <para>The 64-byte layout's tangent frame is built round each normal the way retail meshes have it
+    /// (tangent x binormal = normal; O_HueHouse_B_M1's +X wall carries tangent +Z, binormal -Y). It only decides
+    /// how a normal MAP is read: with a flat one the light comes out the same whatever the frame is.</para>
+    /// </summary>
+    /// <param name="lightmapChannelFilled">The header's qflag: true says the lightmap uvs are a real unwrap (371 of
+    /// 371 unwrapped retail meshes say so). Refused for <see cref="LitLayout.Plain32"/>, which has no channel.</param>
+    /// <param name="bounds">Six floats, min xyz then max xyz.</param>
+    public static byte[] WriteLit(IReadOnlyList<LitSection> sections, LitLayout layout, bool lightmapChannelFilled,
+                                  float[] bounds, byte[]? collisionSection = null)
+    {
+        if (sections.Count == 0) throw new InvalidDataException("No section given to write.");
+        if (bounds is not { Length: 6 }) throw new ArgumentException("Bounds are six floats: min xyz, max xyz.", nameof(bounds));
+        if (lightmapChannelFilled && layout == LitLayout.Plain32)
+            throw new InvalidDataException("A 32-byte vertex has no lightmap channel, so the mesh cannot claim a filled one.");
+        foreach (var s in sections)
+        {
+            int nv = s.Positions.Count;
+            if (nv == 0 || s.Faces.Count == 0) throw new InvalidDataException($"Material '{s.Material}' has no triangles to write.");
+            if (nv > 65535) throw new InvalidDataException($"Material '{s.Material}' has {nv} vertices (>65535 u16 limit).");
+            if (s.Normals.Count != nv || s.Uvs.Count != nv)
+                throw new InvalidDataException($"Material '{s.Material}': {nv} positions, {s.Normals.Count} normals, {s.Uvs.Count} uvs.");
+            if (s.LightmapUvs.Count != 0 && s.LightmapUvs.Count != nv)
+                throw new InvalidDataException($"Material '{s.Material}': {s.LightmapUvs.Count} lightmap uvs for {nv} vertices - all of them or none.");
+        }
+
+        (uint format, uint stride) = layout switch
+        {
+            LitLayout.Plain32 => (1041u, 32u),
+            LitLayout.Lightmap40 => (9233u, 40u),
+            _ => (1041u, 64u),
+        };
+
+        using var ms = new MemoryStream();
+        var w = new BinaryWriter(ms);
+        w.Write((uint)10);                          // version
+        w.Write(new byte[4]);
+        for (int i = 0; i < 6; i++) w.Write(bounds[i]);
+        w.Write((byte)(lightmapChannelFilled ? 1 : 0));   // qflag
+        if (collisionSection is { Length: > 0 }) { w.Write((uint)1); w.Write((uint)collisionSection.Length); w.Write(collisionSection); }
+        else w.Write((uint)0);
+        w.Write((uint)1);                           // numLods
+        w.Write((uint)sections.Count);
+        foreach (var s in sections)
+        {
+            var name = Encoding.Latin1.GetBytes(s.Material);
+            w.Write((uint)name.Length); w.Write(name);
+            w.Write(new byte[12]);
+            w.Write((uint)4);                       // renderType: triangle list
+            w.Write(format);
+            w.Write(stride);
+            w.Write((uint)s.Positions.Count);
+            w.Write((uint)(s.Faces.Count * 3));
+            w.Write((uint)0);                       // materialSettings
+        }
+        foreach (var s in sections)
+        {
+            int nv = s.Positions.Count;
+            (float U, float V) Lm(int i) => s.LightmapUvs.Count == 0 ? (0f, 0f) : s.LightmapUvs[i];
+            void Base(int i)
+            {
+                var p = s.Positions[i]; var n = s.Normals[i]; var uv = s.Uvs[i];
+                w.Write(p.X); w.Write(p.Y); w.Write(p.Z);
+                w.Write(n.X); w.Write(n.Y); w.Write(n.Z);
+                w.Write(uv.U); w.Write(uv.V);
+            }
+            if (layout == LitLayout.Tangent64)
+            {
+                for (int i = 0; i < nv; i++) Base(i);
+                for (int i = 0; i < nv; i++)
+                {
+                    var (lu, lv) = Lm(i);
+                    var (t, b) = TangentFrame(s.Normals[i]);
+                    w.Write(lu); w.Write(lv);
+                    w.Write(t.X); w.Write(t.Y); w.Write(t.Z);
+                    w.Write(b.X); w.Write(b.Y); w.Write(b.Z);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < nv; i++)
+                {
+                    Base(i);
+                    if (layout == LitLayout.Lightmap40) { var (lu, lv) = Lm(i); w.Write(lu); w.Write(lv); }
+                }
+            }
+            foreach (var (a, b, c) in s.Faces) { w.Write((ushort)c); w.Write((ushort)b); w.Write((ushort)a); }   // reversed winding, as Write does
+        }
+        WriteShadow(w, null, "shadow_");
+        w.Write((uint)0);                           // portal mesh chunk: none
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    /// <summary>A tangent and binormal round <paramref name="n"/> with tangent x binormal = normal, level with the
+    /// ground where the normal allows it - the frame a wall's vertices carry in the retail meshes.</summary>
+    public static (Vec3 Tangent, Vec3 Binormal) TangentFrame(Vec3 n)
+    {
+        double nx = n.X, ny = n.Y, nz = n.Z;
+        double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+        if (len < 1e-9) return (new Vec3(1, 0, 0), new Vec3(0, 0, 1));
+        nx /= len; ny /= len; nz /= len;
+        // tangent = normal x up, or +X where the normal is (nearly) vertical and that product vanishes.
+        double tx = -nz, ty = 0, tz = nx;
+        double tl = Math.Sqrt(tx * tx + tz * tz);
+        if (tl < 1e-4) { tx = 1; ty = 0; tz = 0; } else { tx /= tl; tz /= tl; }
+        // binormal = normal x tangent, which makes tangent x binormal = normal.
+        double bx = ny * tz - nz * ty, by = nz * tx - nx * tz, bz = nx * ty - ny * tx;
+        return (new Vec3((float)tx, (float)ty, (float)tz), new Vec3((float)bx, (float)by, (float)bz));
+    }
+
     public static void WriteFile(ObjMesh mesh, string path) => File.WriteAllBytes(path, Write(mesh));
 
     /// <summary>Re-emit a collision section from its full parsed form (<see cref="StandardMesh.CollisionData"/>):

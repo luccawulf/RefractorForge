@@ -16,7 +16,7 @@ namespace RefractorForge.Render;
 /// against the heightmap (<see cref="TerrainShadow.PointLit"/>) and against the mesh (<see cref="MeshOccluder"/>).
 /// Placed lights are added as extra visibility. Pure CPU, so it runs headlessly and is testable.
 /// </summary>
-public static class ObjectLightmapBaker
+public static partial class ObjectLightmapBaker
 {
     /// <summary>
     /// The offline-renderer half of the bake: a sun with angular size, and sky visibility. Every field defaults

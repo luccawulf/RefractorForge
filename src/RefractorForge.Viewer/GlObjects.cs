@@ -54,7 +54,9 @@ public sealed class GlObjects
         // here, so a pane that stamped depth erased whatever was drawn after it - the aircraft behind its own canopy.
         gl.DepthMask(part.DepthWrite);
     }
-    private sealed class Template { public uint Vao; public Part[] Parts = Array.Empty<Part>(); public Vector3 BbMin; public Vector3 BbMax; }
+    private sealed class Template { public uint Vao; public Part[] Parts = Array.Empty<Part>(); public Vector3 BbMin; public Vector3 BbMax;
+                                    /// <summary>No tangent frame: the game draws it fixed-function (MeshLibrary.Mesh.VertexLit).</summary>
+                                    public bool VertexLit; }
 
     private readonly Dictionary<string, Template> _templates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<(Texture2D Bmp, bool AlphaTest), uint> _glTextures = new();   // one GL texture per (bitmap, alpha-tested): cutout foliage skips mipmaps to stop alpha erosion
@@ -65,6 +67,15 @@ public sealed class GlObjects
     /// <summary>Object indices in a hidden group: skipped by Draw and by Raycast, so a hidden thing is neither
     /// seen nor clickable. Set by the viewer when the groups change.</summary>
     public HashSet<int>? HiddenIndices;
+
+    /// <summary>Object index -> the share of the sun and back light the game leaves an object with NO lightmap
+    /// (EngineLight.StaticShare). Null, or no entry, is the whole light. Ignored for an instance drawn with a
+    /// lightmap - the game does the same.</summary>
+    public Dictionary<int, float>? LightShares;
+
+    /// <summary>The radius the game samples the terrain with for this template (EngineLight.StaticRadius), or 0.</summary>
+    public float StaticRadius(string tmpl)
+        => _templates.TryGetValue(tmpl, out var t) ? RefractorForge.Render.EngineLight.StaticRadius(t.BbMin, t.BbMax) : 0f;
 
     /// <summary>Ephemeral overgrowth foliage instances (a VIEW of the .wst-generated trees; never saved), grouped
     /// by template so each VAO binds once. Independent of <see cref="Placements"/>, so Build/Rebuild don't clear it.
@@ -365,6 +376,8 @@ public sealed class GlObjects
         // Per-object baked lightmaps go on texture unit 1; sampled only for instances that have one (uHasLightmap==1).
         int uHasLm = gl.GetUniformLocation(prog, "uHasLightmap");
         int uLm = gl.GetUniformLocation(prog, "uLightmap");
+        int uVertexLit = gl.GetUniformLocation(prog, "uVertexLit");
+        int uLightCut = gl.GetUniformLocation(prog, "uLightCut");
         if (uLm >= 0) gl.Uniform1(uLm, 1);
         bool lmOn = ShowLightmaps && _haveLightmaps && uHasLm >= 0;
         foreach (var (tmpl, world, objIndex) in Placements)
@@ -393,6 +406,9 @@ public sealed class GlObjects
                 }
                 else gl.Uniform1(uHasLm, 0);
             }
+            if (uVertexLit >= 0) gl.Uniform1(uVertexLit, t.VertexLit ? 1 : 0);
+            if (uLightCut >= 0)
+                gl.Uniform1(uLightCut, LightShares is not null && !_instLightmap.ContainsKey(objIndex) && LightShares.TryGetValue(objIndex, out float share) ? 1f - share : 0f);
             gl.BindVertexArray(t.Vao);
             foreach (var part in t.Parts)
             {
@@ -411,6 +427,8 @@ public sealed class GlObjects
                 gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
             }
         }
+            if (uVertexLit >= 0) gl.Uniform1(uVertexLit, 0);   // growth, the model viewer and markers share this program
+            if (uLightCut >= 0) gl.Uniform1(uLightCut, 0f);
             gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
     }
 
@@ -557,7 +575,7 @@ public sealed class GlObjects
         // OrderBy is a stable sort, so everything else keeps its authored order.
         var ordered = parts.OrderBy(p => p.Blend ? 1 : 0).ToArray();
         Bounds(pos, out var bbMin, out var bbMax);
-        var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = ordered, BbMin = bbMin, BbMax = bbMax };
+        var tpl = new Template { Vao = MakeMesh(gl, verts, allIdx.ToArray()), Parts = ordered, BbMin = bbMin, BbMax = bbMax, VertexLit = mesh.VertexLit };
         _templates[key] = tpl;
         return tpl;
     }

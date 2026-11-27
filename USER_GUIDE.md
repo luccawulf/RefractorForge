@@ -453,6 +453,85 @@ what you see is where the game plants every tree and tuft.
   - A lamp against daylight barely registers — in the game as in the bake. Night maps are where lights live.
   - **Bake strength** scales the whole rig without re-aiming it.
 
+### Realistic lighting (Window ▸ Realistic Lighting, BfVietnam)
+
+One bake for the whole level's light. You describe the light as it is — a sun, a sky, your placed lamps — and the
+editor **ray-traces** it: the sun through its disc (so shadows soften with distance), the sky as a coloured dome,
+and both again after they bounce off the ground and the walls. It then works out what the game needs in order to
+draw that light, and writes all of it.
+
+**How the game lights a level** (read off its shaders and its exe — `docs/Realistic_Lighting.md` has the detail):
+
+- **The ground has no light at all at draw time.** The game draws the ground tile times the detail texture and
+  nothing else, so whatever lighting the ground has is *in its tiles*. That is why the bake can put real colour
+  there: blue-tinted shade, warm bounce at the foot of a sunlit wall, soft tree shadows, slopes turned from the sun.
+- **Objects are lit by two lights and a constant.** The sun (`renderer.diffuseColor`), a **second light from the
+  opposite compass side at the same height** (`renderer.SecondaryDiffuseColor` — the engine aims it itself, and every
+  retail level sets it), and an ambient (`renderer.LMambientColor` for lightmapped objects, `renderer.ambientColor`
+  for the rest). An object's lightmap is one number per texel that scales the two lights:
+  `texture x (lightmap x (sun + second light) + ambient)`.
+- So the bake does not write "can this texel see the sun". It traces how much light arrives, and **solves for the
+  lightmap value that makes the game's own formula draw it** — and for the four light colours that let it.
+
+**1. The light**
+
+- **Clear day / Hazy day / Overcast / Golden hour / Moonlit night** — starting points for the colours, the sky's
+  strength and the brightness. They do not move the sun.
+- **Sun bearing / Sun height** — where the sun or the moon stands. Moving it is an edit to the level (save writes
+  `SkyAndSun.con`).
+- **Sun colour**, **Sky colour** (overhead and at the horizon) — the sky's colour is the colour of shade.
+- **Sky strength** — how much light the open sky gives against the sun: about 0.2 is a clear day with dark, crisp
+  shadows, 0.45 is haze, above 1 is overcast. This one slider is most of the difference between a harsh noon and a
+  soft day.
+- **Brightness** — how bright a surface facing the sun is drawn. About 1.05 by day; 0.25–0.35 for a night level.
+- **Bounced light** — light off the ground and the walls; 1 is what the textures' own colours give.
+- **Interior brightness** — the engine draws every ceiling at one fixed level and nothing darker than it. Lower
+  gives deeper interiors.
+- **Lamp headroom** (only with placed lights, only when the light is dim) — a lightmap can only take the level's
+  light *away*, so for a lamp to show on a wall the level's two lights are kept bright and the moon is written low
+  in the map. Higher lets lamps light buildings fully, and makes soldiers and vehicles that bright too.
+
+**2. Preview** — **Render preview** ray-traces what the camera sees now, with this light, in a few seconds. Nothing
+is baked or changed; it is there to tune the light by looking. It shows the light the bake *aims for*, not what the
+game will draw — the game has no ray tracer.
+
+**3. Bake** — **Bake realistic lighting** writes:
+
+1. the **ground tiles**, in colour, from the ground as painted (a copy is kept before the first bake, so baking
+   twice is baking once, and **Revert Ground Texture to Original** still works). Tiles are saved large enough to
+   hold the bake's detail — a level that ships 256 px tiles on a 4 x 4 grid is saved at 512 px;
+2. every object's **lightmap**, for each object whose mesh has an unwrap. An object without one gets no file -
+   the game ignores a lightmap on such a mesh and lights the object itself (make it lightmap-ready first if it
+   matters). The maps are written through the level's own lightmap palette, which is how the game reads them;
+3. the **shadow bits** (`LightmapShadowBits.lsb`), with trees and fences casting;
+4. the level's **light colours** in Init.con — `diffuseColor`, `SecondaryDiffuseColor`, `ambientColor`,
+   `LMambientColor` — and `shadow.shadowColor`, so the moving shadows of soldiers and vehicles are as dark as the
+   shade baked under them.
+
+It replaces what earlier lighting bakes put in the ground. **Z** undoes the ground; **Ctrl+S** writes everything.
+
+After a bake **Viewport shows the game's lighting** is on: the viewport draws the level with the game's own formula,
+so what you fly through is what the game shows. Turn it off for the editor's always-readable light.
+
+**Placed lights** (Window ▸ Night Lighting places them) are traced with everything else: their pools on the ground
+in colour, their shadows — a lamp behind a chain-link fence throws the fence's shadow — and their bounce onto the
+walls and eaves beside them. They join the moonlight the way light does, so a lamp over lit ground lifts it a little
+and a lamp in darkness is exactly as bright as you set it. On a level lit by lamps the two engine lights take the
+lamps' colour, because a lightmap can scale the engine's light but not recolour it: otherwise a sodium lamp would
+light a wall moon-blue.
+
+**What the engine cannot show**, whatever is baked — the summary after a bake counts the first two:
+
+- A face that looks **down** (a ceiling, the underside of an awning) is reached by neither light and shows the
+  ambient alone.
+- Nothing lightmapped can be **darker than the ambient**, so the deepest interiors are a little brighter than traced.
+- A lamp's **colour** shows on the ground; on objects only its brightness does (the lightmap is one channel).
+- **Soldiers and vehicles** are lit by the level's two lights only. A lamp does not light them as they walk under it.
+- Objects with **no lightmap channel at all** stay lit by the two lights, unshadowed. *Lightmap-ready objects…*
+  gives them one.
+
+A Battlefield 1942 level can use the preview; the bake itself is solved against BfVietnam's shaders.
+
 ---
 
 ## 7b. Tunnels (Battlefield Vietnam 1.2) — Window ▸ Tunnels

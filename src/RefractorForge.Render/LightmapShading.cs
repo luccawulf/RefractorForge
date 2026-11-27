@@ -37,6 +37,10 @@ public sealed class SampleChunk
     public readonly float[] Sky;
     public readonly Vector3[] Bounce;
     public readonly Vector3[] Lamp;
+    /// <summary>What arrives straight from the sky, as linear irradiance with its colour - the traced bake's
+    /// counterpart of <see cref="Sky"/>, which is a bare visibility. Allocated on first use: only that bake fills it.</summary>
+    public Vector3[] SkyRgb => _skyRgb ??= new Vector3[Capacity];
+    private Vector3[]? _skyRgb;
 
     public SampleChunk(int capacity)
     {

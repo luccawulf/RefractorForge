@@ -361,7 +361,7 @@ public sealed class LevelScene
 
     /// <summary>A material part's average reflectance, linear 0..1. Subsampled - a few thousand texels settle a
     /// mean to far better than a bounce needs, and some of these textures are 1024 square.</summary>
-    private static Vector3 MeanAlbedo(MeshLibrary.MaterialPart part)
+    internal static Vector3 MeanAlbedo(MeshLibrary.MaterialPart part)
     {
         var tex = part.Texture;
         if (tex is null || tex.Width <= 0 || tex.Height <= 0)

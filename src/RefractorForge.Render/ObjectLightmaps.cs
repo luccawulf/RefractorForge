@@ -123,6 +123,11 @@ public sealed class ObjectLightmaps
     public IReadOnlyList<Entry> Entries => _entries;
     public int Count => _entries.Count;
 
+    /// <summary>The level's <c>Palette.pal</c>, when the maps are to be read the way BfVietnam reads them: an 8-bit
+    /// map's indices go through this file, not through the colour map inside the .tga (measured in the game - see
+    /// <see cref="LightmapPalette"/>). Null reads each file by its own colour map.</summary>
+    public LightmapPalette? Palette { get; private set; }
+
     // <template>_<x>-<y>-<z> ; the template can contain underscores/digits, so anchor the three trailing signed ints.
     private static readonly Regex NameRx = new(@"^(.*)_(-?\d+)-(-?\d+)-(-?\d+)$", RegexOptions.Compiled);
 
@@ -148,7 +153,7 @@ public sealed class ObjectLightmaps
         try
         {
             bool isDds = data.Length > 4 && data[0] == 'D' && data[1] == 'D' && data[2] == 'S' && data[3] == ' ';
-            tex = isDds ? DdsTexture.Decode(data) : TgaTexture.Decode(data);
+            tex = isDds ? DdsTexture.Decode(data) : (Palette?.Decode(data) ?? TgaTexture.Decode(data));
         }
         catch { return; }
         if (tex is null) return;
@@ -158,10 +163,18 @@ public sealed class ObjectLightmaps
     }
 
     /// <summary>Load every ObjectLightMaps/*.tga straight out of the level .rfa archives.</summary>
-    public static ObjectLightmaps FromArchives(IEnumerable<RefractorFlatArchive> archives)
+    /// <param name="throughLevelPalette">Read 8-bit maps through the level's own <c>Palette.pal</c>, as BfVietnam
+    /// does. Off by default: Battlefield 1942's handling has not been measured.</param>
+    public static ObjectLightmaps FromArchives(IEnumerable<RefractorFlatArchive> archives, bool throughLevelPalette = false)
     {
         var olm = new ObjectLightmaps();
-        foreach (var a in archives)
+        var list = archives as IReadOnlyList<RefractorFlatArchive> ?? archives.ToList();
+        if (throughLevelPalette)
+            foreach (var a in list)                               // a later (patch) archive's palette wins
+                foreach (var e in a.Entries)
+                    if (e.Name.Replace('\\', '/').EndsWith("lightmaps/palette.pal", StringComparison.OrdinalIgnoreCase))
+                        try { olm.Palette = LightmapPalette.Parse(a.Read(e)) ?? olm.Palette; } catch { }
+        foreach (var a in list)
             foreach (var e in a.Entries)
             {
                 var n = e.Name.Replace('\\', '/');
@@ -184,7 +197,7 @@ public sealed class ObjectLightmaps
     }
 
     /// <summary>Open the given level .rfa paths and load their ObjectLightMaps/*.tga (skips missing/unreadable).</summary>
-    public static ObjectLightmaps FromRfaPaths(IEnumerable<string> paths)
+    public static ObjectLightmaps FromRfaPaths(IEnumerable<string> paths, bool throughLevelPalette = false)
     {
         var arcs = new List<RefractorFlatArchive>();
         foreach (var p in paths)
@@ -192,11 +205,11 @@ public sealed class ObjectLightmaps
             if (!File.Exists(p) || Path.GetFileName(p).StartsWith("~")) continue;
             try { arcs.Add(new RefractorFlatArchive(p)); } catch { }
         }
-        return FromArchives(arcs);
+        return FromArchives(arcs, throughLevelPalette);
     }
 
     /// <summary>Load every ObjectLightMaps/*.tga from a level FOLDER (recursive).</summary>
-    public static ObjectLightmaps FromFolder(string levelDir)
+    public static ObjectLightmaps FromFolder(string levelDir, bool throughLevelPalette = false)
     {
         var olm = new ObjectLightmaps();
         try
@@ -205,6 +218,11 @@ public sealed class ObjectLightmaps
             {
                 if (dir.Replace('\\', '/').IndexOf("/night/", StringComparison.OrdinalIgnoreCase) >= 0
                     || dir.EndsWith("Night", StringComparison.OrdinalIgnoreCase)) continue;   // skip night set
+                if (throughLevelPalette)
+                {
+                    var pal = Directory.EnumerateFiles(dir, "*.pal").FirstOrDefault(f => Path.GetFileName(f).Equals("Palette.pal", StringComparison.OrdinalIgnoreCase));
+                    if (pal is not null) try { olm.Palette = LightmapPalette.Parse(File.ReadAllBytes(pal)) ?? olm.Palette; } catch { }
+                }
                 foreach (var f in Directory.EnumerateFiles(dir, "*.*"))
                     if (f.EndsWith(".tga", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
                         try { olm.Add(Path.GetFileNameWithoutExtension(f), File.ReadAllBytes(f)); } catch { }
