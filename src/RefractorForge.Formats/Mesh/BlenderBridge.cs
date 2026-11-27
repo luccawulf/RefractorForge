@@ -28,8 +28,10 @@ public static class BlenderBridge
     public static readonly string[] Extensions =
         { ".fbx", ".glb", ".gltf", ".blend", ".stl", ".ply", ".usd", ".usda", ".usdc", ".usdz", ".abc", ".dae" };
 
+    /// <summary>Whether a file has to go through Blender. glTF is read natively (<see cref="GltfMesh"/>); Blender still
+    /// takes one the reader turns down - compressed geometry - which is why the script keeps its glTF branch.</summary>
     public static bool NeedsBlender(string path) =>
-        Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+        Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase) && !GltfMesh.Is(path);
 
     /// <summary>The picker filter: everything the importer takes - OBJ and .3ds read natively, the rest through
     /// Blender.</summary>

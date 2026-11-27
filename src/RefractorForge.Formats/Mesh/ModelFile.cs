@@ -4,8 +4,9 @@ using System.IO;
 
 namespace RefractorForge.Formats.Mesh;
 
-/// <summary>The one place that knows which reader a model file needs. OBJ and <c>.3ds</c> are read here; everything
-/// Blender can open is converted to OBJ first by <see cref="BlenderBridge"/> and then comes through the OBJ door.</summary>
+/// <summary>The one place that knows which reader a model file needs. OBJ, <c>.3ds</c> and glTF (<c>.gltf</c> /
+/// <c>.glb</c>, <see cref="GltfMesh"/>) are read here; everything else Blender can open is converted to OBJ first by
+/// <see cref="BlenderBridge"/> and then comes through the OBJ door.</summary>
 public static class ModelFile
 {
     /// <summary>A model as read, with any materials the file itself carried (a <c>.3ds</c> keeps them inside; an
@@ -21,6 +22,7 @@ public static class ModelFile
             var r = ThreeDsMesh.Load(path);
             return new Loaded(r.Mesh, r.Materials, ZUpMaxConvention: true);
         }
+        if (GltfMesh.Is(path)) return GltfMesh.Load(path);
         return new Loaded(ObjMesh.Load(path), null, ZUpMaxConvention: false);
     }
 }

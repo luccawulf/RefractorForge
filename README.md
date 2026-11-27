@@ -36,6 +36,8 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   algorithm, reversed from `BfVietnam.exe` and matching a capture from the running game tree for tree.
 - **Collision and AI meshes** — view an object's COL01 / COL02 collision meshes, and which objects have an AI
   mesh and which do not.
+- **Free models** — search Poly Haven and Poly Pizza from inside the editor and import a model straight into the
+  map (native glTF reader, no Blender needed); the credit each licence asks for is written into the map.
 - **Lighting** — real-time sun control + shadow mapping, plus **bake-to-game**: terrain sun shadows
   (`LightmapShadowBits.lsb`, byte-exact), per-object lightmaps, and minimap generation.
 - **Environment** — water colour/level/textures, sun azimuth/elevation, fog, skybox import, animated

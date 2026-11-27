@@ -26,6 +26,8 @@ public static class LevelPackager
         public byte[]? MinimapPng { get; init; }
         public byte[]? ThumbnailPng { get; init; }
         public IReadOnlyList<string> Notes { get; init; } = Array.Empty<string>();
+        /// <summary>The map's ModelCredits.txt, if it has one: the third-party models and the credit their licences ask for.</summary>
+        public string? Credits { get; init; }
     }
 
     /// <summary>The readme, so it can be shown before writing and so it is the same text every time.</summary>
@@ -60,6 +62,14 @@ public static class LevelPackager
             sb.AppendLine("NOTES");
             sb.AppendLine("-----");
             foreach (var n in i.Notes) sb.AppendLine("- " + n);
+            sb.AppendLine();
+        }
+        var credits = Online.ModelCredits.Body(i.Credits);
+        if (credits.Length > 0)
+        {
+            sb.AppendLine("THIRD-PARTY MODELS");
+            sb.AppendLine("------------------");
+            sb.AppendLine(credits.TrimEnd());
             sb.AppendLine();
         }
         sb.AppendLine("Packaged with RefractorForge.");

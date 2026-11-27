@@ -37,7 +37,7 @@ public class HelpDocumentTests
         Assert.Contains(h2, t => t.StartsWith("12. Keyboard reference"));
         var h3 = doc.Where(b => b.Kind == HelpDocument.Kind.Heading && b.Level == 3).Select(b => b.Text).ToList();
         foreach (var want in new[] { "Game modes", "When a ship or carrier spawns the wrong team", "Pathmaps on bridges",
-                                     "Collision meshes and AI meshes", "Copy Level To", "Overgrowth and undergrowth" })
+                                     "Collision meshes and AI meshes", "Copy Level To", "Overgrowth and undergrowth", "Free models from Poly Haven" })
             Assert.Contains(h3, t => t.StartsWith(want));
         Assert.Contains(doc, b => b.Kind == HelpDocument.Kind.Table);
         Assert.Contains(doc, b => b.Kind == HelpDocument.Kind.Numbered);

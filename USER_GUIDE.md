@@ -111,6 +111,36 @@ Turn on **Snap** in the ribbon to grid-snap placement/moves; set the step in the
 - **Double-click** a template to open a **3D model viewer** (auto-rotates; drag to orbit, scroll to
   zoom) — handy for checking a mesh before placing it.
 
+### Free models from Poly Haven and Poly Pizza (Tools ▸ Find Free Models…)
+
+Search two free model libraries from inside the editor and bring a model straight into the map:
+
+- **Poly Haven** — about 500 CC0 models (scanned props, furniture, rocks, plants), real-world size, no account. The
+  catalogue shows as soon as the window opens, most downloaded first; type words to narrow it (every word must
+  match the name or a tag) or pick a **Category**.
+- **Poly Pizza** — about 10,000 low-poly models, the size these games want, CC0 or CC-BY. It needs a free API key:
+  make a free account at poly.pizza, create a key on its API settings page (**Get a key…** opens it) and paste it
+  into **API key**. The key is kept in this PC's editor settings; **Forget key** removes it. **CC0 only** and
+  **Hide animated** narrow the results. Models whose licence forbids changes (CC-BY-ND) are never offered, because
+  the import simplifies and converts every model.
+
+1. Click a model to see it on the right: author, licence, triangle count, size and tags. **Open the model's page**
+   shows it on the library's site.
+2. **Download and import** (or double-click the tile). Only the files the editor uses are downloaded (for Poly
+   Haven, the model and its colour texture, not its normal and roughness maps), and they are kept in
+   `%LocalAppData%\RefractorForge\ModelCache`, so a second import does not download again. **Texture size** picks
+   Poly Haven's 1k or 2k set; the import makes textures 512 px by default, so 1k is plenty.
+3. **Import 3D Model** opens with the model loaded, in metres and standing on its base. Set the size, the triangle
+   budget (most Poly Haven models are several thousand triangles; 2,000 is the default) and collision as for any
+   import, then **Add to level** and click to place it.
+4. The credit goes into the map: **`ModelCredits.txt`** inside the level gets the model's name, author, source page
+   and licence (CC-BY asks for exactly that, and it is kept for CC0 models too). **Tools ▸ Package Level…** repeats
+   it in the readme.
+
+Models come in through the editor's own glTF reader, so Blender is not needed; one with compressed geometry (Draco)
+is converted with Blender if it is installed. Cut-out textures (leaves, fences) and double-sided surfaces keep those
+settings. Animated models come in as static objects in their rest pose.
+
 ### Collision meshes and AI meshes (Inspector ▸ Layers)
 
 - **Collision (wireframe)** draws the collision meshes of the placed objects. A mesh can carry two: **COL01**, the

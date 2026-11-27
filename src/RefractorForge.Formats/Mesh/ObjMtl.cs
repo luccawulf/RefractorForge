@@ -14,6 +14,14 @@ public sealed class ObjMaterial
     public string Name = "";
     public Vec3 Diffuse = new(0.8f, 0.8f, 0.8f);
     public string? TextureFile;   // the map_Kd path as written (relative or absolute; spaces and all)
+    /// <summary>A cut-out (glTF <c>alphaMode MASK</c>): texels below <see cref="AlphaCutoff"/> are not drawn - leaf
+    /// cards, fences, grilles. An OBJ never says so; a glTF does.</summary>
+    public bool Cutout;
+    public float AlphaCutoff = 0.5f;
+    /// <summary>Alpha-blended (glTF <c>BLEND</c>): glass, smoke.</summary>
+    public bool Blend;
+    /// <summary>Drawn from both sides (glTF <c>doubleSided</c>).</summary>
+    public bool TwoSided;
 
     /// <summary>The texture's base name without extension — the form a Refractor <c>.rs</c> + texture archive use.</summary>
     public string? TextureName => TextureFile is null ? null : Path.GetFileNameWithoutExtension(TextureFile.Replace('\\', '/'));

@@ -8,9 +8,23 @@ have not been run yet.**
 Nothing goes into the mod: the mesh, its textures and the four `.con` files that register it all live inside the
 level archive, so the map is still one file you can hand to somebody.
 
-## Formats: OBJ directly, everything else through Blender
+## Formats: OBJ and glTF directly, everything else through Blender
 
-OBJ + MTL needs nothing. FBX, glTF/GLB, `.blend`, STL, PLY, USD and Alembic are converted by **Blender itself**,
+OBJ + MTL needs nothing, and since 2026-11 neither does **glTF / GLB**: `Formats/Mesh/GltfMesh.cs` reads it natively,
+because glTF is what the free libraries serve (Poly Haven, Poly Pizza, Sketchfab) and the model browser
+(*Tools ▸ Find Free Models...*, `Formats/Online/ModelSources.cs`) should not need Blender installed. The reader
+produces exactly what the Blender bridge would: Blender's glTF importer maps a file's (x, y, z) to (x, -z, y) and the
+bridge's OBJ export maps it straight back, so the glTF's own coordinates, counter-clockwise winding and normals pass
+through, with V flipped to OBJ's bottom-left origin. `GltfMeshTests` has Blender author a scene (a rotated,
+non-uniformly scaled sphere and a box under a rotated parent), then matches every triangle of the native read against
+Blender's conversion - positions, UVs and winding. It takes the scene's node transforms (a mirroring one turns its
+triangles over), triangle strips and fans, sparse accessors, `KHR_texture_transform`, the specular-glossiness
+diffuse texture, and the base colour's cut-out (`alphaMode MASK` → `alphaTestRef`), blending and `doubleSided`;
+images packed in a `.glb` or a `data:` URI are written out for the texture loader. Geometry compressed with Draco or
+meshopt is the one thing it turns down (`GltfMesh.UnsupportedException`), and the import then hands that file to
+Blender, which reads it.
+
+FBX, `.blend`, STL, PLY, USD and Alembic (and a compressed glTF) are converted by **Blender itself**,
 run in the background (`Formats/Mesh/BlenderBridge.cs`): the importer writes a small Python script, runs
 `blender --background --python-exit-code 3 --python <script> -- <source> model.obj manifest.json` in a scratch
 folder, and reads the OBJ that comes out. Blender is the converter; nothing here parses those formats, which is

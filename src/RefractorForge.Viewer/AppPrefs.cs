@@ -57,6 +57,11 @@ public static class AppPrefs
     /// the way back up.</summary>
     public static string PendingRejoinMap { get; set; } = "";
 
+    /// <summary>The user's own Poly Pizza API key (poly.pizza/settings/api) for the model browser. Kept in the clear
+    /// like the central-server password: it opens a free catalogue, not an account, and it never leaves this PC
+    /// except in the requests to Poly Pizza itself.</summary>
+    public static string PolyPizzaApiKey { get; set; } = "";
+
     private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RefractorForge");
     private static string FilePath => Path.Combine(Dir, "prefs.json");
 
@@ -64,7 +69,7 @@ public static class AppPrefs
                                int? ObjectTextureCap = null, string? CentralServerAddress = null,
                                int? CentralServerPort = null, string? CentralServerPassword = null,
                                string? CentralServerName = null, string? MapDownloadDir = null,
-                               string? PendingRejoinMap = null);
+                               string? PendingRejoinMap = null, string? PolyPizzaApiKey = null);
 
     /// <summary>Load persisted preferences. Call once at startup, BEFORE the level load block reads them.</summary>
     public static void Load()
@@ -83,6 +88,7 @@ public static class AppPrefs
             if (d.CentralServerName is string cn) CentralServerName = cn;
             if (d.MapDownloadDir is string md) MapDownloadDir = md;
             if (d.PendingRejoinMap is string pr) PendingRejoinMap = pr;
+            if (d.PolyPizzaApiKey is string pk) PolyPizzaApiKey = pk;
         }
         catch { /* a corrupt prefs file must never stop the editor starting */ }
     }
@@ -94,7 +100,7 @@ public static class AppPrefs
             Directory.CreateDirectory(Dir);
             File.WriteAllText(FilePath, JsonSerializer.Serialize(new Data(ResolveInheritedMods, LayerBaseMap, GroundCamera, ObjectTextureCap,
                     CentralServerAddress, CentralServerPort, CentralServerPassword, CentralServerName, MapDownloadDir,
-                    PendingRejoinMap),
+                    PendingRejoinMap, PolyPizzaApiKey),
                 new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }

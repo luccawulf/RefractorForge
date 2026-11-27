@@ -734,6 +734,13 @@ string miPartsNote = "";
 int miColMat = RefractorForge.Formats.Rfa.StandardMeshWriter.DefaultCollisionMaterial;
 int miColMatIdx = RefractorForge.Formats.Con.CollisionMaterials.IndexOf(RefractorForge.Formats.Rfa.StandardMeshWriter.DefaultCollisionMaterial);
 System.Threading.Tasks.Task<BlenderBridge.Result>? miConvert = null;
+// Free-model browser (Tools > Find Free Models...): Poly Haven + Poly Pizza. A downloaded model carries its credit into
+// the import dialog, and the credit is written into the map when the model is added.
+bool showModelBrowser = false;
+ModelBrowser? modelBrowser = null;
+RefractorForge.Formats.Online.ModelCredit? miCredit = null;
+string? miCreditPath = null;
+string mbKeyBuf = "";
 // Erosion + river.
 int erodeIterations = 40; float erodeTalus = 1.2f; bool erodeHydraulic = true; float erodeRadius = 60f;
 float riverWidth = 24f, riverDepth = 4f, riverBank = 6f; int riverBankMat = 3, riverBedMat = 4;
@@ -7815,6 +7822,7 @@ Texture2D? LoadImageAsTexture(string imgPath)
         if (ext == ".dds") return DdsTexture.Decode(File.ReadAllBytes(imgPath));
         if (ext == ".tga") return TgaTexture.Decode(File.ReadAllBytes(imgPath));
         if (ext == ".bmp") return Texture2D.LoadBmp(imgPath);
+        if (ext == ".webp") return WicImage.Decode(imgPath);
         using var bmp = new System.Drawing.Bitmap(imgPath);
         int w = bmp.Width, h = bmp.Height;
         var d = bmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
@@ -17193,6 +17201,8 @@ void BuildUi()
             // submitted, so the decal's description had been sitting on Import Sound and describing a picture.
             if (ImGui.MenuItem(Loc.TL("Create Decal Object..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showDecalDialog = true;
             Theme.Tip(Loc.T("A picture you can place: a flat mesh with a texture of your own, registered as a\nlevel-local object so it ships inside the map."));
+            if (ImGui.MenuItem(Loc.TL("Find Free Models (Poly Haven, Poly Pizza)..."), null, false, so is not null && meshLib is not null && levelDir is not null)) OpenModelBrowser();
+            Theme.Tip(Loc.T("Search free model libraries from inside the editor and bring a model straight into the map: Poly Haven\n(CC0 scans, no account) and Poly Pizza (low-poly, with a free API key). The credit each licence asks for\nis written into the map as ModelCredits.txt."));
             if (ImGui.MenuItem(Loc.TL("Import 3D Model..."), null, false, so is not null && meshLib is not null && levelDir is not null)) showModelImport = true;
             Theme.Tip(Loc.T("A model of your own as a placeable static object: the mesh, its textures\nand the .con files that register it, all written inside the map."));
             if (ImGui.MenuItem(Loc.TL("Import Sound (MP3/WAV)..."), null, false, so is not null && levelDir is not null)) showSoundImport = true;
@@ -17639,6 +17649,7 @@ void BuildUi()
     NotesOverlay();
     MapReportWindow();
     DecalDialog();
+    ModelBrowserWindow();
     ModelImportDialog();
     SoundImportDialog();
     TunnelsWindow();
@@ -18937,6 +18948,17 @@ void LoadModelForImport()
         if (m.TotalFaces > 6000)
             miWarn = string.Format(Loc.T("{0} triangles is far past what these games use (a hero mesh is 1,100-2,200; a whole vehicle 2,000-6,000). The triangle budget below will reduce it on import."), m.TotalFaces);
     }
+    catch (RefractorForge.Formats.Mesh.GltfMesh.UnsupportedException ux)
+    {
+        // Draco- or meshopt-compressed geometry: the native reader turns it down, Blender reads it.
+        var exe = BlenderBridge.FindBlender();
+        if (exe is null || miObjPath is null) { miWarn = ux.Message + " " + Loc.T("Install Blender (blender.org) and the editor converts such files with it."); return; }
+        string src = miObjPath;
+        string work = Path.Combine(Path.GetTempPath(), "RefractorForge", "import_" + Guid.NewGuid().ToString("N")[..8]);
+        miObjPath = null; miBusy = true;
+        miBlenderNote = Loc.T("The model's geometry is compressed, so Blender is converting it.");
+        miConvert = System.Threading.Tasks.Task.Run(() => BlenderBridge.ConvertToObj(src, work, exe));
+    }
     catch (Exception ex) { miWarn = Loc.T("Could not read that model: ") + ex.Message; }
 }
 
@@ -18987,10 +19009,10 @@ void ModelImportDialog()
         if (ImGui.Button(Loc.TL("Browse...")))
         {
             var p = Picker.File("Pick a model", BlenderBridge.PickerFilter, levelDir);
-            if (p is not null) { miPath = p; miName = ""; BeginModelLoad(); }
+            if (p is not null) { miPath = p; miName = ""; miCredit = null; miCreditPath = null; BeginModelLoad(); }
         }
         if (miBusy) ImGui.EndDisabled();
-        Theme.Tip(Loc.T("OBJ needs nothing. FBX, glTF, .blend, STL, PLY, USD and Alembic are converted by Blender in the background - install it from blender.org."));
+        Theme.Tip(Loc.T("OBJ and glTF need nothing. FBX, .blend, STL, PLY, USD and Alembic are converted by Blender in the background - install it from blender.org."));
         ImGui.SetNextItemWidth(220f * uiScale);
         InT(Loc.TL("Template name"), ref miName, 40);
 
@@ -19153,7 +19175,10 @@ bool CreateModelObject()
                 }
             }
             previews[sourceMat] = pic;
-            bindings.Add(new RefractorForge.Formats.Con.ModelObject.Material(sourceMat, texName, diffuse));
+            bindings.Add(new RefractorForge.Formats.Con.ModelObject.Material(sourceMat, texName, diffuse,
+                Transparent: mm?.Blend == true && texName is not null,
+                AlphaTestRef: mm?.Cutout == true && texName is not null ? Math.Clamp(mm.AlphaCutoff, 0.01f, 0.99f) : null,
+                TwoSided: mm?.TwoSided == true));
         }
 
         // Detail: the budget applies to LOD 0 and each further LOD halves it. A model already under budget is kept
@@ -19192,6 +19217,13 @@ bool CreateModelObject()
         pendingLevelFiles.RemoveAll(f => f.RelPath.Equals("Init.con", StringComparison.OrdinalIgnoreCase));
         pendingLevelFiles.Add(("Init.con", System.Text.Encoding.Latin1.GetBytes(
             RefractorForge.Formats.Con.DecalObject.PatchInitCon(initText, levelName, baseSub))));
+
+        // A model from a library brings its credit: author, source and licence go into the map's ModelCredits.txt.
+        if (miCredit is not null && string.Equals(miCreditPath, miPath, StringComparison.OrdinalIgnoreCase))
+        {
+            WriteModelCredit(built.Template, miCredit);
+            miCredit = null; miCreditPath = null;
+        }
 
         // Show it now, under the template name, exactly as an imported .obj is. The renderer asks by the RENAMED
         // material, so map each section back to what it was called before Build renamed it.
@@ -19235,6 +19267,238 @@ bool CreateModelObject()
         return true;
     }
     catch (Exception ex) { Toast(Loc.T("Model import failed: ") + ex.Message); return false; }
+}
+
+// ---- Free models (Tools > Find Free Models...) ------------------------------------------------------------------
+//
+// Poly Haven and Poly Pizza searched from inside the editor. A downloaded model goes straight into Import 3D Model with
+// its credit attached; adding it to the level writes the credit into the map's ModelCredits.txt.
+void OpenModelBrowser()
+{
+    modelBrowser ??= new ModelBrowser(() => AppPrefs.PolyPizzaApiKey);
+    showModelBrowser = true;
+    // Poly Haven needs no key and no words: its catalogue shows straight away, most downloaded first.
+    if (modelBrowser.SourceIndex == 0 && modelBrowser.Results.Count == 0 && !modelBrowser.Searching) modelBrowser.Search(false);
+}
+
+void OpenUrl(string url)
+{
+    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); }
+    catch (Exception ex) { Toast(Loc.T("Could not open the page: ") + ex.Message); }
+}
+
+// A caption cut to a width, ending in "..." when it does not fit.
+string Ellipsize(string s, float width)
+{
+    if (ImGui.CalcTextSize(s).X <= width) return s;
+    for (int n = s.Length - 1; n > 0; n--)
+    {
+        var t = s[..n].TrimEnd() + "...";
+        if (ImGui.CalcTextSize(t).X <= width) return t;
+    }
+    return "...";
+}
+
+void OpenImportForDownload(RefractorForge.Formats.Online.ModelDownload d)
+{
+    miPath = d.ModelPath;
+    miName = SanitizeTemplate(d.Hit.Title);
+    miCredit = d.Credit; miCreditPath = d.ModelPath;
+    // A library model is in metres (glTF's unit), Y up, and stands on its own base: keep all three.
+    miUpAxis = 0; miFitMode = 0; miScale = 1f; miOrigin = 0;
+    showModelImport = true;
+    BeginModelLoad();
+    Toast(string.Format(Loc.T("'{0}' downloaded from {1}. Set its size and detail, then press Add to level."), d.Hit.Title, d.Credit.Source));
+}
+
+// The map's ModelCredits.txt: the copy queued this session, else the one the level already has. UTF-8 throughout,
+// because an author's name is not always Latin.
+string? ModelCreditsText()
+{
+    const string rel = RefractorForge.Formats.Online.ModelCredits.FileName;
+    var queued = pendingLevelFiles.Where(f => f.RelPath.Equals(rel, StringComparison.OrdinalIgnoreCase)).Select(f => f.Bytes).LastOrDefault();
+    var bytes = queued ?? ReadLevelBytes(rel);
+    return bytes is null ? null : System.Text.Encoding.UTF8.GetString(bytes);
+}
+
+void WriteModelCredit(string template, RefractorForge.Formats.Online.ModelCredit credit)
+{
+    const string rel = RefractorForge.Formats.Online.ModelCredits.FileName;
+    var text = RefractorForge.Formats.Online.ModelCredits.Add(ModelCreditsText(), template, credit);
+    pendingLevelFiles.RemoveAll(f => f.RelPath.Equals(rel, StringComparison.OrdinalIgnoreCase));
+    pendingLevelFiles.Add((rel, new System.Text.UTF8Encoding(false).GetBytes(text)));
+}
+
+void ModelBrowserWindow()
+{
+    if (modelBrowser is null) return;
+    var mb = modelBrowser;
+    mb.Poll(UploadTexture, id => gl.DeleteTexture(id));   // even while closed: a download that finishes still lands
+    if (mb.TakeFinished() is { } done) OpenImportForDownload(done);
+    if (!showModelBrowser) return;
+    var fbw = window.FramebufferSize;
+    ImGui.SetNextWindowSize(new Vector2(MathF.Min(fbw.X * 0.85f, 1000f * uiScale), MathF.Min(fbw.Y * 0.8f, 700f * uiScale)), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowPos(new Vector2(fbw.X * 0.5f, fbw.Y * 0.5f), ImGuiCond.FirstUseEver, new Vector2(0.5f, 0.5f));
+    if (!ImGui.Begin(Loc.TL("Free 3D Models") + "###modelbrowser", ref showModelBrowser, ImGuiWindowFlags.NoSavedSettings)) { ImGui.End(); return; }
+
+    // Which library. Poly Haven's API terms ask that people can see the models are theirs: the tab and the line say so.
+    int src = mb.SourceIndex;
+    if (ImGui.RadioButton(Loc.TL("Poly Haven##mbsrc"), src == 0)) src = 0;
+    ImGui.SameLine();
+    if (ImGui.RadioButton(Loc.TL("Poly Pizza##mbsrc"), src == 1)) src = 1;
+    if (src != mb.SourceIndex)
+    {
+        mb.SourceIndex = src; mb.Results.Clear(); mb.Selected = null; mb.Status = ""; mb.Error = ""; mb.More = false;
+        if (src == 0 || (mb.PolyPizza.HasKey && mb.Query.Trim().Length > 0)) mb.Search(false);
+    }
+    ImGui.SameLine();
+    Theme.Muted(src == 0 ? Loc.T("Powered by Poly Haven: every model CC0, no account needed.")
+                         : Loc.T("Poly Pizza: low-poly models, CC0 or CC-BY (the credit goes into the map)."));
+
+    if (src == 1 && !mb.PolyPizza.HasKey)
+    {
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextColored(Theme.Warn, Loc.T("Poly Pizza needs a free API key: make a free account at poly.pizza, create a key on its API settings page and paste it here. It is kept in this PC's editor settings."));
+        ImGui.PopTextWrapPos();
+        ImGui.SetNextItemWidth(320f * uiScale);
+        InT(Loc.TL("API key##ppkey"), ref mbKeyBuf, 128, ImGuiInputTextFlags.Password);
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Save key##ppkey")) && mbKeyBuf.Trim().Length > 0)
+        {
+            AppPrefs.PolyPizzaApiKey = mbKeyBuf.Trim(); AppPrefs.Save(); mbKeyBuf = "";
+            if (mb.Query.Trim().Length > 0) mb.Search(false);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Get a key...##ppkey"))) OpenUrl("https://poly.pizza/settings/api");
+    }
+
+    // The search row.
+    ImGui.SetNextItemWidth(280f * uiScale);
+    bool go = InT("##mbquery", ref mb.Query, 100, ImGuiInputTextFlags.EnterReturnsTrue);
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Search##mb"))) go = true;
+    if (go && (src == 0 || mb.PolyPizza.HasKey)) mb.Search(false);
+    ImGui.SameLine();
+    if (src == 0)
+    {
+        var cats = new[] { Loc.T("Any category") }.Concat(mb.PolyHaven.Categories).ToArray();
+        int ci = Math.Clamp(mb.CategoryIndex, 0, cats.Length - 1);
+        ImGui.SetNextItemWidth(170f * uiScale);
+        if (Cbo(Loc.TL("Category##mbcat"), ref ci, cats, cats.Length)) { mb.CategoryIndex = ci; mb.Search(false); }
+    }
+    else
+    {
+        bool ready = mb.PolyPizza.HasKey && mb.Query.Trim().Length > 0;
+        if (ImGui.Checkbox(Loc.TL("CC0 only##mb"), ref mb.Cc0Only) && ready) mb.Search(false);
+        Theme.Tip(Loc.T("Only models in the public domain. CC-BY models are fine to use too: their credit is written into the map."));
+        ImGui.SameLine();
+        if (ImGui.Checkbox(Loc.TL("Hide animated##mb"), ref mb.HideAnimated) && ready) mb.Search(false);
+        Theme.Tip(Loc.T("An animated model comes in as a static object in its rest pose."));
+        if (mb.PolyPizza.HasKey)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton(Loc.TL("Forget key##ppkey"))) { AppPrefs.PolyPizzaApiKey = ""; AppPrefs.Save(); mb.Results.Clear(); mb.Selected = null; }
+        }
+    }
+
+    // Results on the left, the chosen model on the right.
+    float footer = ImGui.GetFrameHeightWithSpacing();
+    float detailW = 330f * uiScale;
+    ImGui.BeginChild("##mbgrid", new Vector2(-detailW - ImGui.GetStyle().ItemSpacing.X, -footer), ImGuiChildFlags.Border);
+    float tile = 128f * uiScale, lineH = ImGui.GetTextLineHeight();
+    var gap = ImGui.GetStyle().ItemSpacing;
+    int perRow = Math.Max(1, (int)((ImGui.GetContentRegionAvail().X + gap.X) / (tile + gap.X)));
+    for (int i = 0; i < mb.Results.Count; i++)
+    {
+        var h = mb.Results[i];
+        if (i % perRow != 0) ImGui.SameLine();
+        ImGui.PushID(i);
+        var p0 = ImGui.GetCursorScreenPos();
+        if (ImGui.Selectable("##tile", ReferenceEquals(mb.Selected, h), ImGuiSelectableFlags.AllowDoubleClick, new Vector2(tile, tile + lineH * 2f + 4f)))
+        {
+            mb.Selected = h;
+            if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left) && !mb.Downloading) mb.Download(h);
+        }
+        if (ImGui.IsItemVisible())
+        {
+            var dlist = ImGui.GetWindowDrawList();
+            var th = mb.Thumbnail(h);
+            if (th is { Tex: > 0 } t)
+            {
+                float sc = Math.Min(tile / t.W, tile / t.H);
+                var size = new Vector2(t.W * sc, t.H * sc);
+                var o = p0 + new Vector2((tile - size.X) * 0.5f, (tile - size.Y) * 0.5f);
+                dlist.AddImage((IntPtr)t.Tex, o, o + size);
+            }
+            else dlist.AddText(p0 + new Vector2(tile * 0.5f - 8f, tile * 0.5f - lineH * 0.5f), ImGui.GetColorU32(ImGuiCol.TextDisabled), th is null ? "..." : "-");
+            dlist.AddText(p0 + new Vector2(2f, tile + 2f), ImGui.GetColorU32(ImGuiCol.Text), Ellipsize(h.Title, tile - 4f));
+            var hl = RefractorForge.Formats.Online.ModelLicense.Parse(h.License);
+            string sub = (h.Triangles is int tr ? string.Format(Loc.T("{0:N0} tris"), tr) + " - " : "") + (hl.Cc0 ? "CC0" : hl.Name);
+            dlist.AddText(p0 + new Vector2(2f, tile + 2f + lineH), ImGui.GetColorU32(ImGuiCol.TextDisabled), Ellipsize(sub, tile - 4f));
+        }
+        ImGui.PopID();
+    }
+    if (mb.More && ImGui.Button(Loc.TL("Show more##mb"), new Vector2(-1f, 0f))) mb.Search(true);
+    ImGui.EndChild();
+
+    ImGui.SameLine();
+    ImGui.BeginChild("##mbdetail", new Vector2(detailW, -footer), ImGuiChildFlags.Border);
+    if (mb.Selected is { } sel)
+    {
+        float dw = ImGui.GetContentRegionAvail().X;
+        if (mb.Thumbnail(sel) is { Tex: > 0 } st)
+        {
+            float sc = Math.Min(dw / st.W, dw * 0.8f / st.H);
+            ImGui.Image((IntPtr)st.Tex, new Vector2(st.W * sc, st.H * sc));
+        }
+        ImGui.PushTextWrapPos(0f);
+        ImGui.PushFont(Theme.FontSemibold);
+        ImGui.TextUnformatted(sel.Title);
+        ImGui.PopFont();
+        Theme.Muted(string.Format(Loc.T("by {0}, from {1}"), sel.Author, sel.Source));
+        var lic = RefractorForge.Formats.Online.ModelLicense.Parse(sel.License);
+        if (lic.Cc0) ImGui.TextColored(Theme.Ok, Loc.T("CC0: free for any use, no credit required (it is written into the map anyway)."));
+        else ImGui.TextColored(Theme.Warn, string.Format(Loc.T("{0}: the author must be credited. The credit is written into the map's ModelCredits.txt."), lic.Name)
+                                           + (lic.NonCommercial ? " " + Loc.T("Non-commercial use only.") : ""));
+        if (sel.Triangles is int tris)
+            ImGui.TextUnformatted(tris > 6000
+                ? string.Format(Loc.T("{0:N0} triangles: more than these games draw for one object, so the import reduces it to its triangle budget (2,000 by default)."), tris)
+                : string.Format(Loc.T("{0:N0} triangles"), tris));
+        if (sel.SizeMeters is { Length: 3 } sz)
+            ImGui.TextUnformatted(string.Format(Loc.T("{0:0.##} x {1:0.##} m, {2:0.##} m tall"), sz[0], sz[1], sz[2]));
+        if (sel.Animated) Theme.Muted(Loc.T("Animated: it comes in as a static object in its rest pose."));
+        if (sel.Tags.Count > 0) Theme.Muted(string.Join(", ", sel.Tags.Take(10)));
+        ImGui.PopTextWrapPos();
+        ImGui.Spacing();
+        if (sel.Source == mb.PolyHaven.Name)
+        {
+            ImGui.SetNextItemWidth(110f * uiScale);
+            CboZ(Loc.TL("Texture size##mbres"), ref mb.QualityIndex, "1k\02k\0");
+            Theme.Tip(Loc.T("The import makes textures 512 px by default (1024 at most), so 1k is all a map uses.\n2k only helps if you raise the import's texture limit."));
+        }
+        if (mb.Downloading)
+        {
+            var (dn, tot) = mb.DownloadProgress;
+            ImGui.ProgressBar(tot > 0 ? Math.Clamp((float)dn / tot, 0f, 1f) : 0f, new Vector2(-1f, 0f),
+                              tot > 0 ? $"{dn / 1024:N0} / {tot / 1024:N0} KB" : $"{dn / 1024:N0} KB");
+            if (ImGui.Button(Loc.TL("Cancel##mbdl"))) mb.CancelDownload();
+        }
+        else if (Theme.AccentButton(Loc.TL("Download and import##mb"), new Vector2(-1f, 0f))) mb.Download(sel);
+        Theme.Tip(Loc.T("Downloads the model, then opens Import 3D Model with it: set its size and detail there and press Add to level."));
+        if (ImGui.Button(Loc.TL("Open the model's page##mb"))) OpenUrl(sel.PageUrl);
+    }
+    else
+    {
+        ImGui.PushTextWrapPos(0f);
+        Theme.Muted(Loc.T("Pick a model to see it here. Double-click one to download and import it straight away."));
+        ImGui.PopTextWrapPos();
+    }
+    ImGui.EndChild();
+
+    if (mb.Error.Length > 0) ImGui.TextColored(Theme.Danger, Ellipsize(mb.Error, ImGui.GetContentRegionAvail().X));
+    else ImGui.TextDisabled(mb.Status);
+    if (mb.Error.Length > 0 && ImGui.IsItemHovered()) ImGui.SetTooltip(mb.Error);
+    ImGui.End();
 }
 
 // ---- Importing a sound ------------------------------------------------------------------------------------------
@@ -19593,6 +19857,7 @@ bool BuildPackage()
             LevelName = levelName, ModName = activeRfProject?.Mod ?? "bf1942", Game = activeRfProject?.Game ?? "BF1942",
             Author = pkgAuthor, Version = pkgVersion, Description = pkgDesc,
             ClientRfaPath = clientRfa, ServerRfaPath = serverRfa, MinimapPng = mini, ThumbnailPng = thumb,
+            Credits = ModelCreditsText(),
         };
         var written = RefractorForge.Formats.Packaging.LevelPackager.Write(inputs, zipPath);
         try { System.IO.Directory.Delete(tmpDir, true); } catch { }
