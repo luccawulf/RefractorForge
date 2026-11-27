@@ -7,12 +7,30 @@ generated positions, the palms land where the game puts them (the row along the 
 the cluster on the slope to its north-east). It has **not** yet been compared tree for tree with a capture.
 Undergrowth is reversed the same way (section below); no in-game comparison yet.
 
+**Update (2026-11-27): in the editor, and confirmed against the game.** `Formats/Terrain/BfvGrowth.cs` is an
+exact C# port of both generators (`BfvGrowth.GenerateOvergrowth`, `UndergrowthField`), and the viewer draws
+them: overgrowth `_m1` near / `_m2` far with the level's own atlas and the game's cell culling, undergrowth per
+display patch with the game's ring, corner-distance visibility, fade and unlit `saturate(4 * atlas * terrain)`
+shading. The Layers panel's overgrowth / undergrowth rows pick the executable to match (stock, or a
+`BfVietnam_Veg_*` build and its Low / Medium / High tier), and the overgrowth bake / convert-to-statics use the
+same model with rotation and scale. Checks:
+
+- **Python reference, Irving:** 1,596 overgrowth instances (1,449 generated + 147 imported), **0 differences**;
+  undergrowth 772 (hangar) and 1,165 (grass at 760, 520) instances, identical (`BfvGrowthTests`).
+- **A real game capture:** Flaming Dart on the Veg Ultra build, **41,559 of 41,559 positions bit-identical**,
+  the same scales, heights within 7.6e-6 m. The Veg builds hard-code 12.5 m overgrowth / 17.5 m undergrowth
+  cells (0x75e110) and their Low / Medium / High hook (0x856bc1) keeps a cell only when
+  `lowbias32(seed) >> 30` is below 1 / 2 / 3.
+- **Still open:** the game numbers imported statics in its own order, not `StaticObjects.con`'s (placement is
+  unaffected); a cell that overflows with imported statics has not been compared against a capture.
+
 The full evidence, every claim tagged verified / inferred / unknown with its address, is
 `docs/BFV_Overgrowth_RE.md` and `docs/BFV_Undergrowth_RE.md`. This page is the editor-facing summary.
 
 ## What it means for RefractorForge
 
-`OvergrowthFoliage` (Formats/Terrain) is a **statistical** scatter today: the painted 4 m map as the grid,
+(Written before the port above; kept for the record.) `OvergrowthFoliage` (Formats/Terrain) was a
+**statistical** scatter: the painted 4 m map as the grid,
 about 2.1 trees per occupied patch (measured on the Veg-Ultra build), the probability roulette, uniform yaw
 and scale, the patch seed `cellY*4711 + cellX*13 + 23`. The reversed algorithm is **exact** for the stock exe,
 so for stock maps it can replace the density model and the editor can preview (or bake, see

@@ -235,6 +235,32 @@ void main(){
     frag = vec4(uColor, a);
 }";
 
+// AI Path level plane: the navmap drawn flat at a chosen height (a bridge deck, a ship, a platform in the sky), so
+// a stroke lands straight above the cells it edits. Same colours as the ground overlay (green passable, white
+// blocked); nav-cell lines once a cell is a few pixels wide, and a bright rim at the plane's edge.
+const string NavPlaneVert = @"#version 330 core
+layout(location=0) in vec3 aPos; uniform mat4 uMVP; out vec3 vW;
+void main(){ gl_Position = uMVP * vec4(aPos,1.0); vW = aPos; }";
+const string NavPlaneFrag = @"#version 330 core
+in vec3 vW; out vec4 frag;
+uniform sampler2D uNav; uniform float uWorld; uniform float uCell; uniform vec4 uRect;
+void main(){
+    vec2 uv = vW.xz / uWorld;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) discard;
+    float blk = texture(uNav, uv).r;                       // 1 blocked / 0 passable
+    vec3 c = mix(vec3(0.25,0.85,0.40), vec3(1.0), blk);
+    float a = mix(0.40, 0.55, blk);
+    vec2 g = vW.xz / uCell;
+    vec2 w = max(fwidth(g), vec2(1e-5));
+    vec2 f = abs(fract(g + 0.5) - 0.5) / w;
+    float line = (1.0 - clamp(min(f.x, f.y), 0.0, 1.0)) * (1.0 - smoothstep(0.15, 0.35, max(w.x, w.y)));
+    c = mix(c, vec3(0.05), line * 0.5);
+    vec2 e = min(vW.xz - uRect.xy, uRect.zw - vW.xz) / max(fwidth(vW.xz), vec2(1e-5));
+    float rim = 1.0 - clamp(min(e.x, e.y) - 1.0, 0.0, 1.0);
+    c = mix(c, vec3(1.0, 0.85, 0.3), rim);
+    frag = vec4(c, max(a, rim));
+}";
+
 // Water surface: a flat quad at the water level; ripples are procedural in the fragment shader
 // (two crossing sine waves perturb the normal), with a sun specular highlight and a grazing-angle
 // sky reflection so the plane reads as translucent water rather than a flat blue sheet.
@@ -533,6 +559,11 @@ vec3 placedLights(vec3 wp, vec3 nrm){
 
 uniform int uUseShadowMap; uniform sampler2D uShadowMap; uniform mat4 uLightSpace;   // real-time sun shadow map (unit 2)
 uniform int uFogEnable; uniform vec3 uFogColor; uniform float uFogStart; uniform float uFogEnd; uniform vec3 uCamPos;
+// Undergrowth, drawn the way BfVietnam.exe draws it (RaShaderUndergrowth.fx, fixed function): UNLIT, colour =
+// saturate(4 x atlas x the terrain colour under it), alpha = atlas alpha x the patch's fade, alpha-tested at
+// min(fade x 255, 100) / 255. The terrain colour is the editor's atlas (unit 4) at the vertex's world position.
+uniform int uGrowthMode; uniform float uGrowthAlpha;
+uniform int uGrowthHasTer; uniform sampler2D uGrowthTer; uniform vec2 uGrowthTerScale; uniform vec2 uGrowthTerOffset;
 out vec4 frag;
 float shadowVis(vec3 wp, vec3 nrm){
     if (uUseShadowMap==0) return 1.0;
@@ -549,6 +580,20 @@ float shadowVis(vec3 wp, vec3 nrm){
 }
 void main(){
     vec4 tc = texture(uTex, vUv);
+    if (uGrowthMode == 1) {
+        vec3 gb = (uUseTex==1) ? tc.rgb : uColor;
+        float ga = ((uUseTex==1) ? tc.a : 1.0) * uGrowthAlpha;
+        float gref = min(floor(uGrowthAlpha * 255.0), 100.0) / 255.0;
+        if (uAlphaEnable == 1 && ga < gref) discard;
+        vec3 ter = (uGrowthHasTer == 1) ? texture(uGrowthTer, vWorld.xz * uGrowthTerScale + uGrowthTerOffset).rgb : vec3(0.25);
+        vec3 gc = clamp(4.0 * gb * ter, 0.0, 1.0);
+        if (uFogEnable==1) {
+            float gfog = clamp((length(vWorld - uCamPos) - uFogStart) / max(uFogEnd - uFogStart, 1.0), 0.0, 1.0);
+            gc = mix(gc, uFogColor, gfog);
+        }
+        frag = vec4(gc, (uAlphaEnable == 1) ? ga : 1.0);
+        return;
+    }
     vec3 base = (uUseTex==1) ? tc.rgb : uColor;
     float a   = (uUseTex==1) ? tc.a   : 1.0;
     // The alpha test is INDEPENDENT of the blend mode - a blended material can carry an alphaTestRef too, and the
@@ -652,6 +697,11 @@ bool sessionDirty = false;                 // an edit that leaves no trace in th
 bool exitConfirmed = false;                // the user chose to leave with unsaved work, so the close goes through
 bool exitPromptRequest = false;            // open the prompt next frame
 Action? exitPending = null;
+// File > Copy Level To... dialog state (see CopyLevelModal).
+bool copyLevelRequest = false;
+string copyLevelName = "";
+bool copyLevelOpenAfter = true;
+string copyLevelError = "";
 // Decal dialog.
 bool showDecalDialog = false;
 string decalName = "poster1";
@@ -1017,6 +1067,11 @@ GameplayObjects gameplay = GameplayObjects.Empty;
 // The editor still edits the one mode it loaded - this filters what is drawn and clickable, nothing else.
 GameplayModes gameplayModes = GameplayModes.Empty;
 int gameTypeFilter = 0;   // 0 = Show All, else 1-based index into gameplayModes.Modes
+// The game mode whose gameplay is EDITED (null = Conquest, or the first mode - what every load starts on). Switching
+// reloads the gameplay layer from that mode's own files; a save writes that mode in full and patches the others.
+string? editGameMode = null;
+string? editModeSwitchPending = null;   // the mode a "save, then switch" prompt is waiting to switch to
+bool editModeSwitchRequest = false;     // open that prompt next frame (opened once, like the other dialogs)
 EditableGameplay gameplayEdit = new(GameplayObjects.Empty);   // mutable editing view of the gameplay layer
 MaterialMap? materialMap = null;
 MaterialPainter? matPainter = null;
@@ -1322,6 +1377,15 @@ Vector2 placePrevMouse = new(-1f, -1f); Matrix4x4 placePrevVp = default; long pl
 bool placePrevOk = false; Vector3 placePrevHit = default;
 uint gizmoVao = 0, gizmoVbo = 0;       // 3 axis handles (drawn as GL_LINES via the marker shader)
 uint collisionVao = 0, collisionVbo = 0; int collisionLineCount = 0; bool collisionDirty = true;  // .sm collision wireframe overlay (RE'd DShape)
+// Which collision sections the overlay draws: 0 COL01 (the coarse hull), 1 COL02 (the detailed hull - what soldiers and
+// vehicles collide with in game), 2 both, COL01 green and COL02 orange. COL02 goes in the second buffer.
+int collisionView = 2;
+// AI meshes: the simplified meshes in aiMeshes/ the game pairs with objects BY NAME (<geometry stem>_a1). Cyan for an
+// object that has one, a red box for a solid object that has none - what a mapper checks before trusting the bots.
+bool showAiMeshes = false, aiMeshDirty = true; int aiSig = 0;
+uint aiVao = 0, aiVbo = 0, aiMissVao = 0, aiMissVbo = 0; int aiLineCount = 0, aiMissLineCount = 0, aiWithCount = 0, aiMissingCount = 0;
+var aiMeshShapeCache = new Dictionary<string, MeshLibrary.CollisionMesh?>(StringComparer.OrdinalIgnoreCase);
+uint collisionVao2 = 0, collisionVbo2 = 0; int collisionLineCount2 = 0;
 // Battlecraft's object view modes (guide figure 17): 0 = textured (this editor's normal view), 1 = flat colour
 // ("detail mesh"), 2 = bounding box, 3 = wireframe. Collision mesh is the existing separate Layers toggle.
 int objectView = 0;
@@ -1387,6 +1451,8 @@ string evVeh1 = "", evVeh2 = "";
 bool editSolRequest = false; int esIndex = -1; string esName = ""; Vector3 esPos = default, esRot = default; int esGroup = 0, esSpawnId = 0; bool esPara = false;
 double gpLastClickTime = -1; GpKind gpLastClickKind = GpKind.ControlPoint; int gpLastClickIndex = -1;   // double-click-to-edit a gameplay handle
 bool showHelp = false; string? helpText = null;             // Help > User Guide window (loads USER_GUIDE.md next to the exe)
+List<HelpDocument.Block>? helpDoc = null;                   // the guide read into blocks (HelpDocument), once
+int helpJump = -1;                                          // block index the contents list asked to scroll to
 bool gpRotDragging = false; float gpRotStartYaw = 0f, gpRotStartMouseX = 0f;  // Rotate-tool yaw drag on a spawn
 bool showTerrain = true, showObjects = true, showVehicles = true, showControlPoints = true, showSpawns = true;
 // Every mapper EXCEPT Object hides the objects, so you can read the ground you are working on (Battlecraft did
@@ -1439,6 +1505,28 @@ bool showUnderFoliage = false;                               // undergrowth over
 // between a bare hillside and a forest. Previewing stock while PLAYING a Veg build is why the trees casting the
 // baked shadows were not on screen, so this is a setting rather than an assumption.
 int vegBuildIdx = 0;   // 0 Stock, 1 Low, 2 Medium, 3 High, 4 Ultra
+// The EXACT growth model (Formats/Terrain/BfvGrowth.cs, docs/BFV_Growth_Placement.md): the map's whole overgrowth,
+// generated once the way the game does at level load and again whenever its inputs change, and the undergrowth
+// field, whose patches are generated on demand around the camera like the game's. Checked tree for tree against a
+// capture of the running game (Flaming Dart, 41,559 trees), so the overlay is the forest a player sees.
+RefractorForge.Formats.Terrain.OvergrowthResult? ogResult = null;
+RefractorForge.Formats.Terrain.UndergrowthField? ugField = null;
+bool growthModelDirty = true;                                // regenerate ogResult / ugField (level, palette, map, build)
+var growthMeshCache = new Dictionary<string, RefractorForge.Formats.Terrain.GrowthMeshInfo?>(StringComparer.OrdinalIgnoreCase);
+HashSet<string>? ogImportable = null;                        // standardMesh/overGrowthGeometries.wst, per level
+var ogImportableTemplate = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);   // template -> its geometry is listed
+long ogStaticsSig = 0;                                       // the statics overgrowth takes over, hashed: one moving regenerates
+float[] ogCellY = Array.Empty<float>();                      // each cell's centre height, for the game's cell cull
+bool ogWholeMap = false;                                     // draw every cell, not only those inside the game's view distance
+bool ugFromAbove = false;                                    // undergrowth around the point under the camera, at any height
+uint ogFarTex = 0, ugTex = 0;                                // the level's overGrowth.rs / underGrowth.rs atlases on the GPU
+bool growthTexResolved = false;
+// Ship and carrier spawn teams (Formats/Cons/SpawnGroups.cs): which team each spawn group belongs to, and the object
+// templates, read once per level when first needed - so a vehicle spawn can say when its ship would fill with the
+// other team's soldiers (BF1918's SMS Dresden for the Allies), and copy the ship for that team.
+RefractorForge.Formats.Con.SpawnGroupTable? spawnGroupTable = null;
+string spawnGroupSource = "";
+RefractorForge.Formats.Con.ObjectTemplateIndex? templateIndex = null;
 // Undergrowth sits on ITS OWN painted grid - 1 m on Ia Drang, 2 m on Con Thien - which is what makes it a carpet
 // rather than scenery. A whole map of it is millions of clumps, so like the engine we only ever generate the ring
 // around the camera and rebuild it when the camera has moved a useful fraction of that ring.
@@ -1870,6 +1958,16 @@ uint aiNavTexId = 0;          // R8 overlay texture (bound to uMat unit 1 in AI 
 bool aiNavTexDirty = false;   // navmap changed -> (re)upload overlay texture
 bool aiNavPainting = false;   // left-drag active in the AI Path mapper
 AiNavStroke? aiNavStroke = null;  // accumulator for the active AI-path drag (per-stroke undo)
+// AI Path on a level plane. The navmap is 2-D, so a high bridge deck, a ship floating over deep water or a platform
+// in the sky (Bespin) is painted by laying a flat plane at that height: the brush lands on the plane, straight above
+// the cells it edits, instead of on the ground far below where the parallax puts it somewhere else.
+bool aiPlaneOn = false;
+float aiPlaneY = 0f;                         // plane height (world Y, metres)
+Vector2 aiPlaneCenter = new(-1f, -1f);       // centre in X/Z; negative = not placed yet (placed on first use)
+float aiPlaneSize = 256f;                    // side of the square plane, metres
+bool aiPlaneWhole = false;                   // span the whole map instead of the square
+bool aiPlanePicking = false;                 // armed: the next click sets the plane's height + centre from the surface
+uint navPlaneProg = 0, navPlaneVao = 0, navPlaneVbo = 0;
 bool snapOn = false, gridOn = true;
 float snapStep = 1f;          // grid step (m) used when Snap is on: object move/place X/Z round to this
 bool gridLabels = false;      // toggle: draw world-coordinate text at grid intersections (separate overlay)
@@ -2198,7 +2296,7 @@ void OnLoad()
                         gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(hp.X, gpDragStart.Y, hp.Z)));
                     else gameplayEdit.SetPos(gpKind, gpIndex, SnapXZ(new Vec3(hp.X, hp.Y, hp.Z)));
                 }
-                if (gpKind == GpKind.Vehicle) { collisionDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
+                if (gpKind == GpKind.Vehicle) { collisionDirty = true; aiMeshDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
                 return;
             }
             // Free terrain-drag of selected static object(s): slide each by the ground delta under the cursor.
@@ -2230,7 +2328,7 @@ void OnLoad()
             if (gpRotDragging && gpIndex >= 0 && mouse!.IsButtonPressed(MouseButton.Left))
             {
                 gameplayEdit.SetYaw(gpKind, gpIndex, gpRotStartYaw + (pos.X - gpRotStartMouseX) * 0.5f);
-                if (gpKind == GpKind.Vehicle) { collisionDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
+                if (gpKind == GpKind.Vehicle) { collisionDirty = true; aiMeshDirty = true; bboxDirty = true; }   // live-update the vehicle collision overlay
                 return;
             }
             // Dragging a gizmo axis: slide the object along that world axis (continues even over a panel).
@@ -2417,11 +2515,11 @@ void OnLoad()
                 return;
             }
             // Active AI-path paint: keep stamping passable/blocked as it drags.
-            if (aiNavPainting && toolNames[tool] == "AIPath" && terrainPick is not null && mouse!.IsButtonPressed(MouseButton.Left))
+            if (aiNavPainting && toolNames[tool] == "AIPath" && mouse!.IsButtonPressed(MouseButton.Left))
             {
                 var fb = window.FramebufferSize;
                 var ray = Picking.ScreenToRay(cam, pos.X, pos.Y, fb.X, fb.Y);
-                if (terrainPick.Raycast(ray, out var nhit)) AiNavDab(nhit.X, nhit.Z);
+                if (AiPathHit(ray, out var nhit)) AiNavDab(nhit.X, nhit.Z);   // the terrain, or the level plane when on
                 return;
             }
             // Active TEXTURE stroke: keep painting the surface texture into the atlas as it drags (live preview).
@@ -2850,8 +2948,21 @@ void OnLoad()
                 return;
             }
 
-            // AI Path: stamp passable/blocked into the editable navmap under the cursor.
-            if (toolNames[tool] == "AIPath" && terrainPick is not null && terrainPick.Raycast(ray, out var nhit))
+            // AI Path, Pick height armed: this click puts the level plane on the surface under the cursor - a bridge
+            // deck, a ship's deck, a platform - centred there, instead of painting.
+            if (toolNames[tool] == "AIPath" && aiPlanePicking)
+            {
+                aiPlanePicking = false;
+                if (PlacementHit(ray, out var php))
+                {
+                    aiPlaneOn = true; aiPlaneY = php.Y; aiPlaneCenter = new Vector2(php.X, php.Z);
+                    Toast(string.Format(Loc.T("Plane height {0:0.##} m"), aiPlaneY));
+                }
+                return;
+            }
+            // AI Path: stamp passable/blocked into the editable navmap under the cursor - on the terrain, or on the
+            // level plane when that is on.
+            if (toolNames[tool] == "AIPath" && AiPathHit(ray, out var nhit))
             {
                 EnsureAiNav();
                 aiNavPainting = true;
@@ -3258,6 +3369,20 @@ void OnLoad()
     gl.BindBuffer(BufferTargetARB.ArrayBuffer, collisionVbo);
     unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0); }
     gl.EnableVertexAttribArray(0);
+    collisionVao2 = gl.GenVertexArray();
+    gl.BindVertexArray(collisionVao2);
+    collisionVbo2 = gl.GenBuffer();
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, collisionVbo2);
+    unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0); }
+    gl.EnableVertexAttribArray(0);
+    foreach (var which in new[] { 0, 1 })
+    {
+        uint va = gl.GenVertexArray(); gl.BindVertexArray(va);
+        uint vb = gl.GenBuffer(); gl.BindBuffer(BufferTargetARB.ArrayBuffer, vb);
+        unsafe { gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0); }
+        gl.EnableVertexAttribArray(0);
+        if (which == 0) { aiVao = va; aiVbo = vb; } else { aiMissVao = va; aiMissVbo = vb; }
+    }
 
     weatherVao = gl.GenVertexArray();
     gl.BindVertexArray(weatherVao);
@@ -3482,6 +3607,7 @@ void OnLoad()
         gl.Uniform1(gl.GetUniformLocation(objProg, "uTex"), 0);          // sampler -> texture unit 0
         gl.Uniform1(gl.GetUniformLocation(objProg, "uLightmap"), 1);     // object lightmap -> texture unit 1
         gl.Uniform1(gl.GetUniformLocation(objProg, "uShadowMap"), 2);    // sun shadow map -> texture unit 2
+        gl.Uniform1(gl.GetUniformLocation(objProg, "uGrowthTer"), 4);    // terrain colour under undergrowth -> texture unit 4
         glObjects = GlObjects.Build(gl, so, meshLib);
         // Object lightmaps are matched lazily (EnsureObjectLightmaps) the first time the layer is enabled - keeps load fast.
         SyncMarkers(); // recompute mesh-less markers now that the library is known
@@ -3492,6 +3618,7 @@ void OnLoad()
                              : " at the map's own resolution (Environment > Object texture detail lowers it)"));
     }
     ResetGrowthSettingsToMap(); // a new map starts from ITS defaults, not the previous map's sliders
+    spawnGroupTable = null; templateIndex = null;   // the spawn-team check reads the new level's own files
     LoadOvergrowthSettings();   // restore the per-map overgrowth overlay config (spacing + on/off), if saved
     RefreshTextureLibrary();    // scan the bundled/user Texture Library folder for the Surface painter + Layer Tool
     // Seed the sun azimuth/elevation from the level's SkyAndSun.con so manual sun control starts where the level is,
@@ -3638,12 +3765,14 @@ void OnKeyDown(IKeyboard k, Key key, int _)
             }
             break;
         case Key.PageUp:
-            if (toolNames[tool] == "Point" && vertGx >= 0)
+            if (toolNames[tool] == "AIPath" && aiPlaneOn) NudgeAiPlane(shiftN ? 10f : 1f);
+            else if (toolNames[tool] == "Point" && vertGx >= 0)
             { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, vertNudgeStep)); vertHeightField += vertNudgeStep; }
             else NudgeLightHeight(+1f);
             break;
         case Key.PageDown:
-            if (toolNames[tool] == "Point" && vertGx >= 0)
+            if (toolNames[tool] == "AIPath" && aiPlaneOn) NudgeAiPlane(shiftN ? -10f : -1f);
+            else if (toolNames[tool] == "Point" && vertGx >= 0)
             { ApplyVertexEdit(st => st.NudgeVertex(vertGx, vertGz, -vertNudgeStep)); vertHeightField -= vertNudgeStep; }
             else NudgeLightHeight(-1f);
             break;
@@ -4180,6 +4309,181 @@ string SpawnVehicleName(VehicleSpawnDef vs)
     return string.IsNullOrEmpty(s) ? vs.Vehicle : s;
 }
 
+// ---- Ship and carrier spawn teams ----------------------------------------------------------------------------------
+//
+// A vehicle can carry soldier spawn points (carriers, destroyers, BF1918's SMS Dresden) and its own spawners (the
+// Dresden's launches). The spawn points belong to a spawn GROUP whose team the game fixes once for every map in
+// game/GlobalSpawnGroups.con - so giving the ship to the other team's spawner still fills it with the first team's
+// soldiers. The editor reads the same files the game does, says so on the spawn, and can copy the ship for the team.
+
+// The game's own file: the first mod in the chain that has game/GlobalSpawnGroups.con wins, as the game finds it.
+string? ReadGlobalSpawnGroups(string modDir)
+{
+    foreach (var sub in new[] { "bf1942", "BfVietnam" })
+    {
+        try
+        {
+            var loose = Path.Combine(modDir, "Archives", sub, "game", "GlobalSpawnGroups.con");
+            if (File.Exists(loose)) return File.ReadAllText(loose, System.Text.Encoding.Latin1);
+            var rfa = Path.Combine(modDir, "Archives", sub, "game.rfa");
+            if (!File.Exists(rfa)) continue;
+            var a = new RefractorFlatArchive(rfa);
+            var e = a.Entries.FirstOrDefault(x => x.Name.Replace('\\', '/').EndsWith("game/GlobalSpawnGroups.con", StringComparison.OrdinalIgnoreCase));
+            if (e is not null) return System.Text.Encoding.Latin1.GetString(a.Read(e));
+        }
+        catch { }
+    }
+    return null;
+}
+
+// The mode whose gameplay the editor edits (and whose SpawnpointManagerSettings.con applies): Conquest when there is one.
+string EditedGameMode() =>
+    editGameMode ??
+    gameplayModes.Modes.FirstOrDefault(m => m.Equals("Conquest", StringComparison.OrdinalIgnoreCase))
+    ?? gameplayModes.Modes.FirstOrDefault() ?? "Conquest";
+
+RefractorForge.Formats.Con.SpawnGroupTable SpawnGroups()
+{
+    if (spawnGroupTable is not null) return spawnGroupTable;
+    var t = new RefractorForge.Formats.Con.SpawnGroupTable();
+    spawnGroupSource = "";
+    try
+    {
+        var (modsDir, modName) = ModsRootOf();
+        if (modsDir is not null && modName is not null && Path.GetDirectoryName(modsDir) is { } gameRoot)
+        {
+            var chain = RefractorForge.Formats.ModChain.ResolveByName(gameRoot, modName);
+            foreach (var mount in chain.Paths)
+                if (ReadGlobalSpawnGroups(mount) is { } text)
+                {
+                    spawnGroupSource = new DirectoryInfo(mount).Name + "/game/GlobalSpawnGroups.con";
+                    t.Apply(text, spawnGroupSource);
+                    break;
+                }
+        }
+    }
+    catch (Exception ex) { Console.WriteLine("Spawn groups: " + ex.Message); }
+    string mode = EditedGameMode();
+    if (ReadLevelText(mode + "/SpawnpointManagerSettings.con") is { } lvl) t.Apply(lvl, mode + "/SpawnpointManagerSettings.con");
+    foreach (var a in gameplayEdit.Additions)
+        if (a.FileLeaf.Equals("SpawnpointManagerSettings.con", StringComparison.OrdinalIgnoreCase)) t.Apply(a.Text, "team copy");
+    spawnGroupTable = t;
+    return t;
+}
+
+RefractorForge.Formats.Con.ObjectTemplateIndex TemplatesIndex()
+{
+    if (templateIndex is not null) return templateIndex;
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    templateIndex = RefractorForge.Formats.Con.ObjectTemplateIndex.Build(
+        meshLib?.ConScripts() ?? Enumerable.Empty<(string Source, string Text)>());
+    Console.WriteLine($"Object templates indexed for the spawn-team check: {templateIndex.Templates.Count:N0} ({sw.ElapsedMilliseconds} ms).");
+    return templateIndex;
+}
+
+// The teams a spawner can actually spawn for: a control point that cannot change hands decides it; one that can
+// gives both teams over a round; an unlinked spawner uses its own setTeam.
+int[] SpawnerTeams(VehicleSpawnDef vs)
+{
+    int ci = GameplayObjects.OwningControlPointIndex(gameplayEdit.ControlPoints, vs.Position, vs.OsId, true);
+    if (ci >= 0)
+    {
+        var cp = gameplayEdit.ControlPoints[ci];
+        return cp.UnableToChangeTeam != 0 && cp.Team is 1 or 2 ? new[] { cp.Team } : new[] { 1, 2 };
+    }
+    return vs.Team is 1 or 2 ? new[] { vs.Team } : new[] { 1, 2 };
+}
+
+string VehicleForTeam(VehicleSpawnDef vs, int team)
+{
+    var s = team == 1 ? vs.Vehicle1 : vs.Vehicle2;
+    return string.IsNullOrEmpty(s) ? vs.Vehicle : s;
+}
+
+// Every (team, vehicle, problem) for one spawner.
+List<(int Team, string Vehicle, List<RefractorForge.Formats.Con.SpawnTeamMismatch> Issues)> SpawnTeamProblems(VehicleSpawnDef vs)
+{
+    var res = new List<(int, string, List<RefractorForge.Formats.Con.SpawnTeamMismatch>)>();
+    if (meshLib is null) return res;
+    foreach (var team in SpawnerTeams(vs))
+    {
+        var veh = VehicleForTeam(vs, team);
+        if (string.IsNullOrWhiteSpace(veh)) continue;
+        var issues = RefractorForge.Formats.Con.VehicleSpawnTeams.Check(TemplatesIndex(), SpawnGroups(), veh, team);
+        if (issues.Count > 0) res.Add((team, veh, issues));
+    }
+    return res;
+}
+
+string DescribeSpawnTeamProblem(int team, string vehicle, RefractorForge.Formats.Con.SpawnTeamMismatch m)
+{
+    var teams = LevelTeams();
+    string src = string.IsNullOrEmpty(spawnGroupSource) ? "the game's GlobalSpawnGroups.con" : spawnGroupSource;
+    return m.IsSpawner
+        ? string.Format(Loc.T("{0} for {1}: its {2} built-in spawner(s) {3} spawn for {4}."), vehicle, teams[team], m.Count, m.Template, teams[m.GroupTeam])
+        : string.Format(Loc.T("{0} for {1}: its {2} soldier spawn point(s) are in spawn group {3}, which {4} gives to {5} - {5} soldiers spawn on it."),
+                        vehicle, teams[team], m.Count, m.Group, src, teams[m.GroupTeam]);
+}
+
+// Copy the vehicle for the team (TeamVehicleCopy): its spawn points move to new groups of that team, its spawners
+// spawn for that team, everything else is shared. Every mode gets the copy on save; this spawner (and every spawn
+// using its template, which shares the vehicle lines) spawns the copy for that team.
+void MakeTeamVehicleCopy(int spawnIndex, int team)
+{
+    if (spawnIndex < 0 || spawnIndex >= gameplayEdit.VehicleSpawns.Count || hist is null || meshLib is null) return;
+    var vs = gameplayEdit.VehicleSpawns[spawnIndex];
+    string vehicle = VehicleForTeam(vs, team);
+    var idx = TemplatesIndex();
+    var groups = SpawnGroups();
+    var used = new HashSet<int>(groups.Groups.Keys);
+    foreach (var t in idx.Templates.Values) if (t.Group is int g) used.Add(g);
+    foreach (var c in gameplayEdit.ControlPoints) used.Add(c.SpawnGroupId);
+    foreach (var s in gameplayEdit.SoldierSpawns) used.Add(s.Group);
+    var r = RefractorForge.Formats.Con.TeamVehicleCopy.Build(idx, groups, vehicle, team, used);
+    if (r is null) { Toast(string.Format(Loc.T("{0} has nothing that belongs to the other team."), vehicle)); return; }
+
+    var marker = RefractorForge.Formats.Con.TeamVehicleCopy.MarkerFor(r.CopyName);
+    if (!gameplayEdit.Additions.Any(a => a.Marker == marker))
+        gameplayEdit.Additions.AddRange(r.Additions(marker));
+    meshLib.AddScripts("rf-teamcopy:" + r.CopyName, r.TemplatesText);   // the editor draws the copy at once
+    idx.Add(r.TemplatesText);
+    groups.Apply(r.GroupsText, "team copy");
+
+    // The vehicle lines live on the shared ObjectSpawner template, so every spawn of that template takes the copy.
+    var cmds = new List<IEditCommand>();
+    for (int i = 0; i < gameplayEdit.VehicleSpawns.Count; i++)
+    {
+        var v = gameplayEdit.VehicleSpawns[i];
+        if (!v.Name.Equals(vs.Name, StringComparison.OrdinalIgnoreCase)) continue;
+        // The other team keeps what it had - spelled out, since a spawner with only the shared Vehicle set would
+        // otherwise hand the copy to both teams.
+        var keep = VehicleForTeam(v, 3 - team);
+        var nu = team == 1 ? v with { Vehicle1 = r.CopyName, Vehicle2 = keep } : v with { Vehicle2 = r.CopyName, Vehicle1 = keep };
+        cmds.Add(new GameplaySetItemCommand(gameplayEdit, GpKind.Vehicle, i, nu, null));
+    }
+    if (cmds.Count > 0) hist.Do(cmds.Count == 1 ? cmds[0] : new CompositeCommand(cmds));
+    var teams = LevelTeams();
+    Console.WriteLine($"Team copy {r.CopyName}: {vehicle} for {teams[team]}, spawn groups {string.Join(", ", r.GroupMap.Select(kv => $"{kv.Key} -> {kv.Value}"))}.");
+    Toast(string.Format(Loc.T("{0} made: {1}'s spawns now belong to {2}. Save writes it into every game mode."), r.CopyName, vehicle, teams[team]));
+}
+
+// Shown under a selected vehicle spawn.
+void SpawnTeamAdvice(int spawnIndex)
+{
+    if (spawnIndex < 0 || spawnIndex >= gameplayEdit.VehicleSpawns.Count) return;
+    var problems = SpawnTeamProblems(gameplayEdit.VehicleSpawns[spawnIndex]);
+    if (problems.Count == 0) return;
+    ImGui.PushTextWrapPos(0f);
+    foreach (var (team, veh, issues) in problems)
+    {
+        foreach (var m in issues) ImGui.TextColored(new Vector4(1f, 0.72f, 0.3f, 1f), DescribeSpawnTeamProblem(team, veh, m));
+        if (ImGui.Button(string.Format(Loc.T("Make a {0} copy of {1}"), LevelTeams()[team], veh) + $"###teamcopy{team}"))
+            MakeTeamVehicleCopy(spawnIndex, team);
+        Theme.Tip(Loc.T("Adds a copy of the vehicle to this level whose soldier spawns are in a new spawn group of\nthis team, and whose own spawners spawn for it. Everything else is shared with the original.\nThis spawner then gives that team the copy. Retail does the same for its second Fletcher."));
+    }
+    ImGui.PopTextWrapPos();
+}
+
 // Resolve a placed sound emitter's .wav bytes: level-local Sound/ (folder or the level .rfa) first, else a shared
 // sound*.rfa in the mod chain's Archives folders. Handles the BFV macro path @ROOT/Sound/@RTD/x.wav by matching the
 // leaf name and preferring the 44kHz variant. Returns null if not found; the caller caches it (resolves once/emitter).
@@ -4570,8 +4874,29 @@ static float SoundVolumeAt(float dist, float near, float far, float volume)
 // demand (toggled on / after object edits) into a static VBO; cheap to draw thereafter.
 void BuildCollisionLines()
 {
-    collisionDirty = false; collisionLineCount = 0;
+    collisionDirty = false; collisionLineCount = 0; collisionLineCount2 = 0;
     if (meshLib is null || so is null) return;
+    // COL01 into the first buffer (or COL02 alone when that is the view), COL02 into the second when both are shown.
+    // Each section is decoded on its own (MeshLibrary.CollisionSection), and the library is put back to "first
+    // section" afterwards so nothing else that reads collision sees the overlay's choice.
+    int first = collisionView == 1 ? 1 : 0;
+    collisionLineCount = UploadCollisionLines(CollectCollisionLines(first), collisionVao, collisionVbo);
+    if (collisionView == 2) collisionLineCount2 = UploadCollisionLines(CollectCollisionLines(1), collisionVao2, collisionVbo2);
+    meshLib.CollisionSection = -1;
+}
+
+int UploadCollisionLines(System.Collections.Generic.List<float> pts, uint vao, uint vbo)
+{
+    if (pts.Count == 0) return 0;
+    gl.BindVertexArray(vao);
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, vbo);
+    gl.BufferData<float>(BufferTargetARB.ArrayBuffer, pts.ToArray(), BufferUsageARB.StaticDraw);
+    return pts.Count / 3;
+}
+
+System.Collections.Generic.List<float> CollectCollisionLines(int section)
+{
+    meshLib!.CollisionSection = section;
     var pts = new System.Collections.Generic.List<float>();
 
     // Append a collision mesh, transformed by world matrix m, as triangle-edge line segments.
@@ -4617,11 +4942,7 @@ void BuildCollisionLines()
             foreach (var (col, local) in vparts) Emit(col, local * spawnWorld);
         }
 
-    collisionLineCount = pts.Count / 3;
-    if (collisionLineCount == 0) return;
-    gl.BindVertexArray(collisionVao);
-    gl.BindBuffer(BufferTargetARB.ArrayBuffer, collisionVbo);
-    gl.BufferData<float>(BufferTargetARB.ArrayBuffer, pts.ToArray(), BufferUsageARB.StaticDraw);
+    return pts;
 }
 
 // Collision overlay: bright green wireframe of the real .sm collision meshes, drawn through the solid geometry
@@ -4680,15 +5001,80 @@ void DrawBBoxes()
     gl.Disable(EnableCap.Blend);
 }
 
+// ---- AI meshes ----------------------------------------------------------------------------------------------------
+// Which placed objects have an AI mesh, drawn as it lies on the map (cyan), and which solid ones do not (a red box).
+// "Solid" = the object's mesh carries collision: decals, grass and lights never get one and are left out.
+void BuildAiMeshLines()
+{
+    aiMeshDirty = false; aiLineCount = 0; aiMissLineCount = 0; aiWithCount = 0; aiMissingCount = 0;
+    if (meshLib is null || so is null || glObjects is null) return;
+    var pts = new List<float>(); var miss = new List<float>();
+    void Seg(List<float> l, Vector3 a, Vector3 b) { l.Add(a.X); l.Add(a.Y); l.Add(a.Z); l.Add(b.X); l.Add(b.Y); l.Add(b.Z); }
+    var solidCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    foreach (var o in so.Objects)
+    {
+        var ai = meshLib.AiMeshFor(o.Template);
+        var mw = LevelScene.MeshWorld(o);
+        if (ai is { } hit)
+        {
+            if (!aiMeshShapeCache.TryGetValue(hit.Name, out var shape)) { shape = meshLib.AiMeshShape(hit.Name); aiMeshShapeCache[hit.Name] = shape; }
+            if (shape is null) continue;
+            aiWithCount++;
+            var w = shape.Positions.Select(p => Vector3.Transform(p, mw)).ToArray();
+            for (int t = 0; t + 2 < shape.Indices.Length; t += 3)
+            {
+                int ia = shape.Indices[t], ib = shape.Indices[t + 1], ic = shape.Indices[t + 2];
+                if ((uint)ia >= (uint)w.Length || (uint)ib >= (uint)w.Length || (uint)ic >= (uint)w.Length) continue;
+                Seg(pts, w[ia], w[ib]); Seg(pts, w[ib], w[ic]); Seg(pts, w[ic], w[ia]);
+            }
+            continue;
+        }
+        if (!solidCache.TryGetValue(o.Template, out var solid))
+        { solid = meshLib.TryGetRenderCollision(o.Template, out var cp) && cp.Length > 0; solidCache[o.Template] = solid; }
+        if (!solid || !glObjects.TryGetTemplateBounds(o.Template, out var mn, out var mx)) continue;
+        aiMissingCount++;
+        var c = new Vector3[8];
+        for (int i = 0; i < 8; i++)
+            c[i] = Vector3.Transform(new Vector3((i & 1) == 0 ? mn.X : mx.X, (i & 2) == 0 ? mn.Y : mx.Y, (i & 4) == 0 ? mn.Z : mx.Z), mw);
+        foreach (var (a, b) in new[] { (0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7) })
+            Seg(miss, c[a], c[b]);
+    }
+    meshLib.CollisionSection = -1;
+    aiLineCount = UploadCollisionLines(pts, aiVao, aiVbo);
+    aiMissLineCount = UploadCollisionLines(miss, aiMissVao, aiMissVbo);
+}
+
+void DrawAiMeshes()
+{
+    if (!showAiMeshes || so is null || meshLib is null) return;
+    int sig = so.Objects.Count * 397 ^ (glObjects?.Placements.Count ?? 0);
+    if (sig != aiSig) { aiSig = sig; aiMeshDirty = true; }
+    if (aiMeshDirty) BuildAiMeshLines();
+    if (aiLineCount == 0 && aiMissLineCount == 0) return;
+    float fogS = fogEnabled ? fogStart : 1e9f;
+    float fogE = fogEnabled ? MathF.Max(fogEnd, fogStart + 1f) : 1e9f + 1f;
+    gl.UseProgram(collisionProg);
+    gl.UniformMatrix4(uCMvp, 1, false, ToFloats(cam.ViewProjection));
+    gl.Uniform3(uCCam, cam.Position.X, cam.Position.Y, cam.Position.Z);
+    gl.Uniform1(uCFogStart, fogS); gl.Uniform1(uCFogEnd, fogE);
+    gl.Enable(EnableCap.Blend);
+    gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+    gl.Disable(EnableCap.DepthTest);
+    if (aiLineCount > 0) { gl.Uniform3(uCColor, 0.25f, 0.85f, 1f); gl.BindVertexArray(aiVao); gl.DrawArrays(PrimitiveType.Lines, 0, (uint)aiLineCount); }
+    if (aiMissLineCount > 0) { gl.Uniform3(uCColor, 1f, 0.25f, 0.25f); gl.BindVertexArray(aiMissVao); gl.DrawArrays(PrimitiveType.Lines, 0, (uint)aiMissLineCount); }
+    gl.Enable(EnableCap.DepthTest);
+    gl.Disable(EnableCap.Blend);
+}
+
 void DrawCollision()
 {
     if (!showCollision || so is null || meshLib is null) return;
     // Re-bake if the object set, the vehicle-spawn set, or the vehicle-visibility toggle changed (the overlay now
     // includes vehicle-spawn collision). Per-object transform edits already set collisionDirty elsewhere.
     int sig = so.Objects.Count * 397 ^ gameplayEdit.VehicleSpawns.Count * 31 ^ (showVehicles ? 1 : 0);
-    if (sig != collisionSig) { collisionSig = sig; collisionDirty = true; bboxDirty = true; }
+    if (sig != collisionSig) { collisionSig = sig; collisionDirty = true; bboxDirty = true; aiMeshDirty = true; }
     if (collisionDirty) BuildCollisionLines();
-    if (collisionLineCount == 0) return;
+    if (collisionLineCount == 0 && collisionLineCount2 == 0) return;
     // Fog-faded shader: only draw as far as the user can see. With fog on, dissolve across fogStart..fogEnd so the
     // wireframe never renders into / beyond the fog; with fog off, push the fade band far out (effectively no cull).
     float fogS = fogEnabled ? fogStart : 1e9f;
@@ -4696,13 +5082,23 @@ void DrawCollision()
     gl.UseProgram(collisionProg);
     gl.UniformMatrix4(uCMvp, 1, false, ToFloats(cam.ViewProjection));
     gl.Uniform3(uCCam, cam.Position.X, cam.Position.Y, cam.Position.Z);
-    gl.Uniform3(uCColor, 0.2f, 1f, 0.45f);
+    // COL01 green, COL02 orange - the same colours whichever is shown alone, so a colour always means one section.
+    if (collisionView == 1) gl.Uniform3(uCColor, 1f, 0.55f, 0.15f); else gl.Uniform3(uCColor, 0.2f, 1f, 0.45f);
     gl.Uniform1(uCFogStart, fogS); gl.Uniform1(uCFogEnd, fogE);
     gl.Enable(EnableCap.Blend);
     gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
     gl.Disable(EnableCap.DepthTest);
-    gl.BindVertexArray(collisionVao);
-    gl.DrawArrays(PrimitiveType.Lines, 0, (uint)collisionLineCount);
+    if (collisionLineCount > 0)
+    {
+        gl.BindVertexArray(collisionVao);
+        gl.DrawArrays(PrimitiveType.Lines, 0, (uint)collisionLineCount);
+    }
+    if (collisionView == 2 && collisionLineCount2 > 0)
+    {
+        gl.Uniform3(uCColor, 1f, 0.55f, 0.15f);
+        gl.BindVertexArray(collisionVao2);
+        gl.DrawArrays(PrimitiveType.Lines, 0, (uint)collisionLineCount2);
+    }
     gl.Enable(EnableCap.DepthTest);
     gl.Disable(EnableCap.Blend);
 }
@@ -5303,6 +5699,175 @@ void OnClosing()
     exitPending = ExitEditor; exitPromptRequest = true;
 }
 
+// ---- File > Copy Level To... ----------------------------------------------------------------------------------
+// Battlecraft's name for it, and its answer to "rename": it cannot rename a level in place, so a rename is a copy
+// under the new name and then the old one removed by hand. The copy itself is LevelCopy (Formats).
+// (state for File > Copy Level To... is declared with the other dialog state near the top)
+
+void OpenCopyLevel()
+{
+    copyLevelName = (CopyLevelSource() is { } cls ? System.IO.Path.GetFileNameWithoutExtension(cls.Path.TrimEnd('\\', '/')) : "Level") + "_copy";
+    copyLevelError = "";
+    copyLevelRequest = true;
+}
+
+// The level being copied: its base .rfa when packed (the numeric patches beside it come along), else its folder.
+(string Path, bool Packed)? CopyLevelSource()
+{
+    if (levelArchives.Length > 0)
+    {
+        var baseRfa = levelArchives.FirstOrDefault(a => !System.Text.RegularExpressions.Regex.IsMatch(
+                          System.IO.Path.GetFileNameWithoutExtension(a), @"_\d+$")) ?? levelArchives[0];
+        return (baseRfa, true);
+    }
+    if (levelDir is not null && System.IO.Directory.Exists(levelDir)) return (levelDir, false);
+    if (levelDir is not null && System.IO.File.Exists(levelDir) && levelDir.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase)) return (levelDir, true);
+    return null;
+}
+
+string? CopyLevelDestination((string Path, bool Packed) cls, string name)
+{
+    try
+    {
+        var full = System.IO.Path.GetFullPath(cls.Path.TrimEnd('\\', '/'));
+        var parent = System.IO.Path.GetDirectoryName(full);
+        if (string.IsNullOrEmpty(parent)) return null;
+        return cls.Packed ? System.IO.Path.Combine(parent, name + ".rfa") : System.IO.Path.Combine(parent, name);
+    }
+    catch { return null; }
+}
+
+void CopyLevelModal()
+{
+    if (copyLevelRequest) { ImGui.OpenPopup(Loc.TL("Copy Level To")); copyLevelRequest = false; }
+    var fbm = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbm.X * 0.5f, fbm.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(540f * uiScale, 0f), ImGuiCond.Appearing);
+    bool clOpen = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Copy Level To"), ref clOpen, ImGuiWindowFlags.NoSavedSettings)) return;
+    var cls = CopyLevelSource();
+    ImGui.PushTextWrapPos(0f);
+    ImGui.TextUnformatted(Loc.T("Copies this level under a new name, as Battlecraft's Copy Level To does: every file moves to the new level folder and the paths inside it (Init/Terrain.con, the growth .wst files, Init.con) are re-pointed. The original is not touched - to rename a map, remove the old one yourself afterwards."));
+    ImGui.PopTextWrapPos();
+    ImGui.Spacing();
+    InT(Loc.TL("New name##copylvl"), ref copyLevelName, 64u);
+    string? clProblem = RefractorForge.Formats.LevelCopy.NameProblem(copyLevelName);
+    string? clDest = cls is { } c0 ? CopyLevelDestination(c0, copyLevelName) : null;
+    if (clProblem is not null) ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T(clProblem));
+    else if (clDest is not null && (System.IO.File.Exists(clDest) || System.IO.Directory.Exists(clDest)))
+    {
+        clProblem = "taken";
+        ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), Loc.T("That name is taken - a level by that name is already there."));
+    }
+    if (clDest is not null) { ImGui.PushTextWrapPos(0f); ImGui.TextDisabled(Loc.T("Writes: ") + clDest); ImGui.PopTextWrapPos(); }
+    if (AnyUnsaved())
+    {
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextColored(new Vector4(1f, 0.8f, 0.3f, 1f), Loc.T("This level has unsaved changes. The copy is made from the files on disk, so save first to include them."));
+        ImGui.PopTextWrapPos();
+        if (ImGui.Button(Loc.TL("Save first##copylvl"))) DoSave();
+    }
+    ImGui.Checkbox(Loc.TL("Open the copy afterwards##copylvl"), ref copyLevelOpenAfter);
+    if (copyLevelError.Length > 0) { ImGui.PushTextWrapPos(0f); ImGui.TextColored(new Vector4(1f, 0.45f, 0.4f, 1f), copyLevelError); ImGui.PopTextWrapPos(); }
+    ImGui.Separator();
+    ImGui.BeginDisabled(clProblem is not null || cls is null);
+    if (ImGui.Button(Loc.TL("Copy##copylvl")) && cls is { } c1 && DoCopyLevel(c1)) ImGui.CloseCurrentPopup();
+    ImGui.EndDisabled();
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Cancel##copylvl"))) ImGui.CloseCurrentPopup();
+    ImGui.EndPopup();
+}
+
+bool DoCopyLevel((string Path, bool Packed) cls)
+{
+    try
+    {
+        var res = cls.Packed ? RefractorForge.Formats.LevelCopy.CopyArchive(cls.Path, copyLevelName)
+                             : RefractorForge.Formats.LevelCopy.CopyFolder(cls.Path, copyLevelName);
+        Console.WriteLine($"Copied level {res.OldName} -> {res.NewName}: {res.Destination}");
+        Console.WriteLine($"   {res.Files} files; {res.References} path(s) re-pointed in {res.FilesRewritten} file(s)"
+                          + (res.OtherMentions > 0 ? $"; {res.OtherMentions} other mention(s) of the old name left as they are (comments, a load picture in the menu archive, briefing text)" : ""));
+        foreach (var note in res.Notes) Console.WriteLine("   " + note);
+        Toast(string.Format(Loc.T("Copied the level to {0}"), res.Destination));
+        copyLevelError = "";
+        if (copyLevelOpenAfter)
+        {
+            Settings.Save(new LevelPaths(res.Destination, null, null, texPicks, meshArchives, cls.Packed ? new[] { res.Destination } : null));
+            ActiveProject.Clear();
+            RelaunchAndExit();
+        }
+        return true;
+    }
+    catch (Exception ex)
+    {
+        copyLevelError = Loc.T("Copy failed: ") + ex.Message;
+        Console.WriteLine("Copy level failed: " + ex);
+        return false;
+    }
+}
+
+// ---- Edit mode: which game mode's gameplay the editor edits ------------------------------------------------------
+void RequestEditMode(string mode)
+{
+    if (mode.Equals(EditedGameMode(), StringComparison.OrdinalIgnoreCase)) return;
+    if (AnyUnsaved()) { editModeSwitchPending = mode; editModeSwitchRequest = true; return; }   // the prompt below saves first
+    SwitchEditMode(mode);
+}
+
+// Reload the gameplay layer from one mode's files. Only ever runs with nothing unsaved, so the files on disk ARE the
+// current state; the undo history is cleared because its gameplay steps belong to the mode being left.
+void SwitchEditMode(string mode)
+{
+    try
+    {
+        GameplayObjects g;
+        if (rfaList.Length > 0) g = GameplayObjects.LoadArchiveMode(rfaList, mode);
+        else if (levelDir is not null && System.IO.Directory.Exists(levelDir)) g = GameplayObjects.LoadFolder(levelDir, mode);
+        else return;
+        gameplay = g;
+        gameplayEdit = new EditableGameplay(g);
+        editGameMode = mode;
+        gpIndex = -1; gpDragging = false; gpRotDragging = false;
+        lockedGameplayKeys.Clear();
+        spawnGroupTable = null; templateIndex = null;   // that mode's own SpawnpointManagerSettings + templates
+        int fi = gameplayModes.Modes.ToList().FindIndex(m => m.Equals(mode, StringComparison.OrdinalIgnoreCase));
+        if (fi >= 0) gameTypeFilter = fi + 1;            // show what you edit
+        hist?.Clear();
+        MarkSaved();
+        Toast(string.Format(Loc.T("Editing the {0} gameplay: {1} control points, {2} vehicle spawns, {3} soldier spawns"),
+                            mode, g.ControlPoints.Count, g.VehicleSpawns.Count, g.SoldierSpawns.Count));
+        Console.WriteLine($"Edit mode -> {mode} ({g.ControlPoints.Count} CP, {g.VehicleSpawns.Count} vehicle, {g.SoldierSpawns.Count} soldier)");
+    }
+    catch (Exception ex) { Toast(Loc.T("Could not switch the game mode: ") + ex.Message); Console.WriteLine("Edit mode switch failed: " + ex); }
+}
+
+void EditModeSwitchModal()
+{
+    if (editModeSwitchRequest) { ImGui.OpenPopup(Loc.TL("Switch game mode")); editModeSwitchRequest = false; }
+    var fbs = window.FramebufferSize;
+    ImGui.SetNextWindowPos(new Vector2(fbs.X * 0.5f, fbs.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    ImGui.SetNextWindowSize(new Vector2(460f * uiScale, 0f), ImGuiCond.Appearing);
+    bool emOpen = true;
+    if (!ImGui.BeginPopupModal(Loc.TL("Switch game mode"), ref emOpen, ImGuiWindowFlags.NoSavedSettings))
+    { editModeSwitchPending = null; return; }   // not open (or dismissed): nothing is waiting
+    ImGui.PushTextWrapPos(0f);
+    ImGui.TextUnformatted(string.Format(Loc.T("The level has unsaved changes. Save them, then switch to editing the {0} gameplay?"), editModeSwitchPending ?? ""));
+    ImGui.PopTextWrapPos();
+    ImGui.Separator();
+    if (ImGui.Button(Loc.TL("Save and switch##editmode")))
+    {
+        var target = editModeSwitchPending;
+        editModeSwitchPending = null;
+        ImGui.CloseCurrentPopup();
+        DoSave();
+        if (target is not null && !AnyUnsaved()) SwitchEditMode(target);
+        else if (target is not null) Toast(Loc.T("The save did not complete, so the game mode was not switched."));
+    }
+    ImGui.SameLine();
+    if (ImGui.Button(Loc.TL("Cancel##editmode"))) { editModeSwitchPending = null; ImGui.CloseCurrentPopup(); }
+    ImGui.EndPopup();
+}
+
 void ExitPromptModal()
 {
     if (exitPromptRequest) { ImGui.OpenPopup(Loc.TL("Unsaved changes")); exitPromptRequest = false; }
@@ -5407,7 +5972,7 @@ void DoSaveCore()
     // Loaded from a folder: write the whole edited level back to disk (objects + terrain + material + gameplay).
     if (levelDir is not null && System.IO.Directory.Exists(levelDir))
     {
-        var written = RefractorForge.Formats.LevelSaver.SaveFolder(levelDir, so, soPath, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null);
+        var written = RefractorForge.Formats.LevelSaver.SaveFolder(levelDir, so, soPath, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, gameplayMode: editGameMode);
         WritePendingLevelFiles(levelDir, written);
         Console.WriteLine($"Saved level to {levelDir} ({written.Count} files):");
         foreach (var w in written) Console.WriteLine("   " + w);
@@ -5506,7 +6071,7 @@ void DoSaveCore()
         // every piece's hash at that version - what "changed here since" and "changed there since" are measured from.
         if (SyncRecordForSave() is { } syncRec) wxFiles.Add((RefractorForge.Collab.SyncRecord.EntryLeaf, syncRec.ToBytes()));
 
-        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles);
+        var names = RefractorForge.Formats.LevelSaver.RepackToRfa(baseRfa, baseRfa, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles, gameplayMode: editGameMode);
         if (names.Count == 0) { Toast(Loc.T("Nothing changed - nothing written.")); return; }
 
         // POST-SAVE VALIDATION: decode every entry of the written archive with the independent engine-validated
@@ -5605,7 +6170,7 @@ void DoSavePatch(bool serverSideOnly = false)
         foreach (var sp in SkyFacePieces()) wxFiles.Add(sp);   // skybox face overrides
         foreach (var mi in MapImagePieces(baseRfa)) wxFiles.Add(mi);   // in-game map re-cut to the combat area
         foreach (var pf in pendingLevelFiles) wxFiles.Add(pf);   // decal objects and other level-local files made this session
-        var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly);
+        var names = RefractorForge.Formats.LevelSaver.WritePatchRfa(baseRfa, outPath, so, heightmap, materialMap, gameplayEdit, growth, BakeShadowLsb(), (waterLevelEdited || cfg.WriteWaterBelow) ? cfg : null, extras, wxFiles, serverSideOnly: serverSideOnly, gameplayMode: editGameMode);
         if (wxFiles.Count > 0) Console.WriteLine($"   Weather: added {wxFiles.Count} Effects file(s) to the patch (test in-game).");
         if (names.Count == 0) { Toast(Loc.T("Nothing edited yet -- no patch written.")); return; }
         var verr = RefractorForge.Formats.Rfa.RefractorFlatArchive.Validate(outPath);
@@ -8125,7 +8690,7 @@ void RebuildObjects()
     if (glObjects is null) glObjects = GlObjects.Build(gl, so, meshLib);
     else glObjects.Rebuild(gl, so, meshLib);
     if (objectLightmapsLoaded) glObjects.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);   // re-match (only if already loaded)
-    collisionDirty = true; bboxDirty = true;   // object set/placement changed -> rebuild the collision overlay next time it's shown
+    collisionDirty = true; aiMeshDirty = true; bboxDirty = true;   // object set/placement changed -> rebuild the collision overlay next time it's shown
     shadowMapDirty = true;   // object moved/added/deleted -> re-render the sun shadow map
 }
 
@@ -8856,20 +9421,25 @@ void OnRender(double dt)
         }
     }
 
-    // Overgrowth foliage overlay (a VIEW of the .wst trees; ephemeral, never saved). Distance-culled so a dense
-    // map stays interactive. Rebuilt lazily when toggled on / the spacing changed (foliageDirty).
+    // Growth: the game's own forest and grass (a VIEW; never saved). The trees are generated once for the whole map and
+    // again when their inputs change; the grass is laid out around the camera as it moves, like the game.
     Stage("foliage");
     if (glObjects is not null && (showFoliage || showUnderFoliage) && !painting)
     {
+        // A static the overgrowth takes over (a palm the mapper placed by hand) uses up its cell's budget and keeps
+        // generated trees off its spot, so moving one regenerates the forest - in about the time of a frame.
+        if (!growthModelDirty && showFoliage && ogResult is { ImportSceneObjects: true } && GrowthStaticsSignature() != ogStaticsSig)
+            growthModelDirty = true;
+        if (growthModelDirty) { BuildGrowthModel(); foliageDirty = true; }
         if (foliageDirty) BuildOvergrowthFoliage();
-        // The grass follows the camera. Rebuild once it has walked a third of the ring - far enough that this is
-        // rare while panning, close enough that the ring's edge never comes into view.
         if (showUnderFoliage)
         {
-            float ring = UnderViewMeters();
-            var here = cam.Position; here.Y = 0f;
-            var was = underAnchor; was.Y = 0f;
-            if (underDirty || Vector3.Distance(here, was) > ring * 0.33f) BuildUndergrowthFoliage(cam.Position);
+            // Rebuilt every half metre: the fade runs over the last 30 % of a 35-70 m view distance, so the patches'
+            // alphas move as the camera does. Laying it out is cheap - the patches are cached, as the game's are
+            // regenerated identically.
+            var here = ugFromAbove ? new Vector3(cam.Position.X, 0f, cam.Position.Z) : cam.Position;
+            var was = ugFromAbove ? new Vector3(underAnchor.X, 0f, underAnchor.Z) : underAnchor;
+            if (underDirty || Vector3.DistanceSquared(here, was) > 0.25f) BuildUndergrowthFoliage(cam.Position);
         }
         else if (glObjects.UndergrowthInstanceCount > 0) BuildUndergrowthFoliage(cam.Position);   // turned off: drop it
         if (glObjects.FoliageInstanceCount > 0 || glObjects.UndergrowthInstanceCount > 0)
@@ -8877,15 +9447,35 @@ void OnRender(double dt)
             gl.UseProgram(objProg);
             gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
             SetFogUniforms(objProg);
-            float vd = growth?.OverPalette?.ViewDistance ?? 0f;
-            float cull = vd > 0f ? vd : (fogEnabled ? fogEnd : (float)cfg.WorldSize * 0.4f);
-            cull = Math.Clamp(cull, 100f, (float)cfg.WorldSize);
-            glObjects.DrawFoliage(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                  cam.ViewProjection, cam.Position, cull);
-            // Undergrowth gets its OWN, much shorter cull - the palette's 35-60 m. Drawing grass out to the
-            // overgrowth's 300+ m is neither what the game does nor something the frame rate would survive.
-            glObjects.DrawUndergrowth(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                      cam.ViewProjection, cam.Position, UnderViewMeters());
+            if (ogResult is { } og && glObjects.FoliageInstanceCount > 0)
+            {
+                // Close up the game draws each tree as its real _m1 object, inside 0.2 x viewDistance (about 110 m on
+                // a 550 m map at medium detail); past that the cell's _m2 batch, until the whole cell drops out at the
+                // view distance - so a forest appears a cell at a time, as it does in game.
+                float closeDist = og.ViewDistance * 0.2f;
+                var vis = OvergrowthCellsVisible(og, cam.Position);
+                Func<int, bool>? cellShown = vis is null ? null : g => (uint)g < (uint)vis.Length && vis[g];
+                float farLimit = 1e9f;
+                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverNear, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                     cam.ViewProjection, cam.Position, 0f, closeDist, cellShown, 0, GlObjects.GrowthShade.Lit);
+                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverFar, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                     cam.ViewProjection, cam.Position, closeDist, farLimit, cellShown, ogFarTex, GlObjects.GrowthShade.Lit);
+            }
+            if (glObjects.UndergrowthInstanceCount > 0)
+            {
+                // Unlit, tinted by the terrain colour under each clump (4 x atlas x terrain), as the game draws it.
+                int uHasTer = gl.GetUniformLocation(objProg, "uGrowthHasTer");
+                int uTerScale = gl.GetUniformLocation(objProg, "uGrowthTerScale"), uTerOff = gl.GetUniformLocation(objProg, "uGrowthTerOffset");
+                gl.ActiveTexture(TextureUnit.Texture4);
+                gl.BindTexture(TextureTarget.Texture2D, terrainTexId);
+                gl.ActiveTexture(TextureUnit.Texture0);
+                if (uHasTer >= 0) gl.Uniform1(uHasTer, terrainTexId != 0 ? 1 : 0);
+                float wsz = MathF.Max(cfg.WorldSize, 1f);
+                if (uTerScale >= 0) gl.Uniform2(uTerScale, terUvScale / wsz, terUvScale / wsz);
+                if (uTerOff >= 0) gl.Uniform2(uTerOff, terUvOffX, terUvOffY);
+                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.Under, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                     cam.ViewProjection, cam.Position, 0f, 1e9f, null, ugTex, GlObjects.GrowthShade.Undergrowth);
+            }
         }
     }
 
@@ -8969,6 +9559,8 @@ void OnRender(double dt)
         gl.DepthMask(true);
         gl.Disable(EnableCap.Blend);
     }
+
+    DrawAiNavPlane();   // AI Path level plane (after the water, so a deck plane over the sea reads on top of it)
 
     // Markers: mesh-less objects (sound/effect emitters, logical points) get a visible 3D indicator
     // diamond so their location is clear. When no mesh library is loaded, every object is a point.
@@ -9099,7 +9691,9 @@ void OnRender(double dt)
     }
 
     // Terrain brush: ring on the ground at the cursor showing the brush radius.
-    if (terrainPick is not null && toolNames[tool] is "Sculpt" or "Smooth" or "Paint" or "AIPath" && !UiWantsMouse())
+    DrawAiPlaneBrush();
+    if (terrainPick is not null && toolNames[tool] is "Sculpt" or "Smooth" or "Paint" or "AIPath" && !UiWantsMouse()
+        && !(aiPlaneOn && toolNames[tool] == "AIPath"))
     {
         var fbb = window.FramebufferSize;
         var bray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbb.X, fbb.Y);
@@ -9186,6 +9780,7 @@ void OnRender(double dt)
     if (!painting) DrawSounds();
     if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Fill);   // back to solid for the overlays below
     if (!painting) DrawCollision();
+    if (!painting) DrawAiMeshes();
     DrawBBoxes();
     DrawWeather();   // weather preview particles (depth-tested so terrain occludes them)
     DrawEffects();   // the level's particle effects (waterfalls/lava/fire/smoke), billboards, depth-tested
@@ -9536,7 +10131,15 @@ void MapperSubToolbar()
             for (int i = 0; i < gameplayModes.Modes.Count; i++) gtLabels[i + 1] = gameplayModes.Modes[i];
             ImGui.SetNextItemWidth(130f);
             Cbo(Loc.TL("Game type"), ref gameTypeFilter, gtLabels, gtLabels.Length);
-            Theme.Tip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing still applies to the mode the level was loaded from."));
+            Theme.Tip(Loc.T("Show only the control points and spawns that exist in this game mode. Editing applies to the mode chosen in Edit."));
+            ImGui.SameLine();
+            var emModes = gameplayModes.Modes.ToArray();
+            int emIdx = Math.Max(0, Array.FindIndex(emModes, m => m.Equals(EditedGameMode(), StringComparison.OrdinalIgnoreCase)));
+            ImGui.SetNextItemWidth(120f);
+            ImGui.BeginDisabled(collab is not null || emModes.Length < 2);
+            if (Cbo(Loc.TL("Edit##editmode"), ref emIdx, emModes, emModes.Length)) RequestEditMode(emModes[emIdx]);
+            ImGui.EndDisabled();
+            Theme.Tip(Loc.T("Which game mode's control points and spawns you edit: Conquest, Ctf, TDM, SinglePlayer, Coop (whatever the\nlevel has). A save writes that mode in full, and moves of objects it shares with the other modes are mirrored\ninto them - nothing is added to or removed from another mode. Switching saves first if there is unsaved work.\nNot available during a collaboration session."));
             ImGui.SameLine();
         }
 
@@ -10005,6 +10608,25 @@ void Inspector()
         Cbo(Loc.TL("Vehicle"), ref aiPathVeh, aiPathVehNames, aiPathVehNames.Length);
         SldF(Loc.TL("Radius (m)"), ref brushRadius, 0.5f, 100f, "%.1f");
         ImGui.Checkbox(Loc.TL("Square brush"), ref squareBrush);
+        // Paint on a level plane: bridges, ships, platforms in the sky (see AiPathHit).
+        if (ImGui.Checkbox(Loc.TL("Paint on a level plane"), ref aiPlaneOn) && aiPlaneOn) PlaceAiPlaneIfNew();
+        Theme.Tip(Loc.T("For a high bridge, a ship floating over deep water or a platform in the sky: paint on a flat plane\nat that height instead of on the ground far below. The pathmap is 2-D, so a cell painted on the\nplane is the same cell as the ground straight beneath it - the plane only puts the brush where the\ndeck is, so what you paint lines up with what you see."));
+        if (aiPlaneOn)
+        {
+            var planePos = new Vector3(aiPlaneCenter.X, aiPlaneY, aiPlaneCenter.Y);
+            if (DrgF3(Loc.TL("X / height / Z##aiplane"), ref planePos, 0.25f)) { aiPlaneCenter = new Vector2(planePos.X, planePos.Z); aiPlaneY = planePos.Y; }
+            Theme.Tip(Loc.T("The plane's centre (X, Z) and its height. PgUp / PgDn raise and lower it 1 m (Shift: 10 m)."));
+            ImGui.Checkbox(Loc.TL("Whole map##aiplane"), ref aiPlaneWhole);
+            if (!aiPlaneWhole) SldF(Loc.TL("Size (m)##aiplane"), ref aiPlaneSize, 16f, MathF.Max(64f, cfg.WorldSize), "%.0f");
+            if (ImGui.Button(aiPlanePicking ? Loc.TL("Cancel pick##aiplanepick") : Loc.TL("Pick height##aiplanepick"))) aiPlanePicking = !aiPlanePicking;
+            Theme.Tip(Loc.T("Then click the deck, bridge or platform in the view: the plane moves to that height, centred there."));
+            ImGui.SameLine();
+            ImGui.BeginDisabled(so is null || selected < 0);
+            if (ImGui.Button(Loc.TL("Fit to selected##aiplane"))) FitAiPlaneToSelection();
+            ImGui.EndDisabled();
+            Theme.Tip(Loc.T("Centre the plane on the selected object and size it to its footprint (at the object's height)."));
+            if (aiPlanePicking) ImGui.TextColored(new Vector4(1f, 0.8f, 0.3f, 1f), Loc.T("Click a surface in the view to set the height."));
+        }
         // Re-seed ONLY this vehicle's buffer (others keep their edits): from the level's shipped navmap, or
         // regenerated from terrain (the old always-generate behaviour, now an explicit choice).
         if (ImGui.Button(Loc.TL("Reload level navmap")))
@@ -10023,7 +10645,7 @@ void Inspector()
         Theme.Tip(Loc.T("Replace this vehicle's navmap with a fresh terrain-derived one (slopes + water + object footprints)."));
         if (aiNavDirty) { ImGui.SameLine(); ImGui.TextColored(new Vector4(1f, 0.8f, 0.3f, 1f), Loc.T("unsaved")); }
         ImGui.Spacing();
-        ImGui.BulletText(Loc.T("Drag to paint (terrain-seeded)."));
+        ImGui.BulletText(Loc.T(aiPlaneOn ? "Drag on the plane to paint." : "Drag to paint (terrain-seeded)."));
         ImGui.BulletText(Loc.T("Z / Y undo & redo each stroke."));
         ImGui.BulletText(Loc.T("Ctrl+S saves all painted vehicles"));
         ImGui.BulletText(Loc.T("   (folder + .rfa)."));
@@ -10145,6 +10767,7 @@ void Inspector()
                 evTtl = v.TimeToLive; evDist = v.Distance; evDmgLost = v.DamageWhenLost; evMaxSpawned = v.MaxNrOfObjectSpawned;
                 evVeh1 = v.Vehicle1; evVeh2 = v.Vehicle2;
             }
+            if (gpKind == GpKind.Vehicle) SpawnTeamAdvice(gpIndex);   // a ship whose built-in spawns belong to the other team
             if (gpKind == GpKind.Soldier && ImGui.Button(Loc.TL("Edit Soldier Spawn...")))
             {
                 var s = (SoldierSpawnDef)gameplayEdit.GetItem(GpKind.Soldier, gpIndex);
@@ -10178,6 +10801,25 @@ void Inspector()
     if (meshLib is not null && !meshLib.TryGet(o.Template, out _) && !meshLib.TryGetAssembledMesh(o.Template, out _))
         ImGui.TextColored(new Vector4(1f, 0.55f, 0.3f, 1f),
             meshLib.HasMeshEntry(o.Template) ? "mesh not shown: .sm present but failed to parse" : "mesh not found in loaded archives");
+    // What the object's mesh carries for collision, and its AI mesh - the two things a mapper asks about when bots or
+    // players behave oddly around it.
+    if (meshLib is not null)
+    {
+        var secs = meshLib.CollisionSectionsOf(o.Template);
+        if (secs.Count > 0)
+            ImGui.TextDisabled(Loc.T("Collision: ") + string.Join(", ", secs.Select(c => $"COL{c.Section + 1:00} {c.Faces:N0} " + Loc.T("faces"))));
+        else
+            ImGui.TextDisabled(Loc.T("Collision: none in the mesh"));
+        Theme.Tip(Loc.T("COL01 is the coarse hull, COL02 the detailed one; in-game tests show COL02 is what soldiers and\nvehicles collide with. Layers > Collision draws either or both (COL01 green, COL02 orange)."));
+        if (meshLib.AiMeshCount > 0)
+        {
+            var ai = meshLib.AiMeshFor(o.Template);
+            ImGui.TextDisabled(ai is { } a ? Loc.T("AI mesh: ") + a.Entry : Loc.T("AI mesh: none"));
+            Theme.Tip(Loc.T("The game pairs an object with aiMeshes/<geometry stem>_a1 by name. Layers > AI meshes shows them all."));
+        }
+    }
+    if (o.ScaleAxes is Vec3 perAxis)
+        ImGui.TextDisabled(string.Format(Loc.T("Scale per axis: {0}  (setting Scale makes it one value)"), perAxis));
     if (multi.Count > 1) ImGui.TextColored(Theme.Accent, string.Format(Loc.T("{0} selected - editing primary (gizmo moves all)"), multi.Count));
     ImGui.Separator();
 
@@ -10304,7 +10946,7 @@ void LayerMenu()
     ImGui.MenuItem(Loc.TL("Terrain"), null, ref showTerrain);
     ImGui.MenuItem(Loc.TL("Static Objects"), "Tab", ref showObjects);
     ImGui.MenuItem(Loc.TL("Texture transparency"), null, ref alphaTransparency);
-    if (ImGui.MenuItem(Loc.TL("Collision (wireframe)"), null, ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
+    if (ImGui.MenuItem(Loc.TL("Collision (wireframe)"), null, ref showCollision) && showCollision) { collisionDirty = true; aiMeshDirty = true; bboxDirty = true; }
     ImGui.Separator();
     ImGui.MenuItem(Loc.TL("Vehicles"), null, ref showVehicles);
     ImGui.MenuItem(Loc.TL("Control Points"), null, ref showControlPoints);
@@ -10371,86 +11013,235 @@ void ToggleObjectsVisible()
 }
 
 // Layer visibility toggles - always shown at the bottom of the Inspector panel.
-// The resolved overgrowth scatter: the .wst geometry scattered per cell (OvergrowthFoliage.Scatter), each dropped
-// to ground height (skipping underwater) and kept only if its mesh resolves in the loaded library. SHARED by the
-// GL overlay AND the bake-to-.con export so they're identical. Empty if no overgrowth / mesh lib / terrain.
-List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterOvergrowthResolved()
+// ---- Growth: overgrowth and undergrowth, generated EXACTLY as BfVietnam.exe does ------------------------------
+//
+// Formats/Terrain/BfvGrowth.cs is the game's own generator (docs/BFV_Growth_Placement.md): the same cells, seeds,
+// random numbers, budgets and spacing, so the trees here are the trees a player sees, in the same places. Overgrowth
+// is generated for the whole map at once, like the game at level load; undergrowth per small patch around the
+// camera, like the game, and only those within its view distance are drawn, faded the way the game fades them.
+
+// What the generator needs from a mesh - box and LOD0 counts - by EXACT name, cached for the level.
+RefractorForge.Formats.Terrain.GrowthMeshInfo? GrowthMeshOf(string name)
 {
-    var outp = new List<(string, float, float, float, float, float)>();
-    if (meshLib is null || growth?.Over is null || growth.OverPalette is null || terrainPick is null) return outp;
-    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, foliageSpacing, foliageDensity, over: true,
-                 keepFraction: RefractorForge.Formats.Terrain.OvergrowthFoliage.KeepFractionFor(VegBuild())))
-    {
-        if (!meshLib.TryGet(fi.Geometry, out _)) continue;             // skip geometries with no mesh in the library
-        float y = terrainPick.HeightAt(fi.WorldX, fi.WorldZ);
-        if (y < cfg.WaterLevel) continue;                              // no foliage underwater
-        outp.Add((fi.Geometry, fi.WorldX, y, fi.WorldZ, fi.YawDeg, fi.Scale));
-    }
-    return outp;
+    if (growthMeshCache.TryGetValue(name, out var m)) return m;
+    m = meshLib is not null && meshLib.TryGetExactMeshBytes(name, out var b)
+        ? RefractorForge.Formats.Terrain.GrowthMeshInfo.FromStandardMesh(b) : null;
+    growthMeshCache[name] = m;
+    return m;
 }
 
-// How far undergrowth reaches on THIS map: the palette's own view distance (35-61 m across retail), clamped to
-// the band the shipped maps use. It is both the generation radius and the draw cull.
-float UnderViewMeters() => RefractorForge.Formats.Terrain.OvergrowthFoliage.ViewMetersFor(growth?.UnderPalette, over: false);
-
-// The undergrowth (grass, bushes, small plants from underGrowth.wst) scattered from its own map and palette, on
-// its own 1-2 m grid - but ONLY around the camera, which is what the engine does and the only way the layer can be
-// shown at its real density: Ia Drang paints 86% of a 2048-cell map, which is over two million clumps map-wide and
-// none of them past 53 m is ever drawn. The seed is per-cell, so a clump stands in the same place however you
-// walked up to it.
-List<(string Tmpl, float X, float Y, float Z, float Yaw, float Scale)> ScatterUndergrowthResolved(Vector3 around)
+// The geometries overgrowth may take over from the static objects (importSceneObjects): the mod's
+// standardMesh/overGrowthGeometries.wst. A level cannot replace it - it lies outside the level's own path.
+HashSet<string> OvergrowthImportable()
 {
-    var outp = new List<(string, float, float, float, float, float)>();
-    if (meshLib is null || growth?.Under is null || growth.UnderPalette is null || terrainPick is null) return outp;
-    // A margin past the cull, so walking up to the rebuild threshold does not uncover a bare rim.
-    float reach = UnderViewMeters() * 1.35f;
-    foreach (var fi in RefractorForge.Formats.Terrain.OvergrowthFoliage.Scatter(growth, cfg, underSpacing, underDensity, over: false,
-                 keepFraction: RefractorForge.Formats.Terrain.OvergrowthFoliage.KeepFractionFor(VegBuild()),
-                 centreX: around.X, centreZ: around.Z, radius: reach, maxInstances: UnderMaxInstances))
-    {
-        if (!meshLib.TryGet(fi.Geometry, out _)) continue;
-        float y = terrainPick.HeightAt(fi.WorldX, fi.WorldZ);
-        if (y < cfg.WaterLevel) continue;
-        outp.Add((fi.Geometry, fi.WorldX, y, fi.WorldZ, fi.YawDeg, fi.Scale));
-    }
-    return outp;
+    if (ogImportable is not null) return ogImportable;
+    ogImportable = meshLib is not null && meshLib.TryReadEntry("standardMesh/overGrowthGeometries.wst", out var b)
+        ? RefractorForge.Formats.Terrain.GrowthDefinition.GeometryList(System.Text.Encoding.Latin1.GetString(b))
+        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    return ogImportable;
 }
 
-static Matrix4x4 FoliageWorld(float x, float y, float z, float yaw, float scale)
-    => Matrix4x4.CreateScale(scale) * Matrix4x4.CreateRotationY(yaw * MathF.PI / 180f) * Matrix4x4.CreateTranslation(x, y, z);
+bool IsGrowthImportable(string template)
+{
+    if (ogImportableTemplate.TryGetValue(template, out var yes)) return yes;
+    var g = meshLib?.GeometryTemplateOf(template) ?? template;
+    yes = OvergrowthImportable().Contains(g);
+    ogImportableTemplate[template] = yes;
+    return yes;
+}
 
-// Rebuild the foliage overlay (a VIEW only - never saved as part of the level). The two layers are rebuilt on
-// different clocks - the trees cover the whole map and only change when you change them, the grass follows the
-// camera - so they are two passes over two GL buckets, not one.
+// The statics overgrowth may take over, in StaticObjects.con order - the order it charges their cells' budgets in.
+List<RefractorForge.Formats.Terrain.GrowthStatic> GrowthStatics()
+{
+    var list = new List<RefractorForge.Formats.Terrain.GrowthStatic>();
+    if (so is null) return list;
+    for (int i = 0; i < so.Objects.Count; i++)
+    {
+        var o = so.Objects[i];
+        if (!IsGrowthImportable(o.Template)) continue;
+        var s = o.EffectiveScale;
+        list.Add(new RefractorForge.Formats.Terrain.GrowthStatic(i, o.Template, meshLib?.GeometryTemplateOf(o.Template) ?? o.Template,
+            new Vector3(o.Position.X, o.Position.Y, o.Position.Z), new Vector3(o.Rotation.X, o.Rotation.Y, o.Rotation.Z),
+            new Vector3(s.X, s.Y, s.Z)));
+    }
+    return list;
+}
+
+// Moving, adding or removing one of those statics changes its cell's forest, so they are hashed every frame the
+// trees are shown; nothing else about the statics matters to growth.
+long GrowthStaticsSignature()
+{
+    if (so is null) return 0;
+    long h = 17;
+    for (int i = 0; i < so.Objects.Count; i++)
+    {
+        var o = so.Objects[i];
+        if (!IsGrowthImportable(o.Template)) continue;
+        var s = o.EffectiveScale;
+        h = h * 31 + i;
+        h = h * 31 + BitConverter.SingleToInt32Bits(o.Position.X);
+        h = h * 31 + BitConverter.SingleToInt32Bits(o.Position.Z);
+        h = h * 31 + BitConverter.SingleToInt32Bits(s.Y);
+    }
+    return h;
+}
+
+// Generate the level's growth with the game's own generator. Cheap - Operation Irving's whole forest takes ~50 ms -
+// so it simply runs again whenever its inputs change: the growth maps, the .wst, the importable statics, the build.
+void BuildGrowthModel()
+{
+    growthModelDirty = false;
+    ogResult = null; ugField = null; ogCellY = Array.Empty<float>();
+    if (gameIsBf1942 || meshLib is null || heightmap is null || growth is null) return;
+    var terrain = RefractorForge.Formats.Terrain.GrowthTerrain.From(heightmap, cfg);
+    var build = VegBuild();
+    try
+    {
+        if (growth.Over is not null && growth.OverPalette is not null)
+        {
+            var def = RefractorForge.Formats.Terrain.GrowthDefinition.Parse(growth.OverPalette.RawXml, over: true);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            ogResult = RefractorForge.Formats.Terrain.BfvGrowth.GenerateOvergrowth(def, growth.Over.Samples, growth.OverSide, terrain,
+                cfg.WorldSize, GrowthMeshOf, def.ImportSceneObjects ? OvergrowthImportable() : null,
+                def.ImportSceneObjects ? GrowthStatics() : null, build);
+            ogStaticsSig = GrowthStaticsSignature();
+            ogCellY = new float[ogResult.GridW * ogResult.GridH];
+            for (int j = 0; j < ogResult.GridH; j++)
+                for (int i = 0; i < ogResult.GridW; i++)
+                    ogCellY[j * ogResult.GridW + i] = (float)terrain.Height((i + 0.5) * ogResult.CellSize, (j + 0.5) * ogResult.CellSize);
+            Console.WriteLine($"Overgrowth ({build}): {ogResult.Generated.Count():N0} generated in {ogResult.GridW}x{ogResult.GridH} cells of " +
+                              $"{ogResult.CellSize:0.##} m, {ogResult.Imported.Count():N0} statics taken over, {ogResult.Dropped.Count:N0} left as statics, " +
+                              $"{ogResult.CellsStoppedOnBudget:N0} cells full ({sw.ElapsedMilliseconds} ms).");
+        }
+        if (growth.Under is not null && growth.UnderPalette is not null)
+        {
+            var udef = RefractorForge.Formats.Terrain.GrowthDefinition.Parse(growth.UnderPalette.RawXml, over: false);
+            ugField = new RefractorForge.Formats.Terrain.UndergrowthField(udef, growth.Under.Samples, growth.UnderSide, terrain,
+                cfg.WorldSize, GrowthMeshOf, build);
+        }
+    }
+    catch (Exception ex) { Console.WriteLine("Growth model: " + ex.Message); }
+}
+
+// The level's own growth atlases. The game draws ALL far overgrowth with overGrowth.rs's texture and ALL undergrowth
+// with underGrowth.rs's - every retail map has its own grass atlas (F_undergrowthOI on Irving, ..OFD on Flaming
+// Dart, ..H on Hue) while the grass meshes' own shaders all name the generic F_undergrowth.
+void ResolveGrowthTextures()
+{
+    growthTexResolved = true;
+    if (ogFarTex != 0) { gl.DeleteTexture(ogFarTex); ogFarTex = 0; }
+    if (ugTex != 0) { gl.DeleteTexture(ugTex); ugTex = 0; }
+    if (meshLib?.Textures is null) return;
+    string? TexOf(string rel)
+    {
+        string? rs = ReadLevelText(rel);
+        if (rs is null && meshLib.TryGetRsText(System.IO.Path.GetFileNameWithoutExtension(rel), out _, out var archiveRs)) rs = archiveRs;
+        if (rs is null) return null;
+        var m = System.Text.RegularExpressions.Regex.Match(rs, @"texture\s+""([^""]+)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups[1].Value : null;
+    }
+    try
+    {
+        if (TexOf("StandardMesh/overGrowth.rs") is { } o && meshLib.Textures.Resolve(o) is { } ot) ogFarTex = UploadTiledTexture(ot);
+        if (TexOf("StandardMesh/underGrowth.rs") is { } u && meshLib.Textures.Resolve(u) is { } ut) ugTex = UploadGrowthAtlas(ut);
+    }
+    catch (Exception ex) { Console.WriteLine("Growth atlases: " + ex.Message); }
+}
+
+// The undergrowth atlas is sampled with U clamped and V wrapped (RaShaderUndergrowth.fx stage 0).
+unsafe uint UploadGrowthAtlas(Texture2D t)
+{
+    uint id = UploadTexture(t);
+    gl.BindTexture(TextureTarget.Texture2D, id);
+    gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.Repeat);
+    return id;
+}
+
+// The overgrowth draw lists. Every generated instance goes in twice: as its _m1 twin - the real object the game
+// creates for it and draws close up - and as its _m2 mesh, the far batch. Statics the game took over are already
+// drawn as statics.
 void BuildOvergrowthFoliage()
 {
     foliageDirty = false;
     foliageCount = 0;
     if (glObjects is null) return;
-    var inst = showFoliage ? ScatterOvergrowthResolved() : new();
-    var gi = new List<(string, Matrix4x4)>(inst.Count);
-    foreach (var (t, x, y, z, yaw, s) in inst) gi.Add((t, FoliageWorld(x, y, z, yaw, s)));
-    glObjects.SetFoliage(gl, gi, meshLib!);
-    foliageCount = inst.Count;
-    underDirty = true;                                       // a level load / palette edit invalidates both
+    if (growthModelDirty) BuildGrowthModel();
+    if (!growthTexResolved) ResolveGrowthTextures();
+    var near = new List<GlObjects.GrowthItem>();
+    var far = new List<GlObjects.GrowthItem>();
+    if (showFoliage && ogResult is { } og && meshLib is not null)
+    {
+        var m1Ok = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var inst in og.Generated)
+        {
+            var rec = og.Records[inst.Record];
+            var world = inst.World();
+            int group = inst.CellJ * og.GridW + inst.CellI;
+            far.Add(new GlObjects.GrowthItem(inst.Geometry, world, group, inst.R, 1f));
+            if (!m1Ok.TryGetValue(rec.M1Name, out var ok)) { ok = meshLib.TryGet(rec.M1Name, out _); m1Ok[rec.M1Name] = ok; }
+            near.Add(new GlObjects.GrowthItem(ok ? rec.M1Name : inst.Geometry, world, group, inst.R, 1f));
+        }
+    }
+    glObjects.SetGrowth(gl, GlObjects.GrowthLayer.OverFar, far, meshLib!);
+    glObjects.SetGrowth(gl, GlObjects.GrowthLayer.OverNear, near, meshLib!);
+    foliageCount = glObjects.FoliageInstanceCount;
+    underDirty = true;
 }
 
-// The near-field undergrowth, regenerated around wherever the camera is now.
+// The undergrowth around the camera, as the game lays it out: the patches of its ring within the view distance
+// (the height difference counted at a fifth), each with the fade the game gives it. "From above" instead takes every
+// patch within the view distance of the point under the camera, at full strength - the game never shows grass to a
+// camera that high, but a mapper looking down on it wants to.
 void BuildUndergrowthFoliage(Vector3 around)
 {
     underDirty = false;
     underAnchor = around;
     underFoliageCount = 0;
     if (glObjects is null) return;
-    var under = showUnderFoliage ? ScatterUndergrowthResolved(around) : new();
-    var gi = new List<(string, Matrix4x4)>(under.Count);
-    foreach (var (t, x, y, z, yaw, s) in under) gi.Add((t, FoliageWorld(x, y, z, yaw, s)));
-    glObjects.SetUndergrowth(gl, gi, meshLib!);
-    underFoliageCount = under.Count;
+    if (growthModelDirty) BuildGrowthModel();
+    if (!growthTexResolved) ResolveGrowthTextures();
+    var items = new List<GlObjects.GrowthItem>();
+    if (showUnderFoliage && ugField is { } f)
+    {
+        if (ugFromAbove)
+        {
+            foreach (var p in f.Around(around.X, around.Z, f.ViewDistance))
+                foreach (var inst in p.Instances) items.Add(new GlObjects.GrowthItem(inst.Geometry, inst.World(), 0, inst.R, 1f));
+        }
+        else
+        {
+            foreach (var (p, _, alpha) in f.Visible(around))
+                foreach (var inst in p.Instances) items.Add(new GlObjects.GrowthItem(inst.Geometry, inst.World(), 0, inst.R, alpha));
+        }
+    }
+    glObjects.SetGrowth(gl, GlObjects.GrowthLayer.Under, items, meshLib!);
+    underFoliageCount = glObjects.UndergrowthInstanceCount;
 }
 
-// Per-map overlay settings (spacing + on/off): a tiny JSON sidecar beside the level (in the folder, or next to the
-// .rfa keyed by its base name), so the overgrowth view + bake are reproducible across sessions.
+// Which overgrowth cells the game draws from here: those whose nearest corner, at the cell's centre height and with
+// the height difference counted at a fifth, lies inside the view distance (GrowthManager::vf9, 0x75e4c0). Null when
+// the whole map is asked for.
+bool[]? OvergrowthCellsVisible(RefractorForge.Formats.Terrain.OvergrowthResult og, Vector3 camPos)
+{
+    if (ogWholeMap) return null;
+    var vis = new bool[og.GridW * og.GridH];
+    float ps = og.CellSize, vd2 = og.ViewDistance * og.ViewDistance;
+    for (int j = 0; j < og.GridH; j++)
+        for (int i = 0; i < og.GridW; i++)
+        {
+            int k = j * og.GridW + i;
+            float x0 = i * ps, z0 = j * ps;
+            // the nearest CORNER, as the game measures it, not the nearest point of the square
+            float cx = MathF.Min(MathF.Abs(camPos.X - x0), MathF.Abs(camPos.X - (x0 + ps)));
+            float cz = MathF.Min(MathF.Abs(camPos.Z - z0), MathF.Abs(camPos.Z - (z0 + ps)));
+            float dy = ((k < ogCellY.Length ? ogCellY[k] : 0f) - camPos.Y) * 0.2f;
+            vis[k] = cx * cx + dy * dy + cz * cz < vd2;
+        }
+    return vis;
+}
+
+// Per-map overlay settings: a tiny JSON sidecar beside the level (in the folder, or next to the .rfa keyed by its base
+// name), so the overlay comes back the way it was left.
 string? OvergrowthSettingsPath()
 {
     if (levelDir is null) return null;
@@ -10460,14 +11251,10 @@ string? OvergrowthSettingsPath()
     return Path.Combine(d, Path.GetFileNameWithoutExtension(full) + ".overgrowth.json");
 }
 
-// What the game itself does: over-growth patches every 12.5 m, under-growth every 17.5 m (both hard-coded in
-// BfVietnam.exe's generator), at x1.0. A freshly opened map shows those, and only a sidecar it saved earlier moves them.
-// Patch spacing for the selected build, from THIS level's palette (the stock exe derives it from the .wst's own
-// viewdistance, so it is per-map: Saigon68's 450 gives 112.5 m, a jungle map with 150 gives 37.5 m).
-// The preview always models the RETAIL exe - BfVietnam.exe, what a player runs. It derives its patch spacing from
-// this level's own .wst viewdistance (viewDistance / (COUNT/2 - 1), COUNT 10), so Saigon68's 450 gives 112.5 m.
-// There is no build selector any more: matching a BfVietnam_Veg_* build was never a shippable answer, because a
-// player would have to install that .exe. Converting the overgrowth to STATIC OBJECTS is - see Tools > Overgrowth.
+// Which executable the overlay reproduces. The stock BfVietnam.exe derives its cells from the .wst's viewDistance;
+// the BfVietnam_Veg_* builds hard-code 12.5 m (over) / 17.5 m (under), and Low/Medium/High keep only a quarter, a
+// half or three quarters of the cells. All five are exact - the capture that confirmed the generator was taken on
+// Veg Ultra.
 RefractorForge.Formats.Terrain.VegetationBuild VegBuild() => vegBuildIdx switch
 {
     1 => RefractorForge.Formats.Terrain.VegetationBuild.VegLow,
@@ -10477,29 +11264,16 @@ RefractorForge.Formats.Terrain.VegetationBuild VegBuild() => vegBuildIdx switch
     _ => RefractorForge.Formats.Terrain.VegetationBuild.Stock,
 };
 
-// Overgrowth is placed on the growth map's OWN grid (worldSize / materialMapSideSize, so 4 m on retail maps),
-// because that is what the painted data says: levels paint 24,000-48,000 tree cells per square kilometre and the
-// figure barely moves from map to map. The old viewDistance/4 model put trees 37-137 m apart depending on the
-// level and drew a few hundred where the game draws tens of thousands. Undergrowth keeps the patch model - its
-// index map is 1-2 m and one per cell would be millions.
-float VegPatchMeters(bool over)
-{
-    float m = RefractorForge.Formats.Terrain.OvergrowthFoliage.PatchMetersFor(
-        over ? growth?.OverPalette : growth?.UnderPalette, cfg?.WorldSize ?? 0f, over);
-    // The growth map's own cell is 4 m on a 1024 m level and 8 m on a 2048 m one, and 4 m plants a third of a
-    // million trees - past what the game can draw. Clamp each layer's default into its own slider's band.
-    return over ? Math.Clamp(m, OverPatchMin, OverPatchMax) : Math.Clamp(m, UnderPatchMin, UnderPatchMax);
-}
-
 void ResetGrowthSettingsToMap()
 {
     foliageDensity = 1f; underDensity = 1f;
-    foliageSpacing = VegPatchMeters(over: true);
-    underSpacing = VegPatchMeters(over: false);
     underDirty = true;
-    // Both overlays open OFF. They are the two most expensive things the editor draws - tens of thousands of tree
-    // instances, and a grass carpet that regenerates as the camera moves - and a level opens fastest and reads
-    // most clearly without them. The Layers panel lists both with their instance counts, one click away.
+    // A new level: its own growth, meshes and atlases.
+    growthModelDirty = true; growthTexResolved = false;
+    growthMeshCache.Clear(); ogImportable = null; ogImportableTemplate.Clear();
+    ugField?.ClearCache();
+    // Both overlays open OFF. They are the two most expensive things the editor draws, and a level opens fastest and
+    // reads most clearly without them. The Layers panel lists both, one click away.
     showFoliage = false;
     showUnderFoliage = false;
     foliageDirty = true;
@@ -10528,9 +11302,8 @@ void SaveOvergrowthSettings()
     if (p is null) { Toast(Loc.T("Open a level first.")); return; }
     try
     {
-        File.WriteAllText(p, System.Text.Json.JsonSerializer.Serialize(new { show = showFoliage, spacing = foliageSpacing, density = foliageDensity,
-                                                                           underShow = showUnderFoliage, underSpacing = underSpacing, underDensity = underDensity,
-                                                                           vegBuild = vegBuildIdx }));
+        File.WriteAllText(p, System.Text.Json.JsonSerializer.Serialize(new { show = showFoliage, underShow = showUnderFoliage,
+                                                                           vegBuild = vegBuildIdx, wholeMap = ogWholeMap, fromAbove = ugFromAbove }));
         Toast($"Saved overgrowth settings -> {Path.GetFileName(p)}");
     }
     catch (Exception ex) { Toast(Loc.T("Save overgrowth settings failed: ") + ex.Message); }
@@ -10544,16 +11317,25 @@ void LoadOvergrowthSettings()
     {
         using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(p));
         var root = doc.RootElement;
-        if (root.TryGetProperty("spacing", out var sp) && sp.TryGetSingle(out var spv)) foliageSpacing = Math.Clamp(spv, OverPatchMin, OverPatchMax);
-        if (root.TryGetProperty("density", out var dn) && dn.TryGetSingle(out var dnv)) foliageDensity = Math.Clamp(dnv, 0.25f, 1.5f);
         if (root.TryGetProperty("show", out var sh)) showFoliage = sh.GetBoolean();
-        if (root.TryGetProperty("underSpacing", out var usp) && usp.TryGetSingle(out var uspv)) underSpacing = Math.Clamp(uspv, UnderPatchMin, UnderPatchMax);
         if (root.TryGetProperty("vegBuild", out var vb) && vb.TryGetInt32(out var vbi)) vegBuildIdx = Math.Clamp(vbi, 0, 4);
-        if (root.TryGetProperty("underDensity", out var udn) && udn.TryGetSingle(out var udnv)) underDensity = Math.Clamp(udnv, 0.25f, 1.5f);
         if (root.TryGetProperty("underShow", out var ush)) showUnderFoliage = ush.GetBoolean();
+        if (root.TryGetProperty("wholeMap", out var wm)) ogWholeMap = wm.GetBoolean();
+        if (root.TryGetProperty("fromAbove", out var fa)) ugFromAbove = fa.GetBoolean();
+        growthModelDirty = true;
         foliageDirty = true;
     }
     catch { }
+}
+
+// Which executable the growth overlays reproduce. Shared by both layers: the build changes undergrowth too.
+void GrowthBuildCombo()
+{
+    string[] builds = { Loc.T("BfVietnam.exe (stock)"), "Veg Low", "Veg Medium", "Veg High", "Veg Ultra" };
+    ImGui.SetNextItemWidth(170f);
+    if (Cbo(Loc.TL("Game build##growthbuild"), ref vegBuildIdx, builds, builds.Length))
+    { growthModelDirty = true; foliageDirty = true; underDirty = true; }
+    Theme.Tip(Loc.T("Which executable to match. The stock game sizes its cells from the map's view distance; the\nBfVietnam_Veg_* builds use 12.5 m cells (a far denser forest), and Low/Medium/High keep a quarter,\nhalf or three quarters of them. Each is exact for that executable."));
 }
 
 // The map's own growth definition, as the game reads it from the .wst: per terrain material, which geometries
@@ -10594,23 +11376,26 @@ void DoExportOvergrowthFiles()
     catch (Exception ex) { Toast(Loc.T("Overgrowth export failed: ") + ex.Message); }
 }
 
-// Bake the editor's overgrowth scatter (exactly what the overlay shows, at the current spacing) into a standalone
-// StaticObjects.con: each tree/rock becomes an object.create + absolutePosition + rotation. The file holds ONLY the
-// overgrowth, separate from the level's own StaticObjects.con. (The engine also generates foliage from the maps at
-// load, so mounting this in-game ON TOP of the overgrowth would double it -- use on a map whose overgrowth you've
-// cleared, or as a one-off prop layer.)
+// Bake the game's overgrowth (the exact generator's output - what the overlay shows) into a standalone
+// StaticObjects.con: each generated tree or rock becomes an object.create with its position, its rotation (the yaw
+// AND the lean toward the terrain the game gives it) and its size as object.geometry.scale, the form retail levels
+// use. The file holds ONLY the overgrowth, separate from the level's own StaticObjects.con. (The engine also grows
+// the forest from the maps at load, so mounting this ON TOP of it doubles every tree - use it on a map whose
+// overgrowth you have switched off, or as a one-off prop layer.)
 void DoBakeOvergrowthToCon()
 {
-    if (growth?.Over is null || meshLib is null || terrainPick is null) { Toast(Loc.T("No overgrowth / mesh archive loaded.")); return; }
-    var inst = ScatterOvergrowthResolved();
+    if (growth?.Over is null || meshLib is null) { Toast(Loc.T("No overgrowth / mesh archive loaded.")); return; }
+    if (growthModelDirty || ogResult is null) BuildGrowthModel();
+    var inst = ogResult?.Generated.ToList() ?? new();
     if (inst.Count == 0) { Toast(Loc.T("No overgrowth to bake (paint overgrowth + load the mesh archive).")); return; }
     var sof = new RefractorForge.Formats.Con.StaticObjectsFile();
-    sof.Header.Add($"rem *** {inst.Count} overgrowth objects baked by RefractorForge (spacing {foliageSpacing:0.#} m) ***");
-    foreach (var (t, x, y, z, yaw, s) in inst)
+    sof.Header.Add($"rem *** {inst.Count} overgrowth objects baked by RefractorForge ({VegBuild()}, cells of {ogResult!.CellSize:0.##} m) ***");
+    foreach (var g in inst)
     {
-        var o = new RefractorForge.Formats.Con.StaticObject(t)
-        { Position = new RefractorForge.Formats.Geometry.Vec3(x, y, z), Rotation = new RefractorForge.Formats.Geometry.Vec3(yaw, 0f, 0f) };
-        if (MathF.Abs(s - 1f) > 1e-3f) o.Scale = s;
+        var r = g.YawPitchRollDegrees();
+        var o = new RefractorForge.Formats.Con.StaticObject(g.Geometry)
+        { Position = new RefractorForge.Formats.Geometry.Vec3(g.X, g.Y, g.Z), Rotation = new RefractorForge.Formats.Geometry.Vec3(r.X, r.Y, r.Z) };
+        if (MathF.Abs(g.Scale - 1f) > 1e-4f) o.ScaleAxes = new RefractorForge.Formats.Geometry.Vec3(g.Scale, g.Scale, g.Scale);
         sof.Objects.Add(o);
     }
     string baseDir = Directory.Exists(levelDir) ? levelDir!
@@ -11937,7 +12722,7 @@ void OpenBrightenDialog()
 // the running game by the bfvVegetationCapture tool is exact tree-for-tree, because it reads the instances the
 // engine already generated - verified on Flaming Dart at 41,559 trees, 99.74% on a tree-bearing material and heights
 // matching the heightmap to a mean 0.028 m.
-void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z, float Yaw)> trees, string source)
+void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z, Vec3 Rot, float Scale)> trees, string source)
 {
     if (so is null || hist is null) { Toast(Loc.T("Load a level first.")); return; }
     if (trees.Count == 0) { Toast(Loc.T("Nothing to convert - paint some overgrowth first.")); return; }
@@ -11947,7 +12732,7 @@ void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z,
     var unresolved = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     var used = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     int skipped = 0;
-    foreach (var (geom, x, y, z, yaw) in trees)
+    foreach (var (geom, x, y, z, rot, scale) in trees)
     {
         if (ogStaticKeep < 1f && rng.NextDouble() > ogStaticKeep) { skipped++; continue; }
         // Overgrowth ships as _m2 impostor geometry; the same tree exists as an _M1 object template that stock
@@ -11965,7 +12750,8 @@ void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z,
             tmpl = hit;
         }
         used[tmpl] = used.GetValueOrDefault(tmpl) + 1;
-        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), tmpl, new Vec3(x, y, z), new Vec3(yaw, 0f, 0f)));
+        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), tmpl, new Vec3(x, y, z), rot)
+                 { ScaleAxes = MathF.Abs(scale - 1f) > 1e-4f ? new Vec3(scale, scale, scale) : null });
     }
     if (cmds.Count == 0)
     {
@@ -11992,10 +12778,9 @@ void ConvertOvergrowthToStatic(List<(string Geometry, float X, float Y, float Z,
                       + (unresolved.Count > 0 ? $", {unresolved.Values.Sum():N0} unresolved" : "") + ".");
     foreach (var kv in used.OrderByDescending(k => k.Value)) Console.WriteLine($"   {kv.Key} x{kv.Value:N0}");
     foreach (var kv in unresolved) Console.WriteLine($"   UNRESOLVED (skipped): {kv.Key} x{kv.Value:N0}");
-    // BFV has no per-object scale command (setScale is not in the binary at all), so the procedural 0.6-1.2 size
-    // variation cannot survive the bake - every tree of a type renders at its template's own size. Say so rather
-    // than letting it be noticed in game.
-    Console.WriteLine("   Note: positions and yaw are exact; per-tree SCALE is lost - BfVietnam has no per-object scale command.");
+    // Each tree keeps its size as object.geometry.scale x/y/z - the form retail BF Vietnam levels use for thousands of
+    // their own trees - and its lean toward the terrain in the rotation, so the static forest is the one the game grew.
+    Console.WriteLine("   Positions, rotation (yaw and lean) and size are kept (object.geometry.scale, as retail levels write it).");
     Toast(string.Format(Loc.T("Converted {0} tree(s) to static objects ({1}). Save writes them into the level."), cmds.Count, source) + wstNote);
 }
 
@@ -12008,8 +12793,13 @@ void QueueLevelFile(string rel, byte[] bytes)
 
 void DoConvertOvergrowthFromScatter()
 {
-    var inst = ScatterOvergrowthResolved();
-    ConvertOvergrowthToStatic(inst.Select(i => (i.Tmpl, i.X, i.Y, i.Z, i.Yaw)).ToList(), Loc.T("the editor's scatter"));
+    if (growthModelDirty || ogResult is null) BuildGrowthModel();
+    var inst = ogResult?.Generated ?? Enumerable.Empty<RefractorForge.Formats.Terrain.GrowthInstance>();
+    ConvertOvergrowthToStatic(inst.Select(i =>
+    {
+        var r = i.YawPitchRollDegrees();
+        return (i.Geometry, i.X, i.Y, i.Z, new Vec3(r.X, r.Y, r.Z), i.Scale);
+    }).ToList(), string.Format(Loc.T("the game's generator ({0})"), VegBuild()));
 }
 
 // The exact path: a tree_dump.bin the user captured from the running game.
@@ -12021,7 +12811,7 @@ void DoConvertOvergrowthFromDump()
     try
     {
         var caps = RefractorForge.Formats.Terrain.OvergrowthCapture.LoadDump(File.ReadAllBytes(path));
-        var trees = new List<(string, float, float, float, float)>();
+        var trees = new List<(string, float, float, float, Vec3, float)>();
         int unknownType = 0;
         foreach (var c in caps)
         {
@@ -12029,7 +12819,7 @@ void DoConvertOvergrowthFromDump()
             // a different level names types this palette does not have - skip those rather than guess a species.
             var ft = pal.TypeByIndex(c.Type);
             if (ft is null || string.IsNullOrWhiteSpace(ft.GeometryName)) { unknownType++; continue; }
-            trees.Add((ft.GeometryName, c.X, c.Y, c.Z, c.YawDeg));
+            trees.Add((ft.GeometryName, c.X, c.Y, c.Z, new Vec3(c.YawDeg, 0f, 0f), c.Scale));
         }
         Console.WriteLine($"Read {caps.Count:N0} captured instance(s) from {Path.GetFileName(path)}"
                           + (unknownType > 0 ? $"; {unknownType:N0} had a type index this level's palette does not declare and were skipped" : "") + ".");
@@ -12047,7 +12837,20 @@ void LayersPanel()
     ImGui.Checkbox(Loc.TL("Static Objects"), ref showObjects);
     ImGui.Checkbox(Loc.TL("Texture transparency"), ref alphaTransparency);
     Theme.Tip(Loc.T("Show texture alpha as transparency (foliage cards, fences, windows, decals).\nOff = everything renders opaque."));
-    if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) { collisionDirty = true; bboxDirty = true; }
+    if (ImGui.Checkbox(Loc.TL("Collision (wireframe)"), ref showCollision) && showCollision) { collisionDirty = true; aiMeshDirty = true; bboxDirty = true; }
+    if (showCollision)
+    {
+        string[] colViews = { Loc.T("COL01 (green)"), Loc.T("COL02 (orange)"), Loc.T("Both") };
+        ImGui.SetNextItemWidth(150f);
+        if (Cbo(Loc.TL("Sections##colview"), ref collisionView, colViews, colViews.Length)) collisionDirty = true;
+        Theme.Tip(Loc.T("A mesh can carry two collision meshes. COL01 is the coarse hull; COL02 the detailed one -\nin-game tests show COL02 is what soldiers and vehicles collide with. Green is always COL01 and\norange always COL02. Select an object to see what its mesh carries."));
+    }
+    if (meshLib is not null && meshLib.AiMeshCount > 0)
+    {
+        string aiLabel = showAiMeshes ? string.Format(Loc.T("AI meshes ({0} with, {1} without)"), aiWithCount, aiMissingCount) : Loc.T("AI meshes");
+        if (ImGui.Checkbox(aiLabel + "###aiMeshLayer", ref showAiMeshes) && showAiMeshes) aiMeshDirty = true;
+        Theme.Tip(Loc.T("Which placed objects have an AI mesh - the simplified mesh in aiMeshes/ the game pairs with an\nobject by name (its geometry name with the last part made _a1: barack_m1 -> barack_a1).\nCyan: the AI mesh, where it lies. Red box: a solid object (its mesh has collision) with none."));
+    }
     ImGui.Checkbox(string.Format(Loc.T("Vehicles ({0})"), gameplayEdit.VehicleSpawns.Count) + "###vehLayer", ref showVehicles);
     ImGui.Checkbox(string.Format(Loc.T("Control Points ({0})"), gameplayEdit.ControlPoints.Count) + "###cpLayer", ref showControlPoints);
     ImGui.Checkbox(string.Format(Loc.T("Spawn Points ({0})"), gameplayEdit.SoldierSpawns.Count) + "###spawnLayer", ref showSpawns);
@@ -12071,28 +12874,24 @@ void LayersPanel()
         }
         Theme.Tip(Loc.T("Play placed LOOPING ambient sounds (frogs, crickets, water...) while the\ncamera is inside their ring, fading with distance. Needs the level's .wav\n(in the level .rfa's Sound/ or a shared sound*.rfa)."));
     }
-    // Overgrowth-trees overlay: instance the .wst foliage geometry on the map (a view of the in-game foliage).
-    // BFV-only feature (BF1942 has no overgrowth system), so hide it for a BF1942 target.
+    // The game's forest and grass, from the game's own generator (BfvGrowth). Exact, so there is nothing to tune here
+    // but which executable to match. BF Vietnam only: BF1942 has no growth system.
     if (!gameIsBf1942 && growth?.Over is not null && growth.OverPalette is not null)
     {
         if (ImGui.Checkbox($"Overgrowth Trees ({foliageCount})###foliageLayer", ref showFoliage)) { foliageDirty = true; BroadcastOvergrowth(); }
         if (showFoliage)
         {
-            // Patch size + density use the game's patch model (default 12.5 m / x1.0 = the density BfVietnam generates).
-            ImGui.SetNextItemWidth(150f);
-            // Down to 1 m: the real value is the growth map's cell size, 4 m on every retail level, and a 6 m
-            // floor silently clamped it to something 2-3x too sparse.
-            if (SldF(Loc.TL("Patch size (m)"), ref foliageSpacing, OverPatchMin, OverPatchMax, "%.1f")) { foliageDirty = true; BroadcastOvergrowth(); }
-            ImGui.SetNextItemWidth(150f);
-            // x1.0 is the density measured against a capture of the running game (0.51 instances per painted
-            // cell of the growth map, matching Operation Flaming Dart to 0.16%). The range runs far below that
-            // because whether the rate is the same on a map that paints most of its ground is NOT settled -
-            // Ia Drang paints 78% where Flaming Dart paints 31% - so this has to be able to reach the answer.
-            if (SldF(Loc.TL("Density x"), ref foliageDensity, 0.02f, 2f, "%.2f")) { foliageDirty = true; BroadcastOvergrowth(); }
-            Theme.Muted(string.Format(Loc.T("= {0:0.000} trees per painted cell of the growth map"),
-                                      RefractorForge.Formats.Terrain.OvergrowthFoliage.CellOccupancy * foliageDensity));
-            if (ImGui.SmallButton(Loc.TL("Map defaults##over"))) { foliageSpacing = VegPatchMeters(over: true); foliageDensity = 1f; foliageDirty = true; BroadcastOvergrowth(); }
-            Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
+            GrowthBuildCombo();
+            if (ogResult is { } og)
+            {
+                Theme.Muted(string.Format(Loc.T("{0:N0} trees in {1} x {2} cells of {3:0.#} m"), og.Generated.Count(), og.GridW, og.GridH, og.CellSize));
+                if (og.ImportSceneObjects)
+                    Theme.Muted(string.Format(Loc.T("{0:N0} placed trees taken over, {1:N0} left as objects"), og.Imported.Count(), og.Dropped.Count));
+                Theme.Muted(string.Format(Loc.T("{0:N0} of {1:N0} cells full"), og.CellsStoppedOnBudget, og.GridW * og.GridH));
+                Theme.Tip(Loc.T("The game cuts the map into square cells (the .wst view distance / 4, fitted to the map) and gives\neach a fixed budget of 2048 vertices: a cell stops at the first tree that no longer fits. So the\nforest's density comes from the view distance and the meshes, not from how much you paint -\na full cell grows nothing more however much of it is painted. Placed trees listed in\noverGrowthGeometries.wst use their cell's budget first and keep generated ones off their spot."));
+            }
+            ImGui.Checkbox(Loc.TL("Whole map##ogwhole"), ref ogWholeMap);
+            Theme.Tip(Loc.T("Off: only the cells the game draws from where the camera is (inside the .wst view distance),\nso the forest appears a cell at a time, as it does in game. On: every cell, for an overview."));
             GrowthDefinitionTree(growth.OverPalette, "overdef");
         }
     }
@@ -12101,14 +12900,11 @@ void LayersPanel()
         if (ImGui.Checkbox($"Undergrowth ({underFoliageCount})###underLayer", ref showUnderFoliage)) { underDirty = true; BroadcastOvergrowth(); }
         if (showUnderFoliage)
         {
-            Theme.Muted(string.Format(Loc.T("Drawn {0:0} m around the camera, like the game."), UnderViewMeters()));
-            ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Patch size (m)##under"), ref underSpacing, UnderPatchMin, UnderPatchMax, "%.1f")) { underDirty = true; BroadcastOvergrowth(); }
-            Theme.Tip(Loc.T("The undergrowth map's own cell size - 1 m on Ia Drang, 2 m on most maps.\nSmaller is thicker grass and more instances."));
-            ImGui.SetNextItemWidth(150f);
-            if (SldF(Loc.TL("Density x##under"), ref underDensity, 0.25f, 1.5f, "%.2f")) { underDirty = true; BroadcastOvergrowth(); }
-            if (ImGui.SmallButton(Loc.TL("Map defaults##under"))) { underSpacing = VegPatchMeters(over: false); underDensity = 1f; underDirty = true; BroadcastOvergrowth(); }
-            Theme.Tip(Loc.T("Back to what the selected build generates for THIS map, at x1.0."));
+            if (!showFoliage) GrowthBuildCombo();
+            if (ugField is { } uf)
+                Theme.Muted(string.Format(Loc.T("Patches of {0:0.##} m, drawn to {1:0} m and faded as the game does"), uf.PatchSize, uf.ViewDistance));
+            if (ImGui.Checkbox(Loc.TL("Show from above##ugabove"), ref ugFromAbove)) underDirty = true;
+            Theme.Tip(Loc.T("The game draws grass only near the camera, measuring height at a fifth - from high up\nthere is none, as in game. This shows every patch within the view distance of the point\nunder the camera instead, at full strength, for looking down on it."));
             GrowthDefinitionTree(growth.UnderPalette, "underdef");
         }
     }
@@ -16224,6 +17020,8 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Open Mod..."))) OpenMod();
             if (ImGui.MenuItem(Loc.TL("Save"), "Ctrl+S", false, so is not null && (soPath is not null || levelDir is not null))) DoSave();
             Theme.Tip(Loc.T("Save the level itself: a folder level is written back to its folder, a .rfa level\nback into that .rfa (through a temp file, verified, with an auto-backup first)."));
+            if (ImGui.MenuItem(Loc.TL("Copy Level To..."), null, false, so is not null && CopyLevelSource() is not null)) OpenCopyLevel();
+            Theme.Tip(Loc.T("The same level under a new name, like Battlecraft's Copy Level To: every file moves to the new level\nfolder and the paths inside it are re-pointed. The original is left as it is. To rename a map, copy it\nto the new name, then remove the old .rfa (or folder) yourself."));
             if (ImGui.MenuItem(Loc.TL("Test This Level (in-game)"), "Ctrl+L", false, so is not null && levelDir is not null)) DoTestLevel();
             Theme.Tip(Loc.T("Save the level, then launch the game so you can test it (lighting, objects, etc.).\nPick this map from the in-game map list once it loads."));
             if (ImGui.MenuItem(Loc.TL("Save as Patch .rfa..."), null, false, so is not null && rfaList.Length > 0)) DoSavePatch();
@@ -16351,7 +17149,7 @@ void BuildUi()
                 Theme.Tip(Loc.T("Places the trees as ordinary static objects and switches the procedural overgrowth off.\nHow much the ENGINE plants is decided by the .exe, not the map - the stock game and the\nBfVietnam_Veg_* builds plant wildly different amounts - so a procedural forest only looks\nright for players running the same build you authored on. Baked to static it is level\ncontent: same trees, every client, stock game, no patched .exe."));
                 if (ImGui.MenuItem(Loc.TL("Convert from a captured tree_dump.bin..."), null, false, canBakeOver && so is not null))
                     DoConvertOvergrowthFromDump();
-                Theme.Tip(Loc.T("Exact, tree for tree. Run the bfvVegetationCapture tool while the game sits in this level\nand it reads the instances the engine already generated; this places those. Positions, yaw\nand species are the game's own. Per-tree SCALE cannot survive - BfVietnam has no per-object\nscale command - so every tree of a type comes out at its template's size."));
+                Theme.Tip(Loc.T("Exact, tree for tree. Run the bfvVegetationCapture tool while the game sits in this level\nand it reads the instances the engine already generated; this places those. Positions, yaw,\nspecies and scale are the game's own (the scale is written as Object.geometry.scale)."));
                 ImGui.SetNextItemWidth(150f * uiScale);
                 SldF(Loc.TL("Keep fraction"), ref ogStaticKeep, 0.05f, 1f, "%.2f");
                 Theme.Tip(Loc.T("Thin the forest as it is baked, for a tree budget. 1.00 keeps every tree."));
@@ -16814,6 +17612,8 @@ void BuildUi()
     HelpWindow();
     ValidateModal();
     ExitPromptModal();
+    CopyLevelModal();
+    EditModeSwitchModal();
     // GPU work happens here, on the render thread that owns the GL context, a slice at a time so the editor keeps
     // drawing. A no-op when nothing is queued.
     gpuLm?.Pump(12.0);
@@ -19235,6 +20035,16 @@ void RunMapValidation()
         SpawnBelowGroundByMode = SpawnBelowGroundByMode(),
     });
     AddMissingTemplateAdvice(r);
+    // Ships and carriers whose built-in soldier spawns belong to the other team than the one the spawner gives them to.
+    try
+    {
+        foreach (var vs in gameplayEdit.VehicleSpawns)
+            foreach (var (team, veh, issues) in SpawnTeamProblems(vs))
+                foreach (var m in issues)
+                    r.Add(RefractorForge.Formats.Validation.IssueSeverity.Warning, "Spawns",
+                          DescribeSpawnTeamProblem(team, veh, m) + " " + Loc.T("Select the spawn to make a copy of the vehicle for that team."), vs.Position);
+    }
+    catch (Exception ex) { Console.WriteLine("Spawn-team check: " + ex.Message); }
     ShowReport(r);
 }
 
@@ -20145,12 +20955,13 @@ void EditSolModal()
     ImGui.EndPopup();
 }
 
-// Help > User Guide window: shows USER_GUIDE.md (shipped next to the exe) as scrollable, wrapped text.
+// Help > User Guide window: USER_GUIDE.md (shipped next to the exe) drawn as a document - headings, paragraphs,
+// bullets, numbered steps, tables, code - with its sections listed on the left (HelpDocument reads the Markdown).
 void HelpWindow()
 {
     if (!showHelp) return;
     var fbh = window.FramebufferSize;
-    ImGui.SetNextWindowSize(new Vector2(720f, MathF.Min(fbh.Y * 0.85f, 820f)), ImGuiCond.Appearing);
+    ImGui.SetNextWindowSize(new Vector2(MathF.Min(fbh.X * 0.9f, 1000f * uiScale), MathF.Min(fbh.Y * 0.85f, 860f * uiScale)), ImGuiCond.Appearing);
     ImGui.SetNextWindowPos(new Vector2(fbh.X * 0.5f, fbh.Y * 0.5f), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
     if (ImGui.Begin(Loc.TL("User Guide / Controls"), ref showHelp, ImGuiWindowFlags.NoSavedSettings))
     {
@@ -20158,10 +20969,105 @@ void HelpWindow()
         {
             try { var hp = Path.Combine(AppContext.BaseDirectory, "USER_GUIDE.md"); helpText = File.Exists(hp) ? File.ReadAllText(hp) : Loc.T("USER_GUIDE.md was not found next to the editor. See the RefractorForge GitHub repository for the full documentation."); }
             catch (Exception ex) { helpText = Loc.T("Could not load USER_GUIDE.md: ") + ex.Message; }
+            helpDoc = null;
         }
+        helpDoc ??= HelpDocument.Parse(helpText);
+
+        // Contents: the guide's sections and sub-sections; a click scrolls the page to it.
+        ImGui.BeginChild("##helptoc", new Vector2(240f * uiScale, 0f), ImGuiChildFlags.Border);
+        Theme.Section(Loc.T("CONTENTS"));
+        for (int hi = 0; hi < helpDoc.Count; hi++)
+        {
+            var hb = helpDoc[hi];
+            if (hb.Kind != HelpDocument.Kind.Heading || hb.Level < 2 || hb.Level > 3) continue;
+            if (hb.Level == 3) ImGui.Indent(12f * uiScale);
+            if (ImGui.Selectable(hb.Text + "##toc" + hi)) helpJump = hi;
+            if (hb.Level == 3) ImGui.Unindent(12f * uiScale);
+        }
+        ImGui.EndChild();
+        ImGui.SameLine();
+
+        ImGui.BeginChild("##helpbody", Vector2.Zero, ImGuiChildFlags.None);
         ImGui.PushTextWrapPos(0f);
-        ImGui.TextUnformatted(helpText);
+        for (int bi = 0; bi < helpDoc.Count; bi++)
+        {
+            var hb = helpDoc[bi];
+            switch (hb.Kind)
+            {
+                case HelpDocument.Kind.Heading:
+                    if (bi > 0) ImGui.Spacing();
+                    if (bi == helpJump) { ImGui.SetScrollHereY(0f); helpJump = -1; }
+                    if (hb.Level <= 2)
+                    {
+                        ImGui.PushFont(Theme.FontTitle);
+                        ImGui.TextColored(hb.Level == 1 ? Theme.Text : Theme.Accent, hb.Text);
+                        ImGui.PopFont();
+                        if (hb.Level == 2) ImGui.Separator();
+                    }
+                    else
+                    {
+                        ImGui.PushFont(Theme.FontSemibold);
+                        ImGui.TextColored(Theme.Accent, hb.Text);
+                        ImGui.PopFont();
+                    }
+                    break;
+                case HelpDocument.Kind.Paragraph:
+                    ImGui.TextWrapped(hb.Text);
+                    break;
+                case HelpDocument.Kind.Bullet:
+                case HelpDocument.Kind.Numbered:
+                {
+                    float ind = (14f + 16f * hb.Level) * uiScale;
+                    ImGui.Indent(ind);
+                    if (hb.Kind == HelpDocument.Kind.Bullet) ImGui.Bullet();
+                    else ImGui.TextColored(Theme.Accent, hb.Marker);
+                    ImGui.SameLine();
+                    ImGui.TextWrapped(hb.Text);
+                    ImGui.Unindent(ind);
+                    break;
+                }
+                case HelpDocument.Kind.Quote:
+                    ImGui.Indent(10f * uiScale);
+                    ImGui.TextColored(Theme.TextMuted, hb.Text);
+                    ImGui.Unindent(10f * uiScale);
+                    break;
+                case HelpDocument.Kind.Code:
+                    ImGui.Indent(10f * uiScale);
+                    ImGui.PushStyleColor(ImGuiCol.Text, Theme.Warn);
+                    ImGui.TextUnformatted(hb.Text);
+                    ImGui.PopStyleColor();
+                    ImGui.Unindent(10f * uiScale);
+                    break;
+                case HelpDocument.Kind.Rule:
+                    ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
+                    break;
+                case HelpDocument.Kind.Table when hb.Rows is { Count: > 0 } rows:
+                {
+                    int cols = Math.Max(1, rows.Max(r => r.Length));
+                    if (ImGui.BeginTable("##helptable" + bi, cols, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp))
+                    {
+                        for (int ri = 0; ri < rows.Count; ri++)
+                        {
+                            ImGui.TableNextRow();
+                            for (int ci = 0; ci < cols; ci++)
+                            {
+                                ImGui.TableSetColumnIndex(ci);
+                                var cell = ci < rows[ri].Length ? rows[ri][ci] : "";
+                                if (ri == 0) ImGui.TextColored(Theme.Accent, cell);
+                                else ImGui.TextWrapped(cell);
+                            }
+                        }
+                        ImGui.EndTable();
+                    }
+                    break;
+                }
+                case HelpDocument.Kind.Blank:
+                    ImGui.Dummy(new Vector2(0f, 2f * uiScale));
+                    break;
+            }
+        }
         ImGui.PopTextWrapPos();
+        ImGui.EndChild();
     }
     ImGui.End();
 }
@@ -21018,6 +21924,130 @@ void AiNavDab(float wx, float wz)
         if (aiNavTexId != 0) UploadAiNavRect(minx, miny, maxx - minx + 1, maxy - miny + 1);
         else aiNavTexDirty = true;
     }
+}
+
+// Where an AI Path stroke lands: the level plane when it is on (the ray meets the plane at its height; outside the
+// plane's square nothing is painted), else the terrain.
+bool AiPathHit(Ray ray, out Vector3 hit)
+{
+    hit = default;
+    if (!aiPlaneOn) return terrainPick is not null && terrainPick.Raycast(ray, out hit);
+    if (MathF.Abs(ray.Dir.Y) < 1e-6f) return false;
+    float tPlane = (aiPlaneY - ray.Origin.Y) / ray.Dir.Y;
+    if (tPlane <= 0f) return false;
+    hit = ray.Origin + ray.Dir * tPlane;
+    var pr = AiPlaneRect();
+    return hit.X >= pr.X && hit.X <= pr.Z && hit.Z >= pr.Y && hit.Z <= pr.W;
+}
+
+// The plane's square in X/Z as (minX, minZ, maxX, maxZ), kept on the map.
+Vector4 AiPlaneRect()
+{
+    float mapW = cfg.WorldSize;
+    if (aiPlaneWhole) return new Vector4(0f, 0f, mapW, mapW);
+    float half = Math.Max(1f, aiPlaneSize) * 0.5f;
+    return new Vector4(Math.Clamp(aiPlaneCenter.X - half, 0f, mapW), Math.Clamp(aiPlaneCenter.Y - half, 0f, mapW),
+                       Math.Clamp(aiPlaneCenter.X + half, 0f, mapW), Math.Clamp(aiPlaneCenter.Y + half, 0f, mapW));
+}
+
+void NudgeAiPlane(float dy)
+{
+    aiPlaneY += dy;
+    Toast(string.Format(Loc.T("Plane height {0:0.##} m"), aiPlaneY));
+}
+
+// First time the plane is switched on: over the selected object if there is one, else where the view looks.
+void PlaceAiPlaneIfNew()
+{
+    if (aiPlaneCenter.X >= 0f) return;
+    if (so is not null && selected >= 0 && selected < so.Objects.Count) { FitAiPlaneToSelection(); return; }
+    var fbc = window.FramebufferSize;
+    var cray = Picking.ScreenToRay(cam, fbc.X * 0.5f, fbc.Y * 0.5f, fbc.X, fbc.Y);
+    if (terrainPick is not null && terrainPick.Raycast(cray, out var cHit)) { aiPlaneCenter = new Vector2(cHit.X, cHit.Z); aiPlaneY = cHit.Y; }
+    else { aiPlaneCenter = new Vector2(cfg.WorldSize * 0.5f, cfg.WorldSize * 0.5f); aiPlaneY = cfg.WaterLevel; }
+}
+
+// Lay the plane over the selected object: centred on it and sized to its footprint plus a margin for the approach,
+// at the height of its origin. Pick height (or PgUp / PgDn) then puts it on the deck itself.
+void FitAiPlaneToSelection()
+{
+    if (so is null || selected < 0 || selected >= so.Objects.Count) return;
+    var selObj = so.Objects[selected];
+    float x0 = selObj.Position.X, x1 = x0, z0 = selObj.Position.Z, z1 = z0;
+    if (TemplateBoundsOf(selObj.Template) is { } selB)
+    {
+        var selWorld = LevelScene.MeshWorld(selObj);
+        x0 = z0 = float.MaxValue; x1 = z1 = float.MinValue;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            var cl = new Vector3((corner & 1) == 0 ? selB.Min.X : selB.Max.X, (corner & 2) == 0 ? selB.Min.Y : selB.Max.Y, (corner & 4) == 0 ? selB.Min.Z : selB.Max.Z);
+            var cw = Vector3.Transform(cl, selWorld);
+            x0 = Math.Min(x0, cw.X); x1 = Math.Max(x1, cw.X); z0 = Math.Min(z0, cw.Z); z1 = Math.Max(z1, cw.Z);
+        }
+    }
+    aiPlaneCenter = new Vector2((x0 + x1) * 0.5f, (z0 + z1) * 0.5f);
+    aiPlaneSize = Math.Clamp(Math.Max(x1 - x0, z1 - z0) + 16f, 16f, Math.Max(16f, cfg.WorldSize));
+    aiPlaneY = selObj.Position.Y;
+    aiPlaneWhole = false;
+}
+
+// The level plane itself: depth-tested against the scene but not written, so a deck above the plane hides it and
+// the ground below shows through it. Drawn only in AI Path with the plane on.
+unsafe void DrawAiNavPlane()
+{
+    if (!aiPlaneOn || toolNames[tool] != "AIPath" || heightmap is null) return;
+    EnsureAiNav();
+    if (aiNavTexDirty) UploadAiNavTexture();
+    if (aiNav is null || aiNavTexId == 0) return;
+    if (navPlaneProg == 0)
+    {
+        navPlaneProg = BuildProgram(NavPlaneVert, NavPlaneFrag);
+        navPlaneVao = gl.GenVertexArray(); gl.BindVertexArray(navPlaneVao);
+        navPlaneVbo = gl.GenBuffer(); gl.BindBuffer(BufferTargetARB.ArrayBuffer, navPlaneVbo);
+        gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * (uint)sizeof(float), (void*)0);
+        gl.EnableVertexAttribArray(0);
+    }
+    var pr = AiPlaneRect();
+    if (pr.Z - pr.X <= 0f || pr.W - pr.Y <= 0f) return;
+    float py = aiPlaneY;
+    float[] quad = { pr.X, py, pr.Y,  pr.Z, py, pr.Y,  pr.Z, py, pr.W,   pr.X, py, pr.Y,  pr.Z, py, pr.W,  pr.X, py, pr.W };
+    gl.UseProgram(navPlaneProg);
+    var vpm = cam.ViewProjection;
+    gl.UniformMatrix4(gl.GetUniformLocation(navPlaneProg, "uMVP"), 1, false, (float*)&vpm);
+    gl.Uniform1(gl.GetUniformLocation(navPlaneProg, "uWorld"), (float)cfg.WorldSize);
+    gl.Uniform1(gl.GetUniformLocation(navPlaneProg, "uCell"), (float)cfg.WorldSize / Math.Max(1, aiNavSide));
+    gl.Uniform4(gl.GetUniformLocation(navPlaneProg, "uRect"), pr.X, pr.Y, pr.Z, pr.W);
+    gl.Uniform1(gl.GetUniformLocation(navPlaneProg, "uNav"), 1);
+    gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, aiNavTexId); gl.ActiveTexture(TextureUnit.Texture0);
+    gl.BindVertexArray(navPlaneVao);
+    gl.BindBuffer(BufferTargetARB.ArrayBuffer, navPlaneVbo);
+    gl.BufferData<float>(BufferTargetARB.ArrayBuffer, quad, BufferUsageARB.DynamicDraw);
+    bool cullWas = gl.IsEnabled(EnableCap.CullFace), blendWas = gl.IsEnabled(EnableCap.Blend);
+    gl.Disable(EnableCap.CullFace);
+    gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+    gl.DepthMask(false);
+    gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+    gl.DepthMask(true);
+    if (!blendWas) gl.Disable(EnableCap.Blend);
+    if (cullWas) gl.Enable(EnableCap.CullFace);
+}
+
+// The brush outline on the level plane: flat at the plane's height (the draped ring would follow the ground below).
+void DrawAiPlaneBrush()
+{
+    if (!aiPlaneOn || toolNames[tool] != "AIPath" || UiWantsMouse()) return;
+    var fbn = window.FramebufferSize;
+    var nray = Picking.ScreenToRay(cam, lastMouse.X, lastMouse.Y, fbn.X, fbn.Y);
+    if (!AiPathHit(nray, out var nph)) return;
+    gl.UseProgram(markerProg);
+    var ringM = Matrix4x4.CreateScale(brushRadius, 1f, brushRadius) * Matrix4x4.CreateTranslation(nph.X, aiPlaneY + 0.05f, nph.Z);
+    gl.UniformMatrix4(uMvpM, 1, false, ToFloats(ringM * cam.ViewProjection));
+    if (aiPathBlock) gl.Uniform3(uColor, 1f, 0.4f, 0.4f); else gl.Uniform3(uColor, 0.4f, 0.7f, 1f);   // red=blocked, blue=passable
+    gl.Uniform1(uSize, 1f);
+    gl.Disable(EnableCap.DepthTest);
+    gl.BindVertexArray(squareBrush ? brushSquareVao : brushRingVao);
+    gl.DrawArrays(PrimitiveType.LineLoop, 0, squareBrush ? 4u : 64u);
+    gl.Enable(EnableCap.DepthTest);
 }
 
 unsafe void UploadAiNavTexture()

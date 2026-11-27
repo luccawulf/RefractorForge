@@ -777,6 +777,57 @@ public sealed class RefractorFlatArchive
         }
     }
 
+    /// <summary>Write a NEW archive whose entries come from one or more source archives under new names - a level
+    /// copied to another name (<c>LevelCopy</c>). An entry is copied as its raw region, nothing re-compressed,
+    /// when its source's compression matches the output; <paramref name="replace"/> (keyed by the NEW name) supplies
+    /// fresh bytes for an entry, such as a .con whose paths were re-pointed. Streamed to a temp file, flushed, then
+    /// moved into place. An existing <paramref name="path"/> is refused: a copy never overwrites anything.</summary>
+    public static void WriteRenamedCopy(
+        string path,
+        IReadOnlyList<(RefractorFlatArchive Source, RefractorFlatArchiveEntry Entry, string Name)> items,
+        IReadOnlyDictionary<string, byte[]> replace,
+        bool compress,
+        XPackId xPackId)
+    {
+        if (File.Exists(path)) throw new IOException($"{path} already exists.");
+        var names = new HashSet<string>(NameComparer);
+        foreach (var it in items)
+            if (!names.Add(it.Name))
+                throw new ArgumentException($"Two entries would be stored as '{it.Name}'.", nameof(items));
+        string tmp = path + ".rfatmp";
+        try
+        {
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                StreamArchive(
+                    fs,
+                    items.Count,
+                    i => items[i].Name,
+                    i =>
+                    {
+                        var (src, e, name) = items[i];
+                        if (replace.TryGetValue(name, out var rep)) return (BuildRegion(rep, compress), rep.Length);
+                        if (src.IsCompressed == compress)
+                        {
+                            var region = src.RawRegion(e);
+                            int unc = e.UncompressedSize;
+                            if (!compress || IsValidCompressedRegion(region, unc)) return (region, unc);
+                        }
+                        var data = src.Read(e);
+                        return (BuildRegion(data, compress), data.Length);
+                    },
+                    compress,
+                    xPackId,
+                    tocTail: new byte[4]);
+            DurableFile.FlushToDisk(tmp);
+            File.Move(tmp, path, overwrite: false);
+        }
+        catch
+        {
+            try { File.Delete(tmp); } catch { }
+            throw;
+        }
+    }
+
     /// <summary>The same repack, with the entries to leave out named rather than tested: each name in
     /// <paramref name="remove"/> drops the entry stored under it, matched by <see cref="NameComparer"/> like the
     /// replacements are - so an editor that shows <c>objects/x</c> can delete a stored <c>objects\x</c> by the

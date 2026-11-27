@@ -103,8 +103,15 @@ public sealed class StaticObjectsFile
 
                 case "object.geometry.scale":
                 case "object.scale":
-                    if (current is not null && float.TryParse(rest, NumberStyles.Float, CultureInfo.InvariantCulture, out var scale))
+                    if (current is null) break;
+                    if (float.TryParse(rest, NumberStyles.Float, CultureInfo.InvariantCulture, out var scale))
                         current.InitScale(scale, rest);
+                    // Retail BF Vietnam writes most scales per axis ("0.861647/0.983059/0.898353"). This case used to
+                    // match the line, fail the single-number parse and drop it, so a save reset every such object to 1.
+                    else if (rest.Contains('/') && Vec3.TryParse(rest, out var axes))
+                        current.InitScaleAxes(axes, rest);
+                    else
+                        current.ExtraLines.Add(line);   // anything else stays exactly as it was
                     break;
 
                 default:
@@ -156,6 +163,8 @@ public sealed class StaticObjectsFile
             if (o.Layer is int l) yield return $"object.layer {l}";
             if (o.Scale is float s)
                 yield return $"object.geometry.scale {o.ScaleSource ?? s.ToString("0.######", CultureInfo.InvariantCulture)}";
+            else if (o.ScaleAxes is Vec3 sa)
+                yield return $"object.geometry.scale {o.ScaleSource ?? sa.ToString()}";
             foreach (var extra in o.ExtraLines) yield return extra;
         }
     }

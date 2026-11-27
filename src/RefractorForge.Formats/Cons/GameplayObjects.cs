@@ -51,6 +51,11 @@ public sealed record GameplayObjects(
 {
     public static GameplayObjects Empty { get; } = new(new List<ControlPointDef>(), new List<VehicleSpawnDef>(), new List<SoldierSpawnDef>());
 
+    /// <summary>Blocks the save appends to every mode's files once (marker-checked) - e.g. a ship copied for the
+    /// other team (<see cref="TeamVehicleCopy"/>): its templates in ObjectSpawnTemplates.con, its spawn groups in
+    /// SpawnpointManagerSettings.con.</summary>
+    public IReadOnlyList<GameplayAddition> Additions { get; init; } = Array.Empty<GameplayAddition>();
+
     public int Count => ControlPoints.Count + VehicleSpawns.Count + SoldierSpawns.Count;
 
     /// <summary>One placed object parsed from a *.con: its create-name and the properties on it.</summary>
@@ -379,11 +384,9 @@ public sealed record GameplayObjects(
     }
 
     /// <summary>Load the Conquest gameplay files from an extracted level folder (empty layers if absent).</summary>
-    public static GameplayObjects LoadFolder(string levelDir)
+    public static GameplayObjects LoadFolder(string levelDir, string? mode = null)
     {
-        // Prefer the multiplayer Conquest folder; fall back to the level root.
-        string dir = System.IO.Directory.Exists(System.IO.Path.Combine(levelDir, "Conquest"))
-            ? System.IO.Path.Combine(levelDir, "Conquest") : levelDir;
+        string dir = GameplayDir(levelDir, mode);
         IEnumerable<string>? Read(string name)
         {
             var p = System.IO.Path.Combine(dir, name);
@@ -392,5 +395,52 @@ public sealed record GameplayObjects(
         return Parse(Read("ControlPoints.con"), Read("ControlPointTemplates.con"),
                      Read("ObjectSpawns.con"), Read("ObjectSpawnTemplates.con"),
                      Read("SoldierSpawns.con"), Read("SoldierSpawnTemplates.con"));
+    }
+    private static readonly string[] GameplayFiles =
+        { "ControlPoints.con", "ControlPointTemplates.con", "ObjectSpawns.con", "ObjectSpawnTemplates.con", "SoldierSpawns.con", "SoldierSpawnTemplates.con" };
+
+    /// <summary>The folder whose gameplay the editor edits: the named game mode's folder (Conquest, Ctf, TDM,
+    /// SinglePlayer, Coop, or a mod's own) when the level has one - the shallowest, so a backup copy never wins -
+    /// else Conquest, else the level root.</summary>
+    public static string GameplayDir(string levelDir, string? mode)
+    {
+        if (!string.IsNullOrEmpty(mode))
+        {
+            var hit = LevelSaver.GameModeDirs(levelDir)
+                .Where(d => new System.IO.DirectoryInfo(d).Name.Equals(mode, System.StringComparison.OrdinalIgnoreCase))
+                .OrderBy(d => d.Count(c => c == System.IO.Path.DirectorySeparatorChar || c == System.IO.Path.AltDirectorySeparatorChar))
+                .FirstOrDefault();
+            if (hit is not null) return hit;
+        }
+        var cq = System.IO.Path.Combine(levelDir, "Conquest");
+        return System.IO.Directory.Exists(cq) ? cq : levelDir;
+    }
+
+    /// <summary>One game mode's gameplay straight out of a packed level: <c>&lt;mode&gt;/ControlPoints.con</c> and
+    /// the rest, the shallowest entry of each in an archive, later archives (patches) winning.</summary>
+    public static GameplayObjects LoadArchiveMode(IEnumerable<string> rfaPaths, string mode)
+    {
+        var files = new Dictionary<string, string[]>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var path in rfaPaths)
+        {
+            if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) continue;
+            var arc = new Rfa.RefractorFlatArchive(path);
+            foreach (var want in GameplayFiles)
+            {
+                string tail = "/" + mode + "/" + want;
+                Rfa.RefractorFlatArchiveEntry? best = null; int bestDepth = int.MaxValue;
+                foreach (var e in arc.Entries)
+                {
+                    var norm = e.Name.Replace((char)92, '/');
+                    if (!norm.EndsWith(tail, System.StringComparison.OrdinalIgnoreCase)) continue;
+                    int depth = norm.Count(c => c == '/');
+                    if (depth < bestDepth) { best = e; bestDepth = depth; }
+                }
+                if (best is not null) files[want] = ConLines.Split(arc.Read(best));
+            }
+        }
+        string[]? F(string n) => files.TryGetValue(n, out var l) ? l : null;
+        return Parse(F("ControlPoints.con"), F("ControlPointTemplates.con"), F("ObjectSpawns.con"),
+                     F("ObjectSpawnTemplates.con"), F("SoldierSpawns.con"), F("SoldierSpawnTemplates.con"));
     }
 }

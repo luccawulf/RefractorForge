@@ -52,11 +52,15 @@ public sealed class ScaleObject : IEditCommand
 public sealed class AddObject : IEditCommand
 {
     public string Id; public string Template; public Vec3 Pos; public Vec3 Rot;
+    /// <summary>An optional per-axis <c>object.geometry.scale</c> - a baked tree keeps the size the game drew it at.</summary>
+    public Vec3? ScaleAxes;
     public AddObject(string id, string template, Vec3 pos, Vec3 rot) { Id = id; Template = template; Pos = pos; Rot = rot; }
     public void Apply(StaticObjectsFile f)
     {
         if (f.FindById(Id) is not null) return;
-        f.Objects.Add(new StaticObject(Template) { Id = Id, Position = Pos, Rotation = Rot });
+        var o = new StaticObject(Template) { Id = Id, Position = Pos, Rotation = Rot };
+        if (ScaleAxes is Vec3 s) o.ScaleAxes = s;
+        f.Objects.Add(o);
     }
     public void Undo(StaticObjectsFile f) { var o = f.FindById(Id); if (o is not null) f.Objects.Remove(o); }
     public string ToWire() => $"ADD {Id} {Template} {Pos} {Rot}";

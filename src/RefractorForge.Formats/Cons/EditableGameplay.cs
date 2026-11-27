@@ -24,6 +24,7 @@ public sealed class EditableGameplay
         ControlPoints = g.ControlPoints.ToList();
         VehicleSpawns = g.VehicleSpawns.ToList();
         SoldierSpawns = g.SoldierSpawns.ToList();
+        Additions.AddRange(g.Additions);
     }
 
     public int Count => ControlPoints.Count + VehicleSpawns.Count + SoldierSpawns.Count;
@@ -132,5 +133,9 @@ public sealed class EditableGameplay
     public static SoldierSpawnDef NewSoldierSpawn(Vec3 pos) => new("SoldierSpawn", pos, Vec3.Zero);
 
     /// <summary>Snapshot back to an immutable <see cref="GameplayObjects"/> (e.g. for saving).</summary>
-    public GameplayObjects ToImmutable() => new(ControlPoints.ToList(), VehicleSpawns.ToList(), SoldierSpawns.ToList());
+    /// <summary>Blocks to append to the modes' files on save (see <see cref="GameplayObjects.Additions"/>).</summary>
+    public List<GameplayAddition> Additions { get; } = new();
+
+    public GameplayObjects ToImmutable() => new(ControlPoints.ToList(), VehicleSpawns.ToList(), SoldierSpawns.ToList())
+    { Additions = Additions.ToList() };
 }

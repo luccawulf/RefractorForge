@@ -25,6 +25,7 @@ public sealed class MeshLibrary
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByTail2 = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _treeByName = new(StringComparer.OrdinalIgnoreCase);   // BF1942 .tm tree meshes (basename, no ext)
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _rsByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RefractorFlatArchiveEntry> _aiByName = new(StringComparer.OrdinalIgnoreCase);   // aiMeshes/<name>.sm
     // animations.rfa: the skin that binds a mesh's vertices to bones, and the skeletons those bones live in. A
     // skinned mesh's .sm holds the BIND pose, which is not the shape the engine draws - see RestPosed.
     private readonly Dictionary<string, RefractorFlatArchiveEntry> _sknByName = new(StringComparer.OrdinalIgnoreCase);
@@ -298,8 +299,9 @@ public sealed class MeshLibrary
         if (entry is not null && BuildCollisionFromEntry(entry) is { } sm) return sm;
         // No .sm collision: trees and bushes are BF1942 .tm meshes, a separate format the .sm resolver never
         // finds. They are solid in-game, so without this branch the collision overlay drew nothing for every
-        // tree on the map — the geometry was in the file all along, just skipped over by the parser.
-        return BuildTreeCollision(template);
+        // tree on the map — the geometry was in the file all along, just skipped over by the parser. A tree has ONE
+        // hull, so it answers for the first section only (shown with COL01, never twice).
+        return _colSection <= 0 ? BuildTreeCollision(template) : null;
     }
 
     private CollisionMesh? BuildTreeCollision(string template)
@@ -331,18 +333,55 @@ public sealed class MeshLibrary
         {
             byte[] bytes = OwningArchive(entry).Read(entry);
             if (StandardMesh.TryParse(bytes, out var sm) && sm is not null)
-                foreach (var sec in sm.CollisionSections)
-                    if (StandardMesh.TryParseCollision(sec, out var verts, out var idx) && idx.Length > 0)
+                for (int s = 0; s < sm.CollisionSections.Count; s++)
+                {
+                    if (_colSection >= 0 && s != _colSection) continue;
+                    if (StandardMesh.TryParseCollision(sm.CollisionSections[s], out var verts, out var idx) && idx.Length > 0)
                     {
                         var pos = new Vector3[verts.Length];
                         for (int i = 0; i < verts.Length; i++) pos[i] = new Vector3(verts[i].X, verts[i].Y, verts[i].Z);
                         result = new CollisionMesh(pos, idx);
                         break;
                     }
+                }
         }
         catch { result = null; }
         _colEntryCache[entry] = result;
         return result;
+    }
+
+    private int _colSection = -1;
+    /// <summary>Which of a mesh's collision sections the collision lookups decode: -1 the first it has (COL01 when
+    /// there is one), 0 COL01, 1 COL02. A .sm carries them in that order - COL01 the coarse hull, COL02 the detailed
+    /// one, which in-game tests show is what soldiers and vehicles collide with. Changing it clears the caches.
+    /// BF1942 tree meshes have one hull, shown for every choice.</summary>
+    public int CollisionSection
+    {
+        get => _colSection;
+        set
+        {
+            if (value == _colSection) return;
+            _colSection = value;
+            _colCache.Clear(); _colEntryCache.Clear(); _vehColCache.Clear(); _staticColCache.Clear();
+        }
+    }
+
+    /// <summary>What a template's mesh carries for collision, per section (0 = COL01, 1 = COL02...): vertex and face
+    /// counts. Empty when the mesh has none or does not resolve.</summary>
+    public IReadOnlyList<(int Section, int Vertices, int Faces)> CollisionSectionsOf(string template)
+    {
+        var res = new List<(int, int, int)>();
+        var entry = Resolve(template) ?? (LodStem(template) is { } stem ? Resolve(stem) : null);
+        if (entry is null) return res;
+        try
+        {
+            if (StandardMesh.TryParse(OwningArchive(entry).Read(entry), out var sm) && sm is not null)
+                for (int s = 0; s < sm.CollisionSections.Count; s++)
+                    if (StandardMesh.TryParseCollision(sm.CollisionSections[s], out var verts, out var idx))
+                        res.Add((s, verts.Length, idx.Length / 3));
+        }
+        catch { }
+        return res;
     }
 
     /// <summary>Open the given RFA archives (missing paths are skipped). Later archives do not override earlier ones.</summary>
@@ -376,6 +415,8 @@ public sealed class MeshLibrary
                 {
                     _ = lib._byName.TryAdd(baseName, e);
                     if (tail2 is not null) _ = lib._byTail2.TryAdd(tail2, e);
+                    if (norm.StartsWith("aiMeshes/", StringComparison.OrdinalIgnoreCase) || norm.Contains("/aiMeshes/", StringComparison.OrdinalIgnoreCase))
+                        _ = lib._aiByName.TryAdd(baseName[..^3], e);
                 }
                 else if (baseName.EndsWith(".tm", StringComparison.OrdinalIgnoreCase)) _ = lib._treeByName.TryAdd(baseName[..^3], e);   // BF1942 tree mesh (treeMesh.rfa)
                 else if (baseName.EndsWith(".skn", StringComparison.OrdinalIgnoreCase)) _ = lib._sknByName.TryAdd(baseName[..^4], e);
@@ -995,6 +1036,85 @@ public sealed class MeshLibrary
             if (!visiting.Add(child)) continue;
             if (_allTemplates!.TryGetValue(child, out var ct)) CollectLodGeometries(ct, add, visiting, depth + 1);
         }
+    }
+
+    /// <summary>How many AI meshes the loaded archives carry (<c>aiMeshes/*.sm</c>).</summary>
+    public int AiMeshCount => _aiByName.Count;
+
+    /// <summary>
+    /// The AI mesh the game uses for a placed template, or null when it has none. The engine finds one by NAME - it
+    /// cuts a geometry's name at its last '_' and loads <c>AIMeshes/&lt;stem&gt;_a1</c> (BF1942.exe builds
+    /// "AIMeshes/" + stem + "_a1.aim" at 0x751a1f; BfVietnam.exe carries the same strings and a compileAIMeshes command).
+    /// Read against BF1942's 90 shipped AI meshes, the geometry names explain the most of them, so every geometry in
+    /// the template's part tree is tried, the object's own first: <c>barack_m1</c> -&gt; <c>aiMeshes/barack_a1</c>.
+    /// </summary>
+    public (string Name, string Entry)? AiMeshFor(string template)
+    {
+        if (string.IsNullOrWhiteSpace(template) || _aiByName.Count == 0) return null;
+        EnsureObjectGeometry();
+        EnsureAllTemplates();
+        var names = new List<string>();
+        void Add(string g)
+        {
+            if (string.IsNullOrEmpty(g)) return;
+            names.Add(Leaf(g));
+            if (_geomFile!.TryGetValue(g, out var f) && f.Length > 0) names.Add(Leaf(f));
+        }
+        if (_objGeom!.TryGetValue(template, out var direct)) Add(direct);
+        if (_allTemplates!.TryGetValue(template, out var root))
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var stack = new Stack<ConTemplate>();
+            stack.Push(root);
+            while (stack.Count > 0 && seen.Count < 256)
+            {
+                var t = stack.Pop();
+                if (!seen.Add(t.Name)) continue;
+                if (t.Geometry is { Length: > 0 } g) Add(g);
+                foreach (var (child, _, _) in t.Children)
+                    if (_allTemplates.TryGetValue(child, out var ct)) stack.Push(ct);
+            }
+        }
+        names.Add(template);
+        foreach (var n in names)
+        {
+            int us = n.LastIndexOf('_');
+            if (us <= 0) continue;
+            var ai = n[..us] + "_a1";
+            if (_aiByName.TryGetValue(ai, out var e)) return (ai, e.Name);
+        }
+        return null;
+    }
+
+    /// <summary>An AI mesh's shape (its collision-style section) for drawing, or null.</summary>
+    public CollisionMesh? AiMeshShape(string aiName)
+    {
+        if (!_aiByName.TryGetValue(aiName, out var e)) return null;
+        try
+        {
+            if (!StandardMesh.TryParse(OwningArchive(e).Read(e), out var sm) || sm is null) return null;
+            foreach (var sec in sm.CollisionSections)
+                if (StandardMesh.TryParseCollision(sec, out var verts, out var idx) && idx.Length > 0)
+                {
+                    var pos = new Vector3[verts.Length];
+                    for (int i = 0; i < verts.Length; i++) pos[i] = new Vector3(verts[i].X, verts[i].Y, verts[i].Z);
+                    return new CollisionMesh(pos, idx);
+                }
+            // An AI mesh written as ordinary LOD geometry: its first LOD's triangles.
+            if (sm.Lods.Count > 0)
+            {
+                var pos = new List<Vector3>(); var idx2 = new List<int>();
+                foreach (var m in sm.Lods[0])
+                {
+                    int b = pos.Count;
+                    foreach (var v in m.Vertices) pos.Add(new Vector3(v.X, v.Y, v.Z));
+                    foreach (var (a, b2, c) in m.Faces) { idx2.Add(b + a); idx2.Add(b + b2); idx2.Add(b + c); }
+                }
+                if (idx2.Count > 0) return new CollisionMesh(pos.ToArray(), idx2.ToArray());
+            }
+        }
+        catch { }
+        return null;
     }
 
     // Depth-first walk for the first ObjectTemplate.geometry in a Bundle/LodObject hierarchy (LodObject -> first child).
@@ -1936,6 +2056,54 @@ public sealed class MeshLibrary
         if (entry is null) return false;
         try { bytes = OwningArchive(entry).Read(entry); entryName = entry.Name; return true; }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// A mesh's <c>.sm</c> bytes by its EXACT name (any case): the file <c>&lt;name&gt;.sm</c>, or the file a
+    /// GeometryTemplate of that name points at. None of <see cref="TryGetMeshBytes"/>'s forgiving fallbacks
+    /// (<c>_m1</c>/<c>_m2</c> suffixes, prefix matches) - the growth generator needs the engine's answer, and the
+    /// engine gives a type whose geometry is missing no record at all rather than a near miss.
+    /// </summary>
+    public bool TryGetExactMeshBytes(string meshName, out byte[] bytes)
+    {
+        bytes = Array.Empty<byte>();
+        if (string.IsNullOrWhiteSpace(meshName)) return false;
+        string leaf = Leaf(meshName);
+        if (_memMeshes.TryGetValue(leaf, out var mem)) { bytes = mem.Sm; return true; }
+        RefractorFlatArchiveEntry? e = _byName.TryGetValue(leaf + ".sm", out var hit) ? hit : null;
+        if (e is null)
+        {
+            EnsureObjectGeometry();
+            if (_geomFile!.TryGetValue(meshName, out var file) && _byName.TryGetValue(Leaf(file) + ".sm", out var viaAlias)) e = viaAlias;
+        }
+        if (e is null) return false;
+        try { bytes = OwningArchive(e).Read(e); return true; }
+        catch { return false; }
+    }
+
+    /// <summary>The bytes of the first archive entry whose path ends with <paramref name="pathSuffix"/> (any case,
+    /// either slash), in mount order - for files that live beside the meshes, such as
+    /// <c>standardMesh/overGrowthGeometries.wst</c>.</summary>
+    public bool TryReadEntry(string pathSuffix, out byte[] bytes)
+    {
+        bytes = Array.Empty<byte>();
+        string want = pathSuffix.Replace('\\', '/');
+        foreach (var arc in _archives)
+            foreach (var e in arc.Entries)
+                if (e.Name.Replace('\\', '/').EndsWith(want, StringComparison.OrdinalIgnoreCase))
+                {
+                    try { bytes = arc.Read(e); return true; } catch { return false; }
+                }
+        return false;
+    }
+
+    /// <summary>The GeometryTemplate name an object template's <c>ObjectTemplate.geometry</c> names (not the file it
+    /// loads), or null when the template sets none. Overgrowth's importSceneObjects compares this name.</summary>
+    public string? GeometryTemplateOf(string template)
+    {
+        if (string.IsNullOrWhiteSpace(template)) return null;
+        EnsureObjectGeometry();
+        return _objGeom!.TryGetValue(template, out var g) && g.Length > 0 ? g : null;
     }
 
     public bool TryGetRsText(string meshName, out string entryName, out string text)

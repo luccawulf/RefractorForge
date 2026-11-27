@@ -100,6 +100,37 @@ public class LevelTests
         finally { try { Directory.Delete(outDir, true); } catch { } }
     }
 
+    /// <summary>Retail BF Vietnam scales most of its vegetation per axis ("object.geometry.scale x/y/z"). The parser
+    /// used to fail the single-number read and DROP the line, so saving a retail level reset thousands of trees to
+    /// scale 1. The per-axis value must survive a save byte for byte, draw per axis, and give way to a uniform scale
+    /// the moment the editor sets one.</summary>
+    [Fact]
+    public void Per_axis_object_scale_survives_a_save()
+    {
+        var text = "Object.create C02F_Trees_M1\r\nObject.absolutePosition 1/2/3\r\nObject.rotation 10/0/0\r\n" +
+                   "Object.geometry.scale 0.861647/0.983059/0.898353\r\nObject.create Crate\r\nObject.absolutePosition 4/5/6\r\n" +
+                   "Object.rotation 0/0/0\r\nObject.geometry.scale 1.25\r\n";
+        var f = StaticObjectsFile.Parse(ConLines.Split(text));
+        var tree = f.Objects[0];
+        Assert.Null(tree.Scale);
+        Assert.Equal(new Vec3(0.861647f, 0.983059f, 0.898353f), tree.ScaleAxes);
+        Assert.Equal(1.25f, f.Objects[1].Scale);
+        Assert.Equal(new Vec3(1.25f, 1.25f, 1.25f), f.Objects[1].EffectiveScale);
+
+        var lines = f.Write().ToList();
+        Assert.Contains("object.geometry.scale 0.861647/0.983059/0.898353", lines);
+        Assert.Contains("object.geometry.scale 1.25", lines);
+        Assert.Equal(tree.ScaleAxes, tree.Clone().ScaleAxes);
+
+        var w = LevelScene.MeshWorld(tree);
+        Assert.Equal(0.861647f, new System.Numerics.Vector3(w.M11, w.M12, w.M13).Length(), 4);
+        Assert.Equal(0.983059f, new System.Numerics.Vector3(w.M21, w.M22, w.M23).Length(), 4);
+
+        tree.Scale = 2f;                       // the scale tool replaces it with one value
+        Assert.Null(tree.ScaleAxes);
+        Assert.Contains("object.geometry.scale 2", f.Write());
+    }
+
     [Fact]
     public void Heightmap_io_roundtrip()
     {

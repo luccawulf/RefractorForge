@@ -310,8 +310,9 @@ public static class GameplayWriter
             if (string.IsNullOrWhiteSpace(s.Vehicle) || have.Contains(s.Name) || !added.Add(s.Name)) continue;
             sb.Append(NL).Append("rem  Added by RefractorForge").Append(NL)
               .Append("ObjectTemplate.create ObjectSpawner ").Append(s.Name).Append(NL)
-              .Append("ObjectTemplate.setObjectTemplate 1 ").Append(s.Vehicle).Append(NL)
-              .Append("ObjectTemplate.setObjectTemplate 2 ").Append(s.Vehicle).Append(NL)
+              // Each team's own vehicle when one is set (a team copy of a ship), the shared one otherwise.
+              .Append("ObjectTemplate.setObjectTemplate 1 ").Append(s.Vehicle1.Length > 0 ? s.Vehicle1 : s.Vehicle).Append(NL)
+              .Append("ObjectTemplate.setObjectTemplate 2 ").Append(s.Vehicle2.Length > 0 ? s.Vehicle2 : s.Vehicle).Append(NL)
               .Append("ObjectTemplate.SpawnDelay 20").Append(NL)
               .Append("ObjectTemplate.SpawnDelayAtStart 0").Append(NL)
               .Append("ObjectTemplate.TimeToLive 120").Append(NL)

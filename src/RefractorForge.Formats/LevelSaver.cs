@@ -59,16 +59,29 @@ public static class LevelSaver
             // templates for any newly placed spawner. Patch-then-append, so an edit to an existing spawner is not
             // lost behind a freshly appended duplicate.
             var patched = GameplayWriter.PatchVehicleSpawnTemplates(File.ReadAllLines(ost), immo.VehicleSpawns);
-            File.WriteAllText(ost, GameplayWriter.AppendMissingSpawnerTemplates(
-                patched.Split((char)10).Select(l => l.TrimEnd((char)13)), immo.VehicleSpawns));
+            var text = GameplayWriter.AppendMissingSpawnerTemplates(patched.Split((char)10).Select(l => l.TrimEnd((char)13)), immo.VehicleSpawns);
+            File.WriteAllText(ost, TeamVehicleCopy.AppendAdditions(text, immo.Additions, "ObjectSpawnTemplates.con"));
             written.Add(ost);
+        }
+
+        // Spawn groups a team copy of a vehicle declares (TeamVehicleCopy), run by every mode before its spawns.
+        if (immo.Additions.Any(a => a.FileLeaf.Equals("SpawnpointManagerSettings.con", System.StringComparison.OrdinalIgnoreCase)))
+        {
+            var spm = Directory.EnumerateFiles(dir, "*.con", SearchOption.TopDirectoryOnly)
+                               .FirstOrDefault(f => Path.GetFileName(f).Equals("SpawnpointManagerSettings.con", System.StringComparison.OrdinalIgnoreCase));
+            if (spm is not null)
+            {
+                File.WriteAllText(spm, TeamVehicleCopy.AppendAdditions(File.ReadAllText(spm), immo.Additions, "SpawnpointManagerSettings.con"));
+                written.Add(spm);
+            }
         }
     }
 
     public static List<string> SaveFolder(string levelDir,
         StaticObjectsFile? staticObjects, string? staticObjectsPath,
         Heightmap? heightmap, MaterialMap? material, EditableGameplay? gameplay,
-        GrowthMaps? growth = null, LightmapShadowBits? shadow = null, TerrainConfig? terrainConfig = null)
+        GrowthMaps? growth = null, LightmapShadowBits? shadow = null, TerrainConfig? terrainConfig = null,
+        string? gameplayMode = null)
     {
         var written = new List<string>();
 
@@ -102,8 +115,8 @@ public static class LevelSaver
         }
         if (gameplay is not null)
         {
-            string cdir = Directory.Exists(Path.Combine(levelDir, "Conquest"))
-                ? Path.Combine(levelDir, "Conquest") : levelDir;
+            // The mode being edited is written in full (Conquest unless the editor switched to another).
+            string cdir = GameplayObjects.GameplayDir(levelDir, gameplayMode);
             var immo = gameplay.ToImmutable();
             // Read the loaded mode as it still is on disk, BEFORE it is overwritten below. Without this "before"
             // the other modes cannot be told which instances actually moved, and guessing corrupts them.
@@ -420,6 +433,27 @@ public static class LevelSaver
         return names;
     }
 
+    /// <summary>The gameplay entry a save writes IN FULL: the edited mode's own copy (<c>Ctf/ControlPoints.con</c>),
+    /// the shallowest when several match, else the Conquest preference every save used before modes could be
+    /// switched. Every other mode's copy is patched, not rewritten.</summary>
+    private static string? PrimaryGameplayEntry(RefractorFlatArchive a, string suffix, string? mode)
+    {
+        if (!string.IsNullOrEmpty(mode))
+        {
+            string tail = "/" + mode + "/" + suffix;
+            string? best = null; int bestDepth = int.MaxValue;
+            foreach (var e in a.Entries)
+            {
+                var norm = e.Name.Replace('\\', '/');
+                if (!norm.EndsWith(tail, System.StringComparison.OrdinalIgnoreCase)) continue;
+                int depth = norm.Count(c => c == '/');
+                if (depth < bestDepth) { best = e.Name; bestDepth = depth; }
+            }
+            if (best is not null) return best;
+        }
+        return FindEntry(a, suffix, true);
+    }
+
     // Every gameplay patcher rejoins with CRLF and appends one of its own, so the lines must carry no phantom EMPTY
     // line after the final newline - a '\n' split made one, and each save added a blank line to each file, for ever
     // (Ctf/ControlPoints.con walked 498 -> 506 -> 512 -> 514 bytes over four saves of one map). ConLines never makes
@@ -452,7 +486,7 @@ public static class LevelSaver
         RefractorFlatArchive arch, StaticObjectsFile? so, Heightmap? heightmap, MaterialMap? material,
         EditableGameplay? gameplay, GrowthMaps? growth, LightmapShadowBits? shadow, TerrainConfig? terrainConfig,
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles,
-        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
+        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null, string? gameplayMode = null)
     {
         var repl = new Dictionary<string, byte[]>(System.StringComparer.OrdinalIgnoreCase);
         var names = new List<string>();
@@ -499,7 +533,7 @@ public static class LevelSaver
             // ordinal) corrupted the other modes on saves that changed nothing at all.
             string[] OL(string suffix)
             {
-                var n = FindEntry(arch, suffix, true);
+                var n = PrimaryGameplayEntry(arch, suffix, gameplayMode);
                 return n is null ? System.Array.Empty<string>() : EntryLines(arch, n);
             }
             var originalGp = GameplayObjects.Parse(OL("ControlPoints.con"), OL("ControlPointTemplates.con"),
@@ -508,7 +542,7 @@ public static class LevelSaver
 
             void WriteInstances(string suffix, string full)
             {
-                var primary = FindEntry(arch, suffix, true);
+                var primary = PrimaryGameplayEntry(arch, suffix, gameplayMode);
                 Put(primary, Latin1(full));
                 foreach (var name in FindEntries(arch, suffix))
                 {
@@ -526,8 +560,18 @@ public static class LevelSaver
                 Put(n, Latin1(GameplayWriter.PatchControlPointRadii(EntryLines(arch, n), immo.ControlPoints)));
             foreach (var n in FindEntries(arch, "SoldierSpawnTemplates.con"))
                 Put(n, Latin1(GameplayWriter.PatchSoldierSpawnTemplates(EntryLines(arch, n), immo.SoldierSpawns)));
+            // Patch-then-append, exactly as a folder save does. The packed path used to only APPEND, so changing an
+            // existing spawner's vehicles or timing (which team gets which vehicle) was silently never saved into an .rfa.
             foreach (var n in FindEntries(arch, "ObjectSpawnTemplates.con"))
-                Put(n, Latin1(GameplayWriter.AppendMissingSpawnerTemplates(EntryLines(arch, n), immo.VehicleSpawns)));
+            {
+                var patched = GameplayWriter.PatchVehicleSpawnTemplates(EntryLines(arch, n), immo.VehicleSpawns);
+                var text = GameplayWriter.AppendMissingSpawnerTemplates(ConLines.Split(patched), immo.VehicleSpawns);
+                Put(n, Latin1(TeamVehicleCopy.AppendAdditions(text, immo.Additions, "ObjectSpawnTemplates.con")));
+            }
+            if (immo.Additions.Count > 0)
+                foreach (var n in FindEntries(arch, "SpawnpointManagerSettings.con"))
+                    Put(n, Latin1(TeamVehicleCopy.AppendAdditions(string.Join(ConLines.NewLine, EntryLines(arch, n)) + ConLines.NewLine,
+                                                                  immo.Additions, "SpawnpointManagerSettings.con")));
         }
 
         // The support files Battlecraft keeps in step. Additive against whatever the archive already ships.
@@ -599,10 +643,11 @@ public static class LevelSaver
         StaticObjectsFile? so, Heightmap? heightmap, MaterialMap? material, EditableGameplay? gameplay,
         GrowthMaps? growth = null, LightmapShadowBits? shadow = null, TerrainConfig? terrainConfig = null,
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles = null,
-        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null)
+        IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null,
+        string? gameplayMode = null)
     {
         var arch = new RefractorFlatArchive(originalRfaPath);
-        var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries);
+        var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries, gameplayMode);
         RefractorFlatArchive.RepackToFile(outRfaPath, arch, repl);   // stream: a huge base archive won't fit in one byte[]
         return names;
     }
@@ -618,10 +663,11 @@ public static class LevelSaver
         GrowthMaps? growth = null, LightmapShadowBits? shadow = null, TerrainConfig? terrainConfig = null,
         IEnumerable<(string Name, byte[] Bytes)>? extraFiles = null,
         IEnumerable<(string RelPath, byte[] Bytes)>? newEntries = null,
-        bool serverSideOnly = false)
+        bool serverSideOnly = false,
+        string? gameplayMode = null)
     {
         var arch = new RefractorFlatArchive(baseRfaPath);
-        var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries);
+        var (repl, names) = BuildReplacements(arch, so, heightmap, material, gameplay, growth, shadow, terrainConfig, extraFiles, newEntries, gameplayMode);
         // SSM (server-side mod) patches: drop client-only content (textures, sounds, movies, baked light) so the
         // patch only carries what a dedicated server needs — the .con gameplay files. Clients never download it.
         if (serverSideOnly)

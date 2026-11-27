@@ -245,8 +245,8 @@ public sealed class LevelScene
     /// (no proxy-box footprint scale or half-height lift — the mesh already has its true size/origin).</summary>
     public static Matrix4x4 MeshWorld(StaticObject o)
     {
-        float sc = o.Scale ?? 1f;
-        return Matrix4x4.CreateScale(sc)
+        var sc = o.EffectiveScale;   // per axis when the level wrote "x/y/z", as retail BF Vietnam does for its trees
+        return Matrix4x4.CreateScale(sc.X, sc.Y, sc.Z)
              * Matrix4x4.CreateFromYawPitchRoll(Rad(o.Rotation.X), Rad(o.Rotation.Y), Rad(o.Rotation.Z))
              * Matrix4x4.CreateTranslation(o.Position.X, o.Position.Y, o.Position.Z);
     }

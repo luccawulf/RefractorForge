@@ -91,7 +91,8 @@ first, and an object that is not yet selected becomes the selection with the sam
 - **Nudge tool** — like Move but gentler, and it keeps the object's own height (Ctrl = finer).
 - Locked objects (everything a level ships is locked) select but do not move: **Object ▸ Unlock**.
 - The Inspector shows **Position / Rotation / Scale** for the selection — drag, or **right-click a
-  field to type an exact value**.
+  field to type an exact value**. An object scaled per axis (`Object.geometry.scale x/y/z`; retail BFV levels
+  have thousands) keeps it on save and shows **Scale per axis**; setting Scale makes it one value again.
 
 ### Keyboard nudging (with object(s) selected)
 - **Arrow keys** — move on X/Z in fine **0.5 m** steps.
@@ -109,6 +110,19 @@ Turn on **Snap** in the ribbon to grid-snap placement/moves; set the step in the
 - **Search** to filter; **single-click** a template to arm it for the Place tool.
 - **Double-click** a template to open a **3D model viewer** (auto-rotates; drag to orbit, scroll to
   zoom) — handy for checking a mesh before placing it.
+
+### Collision meshes and AI meshes (Inspector ▸ Layers)
+
+- **Collision (wireframe)** draws the collision meshes of the placed objects. A mesh can carry two: **COL01**, the
+  coarse hull, and **COL02**, the detailed one. **Sections** shows **COL01** (green), **COL02** (orange) or
+  **Both**, and the colours never change meaning. In-game tests show COL02 is what soldiers and vehicles collide
+  with, although the Max toolkit labels COL01 "simple (soldiers, vehicles)" and COL02 "complex (projectiles)".
+- **AI meshes** shows which objects have an AI mesh, the simplified mesh in `aiMeshes/` that bots use, and counts
+  them (*N with, M without*). Cyan: the AI mesh, where it lies. A red box: a solid object (its mesh has
+  collision) with none. The game pairs them by name: the object's geometry name with its last part made `_a1`
+  (`barack_m1` → `barack_a1`).
+- Select an object and the Inspector says what its mesh carries — *Collision: COL01 312 faces, COL02 1,204 faces*
+  — and which AI mesh file it gets (or *AI mesh: none*).
 
 ### Prefabs (multi-object stamps)
 Select several objects, then **Edit ▸ Save Selection as Prefab…**. Saved prefabs appear in the Object
@@ -180,6 +194,38 @@ control points). To edit one:
 Saving writes the instance files (ControlPoints / ObjectSpawns / SoldierSpawns `.con`) and patches the
 template files **surgically** — fields you didn't touch are preserved byte-for-byte.
 
+### Game modes — Conquest, CTF, TDM, Single Player, Co-op
+
+A level keeps a separate set of gameplay files for every game mode it supports (`Conquest/`, `Ctf/`, `TDM/`,
+`SinglePlayer/`, `Coop/`, or a mod's own folder). Two dropdowns in the Object mapper's ribbon deal with them:
+
+- **Game type** — which mode's flags and spawns are *shown* (and clickable): **Show All**, or one mode.
+- **Edit** — which mode's flags and spawns you *edit*. The editor loads that mode's own files, and **Save** writes
+  that mode in full. Flags and spawns it shares with the other modes (the same name in their files) have their
+  moves mirrored into them, but nothing is ever added to or removed from another mode: a flag you add while editing
+  CTF exists only in CTF, and Conquest's own set is never replaced by CTF's.
+- A level opens on **Conquest** (or its first mode). Switching asks to save first when there is unsaved work, and
+  starts a fresh undo history. It is not available during a live collaboration session.
+
+### When a ship or carrier spawns the wrong team
+
+A vehicle spawner's **team** decides which vehicle spawns for which side. The soldiers who spawn *on* a ship or a
+carrier are a separate matter: they come from spawn points built into the vehicle's own object, and those belong to
+a **spawn group** whose team is set once for the whole game, in the mod's `game/GlobalSpawnGroups.con`. That is why
+an SMSDresden given to the Allies in Battlefield 1918 still fills with Axis troops: its spawn points are in group
+73, and that file gives group 73 to the Axis (team 1).
+
+The editor checks every vehicle spawn against those files:
+
+- A spawn with the problem shows an orange warning in the Inspector, saying which spawn points, which group and
+  which file gives it to the other team. **Tools ▸ Check Map ▸ Validate Map** lists it under *Spawns*.
+- The fix is the button under the warning, **Make a *team* copy of *vehicle***. It adds a copy of the vehicle to this
+  level (for example `SMSDresden_T2`) whose spawn points are in a new spawn group of that team, declares the group
+  in every game mode's `SpawnpointManagerSettings.con`, and switches the spawner to the copy. Mesh, physics and
+  weapons are shared with the original. Save writes it into every game mode.
+- Retail Battlefield 1942 solved its second Fletcher the same way (spawn groups 80 and 81). Details:
+  `docs/Vehicle_Spawn_Teams.md`.
+
 ---
 
 ## 6. Terrain, textures & foliage
@@ -195,7 +241,8 @@ template files **surgically** — fields you didn't touch are preserved byte-for
 - **Growth (F5)** — paint under/overgrowth foliage from the level's `.wst` palette. The Tools menu has
   Save / Export Overgrowth and **Bake Overgrowth → StaticObjects.con**.
 - **AI Path (F6)** — paint the pathfinding grid passable/blocked, per vehicle type. **File ▸ Generate
-  AI Navmaps** regenerates them from the terrain.
+  AI Navmaps** regenerates them from the terrain. For a bridge deck, a ship or a platform high above the
+  ground, paint on a level plane instead (below).
 - **Road tool** (Tools ▸ Road tool) — click to drop spline points, drag to shape; set width / edge
   softness / flatten + shoulder / texture orientation, then **Stamp Road** to paint it onto the terrain
   and material. Points persist so you can tweak and re-stamp.
@@ -218,13 +265,48 @@ other thing: one copy of a square of painted ground, kept at its real size, past
    stamp…** on any other map reads both back (a `_100m` suffix in the file name works too, and **Stamp size**
    can always be typed). Ctrl+S bakes pasted ground into the level's terrain tiles like any other paint.
 
+### Pathmaps on bridges, ships and platforms (AI Path ▸ Paint on a level plane)
+
+A pathmap is a flat, top-down grid, but the brush normally lands on the terrain under the cursor. Under a high
+bridge, beside a ship floating over deep water, or below a platform in the sky, that point is far below what you
+are looking at, and seen at an angle it is somewhere else entirely, so the deck cannot be painted where it is.
+
+1. In the AI Path mapper (F6), tick **Paint on a level plane**. A flat plane appears showing the pathmap (green
+   passable, white blocked, with the cell grid once the cells are big enough to see) and the brush sits on it.
+2. Put the plane on the deck: **Pick height**, then click the deck, bridge or platform in the view (the plane moves
+   to that height, centred there), or **Fit to selected** to centre and size it on the selected object. Fine-tune
+   with **X / height / Z**, or **PgUp / PgDn** (1 m; Shift: 10 m). **Size (m)** or **Whole map** sets its extent.
+3. Paint as usual. Strokes land on the plane, straight above the cells they change; outside the plane nothing is
+   painted.
+
+The pathmap is still 2-D: a cell painted on the plane is the same cell as the ground beneath it, so where a
+bridge crosses a road, the deck and the road share their cells for each vehicle type.
+
 ### Overgrowth and undergrowth (Inspector ▸ Layers, BFV)
 
-**Overgrowth Trees** and **Undergrowth** each scatter the map's own `.wst` definition onto the terrain as a
-preview of what the game grows. A freshly opened map starts from what the game itself generates — patches every
-12.5 m (trees) and 17.5 m (undergrowth) at density ×1.0 — and **Map defaults** takes a slider back there. The
-**Map definition** line under each opens the map's palette: per terrain material, which geometries grow and how
-likely each is. **Tools ▸ Save Overgrowth Settings** keeps both layers' sliders for that map.
+**Overgrowth Trees** and **Undergrowth** are the Battlefield Vietnam engine's own growth, generated with the
+game's exact algorithm, reversed from `BfVietnam.exe`: the same random generator and seeds, the same cells and
+patches, the same per-cell budgets and spacing. Tree positions match a capture from the running game exactly, so
+what you see is where the game plants every tree and tuft.
+
+- **Game build** — which executable to match. The stock `BfVietnam.exe` sizes its tree cells from the map's view
+  distance; the `BfVietnam_Veg_*` builds use 12.5 m cells (a far denser forest), and their **Low / Medium / High**
+  settings keep a quarter, half or three quarters of the cells (**Ultra** keeps all).
+- **Density comes from the game, not from painting.** Each tree cell has a budget of 2048 vertices and stops at the
+  first tree that no longer fits, so a full cell grows nothing more however much of it you paint; the lines under
+  the layer show the trees, the cells and how many are full. Placed trees whose mesh is listed in
+  `standardMesh/overGrowthGeometries.wst` are taken into their cell first, as the game does (*placed trees taken
+  over*).
+- **Whole map** (trees) — off, only the cells the game draws from where the camera is (inside the `.wst` view
+  distance); on, every cell, for an overview.
+- **Show from above** (undergrowth) — the game draws grass only in small patches around the camera, faded towards
+  its view distance, so from high up there is none, exactly as in game. Tick it to see every patch around the point
+  under the camera at full strength while looking down.
+- **Map definition** opens the map's palette: per terrain material, which geometries grow there and how likely
+  each is. **Tools ▸ Save Overgrowth Settings** remembers these choices for the map.
+- **Tools ▸ Overgrowth ▸ Convert Overgrowth to Static Objects** places the generated trees as ordinary objects —
+  position, rotation and scale as the game generates them — so every player sees the same forest whatever
+  executable they run. The reverse-engineering notes are in `docs/BFV_Growth_Placement.md`.
 
 ---
 
@@ -433,12 +515,37 @@ tick **Playable** to seed Conquest flags, spawns and kits. **Create** restarts t
 - **File ▸ Save as Patch .rfa…** — export only the changed files as an overlay `.rfa` that the engine mounts over
   the map. For shipping an update on top of a map without touching it. A patch is not a separate map: in game you
   still launch the base level.
+- **File ▸ Copy Level To…** — the same level under a new name, as Battlecraft's *Copy Level To* does (below).
 - **File ▸ Test This Level (in-game)** (Ctrl+L) — save, then launch the game on this mod (pick the map
   in-game — the client can't be told which map to load from the command line).
 - **File ▸ Import .obj…** — bring in a Wavefront model as a static object (and export it back as `.sm`).
 - **Tools ▸ Convert TGA → DDS** (single or batch), **Tools ▸ Check Map ▸ Validate Map** (missing-asset check)
   and its siblings (bot reachability, performance budget, dependencies, server/client files, compare), **Tools ▸
   Scatter Objects…** (random placement).
+
+### Copy Level To… and renaming a map
+
+A level's name is more than its file name: every file inside a packed level sits under its folder
+(`bfvietnam/levels/<name>/…`), and the level's own files spell that folder out. Battlecraft cannot rename a level in
+place for that reason, and offers *Copy Level To* instead; RefractorForge does the same.
+
+1. **File ▸ Copy Level To…**, type the **New name** (letters, digits, `_` and `-`; no spaces — the game reads a
+   level path as one word). The dialog shows where the copy will be written: beside the original, as
+   `<name>.rfa` for a packed level or a `<name>` folder for a folder level.
+2. **Copy.** Every file moves to the new level folder, and the paths that point at the level's own folder are
+   re-pointed: `Init/Terrain.con` (heightmap, material map, texture and detail paths), the growth `.wst` files'
+   `materialMapFilename`, and the `Init.con` / `Menu/init.con` lines that point inside the level
+   (`textureManager.alternativePath`, `ShaderManager.setTextureParam envmap`, a `game.setLoadPicture` into its own
+   Menu folder). Measured over 105 retail and community levels of both games, those are the only places. File names are left
+   alone, and so are mentions that are not paths (comments, briefing keys, a load picture in the menu archive).
+3. A packed level's patch archives (`<name>_001.rfa`…) are merged into the copy, and the editor's own files kept
+   beside it (lights, groups, notes, growth view) are copied under the new name. A folder copy leaves out its
+   `Backups` folder and the project file, which belong to the original.
+4. **Open the copy afterwards** relaunches the editor on it.
+
+Nothing is ever overwritten: a name that is already taken is refused. **To rename a map**, copy it to the new name,
+check the copy, then delete the old `.rfa` (or folder) yourself. Unsaved changes are not in the copy — it is made
+from the files on disk — so the dialog offers **Save first**. Details: `docs/Level_Copy.md`.
 
 ---
 
@@ -507,6 +614,7 @@ where. Your map stays one packed `.rfa` the whole time.
 | Camera look | **Right-mouse drag** |
 | Fly speed / brush size | **Mouse wheel** |
 | Type an exact slider value | **Right-click the slider** |
+| Raise / lower the AI Path level plane | **PgUp / PgDn** (Shift: 10 m) |
 
 ---
 

@@ -43,11 +43,26 @@ public sealed class StaticObject
     }
 
     private float? _scale;
+    /// <summary>A uniform <c>object.geometry.scale</c>. Setting it replaces a per-axis scale, so the editor's
+    /// scale tool still has one value to work on.</summary>
     public float? Scale
     {
         get => _scale;
-        set { _scale = value; ScaleSource = null; }
+        set { _scale = value; ScaleSource = null; _scaleAxes = null; }
     }
+
+    private Vec3? _scaleAxes;
+    /// <summary>A per-axis <c>object.geometry.scale x/y/z</c>, the form retail BF Vietnam levels write for most of
+    /// their vegetation (Operation Irving's clusters are 0.86/0.98/0.90 and the like). Kept as its own value - and
+    /// its text written back unchanged - so a save does not reset those objects to scale 1.</summary>
+    public Vec3? ScaleAxes
+    {
+        get => _scaleAxes;
+        set { _scaleAxes = value; ScaleSource = null; if (value is not null) _scale = null; }
+    }
+
+    /// <summary>The scale the object is drawn with on each axis: the per-axis value, else the uniform one, else 1.</summary>
+    public Vec3 EffectiveScale => _scaleAxes ?? (_scale is float s ? new Vec3(s, s, s) : new Vec3(1f, 1f, 1f));
 
     /// <summary><c>object.layer</c> if present.</summary>
     public int? Layer { get; set; }
@@ -66,6 +81,7 @@ public sealed class StaticObject
     internal void InitPosition(Vec3 v, string src) { _position = v; PositionSource = src; }
     internal void InitRotation(Vec3 v, string src) { _rotation = v; RotationSource = src; }
     internal void InitScale(float v, string src)    { _scale = v;    ScaleSource = src; }
+    internal void InitScaleAxes(Vec3 v, string src) { _scaleAxes = v; _scale = null; ScaleSource = src; }
 
     /// <summary>Deep copy, preserving Id and original source text (for collaboration state sync).</summary>
     public StaticObject Clone()
@@ -74,6 +90,7 @@ public sealed class StaticObject
         c.InitPosition(Position, PositionSource ?? Position.ToString());
         c.InitRotation(Rotation, RotationSource ?? Rotation.ToString());
         if (Scale is float s) c.InitScale(s, ScaleSource ?? s.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        else if (ScaleAxes is Vec3 sa) c.InitScaleAxes(sa, ScaleSource ?? sa.ToString());
         c.ExtraLines.AddRange(ExtraLines);
         return c;
     }

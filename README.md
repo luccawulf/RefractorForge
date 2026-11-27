@@ -24,19 +24,26 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   procedural water, skybox, fog, animated clouds, and a free-fly camera.
 - **Objects** — place, move, rotate, scale, duplicate, delete, multi-select, prefab stamps, and a
   double-click 3D model viewer. Lossless save (untouched objects stay byte-verbatim).
-- **Gameplay (Conquest)** — control-point flags, vehicle spawns and soldier spawns with full,
-  Battlecraft-style edit dialogs (double-click a marker), including the BF1942 control-point fields.
+- **Gameplay, every game mode** — control-point flags, vehicle spawns and soldier spawns with full,
+  Battlecraft-style edit dialogs (double-click a marker), including the BF1942 control-point fields. Show and
+  edit Conquest, CTF, TDM, Single Player or Co-op; a check (and a one-click fix) for ships and carriers whose
+  built-in spawns belong to the other team.
 - **Terrain & painting** — heightmap sculpt/smooth, gameplay material painting, visual surface texture
   painting (with a custom texture library), under/overgrowth foliage, a spline **road tool**, and AI
-  pathfinding ("search map") painting + generation.
+  pathfinding ("search map") painting + generation, on the ground or on a level plane for bridges, ships and
+  platforms.
+- **Battlefield Vietnam growth, exactly** — overgrowth trees and undergrowth generated with the game's own
+  algorithm, reversed from `BfVietnam.exe` and matching a capture from the running game tree for tree.
+- **Collision and AI meshes** — view an object's COL01 / COL02 collision meshes, and which objects have an AI
+  mesh and which do not.
 - **Lighting** — real-time sun control + shadow mapping, plus **bake-to-game**: terrain sun shadows
   (`LightmapShadowBits.lsb`, byte-exact), per-object lightmaps, and minimap generation.
 - **Environment** — water colour/level/textures, sun azimuth/elevation, fog, skybox import, animated
   clouds, weather preview.
 - **Sound** — preview placed ambient sounds as you fly through their rings.
 - **Pipeline** — RFA archive read/write (LZO1X), `.con` parsing/writing, new-map creation, save-as-
-  patch `.rfa`, `.obj` import, TGA→DDS conversion, map validation, and real-time **collaboration**
-  (multi-user editing).
+  patch `.rfa`, **Copy Level To** (a level under a new name, its paths re-pointed), `.obj` import, TGA→DDS
+  conversion, map validation, and real-time **collaboration** (multi-user editing).
 
 ## Documentation
 
@@ -47,7 +54,10 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   [validated format facts](docs/Validated_Format_Facts.md),
   [RFA archive](docs/RFA_Format_Notes.md),
   [StandardMesh collision](docs/SM_Collision_RE.md),
-  [skeletal animation](docs/Skeletal_Animation_Format.md).
+  [skeletal animation](docs/Skeletal_Animation_Format.md),
+  [BFV growth placement](docs/BFV_Growth_Placement.md),
+  [vehicle spawn teams](docs/Vehicle_Spawn_Teams.md),
+  [copying and renaming a level](docs/Level_Copy.md).
 
 ## Build & run
 

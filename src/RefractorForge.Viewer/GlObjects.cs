@@ -67,16 +67,24 @@ public sealed class GlObjects
     public HashSet<int>? HiddenIndices;
 
     /// <summary>Ephemeral overgrowth foliage instances (a VIEW of the .wst-generated trees; never saved), grouped
-    /// by template so each VAO binds once. Independent of <see cref="Placements"/>, so Build/Rebuild don't clear it.</summary>
-    private readonly Dictionary<string, List<Matrix4x4>> _foliage = new(StringComparer.OrdinalIgnoreCase);
-    public int FoliageInstanceCount { get; private set; }
+    /// by template so each VAO binds once. Independent of <see cref="Placements"/>, so Build/Rebuild don't clear it.
+    /// Three layers, because the game draws three: overgrowth close up as real <c>_m1</c> objects, overgrowth far
+    /// away batched as its <c>_m2</c> meshes, and undergrowth - which lives on a different clock (generated around
+    /// the camera, so rebuilt as you move, while the trees only change when you change them).</summary>
+    public enum GrowthLayer { OverNear = 0, OverFar = 1, Under = 2 }
 
-    /// <summary>Undergrowth is kept in its OWN bucket because it lives on a different clock: overgrowth covers the
-    /// whole map and is rebuilt only when you change it, while undergrowth is generated around the camera (the
-    /// engine does the same) and is therefore rebuilt as you move. Sharing one bucket meant every step re-scattered
-    /// tens of thousands of trees to move a few hundred blades of grass.</summary>
-    private readonly Dictionary<string, List<Matrix4x4>> _under = new(StringComparer.OrdinalIgnoreCase);
-    public int UndergrowthInstanceCount { get; private set; }
+    /// <summary>One growth instance to draw: which mesh, where, which overgrowth cell or undergrowth patch it
+    /// belongs to (the game culls those whole), its radius, and how opaque (undergrowth fades by patch).</summary>
+    public readonly record struct GrowthItem(string Mesh, Matrix4x4 World, int Group, float Radius, float Alpha);
+
+    private readonly Dictionary<string, List<GrowthItem>>[] _growth =
+    {
+        new(StringComparer.OrdinalIgnoreCase), new(StringComparer.OrdinalIgnoreCase), new(StringComparer.OrdinalIgnoreCase),
+    };
+    private readonly int[] _growthCount = new int[3];
+    public int GrowthCount(GrowthLayer layer) => _growthCount[(int)layer];
+    public int FoliageInstanceCount => Math.Max(_growthCount[0], _growthCount[1]);   // the same trees, near and far
+    public int UndergrowthInstanceCount => _growthCount[2];
 
     // Per-instance baked object lightmaps: objIndex -> GL texture (the ObjectLightMaps/*.tga matched to that placement).
     // Sampled via the mesh's 2nd UV channel; bound per-instance in Draw when ShowLightmaps is on.
@@ -406,83 +414,88 @@ public sealed class GlObjects
             gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
     }
 
-    /// <summary>Replace the overgrowth-foliage overlay with these (template, world) instances, uploading any
-    /// template not already on the GPU and skipping ones that don't resolve. Reuses the shared template cache, so
-    /// a tree mesh shared with a placed object is uploaded once.</summary>
-    public void SetFoliage(GL gl, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
-        => FoliageInstanceCount = Fill(gl, _foliage, instances, lib);
-
-    /// <summary>Replace the UNDERGROWTH bucket. Same contract as <see cref="SetFoliage"/>; called far more often,
-    /// because the near-field grass follows the camera.</summary>
-    public void SetUndergrowth(GL gl, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
-        => UndergrowthInstanceCount = Fill(gl, _under, instances, lib);
-
-    private int Fill(GL gl, Dictionary<string, List<Matrix4x4>> bucket, IReadOnlyList<(string Tmpl, Matrix4x4 World)> instances, MeshLibrary lib)
+    /// <summary>Replace one growth layer with these instances, uploading any mesh not already on the GPU and skipping
+    /// ones that do not resolve. Reuses the shared template cache, so a tree mesh shared with a placed object is
+    /// uploaded once. Rebuilding a layer uploads nothing per instance, so the undergrowth can follow the camera.</summary>
+    public void SetGrowth(GL gl, GrowthLayer layer, IReadOnlyList<GrowthItem> items, MeshLibrary lib)
     {
+        var bucket = _growth[(int)layer];
         bucket.Clear();
         int n = 0;
-        foreach (var (tmpl, world) in instances)
+        foreach (var it in items)
         {
-            if (!_templates.ContainsKey(tmpl))
+            if (!_templates.ContainsKey(it.Mesh))
             {
-                if ((!lib.TryGet(tmpl, out var mesh) || mesh is null) && (!lib.TryGetAssembledMesh(tmpl, out mesh) || mesh is null)) continue;
-                UploadMesh(gl, tmpl, mesh);
+                if ((!lib.TryGet(it.Mesh, out var mesh) || mesh is null) && (!lib.TryGetAssembledMesh(it.Mesh, out mesh) || mesh is null)) continue;
+                UploadMesh(gl, it.Mesh, mesh);
             }
-            if (!bucket.TryGetValue(tmpl, out var lst)) { lst = new List<Matrix4x4>(); bucket[tmpl] = lst; }
-            lst.Add(world);
+            if (!bucket.TryGetValue(it.Mesh, out var lst)) { lst = new List<GrowthItem>(); bucket[it.Mesh] = lst; }
+            lst.Add(it);
             n++;
         }
-        return n;
+        _growthCount[(int)layer] = n;
     }
 
     public void ClearFoliage()
     {
-        _foliage.Clear(); FoliageInstanceCount = 0;
-        _under.Clear(); UndergrowthInstanceCount = 0;
+        foreach (var b in _growth) b.Clear();
+        Array.Clear(_growthCount);
     }
 
-    /// <summary>Draw the foliage overlay with a hard distance cull (instances farther than <paramref name="cullDist"/>
-    /// from the camera are skipped) so a dense map stays interactive. No selection/tint; per-template VAO binds once.
-    /// (Phase 1: distance-culled per-instance draw — GPU instancing is a future optimisation.)</summary>
-    public unsafe void DrawFoliage(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
-                                   Matrix4x4 viewProj, Vector3 camPos, float cullDist)
-        => DrawBucket(_foliage, gl, prog, uMVP, uModel, uColor, uUseTex, uAlphaTest, uTint, viewProj, camPos, cullDist);
+    /// <summary>How a growth layer is shaded. <see cref="GrowthShade.Lit"/> is the ordinary object shading. The
+    /// game draws undergrowth UNLIT instead (RaShaderUndergrowth.fx, fixed function): colour =
+    /// saturate(4 x atlas x the terrain colour under it), alpha = atlas alpha x the patch's fade, alpha-tested at
+    /// min(fade, 100/255) and blended over what is behind.</summary>
+    public enum GrowthShade { Lit = 0, Undergrowth = 1 }
 
-    /// <summary>Draw the undergrowth bucket. It gets its OWN cull distance - the palette's, which is 35-60 m -
-    /// because drawing grass out to the overgrowth's 300+ m is neither what the game does nor affordable.</summary>
-    public unsafe void DrawUndergrowth(GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
-                                       Matrix4x4 viewProj, Vector3 camPos, float cullDist)
-        => DrawBucket(_under, gl, prog, uMVP, uModel, uColor, uUseTex, uAlphaTest, uTint, viewProj, camPos, cullDist);
-
-    private unsafe void DrawBucket(Dictionary<string, List<Matrix4x4>> bucket,
-                                   GL gl, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
-                                   Matrix4x4 viewProj, Vector3 camPos, float cullDist)
+    /// <summary>Draw a growth layer. An instance is drawn when its distance from the camera lies in
+    /// [<paramref name="minDist"/> + its radius, <paramref name="maxDist"/> + its radius) and its group passes
+    /// <paramref name="groupVisible"/> - the game culls overgrowth by whole cell. <paramref name="overrideTex"/>, when
+    /// not 0, replaces every part's texture: the game draws all far overgrowth with the level's overGrowth.rs atlas and
+    /// all undergrowth with its underGrowth.rs atlas, whatever the meshes' own shaders name.</summary>
+    public unsafe void DrawGrowth(GL gl, GrowthLayer layer, uint prog, int uMVP, int uModel, int uColor, int uUseTex, int uAlphaTest, int uTint,
+                                  Matrix4x4 viewProj, Vector3 camPos, float minDist, float maxDist, Func<int, bool>? groupVisible,
+                                  uint overrideTex, GrowthShade shade)
     {
+        var bucket = _growth[(int)layer];
         if (bucket.Count == 0) return;
-        float cull2 = cullDist * cullDist;
         gl.UseProgram(prog);
         gl.ActiveTexture(TextureUnit.Texture0);
         { int u = gl.GetUniformLocation(prog, "uHasLightmap"); if (u >= 0) gl.Uniform1(u, 0); }   // foliage has no lightmap
+        int uMode = gl.GetUniformLocation(prog, "uGrowthMode"), uAlpha = gl.GetUniformLocation(prog, "uGrowthAlpha");
+        if (uMode >= 0) gl.Uniform1(uMode, (int)shade);
         gl.Uniform3(uTint, 1f, 1f, 1f);
-        foreach (var (tmpl, worlds) in bucket)
+        bool under = shade == GrowthShade.Undergrowth;
+        if (under)
+        {
+            gl.Enable(EnableCap.Blend);
+            gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+        }
+        foreach (var (tmpl, items) in bucket)
         {
             if (!_templates.TryGetValue(tmpl, out var t)) continue;
             gl.BindVertexArray(t.Vao);
-            foreach (var world in worlds)
+            foreach (var it in items)
             {
-                var tr = world.Translation;
+                if (groupVisible is not null && !groupVisible(it.Group)) continue;
+                var tr = it.World.Translation;
                 float dx = tr.X - camPos.X, dy = tr.Y - camPos.Y, dz = tr.Z - camPos.Z;
-                if (dx * dx + dy * dy + dz * dz > cull2) continue;
-                Matrix4x4 mvpM = world * viewProj, modelM = world;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                float lo = minDist > 0f ? minDist + it.Radius : 0f, hi = maxDist + it.Radius;
+                if (d2 < lo * lo || d2 >= hi * hi) continue;
+                Matrix4x4 mvpM = it.World * viewProj, modelM = it.World;
                 gl.UniformMatrix4(uMVP, 1, false, (float*)&mvpM);
                 gl.UniformMatrix4(uModel, 1, false, (float*)&modelM);
+                if (uAlpha >= 0) gl.Uniform1(uAlpha, it.Alpha);
                 foreach (var part in t.Parts)
                 {
-                    if (part.Tex != 0)
+                    uint tex = overrideTex != 0 ? overrideTex : part.Tex;
+                    if (tex != 0)
                     {
-                        gl.BindTexture(TextureTarget.Texture2D, part.Tex);
+                        gl.BindTexture(TextureTarget.Texture2D, tex);
                         gl.Uniform1(uUseTex, 1);
                         SetAlpha(gl, prog, uAlphaTest, part);
+                        if (under) gl.DepthMask(true);   // undergrowth writes depth (ZWriteEnable defaults on)
                     }
                     else
                     {
@@ -494,7 +507,9 @@ public sealed class GlObjects
                 }
             }
         }
-            gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
+        gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
+        if (uMode >= 0) gl.Uniform1(uMode, 0);
+        if (under) gl.Disable(EnableCap.Blend);
     }
 
     /// <summary>Upload a mesh under a cache key (once), returning its template. Used for gameplay-spawn
