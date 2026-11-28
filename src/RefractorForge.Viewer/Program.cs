@@ -18642,6 +18642,11 @@ void BuildUi()
             {
                 if (ImGui.MenuItem(Loc.TL("Validate Map"), null, false, so is not null)) RunMapValidation();
                 Theme.Tip(Loc.T("Floating and buried objects, missing templates, flags with no spawns,\nspawns outside the combat area, vehicle spawners with nothing to spawn."));
+                if (gameIsBf1942)
+                {
+                    if (ImGui.MenuItem(Loc.TL("Add Missing Map Id"), null, false, so is not null)) AddMissingMapId();
+                    Theme.Tip(Loc.T("Adds game.setMapId to Menu/init.con when the level has none. Without it Battlefield 1942\nloads none of the mod's objects for the level - an older custom map then fails to start."));
+                }
                 if (ImGui.MenuItem(Loc.TL("Bot Reachability"), null, false, heightmap is not null)) RunReachability();
                 Theme.Tip(Loc.T("Flood-fills the navmap from every spawn and reports control points\nbots cannot walk to - without launching the game."));
                 if (ImGui.MenuItem(Loc.TL("Performance Budget"), null, false, so is not null)) RunPerformanceBudget();
@@ -21768,6 +21773,10 @@ void RunMapValidation()
         SpawnBelowGroundByMode = SpawnBelowGroundByMode(),
     });
     AddMissingTemplateAdvice(r);
+    // Battlefield 1942: a level with no game.setMapId loads none of the mod's objects (Formats/Cons/MapId.cs).
+    if (MapIdMissing())
+        r.Add(RefractorForge.Formats.Validation.IssueSeverity.Error, "Level",
+              Loc.T("Menu/init.con has no game.setMapId line. Battlefield 1942 (patch 1.4 and later) then loads none of the mod's objects for this level: it stops with \"template not found\" for a stock object, or the game drops out when the map starts. Tools > Check Map > Add Missing Map Id fixes it."));
     // Ships and carriers whose built-in soldier spawns belong to the other team than the one the spawner gives them to.
     try
     {
@@ -21779,6 +21788,26 @@ void RunMapValidation()
     }
     catch (Exception ex) { Console.WriteLine("Spawn-team check: " + ex.Message); }
     ShowReport(r);
+}
+
+// Battlefield 1942 only: the level's Menu/init.con exists and sets no map id.
+bool MapIdMissing()
+{
+    if (!gameIsBf1942) return false;
+    var mi = PendingText("Menu/init.con") ?? ReadLevelText("Menu/init.con");
+    return mi is not null && !RefractorForge.Formats.Con.MapId.IsSet(mi);
+}
+
+// Append game.setMapId to the level's Menu/init.con, named after the mod the level lives in. Queued for the next save.
+void AddMissingMapId()
+{
+    var mi = PendingText("Menu/init.con") ?? ReadLevelText("Menu/init.con");
+    if (mi is null) { Toast(Loc.T("This level has no Menu/init.con to add a map id to.")); return; }
+    if (RefractorForge.Formats.Con.MapId.IsSet(mi)) { Toast(Loc.T("This level already sets a map id.")); return; }
+    string id = RefractorForge.Formats.Con.MapId.ForMod(ModsRootOf().ModName);
+    QueueLevelFile("Menu/init.con", System.Text.Encoding.Latin1.GetBytes(RefractorForge.Formats.Con.MapId.With(mi, id)));
+    Console.WriteLine($"Menu/init.con: added game.setMapId \"{id}\" (queued for the next save).");
+    Toast(string.Format(Loc.T("Added game.setMapId \"{0}\" to Menu/init.con. Save writes it to the level."), id));
 }
 
 // The Mods folder this level lives under, and which mod - from the archive it was opened from.

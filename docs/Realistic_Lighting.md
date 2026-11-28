@@ -367,7 +367,15 @@ What follows from it (`EngineLight.Bf1942`, `ObjectLightmapBaker.Physical.Bf1942
 - The same 500 MB budget holds the 24-bit maps; BF1942's own ceiling has not been measured.
 
 Not yet known: whether the game darkens the terrain at draw time from `LightmapShadowBits.lsb` (the calibration
-levels had it cleared). Known fault: a lightmap-ready COPY of an object that adds child templates (`stebarbwire_m1`
-with `e_Barbwire`, `mediclocker` with `mediclockerRepairpoint`) is refused by the dedicated server with "template not
-found"; copies of objects without children load. `tools/lightcal/ded-load-check-bf1942.ps1` loads a level on the
-headless server and reads its error box.
+levels had it cleared).
+
+**A correction.** v0.31.0's notes listed a fault: a lightmap-ready copy of an object that adds child templates
+(`stebarbwire_m1` with `e_Barbwire`, `mediclocker` with `mediclockerRepairpoint`) refused by the game with "template
+not found". There is no such fault. The level it was seen on (Snow_El_Alamein, a 2019 custom map) has no
+`game.setMapId` line in its `Menu/init.con`, and without one Battlefield 1942 loads none of the mod's objects for the
+level - so every stock template was missing, and the error named whichever object was created first (its control
+points' `AnimatedFlag` before the bake, the copies' children after). With `game.setMapId "BF1942"` appended, the
+untouched original and the fully baked level - barbed wire, medic lockers and ammo boxes converted - both load on the
+dedicated server. `Formats/Cons/MapId.cs` has the measurement; Validate Map reports a level without the line and
+Tools > Check Map > Add Missing Map Id adds it. `tools/lightcal/ded-load-check-bf1942.ps1` loads a level on the
+headless server and reads its error box; "still running" is not a pass there - an error box keeps the process alive.

@@ -598,6 +598,11 @@ with that sun and sky at once (*Show this light in the viewport*). It is a quick
 fill, no bounce - and it hides the baked lightmaps while it is on. A finished bake, or ticking *Viewport shows the
 game's lighting*, returns the viewport to the baked picture.
 
+**An older Battlefield 1942 custom map that will not start.** A level made before patch 1.4 has no
+`game.setMapId` line in its `Menu/init.con`, and the game then loads none of the mod's objects for it: it stops with
+"template not found" or simply drops out when the map starts. *Tools > Check Map > Validate Map* reports it, and
+*Add Missing Map Id* in the same menu adds the line; save, and the map loads.
+
 **Bake Object Lightmaps** offers *Realistic lighting* as its top quality on both games: the object lightmaps alone,
 by this window's light, with the ground left as it is.
 

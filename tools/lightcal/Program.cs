@@ -843,11 +843,13 @@ if (cmd == "variant")
     // re-pointed to the new name). The source is never written to.
     string srcRfa = args[1], newName = args[2], destDir = args[3];
     Directory.CreateDirectory(destDir);
-    var drops = new List<string>(); var takes = new List<(string Suffix, string From)>(); var strips = new List<(string Suffix, string Rx)>(); var prepends = new List<(string Suffix, string Line)>();   // --strip <entry suffix>=<regex>: leave out the lines that match
+    var drops = new List<string>(); var takes = new List<(string Suffix, string From)>(); var strips = new List<(string Suffix, string Rx)>(); var prepends = new List<(string Suffix, string Line)>(); var crlfs = new List<string>(); var appends = new List<(string Suffix, string Line)>();   // --crlf <entry suffix> x: rewrite with CR LF line ends   // --strip <entry suffix>=<regex>: leave out the lines that match
     for (int i = 4; i + 1 < args.Length; i += 2)
     {
         if (args[i] == "--drop") drops.Add(args[i + 1]);
         else if (args[i] == "--prepend") { int eq = args[i + 1].IndexOf('='); prepends.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
+        else if (args[i] == "--append") { int eq = args[i + 1].IndexOf('='); appends.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
+        else if (args[i] == "--crlf") { crlfs.Add(args[i + 1]); }
         else if (args[i] == "--strip") { int eq = args[i + 1].IndexOf('='); strips.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
         else if (args[i] == "--take") { int eq = args[i + 1].IndexOf('='); takes.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
     }
@@ -856,8 +858,12 @@ if (cmd == "variant")
     var repl = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
     foreach (var (suffix, from) in takes)
     {
-        var other = new RefractorFlatArchive(from);
-        var oe = other.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        // "<other.rfa>::<suffix there>" takes a differently named entry (another level's file).
+        string otherSuffix = suffix, fromPath = from;
+        int sep = from.IndexOf("::", StringComparison.Ordinal);
+        if (sep > 0) { fromPath = from[..sep]; otherSuffix = from[(sep + 2)..]; }
+        var other = new RefractorFlatArchive(fromPath);
+        var oe = other.Entries.First(e => Fwd(e.Name).EndsWith("/" + otherSuffix, StringComparison.OrdinalIgnoreCase));
         var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
         repl[Fwd(mine.Name)] = RefractorForge.Formats.LevelCopy.Retarget(other.Read(oe), new[] { res.OldName }, newName).Bytes;
     }
@@ -876,6 +882,20 @@ if (cmd == "variant")
         var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
         var cur = repl.TryGetValue(Fwd(mine.Name), out var had) ? had : arc.Read(mine);
         repl[Fwd(mine.Name)] = Encoding.Latin1.GetBytes(line + "\r\n").Concat(cur).ToArray();
+    }
+    foreach (var (suffix, line) in appends)
+    {
+        var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        var cur = repl.TryGetValue(Fwd(mine.Name), out var had) ? had : arc.Read(mine);
+        repl[Fwd(mine.Name)] = cur.Concat(new byte[] { 13, 10 }).Concat(Encoding.Latin1.GetBytes(line)).Concat(new byte[] { 13, 10 }).ToArray();
+    }
+    foreach (var suffix in crlfs)
+    {
+        var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        var cur = repl.TryGetValue(Fwd(mine.Name), out var had) ? had : arc.Read(mine);
+        var text = Encoding.Latin1.GetString(cur).Replace("\r\n", "\n").Replace("\n", "\r\n");
+        Console.WriteLine($"  {suffix}: {cur.Count(b => b == 10)} line(s), {cur.Count(b => b == 13)} had CR");
+        repl[Fwd(mine.Name)] = Encoding.Latin1.GetBytes(text);
     }
     int dropped = 0;
     string tmp = res.Destination + ".tmp";
