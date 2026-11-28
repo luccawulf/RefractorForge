@@ -64,7 +64,7 @@ uniform sampler2D uGround;
 uniform int   uUseRaster;
 uniform sampler2D uGAlb;
 uniform sampler2D uGDist;
-const int MAXL = 24;
+const int MAXL = 96;
 uniform int   uLampCount;
 uniform vec4  uLampA[MAXL];   // position, radius
 uniform vec4  uLampB[MAXL];   // colour, intensity

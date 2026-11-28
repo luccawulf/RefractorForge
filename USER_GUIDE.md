@@ -441,6 +441,21 @@ what you see is where the game plants every tree and tuft.
     - what it costs: the copies lose their specular highlight and normal map, and about 3 in 100 retail meshes
       (ones that will not unwrap, and triangle strips) cannot be converted and stay as they were;
     - Battlefield 1942 is not covered yet: its copies are made as before.
+  - **Light volumes** (Tools ▸ Lighting ▸ Light Volumes…, BfVietnam only) fake what the game does not have: fog
+    you can shape, and darkness that covers a soldier standing in an unlit room. A volume is a box filled with
+    nearly transparent planes; their tint adds up the further you look through the box and covers whatever stands
+    inside it (measured in the game: planes at 3 % each left half of what was behind twenty of them).
+    - **Add at the camera** or **Add around the selected objects**. With one object selected the box takes that
+      object's own turn and fits its mesh, so a hangar standing at an angle is covered exactly; **Rotation** turns
+      a box by hand.
+    - Pick a **Preset**: *Dark interior (day)* or *(night)* and *Deep shadow* darken unlit air and stay clear at
+      doors and under lamps; *Lamp shaft (soft / strong)* adds the lamps' own light to the air under them;
+      *Thin mist* and *Fog bank* are an even veil in the level's fog colour. The plane spacing follows the box's
+      size. **Advanced** holds the numbers behind a preset for anyone who wants them.
+    - **Bake** traces the light in the air of the box - sun, sky and your placed lamps - and writes it into the
+      planes; the volume fades out toward its sides and top. Save writes it into the level as an ordinary object.
+    - Every plane is drawn over everything behind it, so a volume costs fill rate: keep them to interiors and
+      lamps rather than a whole map. The window shows the plane count before you bake.
     
     Everything goes into this level's archive (`Objects/RF_LightmapReady/`, `StandardMesh/<mesh>_lm_m1.sm`);
     nothing outside the map changes, and **Point all back at the originals** undoes it for every type. Foliage and

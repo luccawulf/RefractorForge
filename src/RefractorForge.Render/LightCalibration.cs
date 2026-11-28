@@ -432,6 +432,18 @@ public static class LightCalibration
         /// alone make an object show texture x (lightmap + LMambient), with no need to steer normals or raise the
         /// level's lights?</summary>
         public bool Glow { get; init; }
+        /// <summary>With <see cref="Steer"/>: build the FIFTH level instead - can a lattice of nearly transparent
+        /// planes fake a volume of fog or of darkness? (A BF1942 modder's trick: a grid of flat double-sided planes,
+        /// each at about 1 % opacity, so a line of sight through the room crosses many and their tints add up with
+        /// distance; an alpha texture over the lattice sets how dense each pocket is.) The third level's row of
+        /// boards stands behind six such volumes (<see cref="FogVolumes"/>), each a different recipe, so what a
+        /// volume does to the known patches behind it can be read off a screenshot.</summary>
+        public bool Fog { get; init; }
+        /// <summary>With <see cref="Fog"/>: the SIXTH level - volumes built by <see cref="LightVolume"/>, each plane
+        /// with its own tile of an atlas, so the field is three-dimensional: soft edges, a gradient with height, a
+        /// clear pocket inside a dark box, a dark box with a cone of clear air under a lamp, a cone of added light,
+        /// and a faint added haze.</summary>
+        public bool FogShaped { get; init; }
         /// <summary>Retail meshes for the third level, rewritten to the 40-byte lightmap-only form and stood under
         /// the boards, each with a flat mid-grey 24-bit lightmap.</summary>
         public IReadOnlyList<RealMesh> RealMeshes { get; init; } = Array.Empty<RealMesh>();
@@ -444,6 +456,95 @@ public static class LightCalibration
     /// <param name="Steer">Point every normal straight up.</param>
     /// <param name="Keep">Ship the mesh's vertices exactly as they are (it must already carry a lightmap unwrap).</param>
     public sealed record RealMesh(string Name, byte[] Sm, string? Texture, ShaderStyle Style, bool Steer, string What, bool Keep = false);
+
+    /// <summary>How a fog volume's planes are drawn.</summary>
+    public enum FogKind
+    {
+        /// <summary>Black, alpha-blended: darkens what is behind it (order does not matter).</summary>
+        Dark,
+        /// <summary>Black, its alpha rising from 0 at the volume's west face to the stated value at its east face.</summary>
+        DarkGradient,
+        /// <summary>Pale grey, alpha-blended: haze.</summary>
+        Haze,
+        /// <summary>White, added onto what is behind it (the retail muzzle-flash material): light hanging in the air.</summary>
+        Glow,
+        /// <summary>Black, in the plainest blended shader retail glass uses: lit, <c>transparent true</c> and nothing
+        /// else - no alphaTestRef, sortedBlend, depthWrite or twosided line.</summary>
+        DarkGlass,
+    }
+
+    /// <summary>One lattice volume of the fifth level: planes every <paramref name="Spacing"/> metres along all
+    /// three axes, filling a box <see cref="FogWidth"/> x <see cref="FogHeight"/> x <see cref="FogDepth"/> whose
+    /// south face's bottom centre is at X/Y/Z. <paramref name="Alpha"/> is one plane's opacity, of 255.</summary>
+    public sealed record FogVolume(string Id, string Mesh, int X, int Y, int Z, float Spacing, int Alpha, string Kind, string What)
+    {
+        /// <summary>Planes a level line of sight running north crosses.</summary>
+        public int PlanesThrough => (int)MathF.Round(FogDepth / Spacing) + 1;
+        /// <summary>What an alpha-blended volume should leave of the light behind it, seen straight through:
+        /// (1 - alpha) to the number of planes crossed.</summary>
+        public float Transmission => MathF.Pow(1f - Alpha / 255f, PlanesThrough);
+    }
+
+    public const float FogWidth = 7f, FogHeight = 10f, FogDepth = 8f;
+
+    /// <summary>A lattice volume's mesh: one quad per plane (the shader draws both sides), plain 32-byte vertices.
+    /// u runs west to east across the volume and v bottom to top on every plane, so one texture is a field over
+    /// the box: a plane that runs north-south takes the single column of the texture it stands at.</summary>
+    public static byte[] BuildFogMesh(string meshName, float spacing)
+    {
+        var P = new List<Vec3>(); var N = new List<Vec3>(); var Uv = new List<(float, float)>(); var Lm = new List<(float, float)>();
+        var F = new List<(int, int, int)>();
+        float hw = FogWidth * 0.5f;
+        void Quad(Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+        {
+            int i0 = P.Count;
+            foreach (var p in new[] { a, b, c, d })
+            {
+                P.Add(new Vec3(p.X, p.Y, p.Z)); N.Add(new Vec3(0, 1, 0)); Lm.Add((0f, 0f));
+                Uv.Add(((p.X + hw) / FogWidth, 1f - p.Y / FogHeight));
+            }
+            F.Add((i0, i0 + 1, i0 + 2)); F.Add((i0, i0 + 2, i0 + 3));
+        }
+        for (float z = 0f; z <= FogDepth + 1e-3f; z += spacing)          // across the line of sight
+            Quad(new(-hw, 0, z), new(hw, 0, z), new(hw, FogHeight, z), new(-hw, FogHeight, z));
+        for (float x = -hw; x <= hw + 1e-3f; x += spacing)               // along it
+            Quad(new(x, 0, 0), new(x, 0, FogDepth), new(x, FogHeight, FogDepth), new(x, FogHeight, 0));
+        for (float y = spacing; y <= FogHeight + 1e-3f; y += spacing)    // level
+            Quad(new(-hw, y, 0), new(hw, y, 0), new(hw, y, FogDepth), new(-hw, y, FogDepth));
+        var sections = new[] { new StandardMeshWriter.LitSection(meshName + "_Material0", P, N, Uv, Lm, F) };
+        return StandardMeshWriter.WriteLit(sections, StandardMeshWriter.LitLayout.Plain32, false,
+                                           new[] { -hw, 0f, 0f, hw, FogHeight, FogDepth });
+    }
+
+    /// <summary>A volume's texture: its colour, and one plane's alpha - constant, or rising west to east.</summary>
+    public static byte[] FogTexture(FogKind kind, int alpha)
+    {
+        // Square, with a mip chain: the form the level's flat test textures already load in. (The first fog level's
+        // 64 x 4 texture without mips drew nothing at all, so nothing about it is taken on trust.)
+        const int w = 64, h = 64;
+        var px = new byte[w * h * 4];
+        byte c = kind switch { FogKind.Haze => (byte)200, FogKind.Glow => (byte)255, _ => (byte)0 };
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 4;
+                px[o] = c; px[o + 1] = c; px[o + 2] = c;
+                px[o + 3] = (byte)(kind == FogKind.DarkGradient ? (int)MathF.Round(alpha * x / (float)(w - 1)) : alpha);
+            }
+        return DdsTexture.EncodeUncompressedMipped(new Texture2D(w, h, px));
+    }
+
+    /// <summary>A volume's shader: unlit, both sides, no depth write, blended (or added, for <see cref="FogKind.Glow"/>).</summary>
+    public static string FogShader(string meshName, FogKind kind, string texture)
+        => kind == FogKind.DarkGlass
+            ? $"subshader \"{meshName}_Material0\" \"StandardMesh/Default\"\r\n{{\r\n\tlighting true;\r\n\tlightingSpecular false;\r\n\tmaterialDiffuse 1 1 1;\r\n\ttransparent true;\r\n\ttexture \"texture/{texture}\";\r\n}}\r\n\r\n"
+            : RsWriter.Write(new[]
+        {
+            kind == FogKind.Glow
+                ? RsWriter.Glow(meshName + "_Material0", texture)
+                : new RsWriter.Material(meshName + "_Material0", texture, new Vec3(1, 1, 1), Transparent: true, AlphaTestRef: 0f,
+                                        TwoSided: true, Lighting: false, LightingSpecular: false, DepthWrite: false, SortedBlend: true),
+        });
 
     /// <summary>A retail mesh as the third level placed it.</summary>
     public sealed record RealObject(string Id, string Mesh, int X, int Y, int Z, bool Steered, string Style, string? Texture, string What);
@@ -481,6 +582,8 @@ public static class LightCalibration
         /// r g b per level. Empty in a manifest written before that was known.</summary>
         public float[] LevelsShown { get; init; } = Array.Empty<float>();
         public List<Board> Boards { get; init; } = new();
+        /// <summary>The fifth level's fog volumes.</summary>
+        public List<FogVolume> Volumes { get; init; } = new();
         public List<RealObject> Objects { get; init; } = new();
         public List<Swatch> Swatches { get; init; } = new();
         public float[] Viewer { get; init; } = Array.Empty<float>();
@@ -631,6 +734,16 @@ public static class LightCalibration
                                      boardX[i], bottomY, site.BoardsZ, l.What) { Style = l.Style.ToString() });
             }
         }
+        else if (o.Steer && o.Fog)
+        {
+            // Six identical boards whose every patch is known (the third level's board A: lightmap + LMambient),
+            // each to be looked at through a fog volume.
+            boards.Clear();
+            meshes.Add(("rfcal_up_m1", StandardMeshWriter.LitLayout.Lightmap40, true, false, true, ShaderStyle.Plain));
+            for (int i = 0; i < 6; i++)
+                boards.Add(new Board(((char)('A' + i)).ToString(), "rfcal_up_m1", "40-byte, no tangent frame", nameof(LightmapKind.Grey24), true,
+                                     boardX[i], bottomY, site.BoardsZ, "a known board, seen through fog volume " + (char)('A' + i)) { Steered = true });
+        }
         else if (o.Steer)
         {
             // Six boards in one row. A-E: every patch normal straight up, one shader each. F: the first level's
@@ -719,6 +832,84 @@ public static class LightCalibration
             Put($"Objects/{name}/{name}.con", latin.GetBytes("run Objects\r\nrun Geometries\r\n"));
             objectsCon.Append($"run {name}/{name}\r\n");
         }
+        // The fifth level's fog volumes: a mesh, a texture, a shader and an object each, standing in front of its board.
+        var volumes = new List<FogVolume>();
+        if (o.Fog && o.FogShaped)
+        {
+            var size = new Vector3(FogWidth, FogHeight, FogDepth);
+            const float s = 0.5f, fade = 1.5f;
+            float dark = LightVolume.PlaneAlpha(0.09f, s), deep = LightVolume.PlaneAlpha(0.16f, s);
+            var lamp = new Vector3(0f, FogHeight - 1f, 0f);          // a lamp a metre under the box's top, pointing down
+            // 1 inside a cone of half-angle 25 degrees under the lamp, falling to 0 over the next 10.
+            float Cone(Vector3 p)
+            {
+                var d = p - lamp; float len = d.Length();
+                if (len < 1e-3f) return 1f;
+                float ang = MathF.Acos(Math.Clamp(-d.Y / len, -1f, 1f)) * 180f / MathF.PI;
+                return 1f - Math.Clamp((ang - 25f) / 10f, 0f, 1f);
+            }
+            var warm = new Vector3(1f, 0.85f, 0.6f);
+            var shaped = new (bool Additive, Func<Vector3, Vector4> Field, int Alpha, string What)[]
+            {
+                (false, p => new Vector4(0, 0, 0, dark * LightVolume.EdgeFade(p, size, fade)), (int)(dark * 255),
+                 "dark, even, fading out over 1.5 m toward its faces: a soft box, with no lattice showing?"),
+                (false, p => new Vector4(0, 0, 0, deep * (1f - p.Y / FogHeight) * LightVolume.EdgeFade(p, size, fade)), (int)(deep * 255),
+                 "dark at the floor, clear at the top: is the atlas the right way up?"),
+                (false, p => new Vector4(0, 0, 0, deep * Math.Clamp(((p - new Vector3(0, FogHeight * 0.5f, 0)).Length() - 2f) / 1.5f, 0f, 1f) * LightVolume.EdgeFade(p, size, fade)), (int)(deep * 255),
+                 "dark with a clear ball 2 m across in the middle: a hole seen from every side?"),
+                (false, p => new Vector4(0, 0, 0, deep * (1f - Cone(p)) * LightVolume.EdgeFade(p, size, fade)), (int)(deep * 255),
+                 "dark, with a cone of clear air under a lamp at the top: a pool of light to stand in"),
+                (true, p => new Vector4(warm, 0.03f * Cone(p) * Math.Clamp(1.2f - (p - lamp).Length() / FogHeight, 0f, 1f) * LightVolume.EdgeFade(p, size, 0.5f)), 8,
+                 "a cone of warm light ADDED under a lamp, 3 % a plane at most: a shaft"),
+                (true, p => new Vector4(0.8f, 0.85f, 1f, 0.012f * LightVolume.EdgeFade(p, size, fade)), 3,
+                 "a faint cool haze ADDED, 1.2 % a plane, soft edges"),
+            };
+            for (int i = 0; i < shaped.Length; i++)
+            {
+                var r = shaped[i];
+                string name = $"rfcal_vol{(char)('a' + i)}_m1", tex = $"rfcal_vol{(char)('a' + i)}";
+                var built = LightVolume.Build(name, size, s, r.Field);
+                Put($"StandardMesh/{name}.sm", built.Sm);
+                Put($"StandardMesh/{name}.rs", latin.GetBytes(LightVolume.Shader(name, tex, r.Additive)));
+                Put($"Texture/{tex}.dds", DdsTexture.EncodeUncompressedMipped(built.Atlas));
+                Put($"Objects/{name}/Geometries.con", latin.GetBytes(LightVolume.GeometryScript(name, o.Name, o.BaseSub)));
+                Put($"Objects/{name}/Objects.con", latin.GetBytes(LightVolume.ObjectScript(name)));
+                Put($"Objects/{name}/{name}.con", latin.GetBytes("run Objects\r\nrun Geometries\r\n"));
+                objectsCon.Append($"run {name}/{name}\r\n");
+                volumes.Add(new FogVolume(((char)('A' + i)).ToString(), name, boardX[i], groundY, site.BoardsZ - 1 - (int)(FogDepth / 2),
+                                          s, r.Alpha, r.Additive ? nameof(FogKind.Glow) : nameof(FogKind.Dark), r.What));
+            }
+        }
+        else if (o.Fog)
+        {
+            var recipes = new (float Spacing, int Alpha, FogKind Kind, string What)[]
+            {
+                // The first fog level (alphas of 3 to 24 of 255) drew NOTHING, not even the additive volume, so this
+                // one brackets: does a volume draw at all, and from what alpha down does it vanish?
+                (1.0f, 128, FogKind.Dark, "black, 50 % a plane, planes every 1 m: does a volume draw at all? (should be nearly solid black)"),
+                (0.5f, 24, FogKind.Dark, "black, 9 % a plane, planes every 0.5 m"),
+                (0.5f, 8, FogKind.Dark, "black, 3 % a plane, planes every 0.5 m (invisible on the first level)"),
+                (0.5f, 96, FogKind.DarkGradient, "black, alpha from 0 (west) to 38 % (east): where does it start to show?"),
+                (1.0f, 128, FogKind.DarkGlass, "black, 50 % a plane, in retail glass's plain blended shader"),
+                (0.5f, 64, FogKind.Glow, "white, ADDED, 25 % a plane: light in the air"),
+            };
+            for (int i = 0; i < recipes.Length; i++)
+            {
+                var r = recipes[i];
+                string name = $"rfcal_fog{(char)('a' + i)}_m1", tex = $"rfcal_fog{(char)('a' + i)}";
+                Put($"StandardMesh/{name}.sm", BuildFogMesh(name, r.Spacing));
+                Put($"StandardMesh/{name}.rs", latin.GetBytes(FogShader(name, r.Kind, tex)));
+                Put($"Texture/{tex}.dds", FogTexture(r.Kind, r.Alpha));
+                Put($"Objects/{name}/Geometries.con", latin.GetBytes(
+                    $"GeometryTemplate.create StandardMesh {name}\r\nGeometryTemplate.file ../{o.BaseSub}/levels/{o.Name}/StandardMesh/{name}\r\nGeometryTemplate.setLodDistance 0 0\r\nGeometryTemplate.setLodDistance 1 50\r\nGeometryTemplate.setLodDistance 2 100\r\nGeometryTemplate.setLodDistance 3 200\r\nGeometryTemplate.setLodDistance 4 400\r\nGeometryTemplate.setLodDistance 5 800\r\n\r\n"));
+                Put($"Objects/{name}/Objects.con", latin.GetBytes(
+                    $"ObjectTemplate.create SimpleObject {name}\r\nObjectTemplate.geometry {name}\r\nObjectTemplate.HasCollisionPhysics 0\r\n\r\n"));
+                Put($"Objects/{name}/{name}.con", latin.GetBytes("run Objects\r\nrun Geometries\r\n"));
+                objectsCon.Append($"run {name}/{name}\r\n");
+                volumes.Add(new FogVolume(((char)('A' + i)).ToString(), name, boardX[i], groundY, site.BoardsZ - 1 - (int)FogDepth,
+                                          r.Spacing, r.Alpha, r.Kind.ToString(), r.What));
+            }
+        }
         if (Read("Objects/objects.con") is not null)
             throw new InvalidDataException("The base level already has its own Objects/objects.con - pick a base without level-local objects.");
         Put("Objects/objects.con", latin.GetBytes(objectsCon.ToString()));
@@ -746,6 +937,8 @@ public static class LightCalibration
             so.Objects.Add(new StaticObject(ro.Mesh) { Position = new Vec3(ro.X, ro.Y, ro.Z), Rotation = new Vec3(0, 0, 0) });
             Put($"{lmFolder}/{ObjectLightmaps.FileBase(ro.Mesh)}_{ro.X}-{ro.Y}-{ro.Z}.tga", EncodeLightmap(LightmapKind.Uniform24)!);
         }
+        foreach (var v in volumes)
+            so.Objects.Add(new StaticObject(v.Mesh) { Position = new Vec3(v.X, v.Y, v.Z), Rotation = new Vec3(0, 0, 0) });
         Put("StaticObjects.con", LevelSaver.SerializeStaticObjects(so));
         notes.Add("Every retail static object was taken out so nothing stands between the spawn and the boards.");
 
@@ -917,6 +1110,7 @@ public static class LightCalibration
             LevelsShown = levelsShown,
             Boards = boards,
             Objects = realObjects,
+            Volumes = volumes,
             Swatches = swatches,
             Viewer = viewer,
             CentreX = site.CentreX, BoardsZ = site.BoardsZ, ViewerZ = site.ViewerZ,

@@ -118,7 +118,9 @@ public sealed class LiveTraceScene
 /// </summary>
 public static class LiveTraceKernel
 {
-    public const int MaxLamps = 24;
+    /// <summary>Lamps one frame can hold. It was 24, taken in the rig's own order, so a level with more - al_vietnas
+    /// has 49 street lamps - simply lost the later ones from the picture.</summary>
+    public const int MaxLamps = 96;
     public const int StackSize = 66;
     private const int MaxVisits = 1048576;
     private const float FltMax = float.MaxValue;
@@ -143,18 +145,21 @@ public static class LiveTraceKernel
             return new Params(inv, camPos, width, height, day.ToSun, day.SunIrradiance, half <= 1e-6f ? 0f : MathF.Tan(half),
                               day.SkyZenithRadiance, day.SkyHorizonRadiance, day.GroundRadiance,
                               day.Exposure, day.DisplayGamma, MathF.Max(day.Settings.BounceStrength, 0f), Math.Clamp(bounces, 0, 3),
-                              worldSize, LiveTraceKernel.Lamps(rig), ground);
+                              worldSize, LiveTraceKernel.Lamps(rig, camPos), ground);
         }
     }
 
     /// <summary>The rig's lamps that can light anything, at most <see cref="MaxLamps"/>, in the kernel's form.</summary>
-    public static Lamp[] Lamps(LightRig? rig)
+    /// <param name="camPos">With more lamps than fit, the ones whose reach is nearest this point are kept.</param>
+    public static Lamp[] Lamps(LightRig? rig, Vector3? camPos = null)
     {
         var list = new List<Lamp>();
         if (rig is null) return list.ToArray();
-        foreach (var l in rig.Lights)
+        IEnumerable<PointLight> lights = rig.Lights.Where(l => l.Enabled && l.Intensity > 0f && l.Radius > 0f);
+        if (lights.Count() > MaxLamps && camPos is { } cp)
+            lights = lights.OrderBy(l => MathF.Max(0f, (new Vector3(l.Position.X, l.Position.Y, l.Position.Z) - cp).Length() - l.Radius));
+        foreach (var l in lights)
         {
-            if (!l.Enabled || l.Intensity <= 0f || l.Radius <= 0f) continue;
             if (list.Count == MaxLamps) break;
             var d = l.Direction();
             float cone = Math.Clamp(l.ConeDeg, 1f, 179f);

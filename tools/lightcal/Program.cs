@@ -67,7 +67,8 @@ if (cmd == "build")
     var dest = Path.Combine(outDir, name + ".rfa");
     if (File.Exists(dest)) File.Delete(dest);
     bool glow = args.Contains("--glow");
-    bool steer = args.Contains("--steer") || glow;
+    bool fog = args.Contains("--fog");
+    bool steer = args.Contains("--steer") || glow || fog;
     LC.Options opts;
     if (glow)
     {
@@ -100,7 +101,7 @@ if (cmd == "build")
         var bunker = Mesh("O_Sbunker04_m1"); var bush = Mesh("F_bush11_M1");
         opts = new LC.Options(baseRfa, name, outDir, Full: false, LC.Site.HueUnlit)
         {
-            Steer = true,
+            Steer = true, Fog = fog, FogShaped = args.Contains("--shaped"),
             // Both lights reach 1 on a normal that points straight up (Hue's sun stands 36 degrees high: each light
             // gives 0.59 of itself there), in every channel; the red channel still tells the sun from the back light.
             Sun = new Vector3(1.25f, 0.9f, 0.9f), Back = new Vector3(0.5f, 0.9f, 0.9f),
@@ -121,6 +122,7 @@ if (cmd == "build")
     Console.WriteLine($"to sun {m.ToSun[0]:0.###}/{m.ToSun[1]:0.###}/{m.ToSun[2]:0.###}; viewer {m.Viewer[0]:0.#}/{m.Viewer[1]:0.#}/{m.Viewer[2]:0.#}");
     foreach (var b in m.Boards) Console.WriteLine($"  {b.Id}  {b.Mesh,-14} {b.Lightmap,-13} at {b.X}/{b.Y}/{b.Z}  {b.What}");
     foreach (var ro in m.Objects) Console.WriteLine($"  {ro.Id}  {ro.Mesh,-16} at {ro.X}/{ro.Y}/{ro.Z}  {ro.What}");
+    foreach (var v in m.Volumes) Console.WriteLine($"  fog {v.Id}  {v.Mesh,-14} at {v.X}/{v.Y}/{v.Z}  {v.PlanesThrough} planes through, expect x{v.Transmission:0.00}  {v.What}");
     foreach (var n in m.Notes) Console.WriteLine("  note: " + n);
     return;
 }
@@ -167,6 +169,64 @@ if (cmd == "ls")
     foreach (var e in arc.Entries)
         if (args.Length < 3 || Fwd(e.Name).Contains(args[2], StringComparison.OrdinalIgnoreCase))
             Console.WriteLine($"{arc.Read(e).Length,10:N0}  {Fwd(e.Name)}");
+    return;
+}
+
+if (cmd == "unlight")
+{
+    // unlight <level.rfa> <ground-from.rfa> [--write] : put another archive's ground tiles (Textures/tx*.dds) into the
+    // level and take out every baked object lightmap (the palette stays). Nothing else is touched. A dated backup is
+    // made beside the level first, and the result is read back.
+    var path = args[1];
+    var lvl = new RefractorFlatArchive(path);
+    var from = new RefractorFlatArchive(args[2]);
+    static bool IsTile(string n) { var leaf = n.Split('/').Last().ToLowerInvariant(); return n.Contains("/Textures/", StringComparison.OrdinalIgnoreCase) && leaf.StartsWith("tx") && leaf.EndsWith(".dds"); }
+    var src = from.Entries.Where(e => IsTile(Fwd(e.Name))).ToDictionary(e => Fwd(e.Name).Split('/').Last().ToLowerInvariant(), e => e);
+    var repl = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+    int same = 0;
+    foreach (var e in lvl.Entries.Where(e => IsTile(Fwd(e.Name))))
+    {
+        string leaf = Fwd(e.Name).Split('/').Last().ToLowerInvariant();
+        if (!src.TryGetValue(leaf, out var se)) { Console.WriteLine($"NO SOURCE for {leaf} - stopping."); return; }
+        var b = from.Read(se);
+        if (lvl.Read(e).AsSpan().SequenceEqual(b)) { same++; continue; }
+        repl[Fwd(e.Name)] = b;
+    }
+    if (src.Count != lvl.Entries.Count(e => IsTile(Fwd(e.Name)))) { Console.WriteLine($"Tile counts differ ({src.Count} in the source) - stopping."); return; }
+    var gone = lvl.Entries.Select(e => Fwd(e.Name))
+        .Where(n => n.Contains("/objectlightmaps/", StringComparison.OrdinalIgnoreCase) && n.EndsWith(".tga", StringComparison.OrdinalIgnoreCase)).ToList();
+    Console.WriteLine($"{repl.Count} ground tile(s) to replace ({same} already identical), {gone.Count} object lightmap(s) to remove ({gone.Sum(n => (long)lvl.Read(lvl.Entries.First(e => Fwd(e.Name) == n)).Length) / 1048576} MB).");
+    if (!args.Contains("--write")) { Console.WriteLine("dry run - add --write"); return; }
+    string bak = path + ".before_unlight_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+    File.Copy(path, bak);
+    Console.WriteLine("backup: " + bak);
+    RefractorFlatArchive.RepackToFile(path, lvl, repl, gone);
+    var check = new RefractorFlatArchive(path);
+    int bad = repl.Count(kv => !check.Read(check.Entries.First(x => RefractorFlatArchive.NameComparer.Equals(Fwd(x.Name), kv.Key))).AsSpan().SequenceEqual(kv.Value));
+    int left = check.Entries.Count(e => Fwd(e.Name).Contains("/objectlightmaps/", StringComparison.OrdinalIgnoreCase) && Fwd(e.Name).EndsWith(".tga", StringComparison.OrdinalIgnoreCase));
+    Console.WriteLine($"repacked: {check.Entries.Count} entries (was {lvl.Entries.Count}); {repl.Count - bad} of {repl.Count} tiles read back identical; {left} object lightmaps left; {new FileInfo(path).Length / 1048576} MB.");
+    return;
+}
+
+if (cmd == "extract")
+{
+    // extract <archive.rfa> <path substring> <outDir> : write every matching entry out by its leaf name.
+    var arc = new RefractorFlatArchive(args[1]);
+    Directory.CreateDirectory(args[3]);
+    foreach (var e in arc.Entries.Where(x => Fwd(x.Name).Contains(args[2], StringComparison.OrdinalIgnoreCase)))
+        File.WriteAllBytes(Path.Combine(args[3], Fwd(e.Name).Split('/').Last().ToLowerInvariant()), arc.Read(e));
+    return;
+}
+
+if (cmd == "hash")
+{
+    // hash <archive.rfa> <path substring> : size and SHA-1 of every matching entry, to compare archives.
+    var arc = new RefractorFlatArchive(args[1]);
+    foreach (var e in arc.Entries.Where(x => Fwd(x.Name).Contains(args[2], StringComparison.OrdinalIgnoreCase)).OrderBy(x => Fwd(x.Name).ToLowerInvariant()))
+    {
+        var b = arc.Read(e);
+        Console.WriteLine($"{Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(b))[..12]} {b.Length,10} {Fwd(e.Name).Split('/').Last().ToLowerInvariant()}");
+    }
     return;
 }
 

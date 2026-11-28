@@ -214,6 +214,39 @@ public sealed class DaylightSettings
 }
 
 /// <summary>
+/// One light volume as the user set it up: a box standing on <see cref="X"/>/<see cref="Y"/>/<see cref="Z"/> (the
+/// middle of its floor), not rotated. Baking turns it into a level object named <see cref="Name"/> - a lattice of
+/// nearly transparent planes (Render/LightVolume) whose opacity follows the traced light.
+/// </summary>
+public sealed class LightVolumeDef
+{
+    /// <summary>The level object's template (and mesh) name, e.g. <c>rf_vol3_m1</c>.</summary>
+    public string Name { get; set; } = "";
+    public float X { get; set; }
+    public float Y { get; set; }
+    public float Z { get; set; }
+    public float SizeX { get; set; } = 10f;
+    public float SizeY { get; set; } = 6f;
+    public float SizeZ { get; set; } = 10f;
+    /// <summary>Metres between planes.</summary>
+    public float Spacing { get; set; } = 0.5f;
+    /// <summary>Degrees the box is turned about the vertical - the placed object's own yaw.</summary>
+    public float Yaw { get; set; }
+    /// <summary>The preset the volume was made from (an index into the editor's list), or -1 when its numbers were
+    /// set by hand.</summary>
+    public int Preset { get; set; }
+    /// <summary>0 = darkness where the air is unlit, 1 = the lamps' light added where it reaches, 2 = an even mist.</summary>
+    public int Kind { get; set; }
+    public float Strength { get; set; } = 0.12f;
+    /// <summary>Dark volumes: the on-screen brightness at which air counts as lit and the volume is clear.</summary>
+    public float LitLevel { get; set; } = 0.35f;
+    /// <summary>Metres over which the volume fades out at its sides and top.</summary>
+    public float Fade { get; set; } = 1.5f;
+    /// <summary>Set once the volume has been baked into the level's files.</summary>
+    public bool Baked { get; set; }
+}
+
+/// <summary>
 /// The lights placed on one level, and their night-preview setting.
 ///
 /// Stored as a sidecar in the level folder rather than in a <c>.con</c>: the engine has no concept of these, and
@@ -239,6 +272,10 @@ public sealed class LightRig
     /// <summary>The sun and the sky the realistic bake traces (Window > Realistic Lighting). Null until someone
     /// opens that window on this level; an older editor that does not know the field simply ignores it.</summary>
     public DaylightSettings? Daylight { get; set; }
+
+    /// <summary>Light volumes (Tools > Lighting > Light Volumes): boxes of darkness or of glow the editor bakes into
+    /// lattice objects. An older editor ignores the field.</summary>
+    public List<LightVolumeDef> Volumes { get; set; } = new();
 
     /// <summary>Where the rig lives for this level. A folder level keeps it in the folder; a packed level keeps
     /// it beside the archive, since you cannot write a file inside a .rfa - see <see cref="LevelSidecar"/>.</summary>

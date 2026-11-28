@@ -871,6 +871,14 @@ bool gpuTestPassed = false;   // the checkbox can only switch the GPU on once th
 bool showLmReady = false;
 bool lmReadyShowFoliage = false, lmReadyShowEffects = false, lmReadyOnlySelected = false;
 bool lmReadyLightOnly = true;   // BfVietnam: copies take all their light from the lightmap (40-byte vertex + selfillum 1)
+// Light volumes (Tools > Lighting > Light Volumes): the window, and the one bake that can run at a time.
+bool showLightVolumes = false;
+int lvSelected = -1;
+string lvStatus = "";
+System.Threading.Tasks.Task<RefractorForge.Render.LightVolume.Built?>? lvTask = null;
+System.Threading.CancellationTokenSource? lvCancel = null;
+RefractorForge.Formats.Terrain.LightVolumeDef? lvBaking = null;
+List<RefractorForge.Formats.Terrain.LightVolumeDef> lvQueue = new();
 System.Threading.Tasks.Task<(List<RefractorForge.Render.LightmapReadyPlanner.Row> Rows, int Undefined)>? lmReadyScan = null;
 System.Threading.Tasks.Task<(RefractorForge.Formats.Con.LightmapReady.Output Out, Dictionary<string, RefractorForge.Formats.Con.LightmapReady.PatchedMesh> Patches, List<string> Failures, List<string> Chosen)>? lmReadyApply = null;
 List<RefractorForge.Render.LightmapReadyPlanner.Row>? lmReadyRows = null;
@@ -12054,6 +12062,12 @@ RefractorForge.Render.DaylightModel.Fitted RlFitFor(RefractorForge.Render.Daylig
 {
     var st = RlSettings();
     var plain = day.Fit();
+    // The lamp headroom below raises the level's two lights and gives them the LAMPS' colour, because an ordinary
+    // lightmap can only scale those lights. A level whose objects are lightmap-only copies does not need it - their
+    // lightmaps carry the lamp light whatever the two lights are - and it is what turned every soldier and vehicle
+    // sodium-orange under a blue night sky (al_vietnas, 2026-11-28): they have no lightmap and are lit by those two
+    // colours alone. So such a level keeps the plain fit: the moon and the open shade, as traced.
+    if (!gameIsBf1942 && ReadLmReadyManifest().Only is { SelfIllum: true }) return plain;
     var lit = lightRig.Lights.Where(l => l.Enabled && l.Intensity > 0f).ToList();
     if (lit.Count == 0 || st.LampHeadroom <= 0.01f) return plain;
     if (RefractorForge.Render.EngineLight.Luma(plain.Colours.Sun) >= st.LampHeadroom) return plain;
@@ -13444,6 +13458,336 @@ string LmReadyDetail(RefractorForge.Render.LightmapReadyPlanner.Row r)
         sb.AppendLine();
     }
     return sb.ToString().TrimEnd();
+}
+
+// ---- Light volumes ----------------------------------------------------------------------------------------------
+//
+// A box of darkness or of glow, built as a lattice of nearly transparent planes (Render/LightVolume has the trick and
+// what was measured in the game). The editor traces the light in the air inside the box and writes it into the
+// lattice: a dark volume is dense where the air is unlit and clear where a lamp or a doorway lights it, so a soldier
+// in an unlit hangar goes dark with the room; a glow volume adds the lamps' own light where it reaches. BfVietnam only.
+
+float LvGround(float x, float z)
+{
+    if (heightmap is null || cfg is null) return 0f;
+    float sp = cfg.HorizontalSpacing;
+    int ix = Math.Clamp((int)(x / sp), 0, heightmap.Width - 1), iz = Math.Clamp((int)(z / sp), 0, heightmap.Height - 1);
+    return cfg.HeightToMeters(heightmap[ix, iz]);
+}
+
+string LvNextName()
+{
+    for (int i = 1; i < 10000; i++)
+    {
+        string n = $"rf_vol{i}_m1";
+        if (lightRig.Volumes.Any(v => v.Name.Equals(n, StringComparison.OrdinalIgnoreCase))) continue;
+        if (so is not null && so.Objects.Any(o => o.Template.Equals(n, StringComparison.OrdinalIgnoreCase))) continue;
+        return n;
+    }
+    return "rf_vol" + Guid.NewGuid().ToString("N")[..6] + "_m1";
+}
+
+// The presets a mapper picks from. Each is the whole recipe; the plane spacing follows the box's size.
+(string Name, int Kind, float Strength, float LitLevel, float Fade, string What)[] LvPresets() => new[]
+{
+    (Loc.T("Dark interior (day)"), 0, 0.12f, 0.35f, 1.0f, Loc.T("An unlit room or hangar on a daylight map: dark inside, clear at the doors and under lamps.")),
+    (Loc.T("Dark interior (night)"), 0, 0.15f, 0.12f, 1.0f, Loc.T("The same on a night map, where even the lit places are dim.")),
+    (Loc.T("Deep shadow"), 0, 0.26f, 0.35f, 1.0f, Loc.T("Twice as dark: a bunker, a tunnel mouth, a cellar.")),
+    (Loc.T("Lamp shaft (soft)"), 1, 0.4f, 0.35f, 0.5f, Loc.T("The lamps' own light, faintly visible in the air under them.")),
+    (Loc.T("Lamp shaft (strong)"), 1, 0.9f, 0.35f, 0.5f, Loc.T("A clear cone of light under each lamp, as in dust or drizzle.")),
+    (Loc.T("Thin mist"), 2, 0.025f, 0.35f, 2.0f, Loc.T("An even veil in the level's fog colour: a paddy field at dawn, a valley floor.")),
+    (Loc.T("Fog bank"), 2, 0.07f, 0.35f, 3.0f, Loc.T("Thick fog you lose sight in after twenty metres.")),
+};
+
+void LvApplyPreset(RefractorForge.Formats.Terrain.LightVolumeDef v, int preset)
+{
+    var all = LvPresets();
+    if (preset < 0 || preset >= all.Length) { v.Preset = -1; return; }
+    var pr = all[preset];
+    v.Preset = preset; v.Kind = pr.Kind; v.Strength = pr.Strength; v.LitLevel = pr.LitLevel; v.Fade = pr.Fade;
+    v.Spacing = RefractorForge.Render.LightVolumeBaker.SpacingFor(new Vector3(v.SizeX, v.SizeY, v.SizeZ));
+    v.Baked = false;
+}
+
+// The volume's box in the world: the transform its placed object has.
+Matrix4x4 LvWorld(RefractorForge.Formats.Terrain.LightVolumeDef v)
+    => LevelScene.MeshWorld(new StaticObject(v.Name) { Position = new Vec3(v.X, v.Y, v.Z), Rotation = new Vec3(v.Yaw, 0, 0) });
+
+// A new volume in front of the camera, standing on the ground.
+void LvAddAtCamera()
+{
+    var c = cam.Position + cam.Forward * 12f;
+    var v = new RefractorForge.Formats.Terrain.LightVolumeDef { Name = LvNextName(), X = c.X, Y = LvGround(c.X, c.Z), Z = c.Z };
+    LvApplyPreset(v, 0);
+    lightRig.Volumes.Add(v);
+    lvSelected = lightRig.Volumes.Count - 1;
+}
+
+// A new volume around the selected objects. One object: the box takes the object's own turn and fits its mesh, so a
+// hangar standing at an angle is covered exactly. Several: a box square to the map round all of them.
+void LvAddAroundSelection()
+{
+    if (so is null || meshLib is null) return;
+    var sel = multi.Where(i => i >= 0 && i < so.Objects.Count).Select(i => so.Objects[i]).ToList();
+    if (sel.Count == 0) { Toast(Loc.T("Select the objects the volume should cover first.")); return; }
+    var v = new RefractorForge.Formats.Terrain.LightVolumeDef { Name = LvNextName() };
+    if (sel.Count == 1 && meshLib.TryGet(sel[0].Template, out var one) && one.Positions.Length > 0)
+    {
+        var o = sel[0];
+        var lo = new Vector3(float.MaxValue); var hi = new Vector3(float.MinValue);
+        foreach (var p in one.Positions) { lo = Vector3.Min(lo, p); hi = Vector3.Max(hi, p); }
+        lo -= new Vector3(1f, 0f, 1f); hi += new Vector3(1f);
+        // The middle of the mesh's floor, carried into the world by the object's yaw alone (a volume stands upright).
+        var upright = LevelScene.MeshWorld(new StaticObject(o.Template) { Position = o.Position, Rotation = new Vec3(o.Rotation.X, 0, 0) });
+        var c = Vector3.Transform(new Vector3((lo.X + hi.X) * 0.5f, lo.Y, (lo.Z + hi.Z) * 0.5f), upright);
+        v.X = c.X; v.Y = c.Y; v.Z = c.Z; v.Yaw = o.Rotation.X;
+        v.SizeX = MathF.Max(2f, hi.X - lo.X); v.SizeY = MathF.Max(2f, hi.Y - lo.Y); v.SizeZ = MathF.Max(2f, hi.Z - lo.Z);
+    }
+    else
+    {
+        var lo = new Vector3(float.MaxValue); var hi = new Vector3(float.MinValue);
+        foreach (var o in sel)
+        {
+            var world = LevelScene.MeshWorld(o);
+            if (meshLib.TryGet(o.Template, out var m) && m.Positions.Length > 0)
+                foreach (var p in m.Positions) { var w = Vector3.Transform(p, world); lo = Vector3.Min(lo, w); hi = Vector3.Max(hi, w); }
+            else { var w = new Vector3(o.Position.X, o.Position.Y, o.Position.Z); lo = Vector3.Min(lo, w); hi = Vector3.Max(hi, w); }
+        }
+        lo -= new Vector3(1f, 0f, 1f); hi += new Vector3(1f);
+        v.X = (lo.X + hi.X) * 0.5f; v.Y = lo.Y; v.Z = (lo.Z + hi.Z) * 0.5f;
+        v.SizeX = MathF.Max(2f, hi.X - lo.X); v.SizeY = MathF.Max(2f, hi.Y - lo.Y); v.SizeZ = MathF.Max(2f, hi.Z - lo.Z);
+    }
+    LvApplyPreset(v, 0);
+    lightRig.Volumes.Add(v);
+    lvSelected = lightRig.Volumes.Count - 1;
+}
+
+// Planes a volume's lattice will have, and the side of its atlas - what it costs before it is baked.
+(int Planes, int Atlas) LvCost(RefractorForge.Formats.Terrain.LightVolumeDef v)
+{
+    float s = Math.Clamp(v.Spacing, 0.25f, 4f);
+    int n = (int)MathF.Round(v.SizeZ / s) + 1 + (int)MathF.Round(v.SizeX / s) + 1 + (int)MathF.Round(v.SizeY / s);
+    int cols = (int)MathF.Ceiling(MathF.Sqrt(n)), side = 1;
+    while (side < cols * RefractorForge.Render.LightVolume.Tile) side <<= 1;
+    return (n, side);
+}
+
+void LvStartBake(RefractorForge.Formats.Terrain.LightVolumeDef v)
+{
+    if (lvTask is not null || so is null || meshLib is null || heightmap is null) return;
+    if (rlBaking || lmBaking) { Toast(Loc.T("A lighting bake is already running.")); return; }
+    var ground = RlGroundSource();
+    var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground, so, meshLib, holes: env?.IsTunnelMap == true);
+    if (built.Scene is null) { Toast(Loc.T("Nothing to trace: this level has no terrain or objects.")); return; }
+    var day = RlModel(ground);
+    var rig = RlLampSnapshot();
+    var settings = new RefractorForge.Render.LightVolumeBaker.Settings(LvWorld(v), new Vector3(v.SizeX, v.SizeY, v.SizeZ),
+                                                                      v.Spacing, v.Kind, v.Strength, v.LitLevel, v.Fade);
+    if (env is not null) settings = settings with { HazeColour = new Vector3(env.FogColor.X, env.FogColor.Y, env.FogColor.Z) };
+    string name = v.Name; var scene = built.Scene;
+    lvCancel = new System.Threading.CancellationTokenSource();
+    var token = lvCancel.Token;
+    lvBaking = v;
+    lvStatus = string.Format(Loc.T("Tracing the light inside '{0}'..."), v.Name);
+    lvTask = System.Threading.Tasks.Task.Run(() => RefractorForge.Render.LightVolumeBaker.Bake(name, settings, scene, day, rig, token), token);
+}
+
+// The baked lattice into the level: its files queued for the save, the object placed (or moved), and a mesh the
+// viewport can draw now.
+void LvFinish(RefractorForge.Formats.Terrain.LightVolumeDef v, RefractorForge.Render.LightVolume.Built built)
+{
+    if (so is null || meshLib is null) return;
+    var (baseSub, levelName) = LevelIdentity();
+    string name = v.Name, tex = name[..^3];                      // rf_vol3_m1 -> texture rf_vol3
+    var latin = System.Text.Encoding.Latin1;
+    string rs = RefractorForge.Render.LightVolume.Shader(name, tex, v.Kind == 1);
+    var files = new List<(string RelPath, byte[] Bytes)>
+    {
+        ($"StandardMesh/{name}.sm", built.Sm),
+        ($"StandardMesh/{name}.rs", latin.GetBytes(rs)),
+        ($"Texture/{tex}.dds", DdsTexture.EncodeUncompressedMipped(built.Atlas)),
+        ($"Objects/{name}/Geometries.con", latin.GetBytes(RefractorForge.Render.LightVolume.GeometryScript(name, levelName, baseSub))),
+        ($"Objects/{name}/Objects.con", latin.GetBytes(RefractorForge.Render.LightVolume.ObjectScript(name))),
+        ($"Objects/{name}/{name}.con", latin.GetBytes("run Objects\r\nrun Geometries\r\n")),
+    };
+    foreach (var f in files) QueueLevelFile(f.RelPath, f.Bytes);
+    string? oc = PendingText("Objects/objects.con") ?? ReadLevelText("Objects/objects.con");
+    QueueLevelFile("Objects/objects.con", latin.GetBytes(RefractorForge.Formats.Con.DecalObject.PatchObjectsCon(oc, $"run {name}/{name}")));
+    if ((PendingText("Init.con") ?? ReadLevelText("Init.con")) is { } init)
+        QueueLevelFile("Init.con", latin.GetBytes(RefractorForge.Formats.Con.DecalObject.PatchInitCon(init, levelName, baseSub)));
+    BroadcastLevelFiles(name, files);
+
+    // What the viewport draws: the same quads with the atlas on them, blended.
+    var sm = RefractorForge.Formats.Rfa.StandardMesh.Parse(built.Sm);
+    var mat = sm.Lods[0][0];
+    var pos = mat.Vertices.Select(p => new Vector3(p.X, p.Y, p.Z)).ToArray();
+    var uvs = mat.Uvs.Select(u => new Vector2(u.U, u.V)).ToArray();
+    var idx = new List<int>();
+    foreach (var f in mat.Faces) { idx.Add(f.A); idx.Add(f.B); idx.Add(f.C); idx.Add(f.A); idx.Add(f.C); idx.Add(f.B); }   // both sides
+    meshLib.AddMesh(name, new MeshLibrary.Mesh(pos, uvs, new[]
+    {
+        new MeshLibrary.MaterialPart(idx.ToArray(), v.Kind == 0 ? Vector3.Zero : Vector3.One, built.Atlas, AlphaTest: false, Blend: true,
+                                     TextureName: tex, Opacity: 0f, DepthWrite: false, TwoSided: true, Unlit: true, Additive: v.Kind == 1),
+    }));
+
+    // One object, where the box is and turned as it is: an earlier bake's object is replaced rather than nudged.
+    var at = new Vec3(v.X, v.Y, v.Z); var turn = new Vec3(v.Yaw, 0, 0);
+    var placed = so.Objects.Where(o => o.Template.Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
+    var cmds = new List<IEditCommand>();
+    bool inPlace = placed.Count == 1
+        && MathF.Abs(placed[0].Position.X - at.X) + MathF.Abs(placed[0].Position.Y - at.Y) + MathF.Abs(placed[0].Position.Z - at.Z) < 1e-3f
+        && MathF.Abs(placed[0].Rotation.X - turn.X) + MathF.Abs(placed[0].Rotation.Y) + MathF.Abs(placed[0].Rotation.Z) < 1e-3f;
+    if (!inPlace)
+    {
+        foreach (var o in placed) cmds.Add(new DeleteObject(o.Id));
+        cmds.Add(new AddObject(Guid.NewGuid().ToString("N"), name, at, turn));
+    }
+    if (cmds.Count > 0)
+    {
+        if (hist is not null) hist.Do(new CompositeCommand(cmds));
+        else foreach (var c in cmds) c.Apply(so);
+    }
+    v.Baked = true;
+    SyncMarkers(); RebuildObjects(); UploadMarkers(); RebuildCatalog();
+    lvStatus = string.Format(Loc.T("'{0}' baked: {1} planes, a {2} px atlas. Save writes it into the level."), name, built.Planes, built.Atlas.Width);
+    Console.WriteLine("Light volume: " + lvStatus);
+}
+
+void LvPoll()
+{
+    if (lvTask is { IsCompleted: true } t)
+    {
+        var v = lvBaking;
+        lvTask = null; lvBaking = null; lvCancel?.Dispose(); lvCancel = null;
+        if (t.IsFaulted) { lvStatus = Loc.T("Light volume bake failed: ") + t.Exception?.GetBaseException().Message; Toast(lvStatus); lvQueue.Clear(); }
+        else if (t.IsCanceled || t.Result is null) { lvStatus = Loc.T("Cancelled."); lvQueue.Clear(); }
+        else if (v is not null) LvFinish(v, t.Result);
+    }
+    if (lvTask is null && lvQueue.Count > 0)
+    {
+        var next = lvQueue[0]; lvQueue.RemoveAt(0);
+        if (lightRig.Volumes.Contains(next)) LvStartBake(next);
+    }
+}
+
+void LvRemove(RefractorForge.Formats.Terrain.LightVolumeDef v)
+{
+    lightRig.Volumes.Remove(v);
+    if (so is not null)
+    {
+        var dels = so.Objects.Where(o => o.Template.Equals(v.Name, StringComparison.OrdinalIgnoreCase))
+                             .Select(o => (IEditCommand)new DeleteObject(o.Id)).ToList();
+        if (dels.Count > 0)
+        {
+            if (hist is not null) hist.Do(new CompositeCommand(dels));
+            else foreach (var c in dels) c.Apply(so);
+            SyncMarkers(); RebuildObjects(); UploadMarkers();
+        }
+    }
+    lvSelected = Math.Min(lvSelected, lightRig.Volumes.Count - 1);
+}
+
+void LightVolumeWindow()
+{
+    LvPoll();
+    if (!showLightVolumes) return;
+    ImGui.SetNextWindowSize(new Vector2(520f * uiScale, 560f * uiScale), ImGuiCond.FirstUseEver);
+    ImGui.SetNextWindowSizeConstraints(new Vector2(420f * uiScale, 320f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
+    if (!ImGui.Begin(Loc.TL("Light Volumes") + "###lightvolumes", ref showLightVolumes)) { ImGui.End(); return; }
+    ImGui.PushTextWrapPos(0f);
+    Theme.Muted(Loc.T("The game has no fog you can shape and cannot darken a soldier standing in an unlit room. A light volume fakes both: a box filled with nearly transparent planes, whose tint adds up the further you look through it and covers whatever stands inside. Baking traces the light in the air of the box - sun, sky and your placed lamps - and writes it into the planes. BfVietnam only."));
+    ImGui.PopTextWrapPos();
+    bool busy = lvTask is not null;
+
+    ImGui.BeginDisabled(busy);
+    if (ImGui.Button(Loc.TL("Add at the camera"))) LvAddAtCamera();
+    ImGui.SameLine();
+    ImGui.BeginDisabled(multi.Count == 0);
+    if (ImGui.Button(Loc.TL("Add around the selected objects"))) LvAddAroundSelection();
+    ImGui.EndDisabled();
+    ImGui.EndDisabled();
+
+    var vols = lightRig.Volumes;
+    if (vols.Count == 0) { Theme.Muted(Loc.T("No volumes yet.")); }
+    else
+    {
+        if (ImGui.BeginListBox("##lvlist", new Vector2(-1f, MathF.Min(vols.Count, 6) * ImGui.GetTextLineHeightWithSpacing() + 6f)))
+        {
+            for (int i = 0; i < vols.Count; i++)
+            {
+                var v = vols[i];
+                var prs = LvPresets();
+                string what = v.Preset >= 0 && v.Preset < prs.Length ? prs[v.Preset].Name : Loc.T("custom");
+                string label = $"{v.Name}  -  {what}, {v.SizeX:0}x{v.SizeY:0}x{v.SizeZ:0} m{(v.Baked ? "" : "  " + Loc.T("(not baked)"))}###lv{i}";
+                if (ImGui.Selectable(label, lvSelected == i)) lvSelected = i;
+            }
+            ImGui.EndListBox();
+        }
+    }
+
+    if (lvSelected >= 0 && lvSelected < vols.Count)
+    {
+        var v = vols[lvSelected];
+        ImGui.Separator();
+        ImGui.BeginDisabled(busy);
+        var presets = LvPresets();
+        int preset = v.Preset;
+        var names = presets.Select(x => x.Name).Append(Loc.T("Custom")).ToArray();
+        int shown = preset >= 0 && preset < presets.Length ? preset : presets.Length;
+        if (Cbo(Loc.TL("Preset"), ref shown, names, names.Length)) LvApplyPreset(v, shown < presets.Length ? shown : -1);
+        if (v.Preset >= 0 && v.Preset < presets.Length) { ImGui.PushTextWrapPos(0f); Theme.Muted(presets[v.Preset].What); ImGui.PopTextWrapPos(); }
+
+        var pos = new Vector3(v.X, v.Y, v.Z);
+        if (DrgF3(Loc.TL("Floor centre"), ref pos, 0.1f)) { v.X = pos.X; v.Y = pos.Y; v.Z = pos.Z; v.Baked = false; }
+        var size = new Vector3(v.SizeX, v.SizeY, v.SizeZ);
+        if (DrgF3(Loc.TL("Size (x, height, z)"), ref size, 0.1f, 1f, 120f))
+        {
+            v.SizeX = Math.Clamp(size.X, 1f, 120f); v.SizeY = Math.Clamp(size.Y, 1f, 60f); v.SizeZ = Math.Clamp(size.Z, 1f, 120f); v.Baked = false;
+            if (v.Preset >= 0) v.Spacing = RefractorForge.Render.LightVolumeBaker.SpacingFor(new Vector3(v.SizeX, v.SizeY, v.SizeZ));
+        }
+        float yaw = v.Yaw;
+        if (DrgF(Loc.TL("Rotation (degrees)"), ref yaw, 0.5f, -360f, 360f, "%.1f")) { v.Yaw = yaw; v.Baked = false; }
+        if (ImGui.SmallButton(Loc.TL("Stand it on the ground"))) { v.Y = LvGround(v.X, v.Z); v.Baked = false; }
+
+        if (ImGui.CollapsingHeader(Loc.TL("Advanced") + "###lvadv"))
+        {
+            int kind = v.Kind;
+            if (Cbo(Loc.TL("Kind"), ref kind, new[] { Loc.T("Darkness where the air is unlit"), Loc.T("Glow where the lamps reach"), Loc.T("An even mist") }, 3))
+            { v.Kind = kind; v.Preset = -1; v.Baked = false; }
+            float spacing = v.Spacing;
+            if (DrgF(Loc.TL("Plane spacing (m)"), ref spacing, 0.05f, 0.25f, 4f, "%.2f")) { v.Spacing = Math.Clamp(spacing, 0.25f, 4f); v.Preset = -1; v.Baked = false; }
+            Theme.Tip(Loc.T("Closer planes hide the lattice better and cost more to draw. 0.5 m suits a room; use 1 m or more for a hangar."));
+            float strength = v.Strength;
+            if (DrgF(Loc.TL("Strength"), ref strength, 0.005f, 0f, 2f, "%.3f")) { v.Strength = Math.Clamp(strength, 0f, 2f); v.Preset = -1; v.Baked = false; }
+            Theme.Tip(Loc.T("Darkness: how fast unlit air swallows what is behind it, per metre - 0.12 leaves about a third after nine metres.\nGlow: how strongly the lamps' light shows in the air."));
+            if (v.Kind == 0)
+            {
+                float lit = v.LitLevel;
+                if (DrgF(Loc.TL("Counts as lit at"), ref lit, 0.005f, 0.02f, 1f, "%.2f")) { v.LitLevel = Math.Clamp(lit, 0.02f, 1f); v.Preset = -1; v.Baked = false; }
+                Theme.Tip(Loc.T("The on-screen brightness at which air is clear. Lower it on a night map, where even the lit places are dim."));
+            }
+            float fade = v.Fade;
+            if (DrgF(Loc.TL("Edge fade (m)"), ref fade, 0.05f, 0f, 10f, "%.2f")) { v.Fade = Math.Clamp(fade, 0f, 10f); v.Preset = -1; v.Baked = false; }
+        }
+        ImGui.EndDisabled();
+
+        var (planes, atlas) = LvCost(v);
+        Theme.Muted(string.Format(Loc.T("{0} planes, a {1} px texture ({2:0.0} MB)."), planes, atlas, atlas * (long)atlas * 4 * 1.34 / 1048576.0));
+        if (planes > 400) Theme.Muted(Loc.T("That is a lot of planes: widen the spacing or split the volume."));
+
+        ImGui.BeginDisabled(busy || planes > 1200);
+        if (ImGui.Button(Loc.TL("Bake this volume"))) LvStartBake(v);
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(busy);
+        if (ImGui.Button(Loc.TL("Bake all"))) { lvQueue = vols.ToList(); }
+        ImGui.SameLine();
+        if (ImGui.Button(Loc.TL("Remove"))) LvRemove(v);
+        ImGui.EndDisabled();
+    }
+    if (busy) { ImGui.SameLine(); if (ImGui.SmallButton(Loc.TL("Cancel") + "###lvcancel")) lvCancel?.Cancel(); }
+    if (lvStatus.Length > 0) { ImGui.PushTextWrapPos(0f); Theme.Muted(lvStatus); ImGui.PopTextWrapPos(); }
+    ImGui.End();
 }
 
 void LmReadyWindow()
@@ -18104,6 +18448,7 @@ void BuildUi()
                 ImGui.TextDisabled(Loc.T("OBJECT LIGHTMAPS"));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
                 if (ImGui.MenuItem(Loc.TL("Lightmap-Ready Objects..."), null, false, so is not null && meshLib is not null)) OpenLmReady();
+                if (!gameIsBf1942 && ImGui.MenuItem(Loc.TL("Light Volumes..."), null, false, so is not null && meshLib is not null)) showLightVolumes = true;
                 Theme.Tip(Loc.T("Each placed object's lighting (sun, terrain shadow, placed lights) into ObjectLightMaps/*.tga.\nShadow goes to 0 like retail; the game adds renderer.LMambientColor on top, and so does the editor.\nWrites lightmaps only - the terrain shadow below is a separate bake."));
                 // The quality choice belongs beside the button that uses it. It also lives in the Lights panel,
                 // but that is not where anyone goes to start a bake.
@@ -18653,6 +18998,7 @@ void BuildUi()
     GpuSelfTestPoll();
     LmReadyPoll();
     LmReadyWindow();
+    LightVolumeWindow();
     LightmapBakeProgress();
     ShadowBakeProgress();
     BrightenDialog();
