@@ -7,9 +7,11 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/RefractorForge.Formats/RefractorForge.Formats.csproj" />
     <ProjectReference Include="../../src/RefractorForge.Render/RefractorForge.Render.csproj" />
+    <ProjectReference Include="../../src/RefractorForge.VkTrace/RefractorForge.VkTrace.csproj" />
   </ItemGroup>
 </Project>

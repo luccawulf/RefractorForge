@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Numerics;
 using RefractorForge.Render;
+using RefractorForge.VkTrace;
 using Silk.NET.OpenGL;
 
 namespace RefractorForge.Viewer;
@@ -20,7 +21,10 @@ namespace RefractorForge.Viewer;
 /// tracer. Before the mode is first shown the GPU is run against that C# copy on a small view, and the mode refuses
 /// to start if they disagree - nothing here has been run on the GPU by the person who wrote it.</para>
 ///
-/// <para><b>Hardware.</b> Software BVH traversal in an OpenGL 4.3 compute shader, as the Ultra lightmap bake already
+/// <para><b>Hardware.</b> Where the machine has a dedicated card with hardware ray tracing, the kernel runs on Vulkan
+/// ray queries instead (<see cref="VulkanTracer"/>): the same lighting, the traversal done by the card's RT cores, and
+/// its picture handed back to this class's textures - at 4K that is the difference between five frames a second and
+/// editing speed. Otherwise: software BVH traversal in an OpenGL 4.3 compute shader, as the Ultra lightmap bake already
 /// does: OpenGL has no access to RT cores. Refused on anything <see cref="GpuAdapter"/> does not call a dedicated
 /// card, because a sustained load on this machine's integrated GPU has already ended in a bugcheck. Each frame is
 /// split into bands of rows so no single dispatch can run long enough for Windows to reset the driver.</para>
@@ -503,8 +507,74 @@ void main(){
     } else gl_FragDepth = 1.0;
 }";
 
+    // ---- the composite for the Vulkan kernel ---------------------------------------------------------------------
+    // The card hands back the LIGHT (already a display multiplier, with the camera distance in alpha) and the
+    // surface's own colour where it has one (the ground picture, or a triangle's mean colour). An object's real
+    // texture colour is in this class's G-buffer, and is used wherever the two agree on how far away the surface is.
+    public const string CompFragVk = @"#version 330 core
+uniform sampler2D uLight; uniform sampler2D uAlbV; uniform sampler2D uGAlb; uniform sampler2D uGDist;
+uniform mat4 uInvVP; uniform mat4 uVP; uniform vec3 uCamPos; uniform vec2 uWin;
+uniform float uExposure; uniform float uInvGamma;
+uniform vec3 uZenith; uniform vec3 uHorizon; uniform vec3 uGroundRad;
+uniform int uHasWater; uniform float uWaterLevel;
+out vec4 frag;
+vec3 env(vec3 d){ return d.y > 0.0 ? mix(uHorizon, uZenith, pow(clamp(d.y, 0.0, 1.0), 0.6)) : uGroundRad; }
+vec3 toDisp(vec3 l){ return pow(max(l * uExposure, vec3(0.0)), vec3(uInvGamma)); }
+vec3 sky(vec3 d){ return min(toDisp(env(vec3(d.x, max(d.y, 0.001), d.z)) * 2.4), vec3(1.0)); }
+void main(){
+    vec2 uv = gl_FragCoord.xy / uWin;
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 pa = uInvVP * vec4(ndc, 0.0, 1.0), pb = uInvVP * vec4(ndc, 1.0, 1.0);
+    vec3 o = pa.xyz / pa.w;
+    vec3 dir = normalize(pb.xyz / pb.w - o);
+    vec4 l = texture(uLight, uv);
+    vec4 fa = texture(uAlbV, uv);
+    bool hit = l.a >= 0.0;
+    float t = l.a;
+    vec3 albedo = fa.rgb;
+    if (hit && fa.a < 0.75) {
+        vec4 ra = texture(uGAlb, uv);
+        float rd = texture(uGDist, uv).r;
+        if (ra.a > 0.5 && abs(rd - t) < 0.3 + 0.02 * t) albedo = ra.rgb;
+    }
+    vec3 surface = hit ? albedo * l.rgb : vec3(0.0);
+    vec3 c = hit ? surface : sky(dir);
+    if (uHasWater == 1 && dir.y < -1e-4 && uCamPos.y > uWaterLevel) {
+        float tw = (uWaterLevel - uCamPos.y) / dir.y;
+        if (tw > 0.0 && (!hit || tw < t)) {
+            vec3 under = hit ? surface : vec3(0.05, 0.08, 0.09);
+            vec3 mirror = sky(vec3(dir.x, -dir.y, dir.z));
+            float fres = 0.08 + 0.92 * pow(1.0 - min(1.0, -dir.y), 4.0);
+            c = mix(under * vec3(0.45, 0.6, 0.6), mirror, clamp(fres, 0.0, 0.85));
+            t = tw; hit = true;
+        }
+    }
+    frag = vec4(clamp(c, 0.0, 1.0), 1.0);
+    if (hit) {
+        vec4 clip = uVP * vec4(uCamPos + dir * t, 1.0);
+        gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+    } else gl_FragDepth = 1.0;
+}";
+
     // ---- state ---------------------------------------------------------------------------------------------------
     private readonly GL _gl;
+    // The Vulkan kernel, when this machine has a card for it; null leaves the OpenGL kernel below in charge.
+    private VulkanTracer? _vk;
+    private uint _compVk, _lightTex, _albVTex;
+    private readonly Dictionary<string, int> _ucv = new();
+    private int _spp = 1;
+    private int _slowLogged;
+    private int _frameNo;
+    /// <summary>The kernel runs on hardware ray tracing (Vulkan), not the OpenGL compute shader.</summary>
+    public bool Hardware => _vk is not null;
+    /// <summary>Why the hardware path is not in use, when it is not ("" when it is, or was never tried).</summary>
+    public string HardwareNote { get; private set; } = "";
+    /// <summary>Light samples traced per pixel in the last frame (the hardware path traces several when it has time).</summary>
+    public int SamplesPerFrame => _spp;
+    /// <summary>Milliseconds the card spent tracing the last frame, without the hand-over to OpenGL.</summary>
+    public double TraceMs { get; private set; }
+    /// <summary>The framebuffer the finished picture is drawn into: 0, the window, in the editor.</summary>
+    public uint TargetFramebuffer;
     private uint _kernel, _gbuf, _comp, _emptyVao;
     private readonly uint[] _ssbo = new uint[8];
     private readonly Dictionary<string, int> _uk = new(), _ug = new(), _uc = new();
@@ -547,12 +617,6 @@ void main(){
     private void Init()
     {
         int major = _gl.GetInteger(GetPName.MajorVersion), minor = _gl.GetInteger(GetPName.MinorVersion);
-        bool core43 = major > 4 || (major == 4 && minor >= 3);
-        if (!core43 && !(HasExtension("GL_ARB_compute_shader") && HasExtension("GL_ARB_shader_storage_buffer_object")))
-        {
-            Status = $"The traced view needs OpenGL 4.3 compute shaders; this context is {major}.{minor}.";
-            return;
-        }
         string renderer = _gl.GetStringS(StringName.Renderer) ?? "";
         if (!GpuAdapter.LooksDiscrete(renderer))
         {
@@ -561,11 +625,38 @@ void main(){
                      "Display > Graphics (or in the NVIDIA Control Panel) and restart the editor.";
             return;
         }
-        int blocks = _gl.GetInteger((GetPName)GLEnum.MaxComputeShaderStorageBlocks);
-        if (blocks < 8) { Status = $"The traced view needs 8 storage buffers in a compute shader; this card allows {blocks}."; return; }
+        // Hardware ray tracing first. It needs nothing of OpenGL but two textures to hand its picture to.
+        try
+        {
+            var vk = new VulkanTracer();
+            if (vk.Available) _vk = vk;
+            else { HardwareNote = vk.Status; vk.Dispose(); }
+        }
+        catch (Exception ex) { HardwareNote = "Vulkan could not be started: " + ex.Message; }
+        if (_vk is null) Console.WriteLine("Traced view: hardware ray tracing is not in use - " + HardwareNote);
 
-        _kernel = Compute(KernelSource, out string err);
-        if (_kernel == 0) { Status = "The traced view's kernel failed to build: " + err; Console.WriteLine(Status); return; }
+        string err;
+        if (_vk is null)
+        {
+            bool core43 = major > 4 || (major == 4 && minor >= 3);
+            if (!core43 && !(HasExtension("GL_ARB_compute_shader") && HasExtension("GL_ARB_shader_storage_buffer_object")))
+            {
+                Status = $"The traced view needs OpenGL 4.3 compute shaders; this context is {major}.{minor}.";
+                return;
+            }
+            int blocks = _gl.GetInteger((GetPName)GLEnum.MaxComputeShaderStorageBlocks);
+            if (blocks < 8) { Status = $"The traced view needs 8 storage buffers in a compute shader; this card allows {blocks}."; return; }
+            _kernel = Compute(KernelSource, out err);
+            if (_kernel == 0) { Status = "The traced view's kernel failed to build: " + err; Console.WriteLine(Status); return; }
+        }
+        else
+        {
+            _compVk = Program2(CompVert, CompFragVk, out err);
+            if (_compVk == 0) { Status = "The traced view's composite shader failed to build: " + err; Console.WriteLine(Status); return; }
+            foreach (var n in new[] { "uLight", "uAlbV", "uGAlb", "uGDist", "uInvVP", "uVP", "uCamPos", "uWin", "uExposure", "uInvGamma",
+                                      "uZenith", "uHorizon", "uGroundRad", "uHasWater", "uWaterLevel" })
+                _ucv[n] = _gl.GetUniformLocation(_compVk, n);
+        }
         _gbuf = Program2(GBufVert, GBufFrag, out err);
         if (_gbuf == 0) { Status = "The traced view's G-buffer shader failed to build: " + err; Console.WriteLine(Status); return; }
         _comp = Program2(CompVert, CompFrag, out err);
@@ -585,7 +676,7 @@ void main(){
         for (int i = 0; i < _ssbo.Length; i++) _ssbo[i] = _gl.GenBuffer();
         _emptyVao = _gl.GenVertexArray();
         for (int i = 0; i < _queries.Length; i++) _queries[i] = _gl.GenQuery();
-        Status = $"{renderer} (OpenGL {major}.{minor})";
+        Status = _vk is not null ? $"{_vk.DeviceName} (hardware ray tracing, Vulkan)" : $"{renderer} (OpenGL {major}.{minor})";
         Available = true;
     }
 
@@ -655,6 +746,15 @@ void main(){
     public void SetScene(LiveTraceScene scene, Texture2D? ground)
     {
         if (!Available) return;
+        if (_vk is not null)
+        {
+            // The card builds its own acceleration structure from the triangles; none of the BVH goes to OpenGL.
+            _vk.SetScene(scene, ground);
+            _hasGround = ground is not null;
+            Scene = scene;
+            Reset();
+            return;
+        }
         for (int i = 0; i < 32 && _gl.GetError() != GLEnum.NoError; i++) { }
         Upload(0, scene.NodeBounds); Upload(1, scene.NodeLinks); Upload(2, scene.Tris);
         Upload(3, scene.Index); Upload(4, scene.Cuts); Upload(5, scene.MaskBits);
@@ -698,7 +798,7 @@ void main(){
     }
 
     /// <summary>Start the picture again: the camera, the light or the level changed.</summary>
-    public void Reset() { Samples = 0; _needGBuffer = true; }
+    public void Reset() { Samples = 0; _needGBuffer = true; _vk?.Reset(); }
 
     // Internal targets: the G-buffer and the two textures the composite reads, at the traced resolution.
     private void EnsureTargets(int w, int h)
@@ -709,6 +809,7 @@ void main(){
         {
             _fbo = _gl.GenFramebuffer(); _gAlb = _gl.GenTexture(); _gDist = _gl.GenTexture(); _gDepth = _gl.GenRenderbuffer();
             _accumTex = _gl.GenTexture(); _surfTex = _gl.GenTexture();
+            _lightTex = _gl.GenTexture(); _albVTex = _gl.GenTexture();
         }
         _gl.BindTexture(TextureTarget.Texture2D, _gAlb);
         _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.UnsignedByte, null);
@@ -716,10 +817,21 @@ void main(){
         _gl.BindTexture(TextureTarget.Texture2D, _gDist);
         _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.R32f, (uint)w, (uint)h, 0, PixelFormat.Red, PixelType.Float, null);
         Linear(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
-        foreach (var t in new[] { _accumTex, _surfTex })
+        if (_vk is null)
+            foreach (var t in new[] { _accumTex, _surfTex })
+            {
+                _gl.BindTexture(TextureTarget.Texture2D, t);
+                _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba32f, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.Float, null);
+                Linear(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+            }
+        else
         {
-            _gl.BindTexture(TextureTarget.Texture2D, t);
-            _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba32f, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.Float, null);
+            // What the card hands back: the light as half floats, and the surface's own colour.
+            _gl.BindTexture(TextureTarget.Texture2D, _lightTex);
+            _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba16f, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.HalfFloat, null);
+            Linear(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+            _gl.BindTexture(TextureTarget.Texture2D, _albVTex);
+            _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.UnsignedByte, null);
             Linear(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
         }
         _gl.BindTexture(TextureTarget.Texture2D, 0);
@@ -733,7 +845,7 @@ void main(){
         var status = _gl.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         if (status != GLEnum.FramebufferComplete) throw new InvalidOperationException("the traced view's G-buffer is incomplete: " + status);
-        AllocFrame(w, h);
+        if (_vk is null) AllocFrame(w, h);
         Reset();
     }
 
@@ -765,6 +877,7 @@ void main(){
         EnsureTargets(p.Width, p.Height);
         int prevProg = _gl.GetInteger(GetPName.CurrentProgram);
         _gl.GetInteger(GLEnum.DepthFunc, out int prevDepthFunc);
+        if (_vk is not null) { FrameVulkan(p, viewProj, winW, winH, waterLevel, drawGeometry, prevProg, prevDepthFunc); return; }
         ReadTimers();
 
         if (Samples < SampleCap)
@@ -787,7 +900,7 @@ void main(){
                 Set(_ug, "uTex", 0);
                 drawGeometry(viewProj);
                 _gl.DepthMask(true);
-                _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+                _gl.BindFramebuffer(FramebufferTarget.Framebuffer, TargetFramebuffer);
                 _gl.Viewport(0, 0, (uint)winW, (uint)winH);
                 _needGBuffer = false;
             }
@@ -824,6 +937,103 @@ void main(){
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
         _gl.DepthFunc((DepthFunction)prevDepthFunc);
         _gl.BindVertexArray(0);
+        _gl.UseProgram((uint)prevProg);
+        Check("drawing the traced view");
+    }
+
+    // The G-buffer: each object's texture colour and its distance from the camera, once per change of view.
+    private void DrawGBuffer(LiveTraceKernel.Params p, Matrix4x4 viewProj, int winW, int winH, Action<Matrix4x4> drawGeometry)
+    {
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
+        _gl.DrawBuffers(2, new[] { DrawBufferMode.ColorAttachment0, DrawBufferMode.ColorAttachment1 });
+        _gl.Viewport(0, 0, (uint)_w, (uint)_h);
+        _gl.Disable(EnableCap.Blend);
+        _gl.Enable(EnableCap.DepthTest);
+        _gl.DepthMask(true);
+        float* clear = stackalloc float[4];
+        _gl.GetFloat(GetPName.ColorClearValue, clear);
+        _gl.ClearColor(0f, 0f, 0f, 0f);
+        _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        _gl.ClearColor(clear[0], clear[1], clear[2], clear[3]);   // the editor clears its own frame with this
+        _gl.UseProgram(_gbuf);
+        Set3(_ug, "uCamPos", p.CamPos);
+        Set(_ug, "uTex", 0);
+        drawGeometry(viewProj);
+        _gl.DepthMask(true);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, TargetFramebuffer);
+        _gl.Viewport(0, 0, (uint)winW, (uint)winH);
+        _needGBuffer = false;
+    }
+
+    // A frame with the kernel on the card's RT hardware: trace, take the two pictures into textures, composite.
+    private void FrameVulkan(LiveTraceKernel.Params p, Matrix4x4 viewProj, int winW, int winH, float? waterLevel,
+                             Action<Matrix4x4> drawGeometry, int prevProg, int prevDepthFunc)
+    {
+        var vk = _vk!;
+        if (Samples < SampleCap)
+        {
+            _frameNo++;
+            long tg = Stopwatch.GetTimestamp();
+            bool drewG = _needGBuffer;
+            if (_needGBuffer) DrawGBuffer(p, viewProj, winW, winH, drawGeometry);
+            double gMs = Stopwatch.GetElapsedTime(tg).TotalMilliseconds;
+            bool first = Samples == 0;
+            long t0 = Stopwatch.GetTimestamp();
+            var fr = vk.Trace(p, _spp);
+            double traceWall = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            _gl.BindBuffer(BufferTargetARB.PixelUnpackBuffer, 0);
+            _gl.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+            _gl.BindTexture(TextureTarget.Texture2D, _lightTex);
+            _gl.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, (uint)_w, (uint)_h, PixelFormat.Rgba, PixelType.HalfFloat, (void*)fr.Light);
+            if (first)
+            {
+                // The surface's own colour only changes when the view does.
+                _gl.BindTexture(TextureTarget.Texture2D, _albVTex);
+                _gl.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, (uint)_w, (uint)_h, PixelFormat.Rgba, PixelType.UnsignedByte, (void*)fr.Albedo);
+            }
+            _gl.BindTexture(TextureTarget.Texture2D, 0);
+            LastGpuMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            TraceMs = vk.LastGpuMs;
+            Samples = vk.Samples;
+            // A frame that takes this long is a fault, not a frame: say where the time went, once in a while.
+            if ((gMs + LastGpuMs > 100.0 || _slowLogged < 3 || _frameNo % 60 == 0) && _slowLogged < 60)
+            {
+                _slowLogged++;
+                Console.WriteLine($"Traced view frame: {_w} x {_h}, {_spp} sample(s), G-buffer {(drewG ? gMs.ToString("0") + " ms" : "kept")}, card {traceWall:0} ms in {vk.LastBands} band(s) (longest {vk.LastMaxBandMs:0} ms), hand-over {LastGpuMs - traceWall:0} ms.");
+            }
+            // Spend spare time on more light samples a frame, so a moving view is less grainy; give it back when a
+            // frame runs long.
+            if (LastGpuMs < 7.0 && _spp < 16) _spp *= 2;
+            else if (LastGpuMs > 18.0 && _spp > 1) _spp /= 2;
+        }
+
+        _gl.UseProgram(_compVk);
+        _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, _lightTex);
+        _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, _albVTex);
+        _gl.ActiveTexture(TextureUnit.Texture2); _gl.BindTexture(TextureTarget.Texture2D, _gAlb);
+        _gl.ActiveTexture(TextureUnit.Texture3); _gl.BindTexture(TextureTarget.Texture2D, _gDist);
+        _gl.ActiveTexture(TextureUnit.Texture0);
+        Set(_ucv, "uLight", 0); Set(_ucv, "uAlbV", 1); Set(_ucv, "uGAlb", 2); Set(_ucv, "uGDist", 3);
+        Matrix4x4.Invert(viewProj, out var inv);
+        SetMat(_ucv, "uInvVP", inv); SetMat(_ucv, "uVP", viewProj);
+        Set3(_ucv, "uCamPos", p.CamPos);
+        if (_ucv["uWin"] >= 0) _gl.Uniform2(_ucv["uWin"], (float)winW, (float)winH);
+        Set(_ucv, "uExposure", p.Exposure); Set(_ucv, "uInvGamma", 1f / p.Gamma);
+        Set3(_ucv, "uZenith", p.SkyZenith); Set3(_ucv, "uHorizon", p.SkyHorizon); Set3(_ucv, "uGroundRad", p.GroundRadiance);
+        Set(_ucv, "uHasWater", waterLevel is null ? 0 : 1); Set(_ucv, "uWaterLevel", waterLevel ?? 0f);
+        _gl.Disable(EnableCap.Blend);
+        _gl.Enable(EnableCap.DepthTest);
+        _gl.DepthFunc(DepthFunction.Always);
+        _gl.DepthMask(true);
+        _gl.BindVertexArray(_emptyVao);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        _gl.DepthFunc((DepthFunction)prevDepthFunc);
+        _gl.BindVertexArray(0);
+        // Units 2 and 3 are the editor's own (the detail texture, the sun shadow): leave nothing of this bound there.
+        _gl.ActiveTexture(TextureUnit.Texture3); _gl.BindTexture(TextureTarget.Texture2D, 0);
+        _gl.ActiveTexture(TextureUnit.Texture2); _gl.BindTexture(TextureTarget.Texture2D, 0);
+        _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, 0);
+        _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.UseProgram((uint)prevProg);
         Check("drawing the traced view");
     }
@@ -950,15 +1160,34 @@ void main(){
         var sw = Stopwatch.StartNew();
         try
         {
-            for (int i = 0; i < 32 && _gl.GetError() != GLEnum.NoError; i++) { }
-            int prevProg = _gl.GetInteger(GetPName.CurrentProgram);
-            EnsureTargets(w, h);
-            for (uint f = 0; f < frames; f++) Dispatch(p, f, f == 0, useRaster: false);
-            _gl.MemoryBarrier(MemoryBarrierMask.BufferUpdateBarrierBit | MemoryBarrierMask.ShaderStorageBarrierBit);
-            _gl.Finish();
-            double gpuMs = sw.Elapsed.TotalMilliseconds;
-            var acc = Read(6, w * h * 4); var sf = Read(7, w * h * 4);
-            _gl.UseProgram((uint)prevProg);
+            float[] acc, sf;
+            double gpuMs;
+            // The distance comes back from the card as a half float: about three significant digits.
+            float relTol = _vk is null ? 1e-3f : 3e-3f, absTol = _vk is null ? 1e-3f : 0.02f;
+            if (_vk is not null)
+            {
+                _vk.Reset();
+                VulkanTracer.Frame fr = default;
+                for (int f = 0; f < frames; f++) fr = _vk.Trace(p, 1);       // sample f of the card = frame f of the C# copy
+                gpuMs = sw.Elapsed.TotalMilliseconds;
+                acc = _vk.ReadAccum();
+                sf = new float[w * h * 4];
+                Half* light = (Half*)fr.Light;
+                for (int i = 0; i < w * h; i++) sf[i * 4 + 3] = (float)light[i * 4 + 3];
+                _vk.Reset();
+            }
+            else
+            {
+                for (int i = 0; i < 32 && _gl.GetError() != GLEnum.NoError; i++) { }
+                int prevProg = _gl.GetInteger(GetPName.CurrentProgram);
+                EnsureTargets(w, h);
+                for (uint f = 0; f < frames; f++) Dispatch(p, f, f == 0, useRaster: false);
+                _gl.MemoryBarrier(MemoryBarrierMask.BufferUpdateBarrierBit | MemoryBarrierMask.ShaderStorageBarrierBit);
+                _gl.Finish();
+                gpuMs = sw.Elapsed.TotalMilliseconds;
+                acc = Read(6, w * h * 4); sf = Read(7, w * h * 4);
+                _gl.UseProgram((uint)prevProg);
+            }
 
             // The C# side of the comparison, spread over the processor's cores: on a big level it is a few seconds.
             var cpuLight = new Vector3[w * h]; var cpuDist = new float[w * h];
@@ -977,7 +1206,7 @@ void main(){
                     var last = new LiveTraceKernel.Sample(e, Vector3.Zero, cpuDist[py * w + px]);
                     int o = (py * w + px) * 4;
                     bool cpuHit = last.Distance >= 0f, gpuHit = sf[o + 3] >= 0f;
-                    if (cpuHit != gpuHit || (cpuHit && MathF.Abs(sf[o + 3] - last.Distance) > 1e-3f * last.Distance + 1e-3f)) { missMatch++; continue; }
+                    if (cpuHit != gpuHit || (cpuHit && MathF.Abs(sf[o + 3] - last.Distance) > relTol * last.Distance + absTol)) { missMatch++; continue; }
                     if (!cpuHit) continue;
                     surfaces++;
                     float cpu = EngineLight.Luma(LiveTraceKernel.ToDisplay(p, e / frames));
@@ -1027,7 +1256,9 @@ void main(){
 
     public void Dispose()
     {
-        foreach (var p in new[] { _kernel, _gbuf, _comp }) if (p != 0) _gl.DeleteProgram(p);
+        _vk?.Dispose(); _vk = null;
+        foreach (var p in new[] { _kernel, _gbuf, _comp, _compVk }) if (p != 0) _gl.DeleteProgram(p);
+        foreach (var t in new[] { _lightTex, _albVTex }) if (t != 0) _gl.DeleteTexture(t);
         foreach (var b in _ssbo) if (b != 0) _gl.DeleteBuffer(b);
         foreach (var t in new[] { _gAlb, _gDist, _accumTex, _surfTex, _groundTex }) if (t != 0) _gl.DeleteTexture(t);
         if (_gDepth != 0) _gl.DeleteRenderbuffer(_gDepth);

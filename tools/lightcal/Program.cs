@@ -908,6 +908,122 @@ if (cmd == "variant")
     return;
 }
 
+if (cmd == "vktrace")
+{
+    // vktrace <ArchivesDir> <levelName> <outDir> [eyeX eyeY eyeZ targetX targetY targetZ] : the Vulkan traced view on a
+    // real level, headless. Checks the card's kernel against the C# reference on a small view, times frames at
+    // several sizes, and writes the picture. Runs only on a discrete card with hardware ray tracing.
+    string arcDir = args[1], lvl = args[2], outD = args[3];
+    Directory.CreateDirectory(outD);
+    bool Is(string f, string stem) { var n = Path.GetFileNameWithoutExtension(f); return n.Equals(stem, StringComparison.OrdinalIgnoreCase) || (n.StartsWith(stem + "_", StringComparison.OrdinalIgnoreCase) && n[(stem.Length + 1)..].All(char.IsDigit)); }
+    string game = Directory.Exists(Path.Combine(arcDir, "bf1942", "levels")) ? "bf1942" : "BfVietnam";
+    var levelRfas = Directory.GetFiles(Path.Combine(arcDir, game, "levels"), "*.rfa").Where(f => Is(f, lvl)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+    var top = Directory.GetFiles(arcDir, "*.rfa").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+    var meshA = top.Where(f => Is(f, "standardMesh") || Is(f, "Objects") || Is(f, "treeMesh")).Concat(levelRfas).ToArray();
+    var texA = top.Where(f => Is(f, "texture")).Concat(levelRfas).ToArray();
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var loaded = LevelArchive.FromRfa(levelRfas);
+    var lib = MeshLibrary.Open(meshA);
+    lib.AttachTextures(TextureLibrary.Open(texA));
+    var envS = loaded.Environment;
+    var toSun = envS is null ? Vector3.Normalize(new Vector3(-0.5f, 0.8f, -0.35f)) : Vector3.Normalize(new Vector3(envS.SunDirection.X, envS.SunDirection.Y, envS.SunDirection.Z));
+    var day = new Daylight { ToSun = toSun }.Build();
+    var built = LightScene.Build(loaded.Heightmap, loaded.Config, null, loaded.StaticObjects, lib);
+    var scene = LiveTraceScene.From(built) ?? throw new InvalidOperationException("no geometry");
+    Console.WriteLine($"{lvl}: {scene.TriCount:N0} triangles ({scene.TerrainTris:N0} terrain), scene built in {sw.Elapsed.TotalSeconds:0.0} s");
+
+    float F(int i, float d) => args.Length > i ? float.Parse(args[i], System.Globalization.CultureInfo.InvariantCulture) : d;
+    float ws = loaded.Config.WorldSize;
+    var eye = new Vector3(F(4, ws * 0.5f), F(5, 0f), F(6, ws * 0.5f - 60f));
+    var target = new Vector3(F(7, ws * 0.5f), F(8, 0f), F(9, ws * 0.5f));
+    if (args.Length <= 5)
+    {
+        // No view given: stand 25 m above the ground near the first object and look at it.
+        var o0 = loaded.StaticObjects.Objects.Count > 0 ? loaded.StaticObjects.Objects[loaded.StaticObjects.Objects.Count / 2].Position : new RefractorForge.Formats.Geometry.Vec3(ws / 2, 40, ws / 2);
+        target = new Vector3(o0.X, o0.Y + 3f, o0.Z);
+        eye = target + new Vector3(-45f, 22f, -45f);
+    }
+    Matrix4x4 ViewProj(int w, int h)
+    {
+        var view = Matrix4x4.CreateLookAt(eye, target, Vector3.UnitY);
+        var proj = Matrix4x4.CreatePerspectiveFieldOfView(60f * MathF.PI / 180f, w / (float)h, 0.3f, ws * 3f);
+        return view * proj;
+    }
+    LiveTraceKernel.Params P(int w, int h) => LiveTraceKernel.Params.From(day, null, ViewProj(w, h), eye, w, h, null, ws, bounces: 2);
+
+    using var vk = new RefractorForge.VkTrace.VulkanTracer();
+    if (!vk.Available) { Console.WriteLine("NOT AVAILABLE: " + vk.Status); return; }
+    Console.WriteLine("card: " + vk.DeviceName);
+    sw.Restart();
+    vk.SetScene(scene, null);
+    Console.WriteLine($"scene on the card (acceleration structure built) in {sw.Elapsed.TotalMilliseconds:0} ms");
+
+    // ---- 1. the card against the C# kernel ----
+    {
+        int w = 96, h = 64;
+        var p = P(w, h);
+        vk.Reset();
+        vk.Trace(p, 1);
+        var acc = vk.ReadAccum();
+        int surface = 0, hitMismatch = 0, over = 0; double sum = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                var refS = LiveTraceKernel.Shade(scene, p, x, y, 0u, null);
+                int o = (y * w + x) * 4;
+                var gpu = new Vector3(acc[o], acc[o + 1], acc[o + 2]);
+                bool refHit = refS.Distance >= 0f;
+                if (!refHit) { if (gpu.LengthSquared() > 1e-6f) hitMismatch++; continue; }
+                surface++;
+                var a = LiveTraceKernel.ToDisplay(p, refS.Light); var b = LiveTraceKernel.ToDisplay(p, gpu);
+                float d = MathF.Max(MathF.Abs(a.X - b.X), MathF.Max(MathF.Abs(a.Y - b.Y), MathF.Abs(a.Z - b.Z))) * 255f;
+                sum += d; if (d > 24f) over++;
+            }
+        Console.WriteLine($"self-test {w}x{h}: {surface} surface pixels, {hitMismatch} sky/surface mismatches, mean difference {sum / Math.Max(surface, 1):0.00} of 255, {over * 100.0 / Math.Max(surface, 1):0.0}% over 24");
+    }
+
+    // ---- 2. timings ----
+    foreach (var (w, h) in new[] { (960, 556), (1920, 1112), (3840, 2224) })
+    {
+        var p = P(w, h);
+        vk.Reset();
+        vk.Trace(p, 1);                                    // the first frame pays for the new targets
+        double total = 0; const int frames = 20;
+        for (int i = 0; i < frames; i++) { vk.Trace(p, 1); total += vk.LastGpuMs; }
+        double four = 0;
+        for (int i = 0; i < 5; i++) { vk.Trace(p, 4); four += vk.LastGpuMs; }
+        Console.WriteLine($"{w} x {h}: {total / frames:0.0} ms a frame at 1 sample ({1000.0 / (total / frames):0} fps), {four / 5:0.0} ms at 4 samples");
+    }
+
+    // ---- 3. the picture ----
+    unsafe
+    {
+        int w = 1920, h = 1112;
+        var p = P(w, h);
+        vk.Reset();
+        RefractorForge.VkTrace.VulkanTracer.Frame fr = default;
+        for (int i = 0; i < 16; i++) fr = vk.Trace(p, 4);
+        var rgba = new byte[w * h * 4];
+        Half* light = (Half*)fr.Light; byte* alb = (byte*)fr.Albedo;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int s = (y * w + x) * 4, d = ((h - 1 - y) * w + x) * 4;      // row 0 is the bottom row
+                float dist = (float)light[s + 3];
+                for (int c = 0; c < 3; c++)
+                {
+                    float v = dist < 0f ? new[] { 0.55f, 0.68f, 0.9f }[c] : (alb[s + c] / 255f) * (float)light[s + c];
+                    rgba[d + c] = (byte)Math.Clamp((int)(v * 255f + 0.5f), 0, 255);
+                }
+                rgba[d + 3] = 255;
+            }
+        string png = Path.Combine(outD, lvl + "_vktrace.png");
+        SavePng(png, rgba, w, h);
+        Console.WriteLine($"picture ({vk.Samples} samples) -> {png}");
+    }
+    return;
+}
+
 if (cmd == "bake42")
 {
     // bake42 <ArchivesDir> <levelName> <outDir> [maxMaps] : the Battlefield 1942 traced bake on a real level, without

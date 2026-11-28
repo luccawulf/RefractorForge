@@ -87,6 +87,7 @@
   <ItemGroup>
     <ProjectReference Include="..\RefractorForge.Formats\RefractorForge.Formats.csproj" />
     <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
+    <ProjectReference Include="..\RefractorForge.VkTrace\RefractorForge.VkTrace.csproj" />
     <ProjectReference Include="..\RefractorForge.Collab\RefractorForge.Collab.csproj" />
   </ItemGroup>
 

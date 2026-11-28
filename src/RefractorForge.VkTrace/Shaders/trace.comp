@@ -1,0 +1,342 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// The live traced view's kernel on Vulkan hardware ray queries. The LIGHTING is Render/LiveTrace.cs
+// (LiveTraceKernel.Shade) line for line - the same seeds, the same samples, the same lamps - so the C# copy remains
+// the reference this is tested against. Only the two traversal routines differ: the BVH is the driver's, walked by
+// the RT cores, instead of a stack in the shader.
+//
+// Compile:  glslangValidator -V --target-env vulkan1.2 trace.comp -o trace.spv   (tools/compile-vktrace.ps1)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT uScene;
+layout(std430, set = 0, binding = 1) readonly buffer TrisBuf { vec4 tris[];     };   // a, e1, e2, (albedo, cut) per triangle
+layout(std430, set = 0, binding = 2) readonly buffer MapBuf  { int  triMap[];   };   // acceleration-structure order -> triangle
+layout(std430, set = 0, binding = 3) readonly buffer CutBuf  { vec4 cuts[];     };
+layout(std430, set = 0, binding = 4) readonly buffer MaskBuf { uint maskBits[]; };
+layout(set = 0, binding = 5, rgba32f) uniform image2D uAccum;                  // rgb = summed light, a = samples
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uLight;       // rgb = display multiplier, a = camera distance (-1 sky)
+layout(set = 0, binding = 7, rgba8)   uniform writeonly image2D uAlbedo;      // the surface's own colour where the raster has none
+layout(set = 0, binding = 8) uniform sampler2D uGround;
+
+const int MAXL = 96;
+layout(std140, set = 0, binding = 9) uniform Params
+{
+    mat4  uInvVP;
+    vec4  uCamPos;
+    ivec4 uSize;        // width, height, first sample index, reset
+    ivec4 uCounts;      // opaque triangles, terrain triangles, bounces, lamps
+    vec4  uToSun;       // xyz, tan(half the sun's angle)
+    vec4  uSunIrr;
+    vec4  uZenith;
+    vec4  uHorizon;
+    vec4  uGroundRad;
+    vec4  uMisc;        // exposure, gamma, bounce gain, world size
+    ivec4 uFlags;       // has ground picture, samples this frame, first row of this band, -
+    vec4  uLampA[MAXL]; // position, radius
+    vec4  uLampB[MAXL]; // colour, intensity
+    vec4  uLampC[MAXL]; // spot direction, cos(outer) or -2
+    vec4  uLampD[MAXL]; // cos(inner), falloff, source size, flags
+};
+
+const float FAR = 1.0e30;
+const float PI_F = 3.14159265;
+const float TAU_F = 6.28318531;
+const float FIXTURE = 0.35;
+
+uint mixs(uint a, uint b)
+{
+    uint x = a ^ (b + 0x9E3779B9u + (a << 6u) + (a >> 2u));
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float hash01(uint x)
+{
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return float(x & 0xFFFFFFu) / 16777216.0;
+}
+
+void basis(vec3 n, out vec3 u, out vec3 v)
+{
+    vec3 pick = abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    u = normalize(cross(n, pick));
+    v = cross(n, u);
+}
+
+bool cutSolid(int c, float u, float v)
+{
+    vec4 c0 = cuts[c * 2], c1 = cuts[c * 2 + 1];
+    float uvx = c0.x * (1.0 - u - v) + c0.z * u + c1.x * v;
+    float uvy = c0.y * (1.0 - u - v) + c0.w * u + c1.y * v;
+    int first = int(c1.z), wh = int(c1.w);
+    int w = wh >> 8, h = wh & 255;
+    float fu = uvx - floor(uvx), fv = uvy - floor(uvy);
+    int x = min(w - 1, int(fu * float(w))), y = min(h - 1, int(fv * float(h)));
+    int b = y * w + x;
+    return ((maskBits[first + (b >> 5)] >> uint(b & 31)) & 1u) != 0u;
+}
+
+// Geometry 0 holds the opaque triangles, geometry 1 the cut-out ones (leaves, fences); triMap gives the triangle.
+int triangleOf(int geometry, int primitive)
+{
+    return triMap[(geometry == 0 ? 0 : uCounts.x) + primitive];
+}
+
+// Walk the candidates: opaque triangles are accepted by the hardware, a cut-out one only where its mask is solid.
+#define WALK(rq)                                                                                                    \
+    while (rayQueryProceedEXT(rq))                                                                                  \
+    {                                                                                                               \
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)               \
+        {                                                                                                           \
+            int ct = triangleOf(rayQueryGetIntersectionGeometryIndexEXT(rq, false),                                 \
+                                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));                               \
+            float cut = tris[ct * 4 + 3].w;                                                                         \
+            vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, false);                                            \
+            if (cut < 0.0 || cutSolid(int(cut), bc.x, bc.y)) rayQueryConfirmIntersectionEXT(rq);                    \
+        }                                                                                                           \
+    }
+
+bool occluded(vec3 origin, vec3 dir, float maxDist, float skip)
+{
+    origin += dir * skip;
+    maxDist -= skip;
+    if (maxDist <= 0.0) return false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uScene, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 1.0e-4, dir, maxDist);
+    WALK(rq)
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+bool trace(vec3 origin, vec3 dir, float maxDist, float skip,
+           out int tri, out float dist, out vec3 point, out vec3 normal, out vec3 alb)
+{
+    tri = -1; dist = 0.0; point = vec3(0.0); normal = vec3(0.0); alb = vec3(0.0);
+    origin += dir * skip;
+    maxDist -= skip;
+    if (maxDist <= 0.0) return false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uScene, gl_RayFlagsNoneEXT, 0xFF, origin, 1.0e-4, dir, maxDist);
+    WALK(rq)
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return false;
+    int t = triangleOf(rayQueryGetIntersectionGeometryIndexEXT(rq, true), rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    float best = rayQueryGetIntersectionTEXT(rq, true);
+    vec3 nrm = cross(tris[t * 4 + 1].xyz, tris[t * 4 + 2].xyz);
+    float len = length(nrm);
+    nrm = len > 1e-12 ? nrm / len : vec3(0.0, 1.0, 0.0);
+    if (dot(nrm, dir) > 0.0) nrm = -nrm;
+    tri = t; dist = best + skip; point = origin + dir * best; normal = nrm;
+    alb = tris[t * 4 + 3].xyz;
+    return true;
+}
+
+vec3 environment(vec3 d)
+{
+    return d.y > 0.0 ? mix(uHorizon.xyz, uZenith.xyz, pow(clamp(d.y, 0.0, 1.0), 0.6)) : uGroundRad.xyz;
+}
+
+vec3 fromDisplay(vec3 d)
+{
+    if (uMisc.x <= 1e-9) return vec3(0.0);
+    return pow(max(d, vec3(0.0)), vec3(uMisc.y)) / uMisc.x;
+}
+
+vec3 toDisplay(vec3 l)
+{
+    return pow(max(l * uMisc.x, vec3(0.0)), vec3(1.0 / uMisc.y));
+}
+
+vec3 sunDisc(float e1, float e2)
+{
+    if (uToSun.w <= 0.0) return uToSun.xyz;
+    vec3 u, v;
+    basis(uToSun.xyz, u, v);
+    float r = uToSun.w * sqrt(e1), a = e2 * TAU_F;
+    return normalize(uToSun.xyz + u * (cos(a) * r) + v * (sin(a) * r));
+}
+
+float attenuation(int i, vec3 q)
+{
+    vec3 dv = q - uLampA[i].xyz;
+    float d2 = dot(dv, dv), r2 = uLampA[i].w * uLampA[i].w;
+    if (d2 >= r2) return 0.0;
+    float dist = sqrt(d2), t = dist / uLampA[i].w;
+    float window = 1.0 - t * t; window *= window;
+    float a = uLampB[i].w * pow(1.0 - t, uLampD[i].y) * window;
+    float co = uLampC[i].w, ci = uLampD[i].x;
+    if (co > -1.5)
+    {
+        if (dist < 1e-4) return a;
+        float cosA = dot(dv, uLampC[i].xyz) / dist;
+        if (cosA <= co) return 0.0;
+        if (!(cosA >= ci || ci <= co))
+        {
+            float k = (cosA - co) / (ci - co);
+            a *= k * k * (3.0 - 2.0 * k);
+        }
+    }
+    return a;
+}
+
+bool lampClear(vec3 q, vec3 n, vec3 lightPos)
+{
+    vec3 o = q + n * 0.03;
+    vec3 d = lightPos - o;
+    float len = length(d);
+    if (len < 1e-4) return true;
+    float reach = len - max(0.05, FIXTURE);
+    if (reach <= 0.0) return true;
+    return !occluded(o, d / len, reach, 0.01);
+}
+
+vec3 lamps(vec3 q, vec3 n, int ground, uint seed)
+{
+    vec3 sum = vec3(0.0);
+    const float wrap = 0.15;
+    for (int i = 0; i < uCounts.w; i++)
+    {
+        int flags = int(uLampD[i].w);
+        if (ground == 1 && (flags & 2) == 0) continue;
+        if (ground == 2 && (flags & 4) == 0) continue;
+        float a = attenuation(i, q);
+        if (a <= 0.0) continue;
+        vec3 toL = uLampA[i].xyz - q;
+        float len = length(toL);
+        float raw = len > 1e-4 ? dot(n, toL / len) : 1.0;
+        if (raw <= 0.0) continue;
+        float vis = 1.0;
+        if ((flags & 1) != 0 && len >= 1e-4)
+        {
+            float size = uLampD[i].z;
+            if (size <= 0.001) vis = lampClear(q, n, uLampA[i].xyz) ? 1.0 : 0.0;
+            else
+            {
+                vec3 dir = toL / len;
+                vec3 u = normalize(cross(dir, abs(dir.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+                vec3 v = cross(dir, u);
+                float rot = hash01(seed) * TAU_F;
+                float r1 = size * sqrt(hash01(mixs(seed, 31u)));
+                vis = lampClear(q, n, uLampA[i].xyz + u * (cos(rot) * r1) + v * (sin(rot) * r1)) ? 1.0 : 0.0;
+            }
+        }
+        if (vis <= 0.0) continue;
+        sum += uLampB[i].xyz * (a * (raw * (1.0 - wrap) + wrap) * vis);
+    }
+    return sum;
+}
+
+vec3 groundAt(vec3 q)
+{
+    if (uFlags.x == 0) return vec3(0.45, 0.42, 0.33);
+    vec2 uv = clamp(q.xz / uMisc.w, 0.0, 1.0);
+    return textureLod(uGround, uv, 0.0).rgb;
+}
+
+// One sample of the light on a surface point: LiveTraceKernel.Shade from "var start" on.
+vec3 lightSample(vec3 hp, vec3 n, bool terrain, uint seed)
+{
+    vec3 start = hp + n * 0.02;
+    vec3 e = vec3(0.0);
+
+    float ndl = dot(n, uToSun.xyz);
+    if (ndl > 0.0)
+    {
+        vec3 sd = sunDisc(hash01(mixs(seed, 1u)), hash01(mixs(seed, 2u)));
+        if (!occluded(start, sd, FAR, 0.02)) e += uSunIrr.xyz * ndl;
+    }
+
+    {
+        vec3 u, v;
+        basis(n, u, v);
+        float r2 = hash01(mixs(seed, 3u)), a = hash01(mixs(seed, 4u)) * TAU_F, r = sqrt(r2);
+        vec3 hdir = normalize(u * (cos(a) * r) + v * (sin(a) * r) + n * sqrt(max(0.0, 1.0 - r2)));
+        int btri; float bd; vec3 bp, bn, balb;
+        if (!trace(start, hdir, FAR, 0.02, btri, bd, bp, bn, balb))
+            e += environment(hdir) * PI_F;
+        else
+        {
+            vec3 throughput = vec3(1.0);
+            vec3 radiance = vec3(0.0);
+            uint ps = mixs(seed, 5u);
+            for (int depth = 0; depth < uCounts.z; depth++)
+            {
+                throughput *= balb * uMisc.z;
+                if (throughput.x + throughput.y + throughput.z < 1e-4) break;
+                float bl = dot(bn, uToSun.xyz);
+                if (bl > 0.0)
+                {
+                    vec3 sd = sunDisc(hash01(mixs(ps, uint(depth * 2 + 1))), hash01(mixs(ps, uint(depth * 2 + 2))));
+                    if (!occluded(bp, sd, FAR, 0.02)) radiance += throughput * uSunIrr.xyz * (bl / PI_F);
+                }
+                if (uCounts.w > 0)
+                {
+                    vec3 lamp = lamps(bp, bn, 0, mixs(ps, uint(depth * 2 + 201)));
+                    if (lamp.x + lamp.y + lamp.z > 0.0) radiance += throughput * fromDisplay(lamp) * (1.0 / PI_F);
+                }
+                vec3 hu, hv;
+                basis(bn, hu, hv);
+                float e1 = hash01(mixs(ps, uint(depth * 2 + 101))), e2 = hash01(mixs(ps, uint(depth * 2 + 102)));
+                float hr = sqrt(e1), ha = e2 * TAU_F;
+                vec3 next = normalize(hu * (cos(ha) * hr) + hv * (sin(ha) * hr) + bn * sqrt(max(0.0, 1.0 - e1)));
+                int ntri; float nd; vec3 np, nn, nalb;
+                if (!trace(bp, next, FAR, 0.02, ntri, nd, np, nn, nalb))
+                {
+                    radiance += throughput * environment(next);
+                    break;
+                }
+                bp = np; bn = nn; balb = nalb;
+            }
+            e += radiance * PI_F;
+        }
+    }
+
+    if (uCounts.w > 0)
+        e += fromDisplay(lamps(start, n, terrain ? 1 : 2, mixs(seed, 6u)));
+    return e;
+}
+
+void main()
+{
+    // A frame is dispatched as bands of rows, each its own submission, so no single command can run long enough
+    // for Windows to reset the driver.
+    ivec2 pix = ivec2(int(gl_GlobalInvocationID.x), int(gl_GlobalInvocationID.y) + uFlags.z);
+    if (pix.x >= uSize.x || pix.y >= uSize.y) return;
+
+    float nx = (float(pix.x) + 0.5) / float(uSize.x) * 2.0 - 1.0, ny = (float(pix.y) + 0.5) / float(uSize.y) * 2.0 - 1.0;
+    vec4 pa = uInvVP * vec4(nx, ny, 0.0, 1.0), pb = uInvVP * vec4(nx, ny, 1.0, 1.0);
+    vec3 origin = pa.xyz / pa.w;
+    vec3 dir = normalize(pb.xyz / pb.w - origin);
+
+    vec4 prev = uSize.w != 0 ? vec4(0.0) : imageLoad(uAccum, pix);
+    int samples = max(uFlags.y, 1);
+
+    int tri; float hd; vec3 hp, n, triAlb;
+    if (!trace(origin, dir, FAR, 0.0, tri, hd, hp, n, triAlb))
+    {
+        imageStore(uAccum, pix, prev + vec4(0.0, 0.0, 0.0, float(samples)));
+        imageStore(uLight, pix, vec4(0.0, 0.0, 0.0, -1.0));
+        imageStore(uAlbedo, pix, vec4(0.0));
+        return;
+    }
+    float camDist = distance(hp, uCamPos.xyz);
+    bool terrain = tri < uCounts.y;
+    vec3 albedo = terrain ? groundAt(hp) : pow(triAlb, vec3(1.0 / 2.2));
+
+    // The camera ray is the same for every sample of a frame; only the light is sampled again.
+    vec3 e = vec3(0.0);
+    uint pixelSeed = mixs(uint(pix.x), uint(pix.y));
+    for (int s = 0; s < samples; s++)
+        e += lightSample(hp, n, terrain, mixs(pixelSeed, uint(uSize.z + s)));
+
+    vec4 acc = prev + vec4(e, float(samples));
+    imageStore(uAccum, pix, acc);
+    imageStore(uLight, pix, vec4(toDisplay(acc.rgb / max(acc.a, 1.0)), camDist));
+    // Alpha: 1 = terrain (this colour is the ground picture), 0.5 = an object (the triangle's mean colour; the
+    // rasterised texture replaces it where the two agree on the distance).
+    imageStore(uAlbedo, pix, vec4(albedo, terrain ? 1.0 : 0.5));
+}

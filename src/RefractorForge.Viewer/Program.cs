@@ -83,6 +83,9 @@ if (args.Length >= 1 && args[0] == "--relay")
     return;
 }
 
+// The traced view checked end to end, with a hidden window and no editor (TraceCheck.cs).
+if (args.Length >= 1 && args[0] == "--trace-check") { Environment.ExitCode = RefractorForge.Viewer.TraceCheck.Run(args.Skip(1).ToArray()); return; }
+
 // GUI mode: show the launch splash immediately (its own STA thread keeps it painted during the level/GL load).
 Loc.Init();          // UI language (must precede the ImGui controller: the font atlas depends on the script)
 // First run only: ask which language to use, in both languages. Without this a Japanese speaker has to find
@@ -1650,7 +1653,7 @@ string? rlLevelSeen = null;                // the level the game-lighting switch
 RefractorForge.Viewer.LiveTraceView? liveTrace = null;
 bool tracedView = false;
 int traceRes = 0;                          // 0 auto, 1 full, 2 half, 3 quarter
-int traceAutoDiv = 1, traceAutoSettle = 0;
+int traceAutoDiv = 1, traceAutoSettle = 0, traceAutoSlow = 0;
 string traceSceneSig = "";
 bool traceStale = false;
 double traceStaleCheck = 0;
@@ -2275,7 +2278,12 @@ window.Render += dt =>
         // These two lines are what tell a hang apart from a throw apart from a healthy loop: neither = it never
         // finished a frame, first only = it died after one, both = rendering is fine and the fault is elsewhere.
         if (!firstFrameLogged) { firstFrameLogged = true; Console.WriteLine("First frame rendered."); }
-        else if (!steadyLogged && renderedFrames >= 300) { steadyLogged = true; Console.WriteLine($"Rendering steadily ({renderedFrames} frames)."); }
+        else if (!steadyLogged && renderedFrames >= 300)
+        {
+            steadyLogged = true; Console.WriteLine($"Rendering steadily ({renderedFrames} frames).");
+            // --traced: switch the traced view on by itself once the editor is up, for testing it without a click.
+            if (args.Contains("--traced")) { Console.WriteLine("--traced: switching the traced view on."); SetTracedView(true); Console.WriteLine($"--traced: traced view {(tracedView ? "ON" : "off")}."); }
+        }
     }
     catch (Exception ex)
     {
@@ -9530,6 +9538,7 @@ void OnRender(double dt)
 
     // The traced view draws the terrain, the objects, the sky and the water itself; everything after this block
     // (markers, gizmos, brushes) still goes on top of it.
+    if (tracedView && args.Contains("--traced-move")) cam.Yaw += 0.004f;   // test: a view that changes every frame
     if (!TraceThisFrame(fbSize))
     {
         Stage("terrain");
@@ -12495,8 +12504,19 @@ void SetTracedView(bool on)
         tracedView = false;
         return;
     }
-    traceAutoDiv = 1; traceAutoSettle = 0; traceParamSig = 0;
+    traceAutoDiv = TraceAutoStart(); traceAutoSettle = 30; traceAutoSlow = 0; traceParamSig = 0;
     tracedView = true;
+}
+
+// Where Auto starts: the first divisor at which no more than about 2.5 million pixels are traced, so a 4K window
+// begins at half. Full 4K is a quarter of a gigabyte of new textures on the card for a picture Auto would leave
+// within a second anyway - and on a card whose memory is already full, allocating them is what stalls.
+int TraceAutoStart()
+{
+    var fb = window.FramebufferSize;
+    int div = 1;
+    while (div < 4 && (long)(fb.X / div) * (fb.Y / div) > 2_500_000) div *= 2;
+    return div;
 }
 
 // The light as the Realistic Lighting window describes it, for one frame of the traced view.
@@ -12544,7 +12564,13 @@ bool TraceThisFrame(Silk.NET.Maths.Vector2D<int> fb)
     if (traceRes == 0)
     {
         if (traceAutoSettle > 0) traceAutoSettle--;
-        else if (liveTrace.LastGpuMs > 45 && traceAutoDiv < 4) { traceAutoDiv *= 2; traceAutoSettle = 12; }
+        else
+        {
+            // Only a RUN of slow frames lowers the resolution: one long frame - the first after new textures, a
+            // hitch while the card pages - says nothing about the frames after it, and dropped it for good.
+            traceAutoSlow = liveTrace.LastGpuMs > (liveTrace.Hardware ? 20 : 45) ? traceAutoSlow + 1 : 0;
+            if (traceAutoSlow >= 8 && traceAutoDiv < 4) { traceAutoDiv *= 2; traceAutoSettle = 30; traceAutoSlow = 0; }
+        }
     }
     return true;
 }
@@ -12600,8 +12626,9 @@ void TraceControls()
     if (liveTrace!.SelfTestPassed == false) Theme.Muted(Loc.T("GPU check: ") + liveTrace.SelfTestReport);
     if (!tracedView) return;
     string[] res = { Loc.T("Auto"), Loc.T("Full"), Loc.T("Half"), Loc.T("Quarter") };
-    if (Cbo(Loc.TL("Traced resolution"), ref traceRes, res, res.Length)) { traceAutoDiv = 1; traceAutoSettle = 12; }
+    if (Cbo(Loc.TL("Traced resolution"), ref traceRes, res, res.Length)) { traceAutoDiv = TraceAutoStart(); traceAutoSettle = 30; traceAutoSlow = 0; }
     Theme.Tip(Loc.T("How many pixels are traced. Auto starts at full and drops when a frame takes the GPU too long."));
+    Theme.Muted(Loc.T("Running on: ") + liveTrace.Status);
     Theme.Muted(string.Format(Loc.T("{0} x {1}, {2} sample(s) a pixel, {3:0.0} ms a frame on the GPU."),
                               liveTrace.Width, liveTrace.Height, liveTrace.Samples, liveTrace.LastGpuMs));
     if (traceStale)

@@ -593,6 +593,13 @@ lamp's colour all come out as traced. Everything without a lightmap unwrap - mos
 vehicles - is lit by the level's sun and its two ambients, unshadowed; the bake sets those to the pair closest to
 the daylight. The ground is baked the same way as on BfVietnam.
 
+**The live traced view and your graphics card.** On a dedicated card with hardware ray tracing (an RTX or
+RX 6000-class card) the traced view runs on Vulkan ray queries: the same light, traced by the card's ray-tracing
+hardware. Measured on an RTX 4060 laptop with a 746,000-triangle level and a 4K window: 32-39 frames a second at
+full resolution and 85-100 at half, where the older OpenGL kernel managed about five. *Auto* resolution drops to
+half when a frame takes longer than 20 ms. The window's traced-view line says which one is running; without such a
+card the OpenGL kernel is used as before.
+
 **Seeing the light while you set it.** Picking a preset or moving a slider in the window lights the viewport
 with that sun and sky at once (*Show this light in the viewport*). It is a quick stand-in - one sun and the sky's
 fill, no bounce - and it hides the baked lightmaps while it is on. A finished bake, or ticking *Viewport shows the

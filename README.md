@@ -44,7 +44,8 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   `docs/Realistic_Lighting.md`). A ray-traced preview of the camera view tunes the light before baking, and the
   viewport can draw the level exactly as the game will. **Lightmap-only objects** make the game draw a converted
   object as texture x lightmap on every face, so lamp colour, interiors and ceilings come through; a **live traced
-  view** (GPU compute, discrete cards) shows the traced light in the viewport. **Light volumes** (BfVietnam) add
+  view** shows the traced light in the viewport - on Vulkan hardware ray tracing where the card has it (an RTX 4060
+  traces a 4K view of a 900,000-triangle level at editing speed), on an OpenGL compute kernel otherwise. **Light volumes** (BfVietnam) add
   shaped fog, darkness and lamp shafts as a lattice of nearly transparent planes. **Battlefield 1942** is solved
   against its own measurements: a lightmapped object there is texture x 2 x lightmap and nothing else, so the bake
   writes the traced light itself into 24-bit colour lightmaps. Picking a preset or moving a slider lights the

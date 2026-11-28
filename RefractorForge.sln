@@ -21,6 +21,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.Server", "sr
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorBridge", "src\RefractorBridge\RefractorBridge.csproj", "{E676FC12-1B14-4F96-AF27-2C791AA25B23}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RefractorForge.VkTrace", "src\RefractorForge.VkTrace\RefractorForge.VkTrace.csproj", "{A7461999-6353-4F01-AE53-018D6F9461FB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -127,6 +129,18 @@ Global
 		{E676FC12-1B14-4F96-AF27-2C791AA25B23}.Release|x64.Build.0 = Release|Any CPU
 		{E676FC12-1B14-4F96-AF27-2C791AA25B23}.Release|x86.ActiveCfg = Release|Any CPU
 		{E676FC12-1B14-4F96-AF27-2C791AA25B23}.Release|x86.Build.0 = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|x64.Build.0 = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Debug|x86.Build.0 = Debug|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|x64.ActiveCfg = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|x64.Build.0 = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|x86.ActiveCfg = Release|Any CPU
+		{A7461999-6353-4F01-AE53-018D6F9461FB}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -135,6 +149,7 @@ Global
 		{F0854BD6-186A-495F-83FA-EC6092C86AD2} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{D54B821B-F8E5-4C30-A5CD-DA6FD7C56806} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{E676FC12-1B14-4F96-AF27-2C791AA25B23} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{A7461999-6353-4F01-AE53-018D6F9461FB} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {E87B8850-6D0E-47D7-A280-8D12A5388C92}

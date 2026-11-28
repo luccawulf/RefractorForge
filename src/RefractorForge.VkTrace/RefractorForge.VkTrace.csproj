@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The live traced view on Vulkan hardware ray queries (VK_KHR_ray_query). A library with no window and no
+       OpenGL in it, so it can be run and tested headlessly: the editor hands its picture to OpenGL, the tools
+       write it to a file. The lighting is Render/LiveTrace.cs; only the traversal is the hardware's. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Same Silk.NET release as the editor's OpenGL bindings. -->
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Compiled from Shaders/trace.comp by tools/compile-vktrace.ps1 (needs the Vulkan SDK's glslangValidator);
+         the .spv is checked in so a build does not need the SDK. -->
+    <EmbeddedResource Include="Shaders\trace.spv" LogicalName="trace.spv" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RefractorForge.Render\RefractorForge.Render.csproj" />
+  </ItemGroup>
+
+</Project>
