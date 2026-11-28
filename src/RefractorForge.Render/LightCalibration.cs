@@ -8,6 +8,7 @@ using System.Text;
 using RefractorForge.Formats;
 using RefractorForge.Formats.Con;
 using RefractorForge.Formats.Geometry;
+using RefractorForge.Formats.Mesh;
 using RefractorForge.Formats.Rfa;
 using RefractorForge.Formats.Terrain;
 
@@ -154,6 +155,10 @@ public static class LightCalibration
         ColourPalette,
         /// <summary>One value (128) over the whole map: what a mesh with no unwrap is given.</summary>
         Uniform,
+        /// <summary>24-bit, grey: the levels exactly as written, no palette in the way.</summary>
+        Grey24,
+        /// <summary>24-bit, 128 everywhere.</summary>
+        Uniform24,
     }
 
     /// <summary>The channel weights the two coloured lightmap kinds write a level with.</summary>
@@ -163,7 +168,7 @@ public static class LightCalibration
     {
         if (kind == LightmapKind.None) return null;
         var grey = LightmapValues();
-        if (kind == LightmapKind.Uniform) Array.Fill(grey, (byte)128);
+        if (kind is LightmapKind.Uniform or LightmapKind.Uniform24) Array.Fill(grey, (byte)128);
         var rgba = new byte[LmSide * LmSide * 4];
         for (int i = 0; i < grey.Length; i++)
         {
@@ -176,7 +181,7 @@ public static class LightCalibration
             rgba[i * 4 + 3] = 255;
         }
         var tex = new Texture2D(LmSide, LmSide, rgba);
-        if (kind == LightmapKind.Rgb24) return TgaTexture.EncodeRgb24(tex);
+        if (kind is LightmapKind.Rgb24 or LightmapKind.Grey24 or LightmapKind.Uniform24) return TgaTexture.EncodeRgb24(tex);
         var file = TgaTexture.EncodeGrayColormapped(tex);
         if (kind == LightmapKind.ColourPalette)
             for (int i = 0; i < 256; i++)
@@ -194,7 +199,7 @@ public static class LightCalibration
         return kind switch
         {
             LightmapKind.None => Vector3.One,
-            LightmapKind.Uniform => new Vector3(128f / 255f),
+            LightmapKind.Uniform or LightmapKind.Uniform24 => new Vector3(128f / 255f),
             LightmapKind.Rgb24 or LightmapKind.ColourPalette => new Vector3(Levels[level] / 255f, (Levels[level] / 2) / 255f, (Levels[level] * 3 / 4) / 255f),
             _ => new Vector3(v),
         };
@@ -207,7 +212,9 @@ public static class LightCalibration
     /// </summary>
     /// <param name="withUnwrap">False leaves the lightmap channel empty (every vertex at 0,0) and the header's
     /// qflag clear - the state most retail meshes are in.</param>
-    public static byte[] BuildMesh(string meshName, Vector3 toSun, StandardMeshWriter.LitLayout layout, bool withUnwrap)
+    /// <param name="steer">Every patch's normal points straight up instead of its own way - the third level's
+    /// boards: with the two lights clamping on that normal, a patch should show its lightmap value and nothing else.</param>
+    public static byte[] BuildMesh(string meshName, Vector3 toSun, StandardMeshWriter.LitLayout layout, bool withUnwrap, bool steer = false)
     {
         var full = NewSection(); var half = NewSection(); var plate = NewSection();
         float hw = BoardWidth * 0.5f;
@@ -239,7 +246,7 @@ public static class LightCalibration
             float cx = -hw + Border + (c.Column + 0.5f) * Pitch;
             float cy = BoardHeight - Border - (c.Row + 0.5f) * Pitch;
             float h = PatchSize * 0.5f;
-            Quad(c.HalfMaterial ? half : full, cx - h, cy - h, cx + h, cy + h, -0.02f, c.Normal, LevelUv(c.Level));
+            Quad(c.HalfMaterial ? half : full, cx - h, cy - h, cx + h, cy + h, -0.02f, steer ? Vector3.UnitY : c.Normal, LevelUv(c.Level));
         }
 
         var sections = new[]
@@ -257,25 +264,114 @@ public static class LightCalibration
 
     /// <summary>The mesh's shader file: white at full and at half diffuse, and the black plate. A normal map is
     /// named only for the tangent-frame layout, and it is flat, so the light is decided by the vertex normal.</summary>
-    public static string ShaderText(string meshName, bool normalMap)
+    public static string ShaderText(string meshName, bool normalMap, ShaderStyle style = ShaderStyle.Plain)
     {
         var sb = new StringBuilder();
-        void Sub(int i, string diffuse, string texture)
-        {
-            sb.Append($"subshader \"{meshName}_Material{i}\" \"StandardMesh/Default\"\r\n{{\r\n");
-            sb.Append("\tlighting true;\r\n\tlightingSpecular false;\r\n");
-            sb.Append($"\tmaterialDiffuse {diffuse};\r\n");
-            sb.Append($"\ttexture \"texture/{texture}\";\r\n");
-            if (normalMap) sb.Append($"\tnormalmap \"texture/{FlatNormalTexture}\";\r\n");
-            sb.Append("}\r\n\r\n");
-        }
-        Sub(0, "1 1 1", WhiteTexture);
-        Sub(1, "0.5 0.5 0.5", WhiteTexture);
-        Sub(2, "1 1 1", BlackTexture);
+        void Sub(int i, float diffuse, string texture)
+            => sb.Append(Subshader($"{meshName}_Material{i}", style, diffuse, texture, normalMap));
+        Sub(0, 1f, WhiteTexture);
+        Sub(1, 0.5f, WhiteTexture);
+        Sub(2, 1f, BlackTexture);
         return sb.ToString();
     }
 
+    /// <summary>What a board's (or an object's) <c>.rs</c> says besides its texture.</summary>
+    public enum ShaderStyle
+    {
+        /// <summary>lighting, no specular, materialDiffuse: the first two levels' shader.</summary>
+        Plain,
+        /// <summary>As most retail props: specular on with a full-gloss normal map named, on a mesh with no tangent
+        /// frame. Does a lightmap-ready copy that keeps its original shader lines show anything extra?</summary>
+        RetailLike,
+        /// <summary>A vegetation material put in order: alpha-tested, no specular, diffuse 1, no selfillum.</summary>
+        Vegetation,
+        /// <summary>A retail palm's material as it ships: materialDiffuse .5, materialAmbient .4, selfillum .3,
+        /// specular, highEndPerPixel, alpha test. Measures what those lines do.</summary>
+        PalmAsIs,
+        /// <summary>The plain shader with <c>selfillum 1 1 1</c>: does the fixed-function vertex colour then clamp at
+        /// 1 whatever the lights and the normal are, leaving texture x (lightmap + LMambient)?</summary>
+        Glow,
+        /// <summary><c>selfillum .5 .5 .5</c>: is the self-illumination inside the clamp with the two lights?</summary>
+        GlowHalf,
+        /// <summary><c>selfillum 1 1 1</c> with <c>materialDiffuse 0 0 0</c>: the two lights taken out altogether.</summary>
+        GlowNoDiffuse,
+        /// <summary><c>lighting false</c> and nothing else: what an unlit material does with a lightmap.</summary>
+        Unlit,
+        /// <summary><see cref="Vegetation"/> with <c>selfillum 1 1 1</c>.</summary>
+        VegetationGlow,
+    }
+
+    /// <summary>One subshader block in <paramref name="style"/>, its materialDiffuse scaled by
+    /// <paramref name="diffuse"/>.</summary>
+    public static string Subshader(string material, ShaderStyle style, float diffuse, string texture, bool normalMap = false)
+    {
+        string F(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
+        var sb = new StringBuilder();
+        sb.Append($"subshader \"{material}\" \"StandardMesh/Default\"\r\n{{\r\n\tlighting {(style == ShaderStyle.Unlit ? "false" : "true")};\r\n");
+        switch (style)
+        {
+            case ShaderStyle.Glow:
+            case ShaderStyle.GlowHalf:
+            case ShaderStyle.GlowNoDiffuse:
+            {
+                float dd = style == ShaderStyle.GlowNoDiffuse ? 0f : diffuse;
+                string si = style == ShaderStyle.GlowHalf ? ".5 .5 .5" : "1 1 1";
+                sb.Append("\tlightingSpecular false;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(dd)} {F(dd)} {F(dd)};\r\n\tselfillum {si};\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n");
+                if (normalMap) sb.Append($"\tnormalmap \"texture/{FlatNormalTexture}\";\r\n");
+                break;
+            }
+            case ShaderStyle.VegetationGlow:
+                sb.Append("\tlightingSpecular false;\r\n\ttransparent false;\r\n\talphatestref 0.45;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(diffuse)} {F(diffuse)} {F(diffuse)};\r\n\tselfillum 1 1 1;\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n");
+                break;
+            case ShaderStyle.RetailLike:
+                sb.Append("\tlightingSpecular true;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(diffuse)} {F(diffuse)} {F(diffuse)};\r\n");
+                sb.Append("\tmaterialSpecular 0.5 0.5 0.5;\r\n\tmaterialSpecularPower 12.5;\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n\tnormalmap \"texture/{GlossNormalTexture}\";\r\n");
+                break;
+            case ShaderStyle.Vegetation:
+                sb.Append("\tlightingSpecular false;\r\n\ttransparent false;\r\n\talphatestref 0.45;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(diffuse)} {F(diffuse)} {F(diffuse)};\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n");
+                break;
+            case ShaderStyle.PalmAsIs:
+                sb.Append("\tlightingSpecular true;\r\n\ttransparent false;\r\n\talphatestref 0.45;\r\n\thighEndPerPixel true;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(0.5f * diffuse)} {F(0.5f * diffuse)} {F(0.5f * diffuse)};\r\n");
+                sb.Append("\tmaterialAmbient .4 .4 .4;\r\n\tselfillum .3 .3 .3;\r\n");
+                sb.Append("\tmaterialSpecular 0.898039 0.898039 0.898039;\r\n\tmaterialSpecularPower 12.5;\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n\tnormalmap \"texture/{GlossNormalTexture}\";\r\n");
+                break;
+            default:
+                sb.Append("\tlightingSpecular false;\r\n");
+                sb.Append($"\tmaterialDiffuse {F(diffuse)} {F(diffuse)} {F(diffuse)};\r\n");
+                sb.Append($"\ttexture \"texture/{texture}\";\r\n");
+                if (normalMap) sb.Append($"\tnormalmap \"texture/{FlatNormalTexture}\";\r\n");
+                break;
+        }
+        sb.Append("}\r\n\r\n");
+        return sb.ToString();
+    }
+
+    /// <summary>The material <see cref="EngineLight"/> is asked to light a patch of this style with - the editor's
+    /// present belief about what the shader lines do, which the third level measures.</summary>
+    public static EngineLight.Material MaterialOf(ShaderStyle style, float diffuse) => style switch
+    {
+        ShaderStyle.PalmAsIs => new EngineLight.Material(new Vector3(0.5f * diffuse), new Vector3(0.4f), new Vector3(0.3f)),
+        ShaderStyle.Glow or ShaderStyle.VegetationGlow => new EngineLight.Material(new Vector3(diffuse), Vector3.One, Vector3.One),
+        ShaderStyle.GlowHalf => new EngineLight.Material(new Vector3(diffuse), Vector3.One, new Vector3(0.5f)),
+        ShaderStyle.GlowNoDiffuse => new EngineLight.Material(Vector3.Zero, Vector3.One, Vector3.One),
+        // A guess, there to be measured: an unlit material is drawn at full strength under its lightmap.
+        ShaderStyle.Unlit => new EngineLight.Material(Vector3.Zero, Vector3.One, Vector3.One),
+        _ => new EngineLight.Material(new Vector3(diffuse), Vector3.One, Vector3.Zero),
+    };
+
     public const string WhiteTexture = "rfcal_white", BlackTexture = "rfcal_black", FlatNormalTexture = "rfcal_flat_n";
+    /// <summary>A flat normal map whose alpha - the gloss - is full, so a specular term shows at its strongest.</summary>
+    public const string GlossNormalTexture = "rfcal_gloss_n";
 
     private static byte[] FlatTexture(byte r, byte g, byte b, byte a)
     {
@@ -322,7 +418,35 @@ public static class LightCalibration
         /// dim; from this build on it is clear everywhere.)</summary>
         public bool Unlit { get; init; }
         public Vector3 ShadowAmbient { get; init; } = new(60f, 120f, 200f);
+        /// <summary>Build the THIRD level instead: can a lightmap do all of an object's lighting? Six boards whose
+        /// patch normals all point straight up, under two lights strong enough to clamp on that normal, so a patch
+        /// should show <c>lightmap + LMambient</c> and nothing else - grey and coloured 24-bit maps, a retail prop's
+        /// shader lines, a vegetation material put in order, a palm's as it ships - and one board of ordinary normals
+        /// turned half round (does an object's rotation turn its normals?). Under them stand
+        /// <see cref="RealMeshes"/>: retail meshes rewritten the same way.</summary>
+        public bool Steer { get; init; }
+        /// <summary>With <see cref="Steer"/>: build the FOURTH level instead. The same row of six boards, but with
+        /// their ordinary normals and under two WEAK lights, each board with a different lever in its shader:
+        /// <c>selfillum 1</c>, <c>selfillum .5</c>, <c>selfillum 1</c> with no diffuse, <c>lighting false</c>, and
+        /// the first and last of those again on a tangent-frame (per-pixel) mesh. The question: does a shader line
+        /// alone make an object show texture x (lightmap + LMambient), with no need to steer normals or raise the
+        /// level's lights?</summary>
+        public bool Glow { get; init; }
+        /// <summary>Retail meshes for the third level, rewritten to the 40-byte lightmap-only form and stood under
+        /// the boards, each with a flat mid-grey 24-bit lightmap.</summary>
+        public IReadOnlyList<RealMesh> RealMeshes { get; init; } = Array.Empty<RealMesh>();
     }
+
+    /// <summary>A retail mesh for the third level.</summary>
+    /// <param name="Name">The new mesh and object name.</param>
+    /// <param name="Sm">The retail .sm.</param>
+    /// <param name="Texture">The texture its shader names (<c>texture/&lt;this&gt;</c>), or null for the flat white one.</param>
+    /// <param name="Steer">Point every normal straight up.</param>
+    /// <param name="Keep">Ship the mesh's vertices exactly as they are (it must already carry a lightmap unwrap).</param>
+    public sealed record RealMesh(string Name, byte[] Sm, string? Texture, ShaderStyle Style, bool Steer, string What, bool Keep = false);
+
+    /// <summary>A retail mesh as the third level placed it.</summary>
+    public sealed record RealObject(string Id, string Mesh, int X, int Y, int Z, bool Steered, string Style, string? Texture, string What);
 
     public sealed record Board(string Id, string Mesh, string Layout, string Lightmap, bool Unwrapped, int X, int Y, int Z, string What)
     {
@@ -331,6 +455,12 @@ public static class LightCalibration
         /// <summary>What the level's terrain shadow map holds under the board: "flag set" (in terrain shadow) or
         /// "flag clear" (not).</summary>
         public string? ShadowMap { get; init; }
+        /// <summary>Every patch normal points straight up (the third level).</summary>
+        public bool Steered { get; init; }
+        /// <summary>The board's <see cref="ShaderStyle"/>.</summary>
+        public string Style { get; init; } = nameof(ShaderStyle.Plain);
+        /// <summary>The board's yaw in degrees. At 180 it shows its back, so its columns read right to left.</summary>
+        public int Yaw { get; init; }
     }
 
     public sealed record Swatch(float[] Tile, float[] Expected);
@@ -351,6 +481,7 @@ public static class LightCalibration
         /// r g b per level. Empty in a manifest written before that was known.</summary>
         public float[] LevelsShown { get; init; } = Array.Empty<float>();
         public List<Board> Boards { get; init; } = new();
+        public List<RealObject> Objects { get; init; } = new();
         public List<Swatch> Swatches { get; init; } = new();
         public float[] Viewer { get; init; } = Array.Empty<float>();
         public int CentreX { get; init; }
@@ -415,11 +546,11 @@ public static class LightCalibration
         // ---- the site must be what the layout assumes: dry, in bounds and near enough level ----
         var site = o.Site;
         const int boardPitch = 8;
-        int[] boardX = o.Unlit
+        int[] boardX = o.Unlit || o.Steer
             ? new[] { site.CentreX - 20, site.CentreX - 12, site.CentreX - 4, site.CentreX + 4, site.CentreX + 12, site.CentreX + 20 }
             : new[] { site.CentreX - 12, site.CentreX - 4, site.CentreX + 4, site.CentreX + 12 };
         int backZ = site.BoardsZ + (o.Unlit ? 5 : 0);         // the second level's upper row stands five metres behind
-        int north = o.Unlit ? 13 : 6;                         // how far past the boards the level reaches
+        int north = o.Unlit || o.Steer ? 13 : 6;                         // how far past the boards the level reaches
         if (boardX[0] - 8 < 0 || boardX[^1] + 8 > cfg.WorldSize || site.ViewerZ - 12 < 0 || site.BoardsZ + north > cfg.WorldSize || site.ViewerZ >= site.BoardsZ)
             throw new InvalidDataException($"The site does not fit the map ({cfg.WorldSize} m square), or its boards are not north of its viewer.");
         float lo = float.MaxValue, hi = float.MinValue;
@@ -434,15 +565,16 @@ public static class LightCalibration
             }
         if (lo < cfg.WaterLevel + 0.5f) throw new InvalidDataException($"The site is under water ({lo:0.0} m, water at {cfg.WaterLevel:0.0}).");
         if (hi - lo > 2.5f) throw new InvalidDataException($"The site is not level: {lo:0.0} to {hi:0.0} m.");
-        int bottomY = (int)MathF.Ceiling(hi + 1.2f);          // whole metres: a lightmap is keyed by the truncated position
+        int bottomY = (int)MathF.Ceiling(hi + (o.Steer ? 4.2f : 1.2f));   // whole metres: a lightmap is keyed by the truncated position
+        int groundY = (int)MathF.Ceiling(hi);                 // where the third level's real meshes stand, under the boards
         // The second level's upper row stands further back, where a row looks lower: lift it clear of the front row.
         int topY = bottomY + (o.Unlit ? 5 : 4);
 
         // ---- the boards ----
-        var meshes = new List<(string Name, StandardMeshWriter.LitLayout Layout, bool Unwrap, bool NormalMap)>
+        var meshes = new List<(string Name, StandardMeshWriter.LitLayout Layout, bool Unwrap, bool NormalMap, bool Steer, ShaderStyle Style)>
         {
-            ("rfcal_pv_m1", StandardMeshWriter.LitLayout.Lightmap40, true, false),
-            ("rfcal_p32_m1", StandardMeshWriter.LitLayout.Plain32, false, false),
+            ("rfcal_pv_m1", StandardMeshWriter.LitLayout.Lightmap40, true, false, false, ShaderStyle.Plain),
+            ("rfcal_p32_m1", StandardMeshWriter.LitLayout.Plain32, false, false, false, ShaderStyle.Plain),
         };
         var boards = new List<Board>
         {
@@ -477,10 +609,53 @@ public static class LightCalibration
                     });
                 }
         }
+        else if (o.Steer && o.Glow)
+        {
+            // Six boards in one row, ordinary normals, one shader lever each; the last two on the per-pixel layout.
+            boards.Clear();
+            var levers = new (string Id, string Mesh, StandardMeshWriter.LitLayout Layout, ShaderStyle Style, LightmapKind Kind, string What)[]
+            {
+                ("A", "rfcal_g1_m1", StandardMeshWriter.LitLayout.Lightmap40, ShaderStyle.Glow, LightmapKind.Grey24, "selfillum 1: lightmap + LMambient on every patch, whatever its normal?"),
+                ("B", "rfcal_gh_m1", StandardMeshWriter.LitLayout.Lightmap40, ShaderStyle.GlowHalf, LightmapKind.Grey24, "selfillum .5: is it inside the clamp with the two lights?"),
+                ("C", "rfcal_g0_m1", StandardMeshWriter.LitLayout.Lightmap40, ShaderStyle.GlowNoDiffuse, LightmapKind.Rgb24, "selfillum 1, materialDiffuse 0, coloured lightmap"),
+                ("D", "rfcal_nl_m1", StandardMeshWriter.LitLayout.Lightmap40, ShaderStyle.Unlit, LightmapKind.Grey24, "lighting false: what does an unlit material do with a lightmap?"),
+                ("E", "rfcal_ppg_m1", StandardMeshWriter.LitLayout.Tangent64, ShaderStyle.Glow, LightmapKind.Grey24, "selfillum 1 on the per-pixel (tangent-frame) path"),
+                ("F", "rfcal_ppn_m1", StandardMeshWriter.LitLayout.Tangent64, ShaderStyle.Unlit, LightmapKind.Grey24, "lighting false on the per-pixel path"),
+            };
+            for (int i = 0; i < levers.Length; i++)
+            {
+                var l = levers[i];
+                bool pp = l.Layout == StandardMeshWriter.LitLayout.Tangent64;
+                meshes.Add((l.Mesh, l.Layout, true, pp, false, l.Style));
+                boards.Add(new Board(l.Id, l.Mesh, pp ? "64-byte, tangent frame" : "40-byte, no tangent frame", l.Kind.ToString(), true,
+                                     boardX[i], bottomY, site.BoardsZ, l.What) { Style = l.Style.ToString() });
+            }
+        }
+        else if (o.Steer)
+        {
+            // Six boards in one row. A-E: every patch normal straight up, one shader each. F: the first level's
+            // board of normals pointing every way, turned half round.
+            boards.Clear();
+            var steered = new (string Id, string Mesh, ShaderStyle Style, LightmapKind Kind, string What)[]
+            {
+                ("A", "rfcal_up_m1", ShaderStyle.Plain, LightmapKind.Grey24, "normals up, grey 24-bit lightmap: lightmap + LMambient on every patch?"),
+                ("B", "rfcal_up_m1", ShaderStyle.Plain, LightmapKind.Rgb24, "normals up, coloured 24-bit lightmap: per channel?"),
+                ("C", "rfcal_upr_m1", ShaderStyle.RetailLike, LightmapKind.Grey24, "normals up, a retail prop's shader lines (specular, a normal map named)"),
+                ("D", "rfcal_upv_m1", ShaderStyle.Vegetation, LightmapKind.Grey24, "normals up, a vegetation material put in order (alpha test only)"),
+                ("E", "rfcal_upp_m1", ShaderStyle.PalmAsIs, LightmapKind.Grey24, "normals up, a retail palm's material as it ships"),
+            };
+            foreach (var s in steered.Select(x => (x.Mesh, x.Style)).Distinct())
+                meshes.Add((s.Mesh, StandardMeshWriter.LitLayout.Lightmap40, true, false, true, s.Style));
+            for (int i = 0; i < steered.Length; i++)
+                boards.Add(new Board(steered[i].Id, steered[i].Mesh, "40-byte, no tangent frame", steered[i].Kind.ToString(), true,
+                                     boardX[i], bottomY, site.BoardsZ, steered[i].What) { Steered = true, Style = steered[i].Style.ToString() });
+            boards.Add(new Board("F", "rfcal_pv_m1", "40-byte, no tangent frame", nameof(LightmapKind.Grey24), true, boardX[5], bottomY, site.BoardsZ,
+                                 "ordinary normals, the board turned half round: do its normals turn with it?") { Yaw = 180 });
+        }
         else if (o.Full)
         {
-            meshes.Add(("rfcal_pp_m1", StandardMeshWriter.LitLayout.Tangent64, true, true));
-            meshes.Add(("rfcal_ppq0_m1", StandardMeshWriter.LitLayout.Tangent64, false, true));
+            meshes.Add(("rfcal_pp_m1", StandardMeshWriter.LitLayout.Tangent64, true, true, false, ShaderStyle.Plain));
+            meshes.Add(("rfcal_ppq0_m1", StandardMeshWriter.LitLayout.Tangent64, false, true, false, ShaderStyle.Plain));
             boards.Add(new("E", "rfcal_pp_m1", "64-byte, tangent frame", nameof(LightmapKind.Grey), true, boardX[0], topY, site.BoardsZ, "lightmapped, the per-pixel path"));
             boards.Add(new("F", "rfcal_pp_m1", "64-byte, tangent frame", nameof(LightmapKind.None), true, boardX[1], topY, site.BoardsZ, "the same mesh with no lightmap file"));
             boards.Add(new("G", "rfcal_pp_m1", "64-byte, tangent frame", nameof(LightmapKind.Rgb24), true, boardX[2], topY, site.BoardsZ, "a coloured lightmap"));
@@ -488,10 +663,50 @@ public static class LightCalibration
         }
 
         var objectsCon = new StringBuilder();
-        foreach (var (name, layout, unwrap, normalMap) in meshes)
+        // The third level's retail meshes: rewritten, each with its own shader, object and flat lightmap.
+        var realObjects = new List<RealObject>();
+        var realFiles = new List<(string Mesh, byte[] Sm, string Rs)>();
+        if (o.Steer)
+            for (int i = 0; i < o.RealMeshes.Count; i++)
+            {
+                var rm = o.RealMeshes[i];
+                var sm = StandardMesh.Parse(rm.Sm);
+                bool hasUnwrap = sm.Lods.Count > 0 && sm.Lods[0].All(x => x.HasLightmapUv);
+                if (rm.Keep && !hasUnwrap) throw new InvalidDataException($"{rm.Name}: a mesh kept as shipped must already carry a lightmap unwrap.");
+                IReadOnlyList<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>>? unwrapped = null;
+                if (!hasUnwrap)
+                {
+                    var r = LightmapUnwrapper.Unwrap(sm);
+                    if (r.Status != LightmapUnwrapper.UnwrapStatus.Ok || r.Lod0Plan is null)
+                        throw new InvalidDataException($"{rm.Name}: the mesh could not be unwrapped ({r.Status}).");
+                    unwrapped = LightmapUnwrapper.AllLodPlans(sm, r.Lod0Plan);
+                }
+                var plans = LightmapUnwrapper.LightmapOnlyPlans(sm, unwrapped, rm.Steer ? (0f, 1f, 0f) : null);
+                var bytes = rm.Keep ? rm.Sm : StandardMeshRewriter.Write(rm.Sm, sm, plans, new StandardMeshRewriter.Options(SetQFlag: true));
+                var rs = new StringBuilder();
+                foreach (var matName in sm.Lods.SelectMany(l => l.Select(x => x.Name)).Distinct(StringComparer.OrdinalIgnoreCase))
+                    rs.Append(Subshader(matName, rm.Style, 1f, rm.Texture ?? WhiteTexture, rm.Keep));
+                realFiles.Add((rm.Name, bytes, rs.ToString()));
+                // Spread along the row, under the boards and a little behind their plane.
+                float t = o.RealMeshes.Count == 1 ? 0.5f : i / (float)(o.RealMeshes.Count - 1);
+                int x = (int)MathF.Round(boardX[0] + 2 + t * (boardX[^1] - boardX[0] - 4));
+                realObjects.Add(new RealObject(((char)('G' + i)).ToString(), rm.Name, x, groundY, site.BoardsZ + 5, rm.Steer, rm.Style.ToString(), rm.Texture, rm.What));
+            }
+
+        foreach (var (name, layout, unwrap, normalMap, steer, style) in meshes.Select(x => (x.Name, (StandardMeshWriter.LitLayout?)x.Layout, x.Unwrap, x.NormalMap, x.Steer, x.Style))
+                     .Concat(realFiles.Select(x => (x.Mesh, (StandardMeshWriter.LitLayout?)null, true, false, false, ShaderStyle.Plain))))
         {
-            Put($"StandardMesh/{name}.sm", BuildMesh(name, toSun, layout, unwrap));
-            Put($"StandardMesh/{name}.rs", latin.GetBytes(ShaderText(name, normalMap)));
+            if (layout is { } lay)
+            {
+                Put($"StandardMesh/{name}.sm", BuildMesh(name, toSun, lay, unwrap, steer));
+                Put($"StandardMesh/{name}.rs", latin.GetBytes(ShaderText(name, normalMap, style)));
+            }
+            else
+            {
+                var rf = realFiles.First(x => x.Mesh == name);
+                Put($"StandardMesh/{name}.sm", rf.Sm);
+                Put($"StandardMesh/{name}.rs", latin.GetBytes(rf.Rs));
+            }
             var geom = new StringBuilder()
                 .Append($"GeometryTemplate.create StandardMesh {name}\r\n")
                 .Append($"GeometryTemplate.file ../{o.BaseSub}/levels/{o.Name}/StandardMesh/{name}\r\n");
@@ -509,7 +724,8 @@ public static class LightCalibration
         Put("Objects/objects.con", latin.GetBytes(objectsCon.ToString()));
         Put($"Texture/{WhiteTexture}.dds", FlatTexture(255, 255, 255, 255));
         Put($"Texture/{BlackTexture}.dds", FlatTexture(0, 0, 0, 255));
-        if (o.Full && !o.Unlit) Put($"Texture/{FlatNormalTexture}.dds", FlatTexture(128, 128, 255, 0));   // alpha is the gloss: none
+        if ((o.Full && !o.Unlit) || o.Glow) Put($"Texture/{FlatNormalTexture}.dds", FlatTexture(128, 128, 255, 0));   // alpha is the gloss: none
+        if (o.Steer) Put($"Texture/{GlossNormalTexture}.dds", FlatTexture(128, 128, 255, 255));
 
         // The lightmap folder keeps the spelling the level already uses.
         string lmFolder = arc.Entries.Select(e => e.Name.Replace('\\', '/'))
@@ -521,9 +737,14 @@ public static class LightCalibration
         var so = new StaticObjectsFile();
         foreach (var b in boards)
         {
-            so.Objects.Add(new StaticObject(b.Mesh) { Position = new Vec3(b.X, b.Y, b.Z), Rotation = new Vec3(0, 0, 0) });
+            so.Objects.Add(new StaticObject(b.Mesh) { Position = new Vec3(b.X, b.Y, b.Z), Rotation = new Vec3(b.Yaw, 0, 0) });
             if (EncodeLightmap(Enum.Parse<LightmapKind>(b.Lightmap)) is { } tga)
                 Put($"{lmFolder}/{ObjectLightmaps.FileBase(b.Mesh)}_{b.X}-{b.Y}-{b.Z}.tga", tga);
+        }
+        foreach (var ro in realObjects)
+        {
+            so.Objects.Add(new StaticObject(ro.Mesh) { Position = new Vec3(ro.X, ro.Y, ro.Z), Rotation = new Vec3(0, 0, 0) });
+            Put($"{lmFolder}/{ObjectLightmaps.FileBase(ro.Mesh)}_{ro.X}-{ro.Y}-{ro.Z}.tga", EncodeLightmap(LightmapKind.Uniform24)!);
         }
         Put("StaticObjects.con", LevelSaver.SerializeStaticObjects(so));
         notes.Add("Every retail static object was taken out so nothing stands between the spawn and the boards.");
@@ -695,6 +916,7 @@ public static class LightCalibration
             Detail = A(detailRgb),
             LevelsShown = levelsShown,
             Boards = boards,
+            Objects = realObjects,
             Swatches = swatches,
             Viewer = viewer,
             CentreX = site.CentreX, BoardsZ = site.BoardsZ, ViewerZ = site.ViewerZ,
@@ -823,15 +1045,19 @@ public static class LightCalibration
         var kind = Enum.Parse<LightmapKind>(board.Lightmap);
         float d = cell.HalfMaterial ? 0.5f : 1f;
         // The mesh's layout picks the shader family: only the tangent-frame boards are lit per pixel.
-        var mat = new EngineLight.Material(new Vector3(d), Vector3.One, Vector3.Zero) { VertexLit = !board.Mesh.Contains("_pp", StringComparison.OrdinalIgnoreCase) };
+        var style = Enum.TryParse<ShaderStyle>(board.Style, out var st) ? st : ShaderStyle.Plain;
+        var mat = MaterialOf(style, d) with { VertexLit = !board.Mesh.Contains("_pp", StringComparison.OrdinalIgnoreCase) };
         var c = m.Colours;
+        // The normal the engine lights with: the stored one (straight up on a steered board), turned with the object.
+        var n = board.Steered ? Vector3.UnitY : cell.Normal;
+        if (board.Yaw != 0) n = Vector3.Transform(n, Matrix4x4.CreateRotationY(board.Yaw * MathF.PI / 180f));
         // No file, or a file on a mesh with no unwrap (which the game ignores): lit as an object without a lightmap.
-        if (kind == LightmapKind.None || !board.Unwrapped) return EngineLight.Dynamic(cell.Normal, m.ToSunVector, c, mat);
+        if (kind == LightmapKind.None || !board.Unwrapped) return EngineLight.Dynamic(n, m.ToSunVector, c, mat);
         // A 24-bit map is read as written; an 8-bit one through the level's palette, whatever colour map it carries.
-        var lm = kind == LightmapKind.Rgb24 ? LightmapRgb(kind, cell.Level)
+        var lm = kind is LightmapKind.Rgb24 or LightmapKind.Grey24 or LightmapKind.Uniform24 ? LightmapRgb(kind, cell.Level)
                : m.LevelsShown.Length >= 15 ? new Vector3(m.LevelsShown[cell.Level * 3], m.LevelsShown[cell.Level * 3 + 1], m.LevelsShown[cell.Level * 3 + 2])
                : LightmapRgb(LightmapKind.Grey, cell.Level);
-        return EngineLight.Lightmapped(lm, cell.Normal, m.ToSunVector, c, mat);
+        return EngineLight.Lightmapped(lm, n, m.ToSunVector, c, mat);
     }
 
     /// <summary>

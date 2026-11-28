@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using RefractorForge.Formats.Rfa;
 
@@ -102,6 +103,112 @@ public static class LightmapUnwrapper
 
     private static UnwrapResult Fail(UnwrapStatus s, string why)
         => new(s, new UnwrapDiagnostics(0, 0, 0, 0, 0, 0, false, 0f, 0f, 0f, 0f, why), null);
+
+    /// <summary>
+    /// The plan for EVERY LOD of a mesh, from its LOD0 plan: each lower LOD gets a lightmap channel too, its UVs taken
+    /// from the nearest LOD0 vertex that faces the same way.
+    ///
+    /// <para>Why every LOD: across every retail BfVietnam mesh with more than one LOD (1,560 of them), not one mixes
+    /// vertex layouts between LODs - 1,525 are 32-byte throughout and 35 carry the lightmap channel in all of them.
+    /// A copy whose LOD0 was widened to 40 bytes while its LODs 1-5 stayed at 32 crashed the game client while
+    /// it loaded the level (Operation_Flaming_Dart's palms, 2026-11-27), though the dedicated server, which builds no
+    /// render meshes, loaded it. A lower LOD is a reduction of LOD0, so the nearest LOD0 vertex points into the same
+    /// part of the lightmap; one far enough away to need it can afford the approximation.</para>
+    /// </summary>
+    public static IReadOnlyList<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>> AllLodPlans(
+        StandardMesh mesh, IReadOnlyList<StandardMeshRewriter.MaterialPlan?> lod0Plan)
+    {
+        var plans = new List<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>> { lod0Plan };
+        if (mesh.Lods.Count < 2) return plans;
+
+        // LOD0 as it will be written: every output vertex (originals, then clones) with its lightmap UV.
+        var srcPos = new List<Vector3>(); var srcNrm = new List<Vector3>(); var srcUv = new List<(float U, float V)>();
+        var srcMat = new List<string>();
+        var lod0 = mesh.Lods[0];
+        for (int m = 0; m < lod0.Count; m++)
+        {
+            var mat = lod0[m];
+            var p = m < lod0Plan.Count ? lod0Plan[m] : null;
+            (float U, float V)[] uv = p is { Uv2.Length: > 0 } ? p.Uv2 : mat.HasLightmapUv ? mat.LightmapUvs : Array.Empty<(float, float)>();
+            if (uv.Length == 0) continue;
+            int nv = mat.NumVertices, clones = p?.CloneSources.Length ?? 0;
+            for (int v = 0; v < nv + clones && v < uv.Length; v++)
+            {
+                int s = v < nv ? v : p!.CloneSources[v - nv];
+                if (s >= mat.Vertices.Length) continue;
+                srcPos.Add(new Vector3(mat.Vertices[s].X, mat.Vertices[s].Y, mat.Vertices[s].Z));
+                var n = s < mat.Normals.Length ? mat.Normals[s] : default;
+                srcNrm.Add(new Vector3(n.X, n.Y, n.Z));
+                srcUv.Add(uv[v]);
+                srcMat.Add(mat.Name);
+            }
+        }
+        if (srcPos.Count == 0) return plans;
+        var lo = new Vector3(float.MaxValue); var hi = new Vector3(float.MinValue);
+        foreach (var q in srcPos) { lo = Vector3.Min(lo, q); hi = Vector3.Max(hi, q); }
+        float facing = MathF.Max((hi - lo).LengthSquared() * 0.0004f, 1e-6f);   // (2 % of the diagonal)^2 per unit of turn
+
+        for (int l = 1; l < mesh.Lods.Count; l++)
+        {
+            var row = new List<StandardMeshRewriter.MaterialPlan?>();
+            foreach (var mat in mesh.Lods[l])
+            {
+                bool promote = mat.VertexByteSize == 32;
+                if (!promote && mat.VertexByteSize - 32 < 8) { row.Add(null); continue; }
+                bool sameName = srcMat.Contains(mat.Name, StringComparer.OrdinalIgnoreCase);
+                var uv2 = new (float U, float V)[mat.NumVertices];
+                for (int v = 0; v < mat.NumVertices; v++)
+                {
+                    var p = v < mat.Vertices.Length ? new Vector3(mat.Vertices[v].X, mat.Vertices[v].Y, mat.Vertices[v].Z) : Vector3.Zero;
+                    var nn = v < mat.Normals.Length ? mat.Normals[v] : default;
+                    var n = new Vector3(nn.X, nn.Y, nn.Z);
+                    float best = float.MaxValue; int bi = 0;
+                    for (int k = 0; k < srcPos.Count; k++)
+                    {
+                        if (sameName && !string.Equals(srcMat[k], mat.Name, StringComparison.OrdinalIgnoreCase)) continue;
+                        float d = Vector3.DistanceSquared(p, srcPos[k]) + (1f - Vector3.Dot(n, srcNrm[k])) * facing;
+                        if (d < best) { best = d; bi = k; }
+                    }
+                    uv2[v] = srcUv[bi];
+                }
+                row.Add(new StandardMeshRewriter.MaterialPlan(uv2, Array.Empty<int>(), null,
+                                                              promote ? StandardMeshRewriter.StridePromotion.To40 : null));
+            }
+            plans.Add(row);
+        }
+        return plans;
+    }
+
+    /// <summary>
+    /// Plans that turn a mesh into one the engine lights from its LIGHTMAP ALONE: every material of every LOD on the
+    /// 40-byte fixed-function vertex (a 64-byte one gives up its tangent frame and keeps its lightmap UV, a 32-byte
+    /// one takes <paramref name="unwrapped"/>'s), and - when <paramref name="normal"/> is given - that one normal on
+    /// every vertex. With the normal on the two lights' bisector (straight up: the engine's second light is the
+    /// first mirrored in azimuth) and the lights strong enough to clamp, the game draws
+    /// <c>texture x (lightmap + LMambient)</c> on every face whichever way it looks.
+    /// </summary>
+    /// <param name="unwrapped">Plans from <see cref="Unwrap"/> / <see cref="AllLodPlans"/> for a mesh that had no
+    /// unwrap, or null for one that already carries lightmap UVs.</param>
+    public static IReadOnlyList<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>> LightmapOnlyPlans(
+        StandardMesh mesh, IReadOnlyList<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>>? unwrapped,
+        (float X, float Y, float Z)? normal)
+    {
+        var plans = new List<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>>();
+        for (int l = 0; l < mesh.Lods.Count; l++)
+        {
+            var row = new List<StandardMeshRewriter.MaterialPlan?>();
+            for (int m = 0; m < mesh.Lods[l].Count; m++)
+            {
+                var mat = mesh.Lods[l][m];
+                var b = unwrapped is not null && l < unwrapped.Count && m < unwrapped[l].Count ? unwrapped[l][m] : null;
+                var promote = b?.Promote ?? (mat.VertexByteSize is 32 or 64 ? StandardMeshRewriter.StridePromotion.To40 : null);
+                row.Add(new StandardMeshRewriter.MaterialPlan(b?.Uv2 ?? Array.Empty<(float, float)>(), b?.CloneSources ?? Array.Empty<int>(),
+                                                              b?.Indices, promote, normal));
+            }
+            plans.Add(row);
+        }
+        return plans;
+    }
 
     /// <summary>
     /// Build an unwrap for the mesh's LOD0. Pure and deterministic: the same bytes give the same plan. Never

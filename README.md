@@ -42,7 +42,9 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   ray-traces it with bounces and solves it into what the game draws with: the ground tiles in colour, every object's
   lightmap, and the level's four light colours, fitted to the engine's own formula (read from its shaders and exe —
   `docs/Realistic_Lighting.md`). A ray-traced preview of the camera view tunes the light before baking, and the
-  viewport can draw the level exactly as the game will.
+  viewport can draw the level exactly as the game will. **Lightmap-only objects** make the game draw a converted
+  object as texture x lightmap on every face, so lamp colour, interiors and ceilings come through; a **live traced
+  view** (GPU compute, discrete cards) shows the traced light in the viewport. BfVietnam only for now.
 - **Lighting** — real-time sun control + shadow mapping, plus **bake-to-game**: terrain sun shadows
   (`LightmapShadowBits.lsb`, byte-exact), per-object lightmaps, and minimap generation.
 - **Environment** — water colour/level/textures, sun azimuth/elevation, fog, skybox import, animated

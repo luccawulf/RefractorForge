@@ -527,6 +527,7 @@ uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/d
 // ambient LMambientColor for a lightmapped surface, ambientColor otherwise.
 uniform int uGame; uniform vec3 uGSun; uniform vec3 uGBack; uniform vec3 uGAmb;
 uniform int uVertexLit;                                   // the mesh has no tangent frame: the game draws it fixed-function
+uniform vec3 uMatDif; uniform vec3 uSelfIllum;            // the part's materialDiffuse and selfillum (1 / 0 for an ordinary material)
 uniform float uLightCut;                                  // how much of the two lights an unlightmapped object LOSES in terrain shadow (0 = none)
 // ---- Placed lights -------------------------------------------------------------------------------
 // Refractor cannot render dynamic point lights (a frame capture of the running game shows thousands of
@@ -636,7 +637,9 @@ void main(){
             // blue channel scaling both lights; one without is lit per vertex, the lights' sum clamped to 1 first
             // and the map applied channel by channel.
             vec3 lmg = vec3(lmt.b);
-            if (uVertexLit == 1) { two = min(two, vec3(1.0)); lmg = lmt.rgb; }
+            // Fixed-function: the vertex colour is the lights x materialDiffuse + selfillum, clamped, UNDER the
+            // lightmap - so selfillum 1 leaves texture x (lightmap + LMambient) on every face (measured).
+            if (uVertexLit == 1) { two = min(uMatDif * two + uSelfIllum, vec3(1.0)); lmg = lmt.rgb; }
             c = base * uTint * min(lmg * two + uLmAmbient, vec3(1.0));
         }
     } else {
@@ -828,6 +831,9 @@ bool showTunnels = false;         // the Tunnels (BFV 1.2) window
 // samples squared times the texel count, so the top setting is minutes rather than seconds on a big map - which
 // is why it runs in the background behind a progress bar instead of freezing the editor.
 int lmQuality = 2;                 // 0 draft, 1 good, 2 high, 3 ultra - see ApplyLightmapQuality
+// Battlefield Vietnam: the object lightmaps are baked by the Realistic Lighting solve (its light, its quality) rather
+// than by one of the tiers above. Chosen as the top entry of Lightmap quality, where BF1942 still has Ultra.
+bool lmUseRealistic = false;
 int lmBakeSamples = 3;
 float lmTexelsPerMetre = 40f;
 int lmBakeMaxSize = 1024;
@@ -864,6 +870,7 @@ bool gpuTestPassed = false;   // the checkbox can only switch the GPU on once th
 // mesh, so a bake can reach them. The scan and the patching run on workers; the mesh library is read here first.
 bool showLmReady = false;
 bool lmReadyShowFoliage = false, lmReadyShowEffects = false, lmReadyOnlySelected = false;
+bool lmReadyLightOnly = true;   // BfVietnam: copies take all their light from the lightmap (40-byte vertex + selfillum 1)
 System.Threading.Tasks.Task<(List<RefractorForge.Render.LightmapReadyPlanner.Row> Rows, int Undefined)>? lmReadyScan = null;
 System.Threading.Tasks.Task<(RefractorForge.Formats.Con.LightmapReady.Output Out, Dictionary<string, RefractorForge.Formats.Con.LightmapReady.PatchedMesh> Patches, List<string> Failures, List<string> Chosen)>? lmReadyApply = null;
 List<RefractorForge.Render.LightmapReadyPlanner.Row>? lmReadyRows = null;
@@ -1598,12 +1605,16 @@ bool showNightWindow = false;
 bool showRealLight = false;
 bool gameLighting = false;                 // the viewport draws ground and objects with the game's own formula
 RefractorForge.Render.ObjectLightmapBaker.Physical? lmPhysical = null;   // set while a traced object bake runs
+bool[]? lmJobColour = null;     // per bake job: the traced map carries colour (a mesh the game lights per vertex)
+string lmColourNote = "";       // what the last bake had to do to fit its colour maps into the game
+const long LightmapColourBudgetBytes = 500L * 1048576;   // 24-bit lightmap files a level may carry (see FinishObjectLightmapBake)
 RefractorForge.Formats.Terrain.LightRig? rlRig = null;                   // the lamps as they were when it started
 bool rlBaking = false;                     // the GROUND stage; the object stage reuses the lightmap bake's state
 System.Threading.Tasks.Task? rlTask = null;
 System.Threading.CancellationTokenSource? rlCancel = null;
 int rlDone = 0, rlTotal = 1;
 double rlStarted = 0, rlShadowShare = 0;
+bool rlObjectsOnly = false;               // this realistic bake is the object lightmaps alone (Lightmap quality: Realistic)
 RefractorForge.Render.GroundLightBake.Result? rlGround = null;
 Texture2D? rlLitGround = null;
 RefractorForge.Render.DaylightModel? rlDay = null;
@@ -1616,6 +1627,20 @@ System.Threading.Tasks.Task? rlPrevTask = null; System.Threading.CancellationTok
 double rlPrevSeconds = 0;
 RefractorForge.Render.LightPreview.Prepared? rlPrevScene = null; string rlPrevSceneSig = "";
 string? rlLevelSeen = null;                // the level the game-lighting switch was last set for
+// The live traced view (View > Traced light): the Realistic Lighting light ray-traced on the GPU every frame
+// (Viewer/LiveTraceView.cs). Made on first use; refused on anything that is not a dedicated graphics card.
+RefractorForge.Viewer.LiveTraceView? liveTrace = null;
+bool tracedView = false;
+int traceRes = 0;                          // 0 auto, 1 full, 2 half, 3 quarter
+int traceAutoDiv = 1, traceAutoSettle = 0;
+string traceSceneSig = "";
+bool traceStale = false;
+double traceStaleCheck = 0;
+long traceParamSig = 0;
+Texture2D? traceGround = null;             // the ground the traced scene was built with
+object? traceLevel = null;                 // the heightmap it was built for: another level turns the mode off
+Texture2D? rlMeanFor = null; Vector3 rlMeanVal = Vector3.Zero;
+HashSet<int> traceNoSelection = new();
 bool nightColourLightmaps = true;      // BF1942 keeps a lamp's colour in a 24-bit object lightmap; BFV reads .b only
 int nightQuality = 1;                  // 0 draft (hard shadows), 1 good, 2 high (soft, many samples)
 bool nightBakeGround = true, nightBakeObjects = true, nightBakeGlows = true;
@@ -8931,7 +8956,8 @@ void LightmapBakeProgress()
                 // The ground stage had already gone in. Say so: the ground now carries the new light and the
                 // objects the old, and one undo puts the ground back.
                 lmPhysical = null; rlRig = null;
-                Toast(Loc.T("Lighting bake cancelled after the ground was done. The objects keep their old lightmaps; undo (Z) puts the ground back."));
+                if (rlObjectsOnly) { rlObjectsOnly = false; Toast(Loc.T("Lighting bake cancelled - the level is unchanged.")); }
+                else Toast(Loc.T("Lighting bake cancelled after the ground was done. The objects keep their old lightmaps; undo (Z) puts the ground back."));
                 return;
             }
             Toast(Loc.T("Lightmap bake cancelled - the level keeps the lightmaps it had."));
@@ -8969,6 +8995,8 @@ void BakeObjectLightmaps()
 {
     if (so is null || meshLib is null || heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
     if (lmBaking) { Toast(Loc.T("A lightmap bake is already running.")); return; }
+    // Realistic chosen as the quality: set up the traced solve and come back through here with it in place.
+    if (lmUseRealistic && !gameIsBf1942 && lmPhysical is null) { BakeRealisticObjects(); return; }
     var es = EffectiveSun(); var sunV = new Vec3(es.X, es.Y, es.Z);
     // One job per LOD MESH of each placed object, because that is how the game files lightmaps: O_HueHouse_B's is
     // O_HueHouse_B_M1_<pos>.tga (and _M2_ for the far LOD), never O_HueHouse_B_<pos>.tga - a file named after the
@@ -9039,6 +9067,7 @@ void BakeObjectLightmaps()
     var jobMeshes = jobs.Select(j => j.Mesh).ToArray();
     // The traced bake (Realistic Lighting): one scene for everything, so no self-occluder, no night scene, no tiers.
     var physRef = lmPhysical; var physRig = rlRig;
+    var jobColour = new bool[jobs.Count]; lmJobColour = jobColour;   // maps that carry colour and must be written 24-bit
     var jobPrimary = jobs.Select(j => j.Primary).ToArray();
     lmTask = System.Threading.Tasks.Task.Run(() =>
     {
@@ -9058,6 +9087,7 @@ void BakeObjectLightmaps()
                     var ph = (jobPrimary[i] ? physRef : physRef with { SurfaceOffset = 0.08f }) with { VertexLit = jobMeshes[i].VertexLit };
                     var pm = ObjectLightmapBaker.BakePhysical(jobMeshes[i], worlds[i], sizes[i], samplesRef, ph, physRig, 2, token);
                     results[i] = pm?.Map;
+                    if (pm is { Colour: true }) jobColour[i] = true;
                     if (pm is not null)
                         lock (rlStatLock) { rlMaps++; rlMapFloor += pm.AtFloor; rlMapCeil += pm.AtCeiling; rlMapErr += pm.MeanError; }
                     // No unwrap: nothing is written. A flat one-value map was tried for these - and measured in the
@@ -9102,6 +9132,8 @@ void FinishObjectLightmapBake()
     else if (LevelLightmapPalette() is { } levelPal && (levelPal.Usable || lmSelectedOnly)) { lmPalette = levelPal; lmPaletteReplaced = false; }
     else lmPaletteReplaced = true;
     int baked = 0, noUnwrap = 0, lodMaps = 0, uniform = 0;
+    var tracedColour = new List<(string Key, Texture2D Tex)>();
+    lmColourNote = "";
     for (int i = 0; i < jobs.Count; i++)
     {
         var (o, meshName, _, primary) = jobs[i];
@@ -9136,7 +9168,37 @@ void FinishObjectLightmapBake()
         if (primary) { olm.AddBaked(o.Template, x, y, z, tex); baked++; } else lodMaps++;
         // A 24-bit map keeps the lamps' colour (BF1942 reads it - GC_Bespin_Night ships exactly this); the grey
         // palette form is what BfVietnam's .b-only shader wants and what every retail map is.
-        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = lmColour ? TgaTexture.EncodeRgb24(tex) : EncodeGreyLightmap(tex, lmPalette);
+        // A traced map for a mesh the game lights per vertex is solved per channel: 24-bit too (BfVietnam reads a
+        // 24-bit map exactly as written - measured).
+        bool rgbMap = lmColour || (lmJobColour is { } jc && i < jc.Length && jc[i]);
+        if (rgbMap && !lmColour && !gameIsBf1942) { tracedColour.Add(($"{fileBase}_{x}-{y}-{z}.tga", tex)); continue; }
+        bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = rgbMap ? TgaTexture.EncodeRgb24(tex) : EncodeGreyLightmap(tex, lmPalette);
+    }
+    lmJobColour = null;
+    // The traced colour maps, within what the game can hold. A 24-bit map costs the 32-bit client four bytes a texel
+    // plus mips, against one for an 8-bit map: Operation_Flaming_Dart with 288 of them at 1024 px (864 MB of files)
+    // ran the client out of memory while loading - it died creating effects/particles.fx at 2 GB (2026-11-28).
+    // So: a map with no colour to speak of is written 8-bit through the palette, and the largest of the rest are
+    // halved, one at a time, until the 24-bit maps fit the budget.
+    if (tracedColour.Count > 0)
+    {
+        var plan = RefractorForge.Render.LightmapBudget.Fit(tracedColour.Select(t => t.Tex).ToList(), LightmapColourBudgetBytes);
+        int grey = 0, halved = 0; long bytes = 0;
+        for (int i = 0; i < tracedColour.Count; i++)
+        {
+            var (key, tex) = tracedColour[i];
+            var p = plan[i];
+            if (!p.Colour) { bakedObjectLightmaps[key] = EncodeGreyLightmap(RefractorForge.Render.LightmapBudget.Grey(tex), lmPalette); grey++; continue; }
+            var t = tex;
+            for (int h = 0; h < p.Halvings; h++) t = RefractorForge.Render.LightmapBudget.Halve(t);
+            if (p.Halvings > 0) halved++;
+            var enc = TgaTexture.EncodeRgb24(t);
+            bytes += enc.Length;
+            bakedObjectLightmaps[key] = enc;
+        }
+        Console.WriteLine($"   Traced colour maps: {tracedColour.Count - grey} written 24-bit ({bytes / 1048576.0:0} MB, {halved} at reduced size to fit {LightmapColourBudgetBytes / 1048576} MB), {grey} without colour written 8-bit.");
+        lmColourNote = halved > 0
+            ? string.Format(Loc.T("{0} of the colour lightmaps were written at reduced size so the game can hold them all."), halved) : "";
     }
     if (lmPaletteReplaced) bakedObjectLightmaps["Palette.pal"] = lmPalette.ToRiff();
     objectLightmaps = olm; objectLightmapsLoaded = true;
@@ -9441,321 +9503,326 @@ void OnRender(double dt)
     gridPrevOn = gridOn;
     if (gridOn && gridDirty && terrainPick is not null) { BuildGrid(); gridDirty = false; }
 
-    Stage("terrain");
-    if (showTerrain)
+    // The traced view draws the terrain, the objects, the sky and the water itself; everything after this block
+    // (markers, gizmos, brushes) still goes on top of it.
+    if (!TraceThisFrame(fbSize))
     {
-        gl.UseProgram(terrainProg);
-        gl.UniformMatrix4(uMvp, 1, false, mvp);
-        gl.Uniform3(uLight, ld.X, ld.Y, ld.Z);
-        SetLightUniforms(uAmbLightT, uDifLightT, terrainProg);
-        gl.Uniform1(uWater, cfg.WaterLevel);
-        gl.Uniform1(uMaxH, maxH);
-        SetFogUniforms(terrainProg);
-        if (terrainTexId != 0) { gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.Texture2D, terrainTexId); }
-        if (detailTexId != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, detailTexId); gl.ActiveTexture(TextureUnit.Texture0); }
-        gl.Uniform1(uUseShadowMapT, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
-        unsafe { var ls = lightSpace; gl.UniformMatrix4(uLightSpaceT, 1, false, (float*)&ls); }
-        if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
-        bool showPaint = toolNames[tool] == "Paint" && paintLayer != 3 && matTexId != 0;   // Texture layer shows the real atlas, no tint
-        bool showNav = toolNames[tool] == "AIPath";
-        if (showNav) { EnsureAiNav(); if (aiNavTexDirty) UploadAiNavTexture(); if (aiNav is null || aiNavTexId == 0) showNav = false; }
-        gl.Uniform1(uShowMat, showPaint ? (paintLayer == 0 ? 1 : 2) : (showNav ? 3 : 0));
-        if (showPaint) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, matTexId); gl.ActiveTexture(TextureUnit.Texture0); }
-        else if (showNav) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, aiNavTexId); gl.ActiveTexture(TextureUnit.Texture0); }
-        gl.BindVertexArray(terrainVao);
-        // Terrain view mode (Battlecraft J/K/L): 1 draws the mesh as lines only; 0 and 2 draw it solid, and 2 adds
-        // the draped grid below as its overlay.
-        if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
-        unsafe { gl.DrawElements(PrimitiveType.Triangles, (uint)terrainIndexCount, DrawElementsType.UnsignedInt, (void*)0); }
-        if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Fill);
-    }
-
-    // Draped world-grid overlay. Wireframe already draws the mesh as lines, so the grid is suppressed there (it
-    // would sit on top and ignore the Grid checkbox); textured-wireframe forces it on as its overlay.
-    Stage("grid");
-    if (terrainView != 1) DrawGrid(terrainView == 2);
-
-    // Texture transparency: blend object + foliage alpha (the shader's alpha-test discard does the hard cutout,
-    // blending softens the edges). Opaque parts output alpha=1.0 so they're unaffected.
-    if (alphaTransparency) { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
-    gl.UseProgram(objProg); gl.Uniform1(uAlphaEnableO, alphaTransparency ? 1 : 0);   // toggle off -> no discard + opaque output (objects revert to solid)
-    SetLightUniforms(uAmbLightO, uDifLightO, objProg);   // one set covers every object pass this frame (uniforms are per-program state)
-
-    // Real object geometry (GPU). Selected object is tinted via the highlight colour.
-    Stage("objects");
-    if (glObjects is not null && objectsOn)
-    {
-        gl.UseProgram(objProg);
-        gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
-        SetFogUniforms(objProg);
-        gl.Uniform1(uUseShadowMapO, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
-        unsafe { var lso = lightSpace; gl.UniformMatrix4(uLightSpaceO, 1, false, (float*)&lso); }
-        if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
-        // Baked object lighting unless you're driving the sun manually - then objects light DYNAMICALLY (N-L + the
-        // real-time shadow map) so they respond to the sun in real time (a static baked lightmap can't move with it).
-        // Wireframe object view: line polygons for every object drawn in this pass (statics, vehicle spawners,
-        // flags, spawn markers). Flat shading comes with it so the lines are the material colour, not texture.
-        if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
-        bool wantLm = showObjectLightmaps && !sunOverride;
-        if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
-        glObjects.ShowLightmaps = wantLm;
-        glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
-        glObjects.HiddenIndices = HiddenIndexSet();
-        glObjects.LightShares = gameLighting && !gameIsBf1942 ? StaticLightShares(ld) : null;
-        glObjects.Draw(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                       cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f), LockedIndices());
-
-        // Continuously-rotating object parts (BF1942 RotationalBundle: windmill blades, watermill wheel, mod fans/rotors).
-        // These are kept OUT of the static flattened mesh, so they're drawn here (always — else the part vanishes when
-        // the toggle's off); the "Animate objects" toggle only controls whether they SPIN (else they sit at rest angle).
-        if (meshLib is not null)
-            foreach (var (tmpl, world, _) in glObjects.Placements)
-            {
-                if (!meshLib.TryGetAnimatedParts(tmpl, out var aparts)) continue;
-                float t = showAnimations ? (float)appClock : 0f;
-                for (int ai = 0; ai < aparts.Length; ai++)
-                {
-                    var ap = aparts[ai];
-                    // Spin about the pivot using the editor's own (X,Y,Z)->yaw/pitch/roll convention (same as static
-                    // placement rotations) — this matched the in-game windmill; the earlier "weird" look was the doubled
-                    // static+spinning blades, now fixed by excluding rotating parts from the static mesh.
-                    var spin = Matrix4x4.CreateTranslation(-ap.Pivot)
-                             * Matrix4x4.CreateFromYawPitchRoll(ap.SpeedDeg.X * t * MathF.PI / 180f,
-                                                                ap.SpeedDeg.Y * t * MathF.PI / 180f,
-                                                                ap.SpeedDeg.Z * t * MathF.PI / 180f)
-                             * Matrix4x4.CreateTranslation(ap.Pivot);
-                    var model = spin * ap.StaticLocal * world;
-                    glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                       cam.ViewProjection, $"anim::{tmpl}::{ai}", ap.Mesh, model, Vector3.One);
-                }
-            }
-
-        // Vehicle spawns: draw each one's FULL assembled mesh (hull + turret + barrel + wheels + treads).
-        if (showVehicles && meshLib is not null && glObjects is not null)
+        Stage("terrain");
+        if (showTerrain)
         {
-            gl.UseProgram(objProg);
-            gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
-            SetFogUniforms(objProg);
-            foreach (var v in gameplayEdit.VehicleSpawns)
-            {
-                if (!GpVisible(GpKind.Vehicle, gameplayEdit.VehicleSpawns.IndexOf(v))) continue;   // game-type filter
-                // Show the spawner's owning-team vehicle (SpawnVehicleName), not the team-2-preferred display fallback,
-                // so enemy-team spawners render their real vehicle. NO tint — render exactly as a placed object (the
-                // distinct team models are the faction cue; a colour cast looked wrong on the vehicle textures).
-                string veh = SpawnVehicleName(v);
-                // TryGetRenderMesh (assembled vehicle -> single mesh -> generic Bundle) resolves custom map vehicles in any
-                // folder (interstate le_mans Big_Ear/P71_Marked...), not just /Vehicles/.
-                if (string.IsNullOrWhiteSpace(veh) || !meshLib.TryGetRenderMesh(veh, out var vmesh) || vmesh is null) continue;
-                var spawnWorld = Matrix4x4.CreateFromYawPitchRoll(
-                                     v.Rotation.X * MathF.PI / 180f, v.Rotation.Y * MathF.PI / 180f, v.Rotation.Z * MathF.PI / 180f)
-                               * Matrix4x4.CreateTranslation(v.Position.X, v.Position.Y, v.Position.Z);
-                // Same tint rules as a static object, so a vehicle spawner reads the same way: selected is the
-                // amber highlight, locked is red, and locked-AND-selected is the lighter red - otherwise you
-                // could not tell which of several locked spawners you had picked.
-                int vIdx = gameplayEdit.VehicleSpawns.IndexOf(v);
-                if (!GpVisible(GpKind.Vehicle, vIdx)) continue;   // game-type filter
-                bool vSel = gpKind == GpKind.Vehicle && gpIndex == vIdx && vIdx >= 0;
-                bool vLocked = vIdx >= 0 && IsGameplayLocked(GpKind.Vehicle, vIdx);
-                var vTint = vLocked ? (vSel ? new Vector3(2.1f, 0.72f, 0.62f) : new Vector3(1.6f, 0.42f, 0.38f))
-                          : vSel ? new Vector3(1.5f, 1.4f, 0.4f) : Vector3.One;
-                glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                   cam.ViewProjection, $"veh::{veh}", vmesh, spawnWorld, vTint);
-            }
+            gl.UseProgram(terrainProg);
+            gl.UniformMatrix4(uMvp, 1, false, mvp);
+            gl.Uniform3(uLight, ld.X, ld.Y, ld.Z);
+            SetLightUniforms(uAmbLightT, uDifLightT, terrainProg);
+            gl.Uniform1(uWater, cfg.WaterLevel);
+            gl.Uniform1(uMaxH, maxH);
+            SetFogUniforms(terrainProg);
+            if (terrainTexId != 0) { gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.Texture2D, terrainTexId); }
+            if (detailTexId != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, detailTexId); gl.ActiveTexture(TextureUnit.Texture0); }
+            gl.Uniform1(uUseShadowMapT, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
+            unsafe { var ls = lightSpace; gl.UniformMatrix4(uLightSpaceT, 1, false, (float*)&ls); }
+            if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
+            bool showPaint = toolNames[tool] == "Paint" && paintLayer != 3 && matTexId != 0;   // Texture layer shows the real atlas, no tint
+            bool showNav = toolNames[tool] == "AIPath";
+            if (showNav) { EnsureAiNav(); if (aiNavTexDirty) UploadAiNavTexture(); if (aiNav is null || aiNavTexId == 0) showNav = false; }
+            gl.Uniform1(uShowMat, showPaint ? (paintLayer == 0 ? 1 : 2) : (showNav ? 3 : 0));
+            if (showPaint) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, matTexId); gl.ActiveTexture(TextureUnit.Texture0); }
+            else if (showNav) { gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, aiNavTexId); gl.ActiveTexture(TextureUnit.Texture0); }
+            gl.BindVertexArray(terrainVao);
+            // Terrain view mode (Battlecraft J/K/L): 1 draws the mesh as lines only; 0 and 2 draw it solid, and 2 adds
+            // the draped grid below as its overlay.
+            if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
+            unsafe { gl.DrawElements(PrimitiveType.Triangles, (uint)terrainIndexCount, DrawElementsType.UnsignedInt, (void*)0); }
+            if (terrainView == 1) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Fill);
         }
 
-        // Control points get a flagpole; soldier spawns get the engine's spawn-marker mesh.
-        if (meshLib is not null && glObjects is not null)
+        // Draped world-grid overlay. Wireframe already draws the mesh as lines, so the grid is suppressed there (it
+        // would sit on top and ignore the Grid checkbox); textured-wireframe forces it on as its overlay.
+        Stage("grid");
+        if (terrainView != 1) DrawGrid(terrainView == 2);
+
+        // Texture transparency: blend object + foliage alpha (the shader's alpha-test discard does the hard cutout,
+        // blending softens the edges). Opaque parts output alpha=1.0 so they're unaffected.
+        if (alphaTransparency) { gl.Enable(EnableCap.Blend); gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha); }
+        gl.UseProgram(objProg); gl.Uniform1(uAlphaEnableO, alphaTransparency ? 1 : 0);   // toggle off -> no discard + opaque output (objects revert to solid)
+        SetLightUniforms(uAmbLightO, uDifLightO, objProg);   // one set covers every object pass this frame (uniforms are per-program state)
+
+        // Real object geometry (GPU). Selected object is tinted via the highlight colour.
+        Stage("objects");
+        if (glObjects is not null && objectsOn)
         {
             gl.UseProgram(objProg);
             gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
             SetFogUniforms(objProg);
-            void DrawGp(string key, MeshLibrary.Mesh mesh, Vec3 pos, Vec3 rot, Vector3? solidColor = null)
-            {
-                var w = Matrix4x4.CreateFromYawPitchRoll(rot.X * MathF.PI / 180f, rot.Y * MathF.PI / 180f, rot.Z * MathF.PI / 180f)
-                      * Matrix4x4.CreateTranslation(pos.X, pos.Y, pos.Z);
-                glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                   cam.ViewProjection, key, mesh, w, Vector3.One, solidColor);
-            }
-            // Soldier spawn marker: a simple soldier-sized box (NOT the engine's 3-arrow spawn mesh), oriented to yaw.
-            if (showSpawns)
-                foreach (var s in gameplayEdit.SoldierSpawns) DrawGp("gp::soldbox", SoldierBoxMesh(), s.Position, s.Rotation);
-            // Control point: the flag-pole/base mesh (flagbase_m1) + the owning team's flag cloth at the mount height.
-            // Mesh names come from the CP template (geometry + setTeamGeometry), defaulting to the stock BF1942 flags.
-            // Both meshes are textured (no tint needed); each is drawn only when it resolves, so a BFV map that names a
-            // mesh it doesn't ship simply shows no pole (graceful).
-            if (showControlPoints)
-                foreach (var cp in gameplayEdit.ControlPoints)
+            gl.Uniform1(uUseShadowMapO, (shadowsOn && shadowMapDepthTex != 0) ? 1 : 0);
+            unsafe { var lso = lightSpace; gl.UniformMatrix4(uLightSpaceO, 1, false, (float*)&lso); }
+            if (shadowMapDepthTex != 0) { gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, shadowMapDepthTex); gl.ActiveTexture(TextureUnit.Texture0); }
+            // Baked object lighting unless you're driving the sun manually - then objects light DYNAMICALLY (N-L + the
+            // real-time shadow map) so they respond to the sun in real time (a static baked lightmap can't move with it).
+            // Wireframe object view: line polygons for every object drawn in this pass (statics, vehicle spawners,
+            // flags, spawn markers). Flat shading comes with it so the lines are the material colour, not texture.
+            if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
+            bool wantLm = showObjectLightmaps && !sunOverride;
+            if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
+            glObjects.ShowLightmaps = wantLm;
+            glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
+            glObjects.HiddenIndices = HiddenIndexSet();
+            glObjects.LightShares = gameLighting && !gameIsBf1942 ? StaticLightShares(ld) : null;
+            glObjects.Draw(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                           cam.ViewProjection, multi, selected, new Vector3(1.5f, 1.4f, 0.4f), LockedIndices());
+
+            // Continuously-rotating object parts (BF1942 RotationalBundle: windmill blades, watermill wheel, mod fans/rotors).
+            // These are kept OUT of the static flattened mesh, so they're drawn here (always — else the part vanishes when
+            // the toggle's off); the "Animate objects" toggle only controls whether they SPIN (else they sit at rest angle).
+            if (meshLib is not null)
+                foreach (var (tmpl, world, _) in glObjects.Placements)
                 {
-                    if (!GpVisible(GpKind.ControlPoint, gameplayEdit.ControlPoints.IndexOf(cp))) continue;   // game-type filter
-                    var poleName = string.IsNullOrEmpty(cp.PoleGeometry) ? "flagbase_m1" : cp.PoleGeometry;
-                    if (meshLib.TryGet(poleName, out var pole) && pole is not null)
-                        DrawGp($"gp::cp::{poleName}", pole, cp.Position, Vec3.Zero);
-                    var flagName = cp.Team == 1 ? cp.FlagGeometry1 : cp.FlagGeometry2;   // team1=axis, team2=allied cloth; neutral(0) uses this shape but rendered WHITE (below)
-                    if (!string.IsNullOrEmpty(flagName) && meshLib.TryGet(flagName, out var flag) && flag is not null)
+                    if (!meshLib.TryGetAnimatedParts(tmpl, out var aparts)) continue;
+                    float t = showAnimations ? (float)appClock : 0f;
+                    for (int ai = 0; ai < aparts.Length; ai++)
                     {
-                        float fy = cp.FlagHeight > 0 ? cp.FlagHeight : 8.2f;
-                        // Hang the flag from near the TOP of the actual pole mesh (a touch below the finial), not the fixed
-                        // mount height, so it sits high on poles of any height instead of leaving bare pole above it.
-                        float poleTopY = fy;
-                        if (pole is not null && pole.Positions.Length > 0)
-                        { float mxY = pole.Positions[0].Y; foreach (var pp in pole.Positions) if (pp.Y > mxY) mxY = pp.Y; poleTopY = mxY - 0.5f; }
-                        // Re-anchor the flag cloth onto the pole. The 180° roll rights it (local (x,y)->(-x,-y)); from the
-                        // mesh's own AABB we then place its TOP at the pole top and its near (hoist) edge AT the pole so it
-                        // flies out. (If it flies the wrong way or the canton ends up at the free end, flip fhi.X -> flo.X.)
-                        var fpos0 = flag.Positions;
-                        if (fpos0.Length > 0)
-                        {
-                            Vector3 flo = fpos0[0], fhi = fpos0[0];
-                            foreach (var p in fpos0) { flo = Vector3.Min(flo, p); fhi = Vector3.Max(fhi, p); }
-                            const float hoistInset = 0.05f;   // forward: hoist edge sits just in front of the pole
-                            const float poleGap = 0.08f;      // the cloth sits just off the pole: 1 ft out, then 0.75 ft back so it is not floating free
-                            const float flagLateral = 0.4f;   // "right": shift the flag laterally (Z) to line up with the pole (flip sign if it goes the wrong way)
-                            const float flagRise = 0.1f;      // cloth height: 1 m down from the old 0.8, then a foot back up
-                            var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset + poleGap, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
-                            DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f), cp.Team == 0 ? new Vector3(0.9f, 0.9f, 0.9f) : (Vector3?)null);   // neutral CP -> white flag
-                        }
+                        var ap = aparts[ai];
+                        // Spin about the pivot using the editor's own (X,Y,Z)->yaw/pitch/roll convention (same as static
+                        // placement rotations) — this matched the in-game windmill; the earlier "weird" look was the doubled
+                        // static+spinning blades, now fixed by excluding rotating parts from the static mesh.
+                        var spin = Matrix4x4.CreateTranslation(-ap.Pivot)
+                                 * Matrix4x4.CreateFromYawPitchRoll(ap.SpeedDeg.X * t * MathF.PI / 180f,
+                                                                    ap.SpeedDeg.Y * t * MathF.PI / 180f,
+                                                                    ap.SpeedDeg.Z * t * MathF.PI / 180f)
+                                 * Matrix4x4.CreateTranslation(ap.Pivot);
+                        var model = spin * ap.StaticLocal * world;
+                        glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                           cam.ViewProjection, $"anim::{tmpl}::{ai}", ap.Mesh, model, Vector3.One);
                     }
                 }
-        }
-    }
 
-    // Growth: the game's own forest and grass (a VIEW; never saved). The trees are generated once for the whole map and
-    // again when their inputs change; the grass is laid out around the camera as it moves, like the game.
-    Stage("foliage");
-    if (glObjects is not null && (showFoliage || showUnderFoliage) && !painting)
-    {
-        // A static the overgrowth takes over (a palm the mapper placed by hand) uses up its cell's budget and keeps
-        // generated trees off its spot, so moving one regenerates the forest - in about the time of a frame.
-        if (!growthModelDirty && showFoliage && ogResult is { ImportSceneObjects: true } && GrowthStaticsSignature() != ogStaticsSig)
-            growthModelDirty = true;
-        if (growthModelDirty) { BuildGrowthModel(); foliageDirty = true; }
-        if (foliageDirty) BuildOvergrowthFoliage();
-        if (showUnderFoliage)
-        {
-            // Rebuilt every half metre: the fade runs over the last 30 % of a 35-70 m view distance, so the patches'
-            // alphas move as the camera does. Laying it out is cheap - the patches are cached, as the game's are
-            // regenerated identically.
-            var here = ugFromAbove ? new Vector3(cam.Position.X, 0f, cam.Position.Z) : cam.Position;
-            var was = ugFromAbove ? new Vector3(underAnchor.X, 0f, underAnchor.Z) : underAnchor;
-            if (underDirty || Vector3.DistanceSquared(here, was) > 0.25f) BuildUndergrowthFoliage(cam.Position);
-        }
-        else if (glObjects.UndergrowthInstanceCount > 0) BuildUndergrowthFoliage(cam.Position);   // turned off: drop it
-        if (glObjects.FoliageInstanceCount > 0 || glObjects.UndergrowthInstanceCount > 0)
-        {
-            gl.UseProgram(objProg);
-            gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
-            SetFogUniforms(objProg);
-            if (ogResult is { } og && glObjects.FoliageInstanceCount > 0)
+            // Vehicle spawns: draw each one's FULL assembled mesh (hull + turret + barrel + wheels + treads).
+            if (showVehicles && meshLib is not null && glObjects is not null)
             {
-                // Close up the game draws each tree as its real _m1 object, inside 0.2 x viewDistance (about 110 m on
-                // a 550 m map at medium detail); past that the cell's _m2 batch, until the whole cell drops out at the
-                // view distance - so a forest appears a cell at a time, as it does in game.
-                float closeDist = og.ViewDistance * 0.2f;
-                var vis = OvergrowthCellsVisible(og, cam.Position);
-                Func<int, bool>? cellShown = vis is null ? null : g => (uint)g < (uint)vis.Length && vis[g];
-                float farLimit = 1e9f;
-                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverNear, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                     cam.ViewProjection, cam.Position, 0f, closeDist, cellShown, 0, GlObjects.GrowthShade.Lit);
-                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverFar, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                     cam.ViewProjection, cam.Position, closeDist, farLimit, cellShown, ogFarTex, GlObjects.GrowthShade.Lit);
+                gl.UseProgram(objProg);
+                gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
+                SetFogUniforms(objProg);
+                foreach (var v in gameplayEdit.VehicleSpawns)
+                {
+                    if (!GpVisible(GpKind.Vehicle, gameplayEdit.VehicleSpawns.IndexOf(v))) continue;   // game-type filter
+                    // Show the spawner's owning-team vehicle (SpawnVehicleName), not the team-2-preferred display fallback,
+                    // so enemy-team spawners render their real vehicle. NO tint — render exactly as a placed object (the
+                    // distinct team models are the faction cue; a colour cast looked wrong on the vehicle textures).
+                    string veh = SpawnVehicleName(v);
+                    // TryGetRenderMesh (assembled vehicle -> single mesh -> generic Bundle) resolves custom map vehicles in any
+                    // folder (interstate le_mans Big_Ear/P71_Marked...), not just /Vehicles/.
+                    if (string.IsNullOrWhiteSpace(veh) || !meshLib.TryGetRenderMesh(veh, out var vmesh) || vmesh is null) continue;
+                    var spawnWorld = Matrix4x4.CreateFromYawPitchRoll(
+                                         v.Rotation.X * MathF.PI / 180f, v.Rotation.Y * MathF.PI / 180f, v.Rotation.Z * MathF.PI / 180f)
+                                   * Matrix4x4.CreateTranslation(v.Position.X, v.Position.Y, v.Position.Z);
+                    // Same tint rules as a static object, so a vehicle spawner reads the same way: selected is the
+                    // amber highlight, locked is red, and locked-AND-selected is the lighter red - otherwise you
+                    // could not tell which of several locked spawners you had picked.
+                    int vIdx = gameplayEdit.VehicleSpawns.IndexOf(v);
+                    if (!GpVisible(GpKind.Vehicle, vIdx)) continue;   // game-type filter
+                    bool vSel = gpKind == GpKind.Vehicle && gpIndex == vIdx && vIdx >= 0;
+                    bool vLocked = vIdx >= 0 && IsGameplayLocked(GpKind.Vehicle, vIdx);
+                    var vTint = vLocked ? (vSel ? new Vector3(2.1f, 0.72f, 0.62f) : new Vector3(1.6f, 0.42f, 0.38f))
+                              : vSel ? new Vector3(1.5f, 1.4f, 0.4f) : Vector3.One;
+                    glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                       cam.ViewProjection, $"veh::{veh}", vmesh, spawnWorld, vTint);
+                }
             }
-            if (glObjects.UndergrowthInstanceCount > 0)
+
+            // Control points get a flagpole; soldier spawns get the engine's spawn-marker mesh.
+            if (meshLib is not null && glObjects is not null)
             {
-                // Unlit, tinted by the terrain colour under each clump (4 x atlas x terrain), as the game draws it.
-                int uHasTer = gl.GetUniformLocation(objProg, "uGrowthHasTer");
-                int uTerScale = gl.GetUniformLocation(objProg, "uGrowthTerScale"), uTerOff = gl.GetUniformLocation(objProg, "uGrowthTerOffset");
-                gl.ActiveTexture(TextureUnit.Texture4);
-                gl.BindTexture(TextureTarget.Texture2D, terrainTexId);
+                gl.UseProgram(objProg);
+                gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
+                SetFogUniforms(objProg);
+                void DrawGp(string key, MeshLibrary.Mesh mesh, Vec3 pos, Vec3 rot, Vector3? solidColor = null)
+                {
+                    var w = Matrix4x4.CreateFromYawPitchRoll(rot.X * MathF.PI / 180f, rot.Y * MathF.PI / 180f, rot.Z * MathF.PI / 180f)
+                          * Matrix4x4.CreateTranslation(pos.X, pos.Y, pos.Z);
+                    glObjects.DrawMesh(gl, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                       cam.ViewProjection, key, mesh, w, Vector3.One, solidColor);
+                }
+                // Soldier spawn marker: a simple soldier-sized box (NOT the engine's 3-arrow spawn mesh), oriented to yaw.
+                if (showSpawns)
+                    foreach (var s in gameplayEdit.SoldierSpawns) DrawGp("gp::soldbox", SoldierBoxMesh(), s.Position, s.Rotation);
+                // Control point: the flag-pole/base mesh (flagbase_m1) + the owning team's flag cloth at the mount height.
+                // Mesh names come from the CP template (geometry + setTeamGeometry), defaulting to the stock BF1942 flags.
+                // Both meshes are textured (no tint needed); each is drawn only when it resolves, so a BFV map that names a
+                // mesh it doesn't ship simply shows no pole (graceful).
+                if (showControlPoints)
+                    foreach (var cp in gameplayEdit.ControlPoints)
+                    {
+                        if (!GpVisible(GpKind.ControlPoint, gameplayEdit.ControlPoints.IndexOf(cp))) continue;   // game-type filter
+                        var poleName = string.IsNullOrEmpty(cp.PoleGeometry) ? "flagbase_m1" : cp.PoleGeometry;
+                        if (meshLib.TryGet(poleName, out var pole) && pole is not null)
+                            DrawGp($"gp::cp::{poleName}", pole, cp.Position, Vec3.Zero);
+                        var flagName = cp.Team == 1 ? cp.FlagGeometry1 : cp.FlagGeometry2;   // team1=axis, team2=allied cloth; neutral(0) uses this shape but rendered WHITE (below)
+                        if (!string.IsNullOrEmpty(flagName) && meshLib.TryGet(flagName, out var flag) && flag is not null)
+                        {
+                            float fy = cp.FlagHeight > 0 ? cp.FlagHeight : 8.2f;
+                            // Hang the flag from near the TOP of the actual pole mesh (a touch below the finial), not the fixed
+                            // mount height, so it sits high on poles of any height instead of leaving bare pole above it.
+                            float poleTopY = fy;
+                            if (pole is not null && pole.Positions.Length > 0)
+                            { float mxY = pole.Positions[0].Y; foreach (var pp in pole.Positions) if (pp.Y > mxY) mxY = pp.Y; poleTopY = mxY - 0.5f; }
+                            // Re-anchor the flag cloth onto the pole. The 180° roll rights it (local (x,y)->(-x,-y)); from the
+                            // mesh's own AABB we then place its TOP at the pole top and its near (hoist) edge AT the pole so it
+                            // flies out. (If it flies the wrong way or the canton ends up at the free end, flip fhi.X -> flo.X.)
+                            var fpos0 = flag.Positions;
+                            if (fpos0.Length > 0)
+                            {
+                                Vector3 flo = fpos0[0], fhi = fpos0[0];
+                                foreach (var p in fpos0) { flo = Vector3.Min(flo, p); fhi = Vector3.Max(fhi, p); }
+                                const float hoistInset = 0.05f;   // forward: hoist edge sits just in front of the pole
+                                const float poleGap = 0.08f;      // the cloth sits just off the pole: 1 ft out, then 0.75 ft back so it is not floating free
+                                const float flagLateral = 0.4f;   // "right": shift the flag laterally (Z) to line up with the pole (flip sign if it goes the wrong way)
+                                const float flagRise = 0.1f;      // cloth height: 1 m down from the old 0.8, then a foot back up
+                                var fpos = new Vec3(cp.Position.X + fhi.X - hoistInset + poleGap, cp.Position.Y + poleTopY + flo.Y + flagRise, cp.Position.Z - (flo.Z + fhi.Z) * 0.5f + flagLateral);
+                                DrawGp($"gp::cpflag::{flagName}", flag, fpos, new Vec3(0f, 0f, 180f), cp.Team == 0 ? new Vector3(0.9f, 0.9f, 0.9f) : (Vector3?)null);   // neutral CP -> white flag
+                            }
+                        }
+                    }
+            }
+        }
+
+        // Growth: the game's own forest and grass (a VIEW; never saved). The trees are generated once for the whole map and
+        // again when their inputs change; the grass is laid out around the camera as it moves, like the game.
+        Stage("foliage");
+        if (glObjects is not null && (showFoliage || showUnderFoliage) && !painting)
+        {
+            // A static the overgrowth takes over (a palm the mapper placed by hand) uses up its cell's budget and keeps
+            // generated trees off its spot, so moving one regenerates the forest - in about the time of a frame.
+            if (!growthModelDirty && showFoliage && ogResult is { ImportSceneObjects: true } && GrowthStaticsSignature() != ogStaticsSig)
+                growthModelDirty = true;
+            if (growthModelDirty) { BuildGrowthModel(); foliageDirty = true; }
+            if (foliageDirty) BuildOvergrowthFoliage();
+            if (showUnderFoliage)
+            {
+                // Rebuilt every half metre: the fade runs over the last 30 % of a 35-70 m view distance, so the patches'
+                // alphas move as the camera does. Laying it out is cheap - the patches are cached, as the game's are
+                // regenerated identically.
+                var here = ugFromAbove ? new Vector3(cam.Position.X, 0f, cam.Position.Z) : cam.Position;
+                var was = ugFromAbove ? new Vector3(underAnchor.X, 0f, underAnchor.Z) : underAnchor;
+                if (underDirty || Vector3.DistanceSquared(here, was) > 0.25f) BuildUndergrowthFoliage(cam.Position);
+            }
+            else if (glObjects.UndergrowthInstanceCount > 0) BuildUndergrowthFoliage(cam.Position);   // turned off: drop it
+            if (glObjects.FoliageInstanceCount > 0 || glObjects.UndergrowthInstanceCount > 0)
+            {
+                gl.UseProgram(objProg);
+                gl.Uniform3(uLightO, ld.X, ld.Y, ld.Z);
+                SetFogUniforms(objProg);
+                if (ogResult is { } og && glObjects.FoliageInstanceCount > 0)
+                {
+                    // Close up the game draws each tree as its real _m1 object, inside 0.2 x viewDistance (about 110 m on
+                    // a 550 m map at medium detail); past that the cell's _m2 batch, until the whole cell drops out at the
+                    // view distance - so a forest appears a cell at a time, as it does in game.
+                    float closeDist = og.ViewDistance * 0.2f;
+                    var vis = OvergrowthCellsVisible(og, cam.Position);
+                    Func<int, bool>? cellShown = vis is null ? null : g => (uint)g < (uint)vis.Length && vis[g];
+                    float farLimit = 1e9f;
+                    glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverNear, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                         cam.ViewProjection, cam.Position, 0f, closeDist, cellShown, 0, GlObjects.GrowthShade.Lit);
+                    glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.OverFar, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                         cam.ViewProjection, cam.Position, closeDist, farLimit, cellShown, ogFarTex, GlObjects.GrowthShade.Lit);
+                }
+                if (glObjects.UndergrowthInstanceCount > 0)
+                {
+                    // Unlit, tinted by the terrain colour under each clump (4 x atlas x terrain), as the game draws it.
+                    int uHasTer = gl.GetUniformLocation(objProg, "uGrowthHasTer");
+                    int uTerScale = gl.GetUniformLocation(objProg, "uGrowthTerScale"), uTerOff = gl.GetUniformLocation(objProg, "uGrowthTerOffset");
+                    gl.ActiveTexture(TextureUnit.Texture4);
+                    gl.BindTexture(TextureTarget.Texture2D, terrainTexId);
+                    gl.ActiveTexture(TextureUnit.Texture0);
+                    if (uHasTer >= 0) gl.Uniform1(uHasTer, terrainTexId != 0 ? 1 : 0);
+                    float wsz = MathF.Max(cfg.WorldSize, 1f);
+                    if (uTerScale >= 0) gl.Uniform2(uTerScale, terUvScale / wsz, terUvScale / wsz);
+                    if (uTerOff >= 0) gl.Uniform2(uTerOff, terUvOffX, terUvOffY);
+                    glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.Under, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
+                                         cam.ViewProjection, cam.Position, 0f, 1e9f, null, ugTex, GlObjects.GrowthShade.Undergrowth);
+                }
+            }
+        }
+
+        if (alphaTransparency) gl.Disable(EnableCap.Blend);   // restore opaque state; water sets its own blend below
+
+        // Water surface: translucent plane at the level's water height, blended over terrain + objects
+        // (depth-test on so submerged terrain still occludes it, depth-write off so it doesn't occlude).
+        if (showWater && waterProg != 0)
+        {
+            gl.Enable(EnableCap.Blend);
+            gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            gl.DepthMask(false);
+            gl.UseProgram(waterProg);
+            gl.UniformMatrix4(uMvpW, 1, false, mvp);
+            gl.Uniform3(uLightW, ld.X, ld.Y, ld.Z);
+            gl.Uniform3(uCamW, cam.Position.X, cam.Position.Y, cam.Position.Z);
+            gl.Uniform1(uTimeW, (float)appClock);
+            gl.Uniform1(uWaterYW, cfg.WaterLevel);          // live: follows the Water Level slider
+            gl.Uniform3(uWaterColorW, waterColor.X, waterColor.Y, waterColor.Z);   // level's water.color
+            gl.Uniform1(uWaterAlphaW, waterAlpha);                                  // level's transparency
+            SetWaterDepthUniforms(shallowColor, deepColor, env?.ColorDepth ?? 20f, cfg.WaterLevel);
+            { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
+            { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterOpacity)); }
+            { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
+            { int usr = gl.GetUniformLocation(waterProg, "uSkyRot"); if (usr >= 0) gl.Uniform1(usr, SkyPreviewYawRad()); }
+            if (skyCubeTex != 0)
+            {
+                gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.TextureCubeMap, skyCubeTex);
+                int us = gl.GetUniformLocation(waterProg, "uSkyCube"); if (us >= 0) gl.Uniform1(us, 3);
                 gl.ActiveTexture(TextureUnit.Texture0);
-                if (uHasTer >= 0) gl.Uniform1(uHasTer, terrainTexId != 0 ? 1 : 0);
-                float wsz = MathF.Max(cfg.WorldSize, 1f);
-                if (uTerScale >= 0) gl.Uniform2(uTerScale, terUvScale / wsz, terUvScale / wsz);
-                if (uTerOff >= 0) gl.Uniform2(uTerOff, terUvOffX, terUvOffY);
-                glObjects.DrawGrowth(gl, GlObjects.GrowthLayer.Under, objProg, uMvpO, uModelO, uColorO, uUseTexO, uAlphaTestO, uTintO,
-                                     cam.ViewProjection, cam.Position, 0f, 1e9f, null, ugTex, GlObjects.GrowthShade.Undergrowth);
             }
-        }
-    }
-
-    if (alphaTransparency) gl.Disable(EnableCap.Blend);   // restore opaque state; water sets its own blend below
-
-    // Water surface: translucent plane at the level's water height, blended over terrain + objects
-    // (depth-test on so submerged terrain still occludes it, depth-write off so it doesn't occlude).
-    if (showWater && waterProg != 0)
-    {
-        gl.Enable(EnableCap.Blend);
-        gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-        gl.DepthMask(false);
-        gl.UseProgram(waterProg);
-        gl.UniformMatrix4(uMvpW, 1, false, mvp);
-        gl.Uniform3(uLightW, ld.X, ld.Y, ld.Z);
-        gl.Uniform3(uCamW, cam.Position.X, cam.Position.Y, cam.Position.Z);
-        gl.Uniform1(uTimeW, (float)appClock);
-        gl.Uniform1(uWaterYW, cfg.WaterLevel);          // live: follows the Water Level slider
-        gl.Uniform3(uWaterColorW, waterColor.X, waterColor.Y, waterColor.Z);   // level's water.color
-        gl.Uniform1(uWaterAlphaW, waterAlpha);                                  // level's transparency
-        SetWaterDepthUniforms(shallowColor, deepColor, env?.ColorDepth ?? 20f, cfg.WaterLevel);
-        { int ur = gl.GetUniformLocation(waterProg, "uReflect"); if (ur >= 0) gl.Uniform1(ur, gameIsBf1942 ? 0f : waterReflect); }
-        { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterOpacity)); }
-        { int uc = gl.GetUniformLocation(waterProg, "uHasSkyCube"); if (uc >= 0) gl.Uniform1(uc, skyCubeTex != 0 ? 1 : 0); }
-        { int usr = gl.GetUniformLocation(waterProg, "uSkyRot"); if (usr >= 0) gl.Uniform1(usr, SkyPreviewYawRad()); }
-        if (skyCubeTex != 0)
-        {
-            gl.ActiveTexture(TextureUnit.Texture3); gl.BindTexture(TextureTarget.TextureCubeMap, skyCubeTex);
-            int us = gl.GetUniformLocation(waterProg, "uSkyCube"); if (us >= 0) gl.Uniform1(us, 3);
-            gl.ActiveTexture(TextureUnit.Texture0);
-        }
-        // BfVietnam's animated water: pick the two frames to cross-fade from the clock.
-        bool wseq = !gameIsBf1942 && useWaterTextures && waterSeqTex.Length > 1;
-        { int u = gl.GetUniformLocation(waterProg, "uWaterSeq"); if (u >= 0) gl.Uniform1(u, wseq ? 1 : 0); }
-        if (wseq)
-        {
-            float cyc = MathF.Max(0.25f, waterSeqCycle);
-            float f = (float)(appClock / cyc) * waterSeqTex.Length;
-            int fa = (int)MathF.Floor(f), fb = fa + 1;
-            float mix = f - fa;
-            gl.ActiveTexture(TextureUnit.Texture4); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fa % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
-            { int u = gl.GetUniformLocation(waterProg, "uSeqA"); if (u >= 0) gl.Uniform1(u, 4); }
-            gl.ActiveTexture(TextureUnit.Texture5); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fb % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
-            { int u = gl.GetUniformLocation(waterProg, "uSeqB"); if (u >= 0) gl.Uniform1(u, 5); }
-            { int u = gl.GetUniformLocation(waterProg, "uSeqMix"); if (u >= 0) gl.Uniform1(u, mix); }
-            { int u = gl.GetUniformLocation(waterProg, "uWaterScaleM"); if (u >= 0) gl.Uniform1(u, waterScaleM); }
-            { int u = gl.GetUniformLocation(waterProg, "uMatDiffuse"); if (u >= 0) gl.Uniform3(u, waterMatDiffuse.X, waterMatDiffuse.Y, waterMatDiffuse.Z); }
-            gl.ActiveTexture(TextureUnit.Texture0);
-        }
-        bool wtex = !wseq && haveWaterTex && useWaterTextures && env is not null;
-        gl.Uniform1(uHasWaterTexW, wtex ? 1 : 0);
-        if (wtex)
-        {
-            gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.Texture2D, waterTex1); gl.Uniform1(uTexL1W, 0);
-            gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, waterTex2); gl.Uniform1(uTexL2W, 1);
-            gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, waterNorm); gl.Uniform1(uNormalW, 2);
-            gl.Uniform2(uScroll1W, env.ScrollDir1X * env.ScrollSpeed1, env.ScrollDir1Y * env.ScrollSpeed1);   // dir * speed
-            gl.Uniform2(uScroll2W, env.ScrollDir2X * env.ScrollSpeed2, env.ScrollDir2Y * env.ScrollSpeed2);
-            gl.Uniform2(uScrollNW, env.ScrollDirNX * env.ScrollSpeedN, env.ScrollDirNY * env.ScrollSpeedN);
-            gl.Uniform1(uTile1W, env.TileLayer1); gl.Uniform1(uTile2W, env.TileLayer2); gl.Uniform1(uTileNW, env.TileNormal);
-            gl.Uniform3(uSpecColW, env.WaterSpecularColor.X, env.WaterSpecularColor.Y, env.WaterSpecularColor.Z);
-            gl.ActiveTexture(TextureUnit.Texture0);
-        }
-        SetFogUniforms(waterProg);                      // fade distant water into the fog like the terrain
-        gl.BindVertexArray(waterVao);
-        gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
-        // The tunnel water: a second plane at waterBelowLevel, seen through the holes and from underground.
-        if (cfg.DrawWaterBelowTerrain && cfg.WaterBelowLevel is float wbl)
-        {
-            gl.Uniform1(uWaterYW, wbl);
-            gl.Uniform3(uWaterColorW, belowColor.X, belowColor.Y, belowColor.Z);
-            // No depth ramp for this body: it sits BELOW the terrain, so the surface heightmap says "zero deep"
-            // everywhere and the whole sheet would read as shallowColor. The editor has no tunnel floor to
-            // measure against, so it shows waterBelowTerrain.color as-is.
-            SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater(), useDepth: false);
-            gl.Uniform1(uWaterAlphaW, belowAlpha);
-            { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
-            { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterBelowOpacity)); }
+            // BfVietnam's animated water: pick the two frames to cross-fade from the clock.
+            bool wseq = !gameIsBf1942 && useWaterTextures && waterSeqTex.Length > 1;
+            { int u = gl.GetUniformLocation(waterProg, "uWaterSeq"); if (u >= 0) gl.Uniform1(u, wseq ? 1 : 0); }
+            if (wseq)
+            {
+                float cyc = MathF.Max(0.25f, waterSeqCycle);
+                float f = (float)(appClock / cyc) * waterSeqTex.Length;
+                int fa = (int)MathF.Floor(f), fb = fa + 1;
+                float mix = f - fa;
+                gl.ActiveTexture(TextureUnit.Texture4); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fa % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
+                { int u = gl.GetUniformLocation(waterProg, "uSeqA"); if (u >= 0) gl.Uniform1(u, 4); }
+                gl.ActiveTexture(TextureUnit.Texture5); gl.BindTexture(TextureTarget.Texture2D, waterSeqTex[((fb % waterSeqTex.Length) + waterSeqTex.Length) % waterSeqTex.Length]);
+                { int u = gl.GetUniformLocation(waterProg, "uSeqB"); if (u >= 0) gl.Uniform1(u, 5); }
+                { int u = gl.GetUniformLocation(waterProg, "uSeqMix"); if (u >= 0) gl.Uniform1(u, mix); }
+                { int u = gl.GetUniformLocation(waterProg, "uWaterScaleM"); if (u >= 0) gl.Uniform1(u, waterScaleM); }
+                { int u = gl.GetUniformLocation(waterProg, "uMatDiffuse"); if (u >= 0) gl.Uniform3(u, waterMatDiffuse.X, waterMatDiffuse.Y, waterMatDiffuse.Z); }
+                gl.ActiveTexture(TextureUnit.Texture0);
+            }
+            bool wtex = !wseq && haveWaterTex && useWaterTextures && env is not null;
+            gl.Uniform1(uHasWaterTexW, wtex ? 1 : 0);
+            if (wtex)
+            {
+                gl.ActiveTexture(TextureUnit.Texture0); gl.BindTexture(TextureTarget.Texture2D, waterTex1); gl.Uniform1(uTexL1W, 0);
+                gl.ActiveTexture(TextureUnit.Texture1); gl.BindTexture(TextureTarget.Texture2D, waterTex2); gl.Uniform1(uTexL2W, 1);
+                gl.ActiveTexture(TextureUnit.Texture2); gl.BindTexture(TextureTarget.Texture2D, waterNorm); gl.Uniform1(uNormalW, 2);
+                gl.Uniform2(uScroll1W, env.ScrollDir1X * env.ScrollSpeed1, env.ScrollDir1Y * env.ScrollSpeed1);   // dir * speed
+                gl.Uniform2(uScroll2W, env.ScrollDir2X * env.ScrollSpeed2, env.ScrollDir2Y * env.ScrollSpeed2);
+                gl.Uniform2(uScrollNW, env.ScrollDirNX * env.ScrollSpeedN, env.ScrollDirNY * env.ScrollSpeedN);
+                gl.Uniform1(uTile1W, env.TileLayer1); gl.Uniform1(uTile2W, env.TileLayer2); gl.Uniform1(uTileNW, env.TileNormal);
+                gl.Uniform3(uSpecColW, env.WaterSpecularColor.X, env.WaterSpecularColor.Y, env.WaterSpecularColor.Z);
+                gl.ActiveTexture(TextureUnit.Texture0);
+            }
+            SetFogUniforms(waterProg);                      // fade distant water into the fog like the terrain
+            gl.BindVertexArray(waterVao);
             gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+            // The tunnel water: a second plane at waterBelowLevel, seen through the holes and from underground.
+            if (cfg.DrawWaterBelowTerrain && cfg.WaterBelowLevel is float wbl)
+            {
+                gl.Uniform1(uWaterYW, wbl);
+                gl.Uniform3(uWaterColorW, belowColor.X, belowColor.Y, belowColor.Z);
+                // No depth ramp for this body: it sits BELOW the terrain, so the surface heightmap says "zero deep"
+                // everywhere and the whole sheet would read as shallowColor. The editor has no tunnel floor to
+                // measure against, so it shows waterBelowTerrain.color as-is.
+                SetWaterDepthUniforms(belowShallowColor, belowDeepColor, belowColorDepth, EffectiveTunnelWater(), useDepth: false);
+                gl.Uniform1(uWaterAlphaW, belowAlpha);
+                { int u = gl.GetUniformLocation(waterProg, "uReflect"); if (u >= 0) gl.Uniform1(u, gameIsBf1942 ? 0f : waterBelowReflect); }
+                { int uo = gl.GetUniformLocation(waterProg, "uWaterOpacityMul"); if (uo >= 0) gl.Uniform1(uo, WaterOpacityMul(waterBelowOpacity)); }
+                gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+            }
+            gl.DepthMask(true);
+            gl.Disable(EnableCap.Blend);
         }
-        gl.DepthMask(true);
-        gl.Disable(EnableCap.Blend);
     }
 
     DrawAiNavPlane();   // AI Path level plane (after the water, so a deck plane over the sea reads on top of it)
@@ -11948,6 +12015,13 @@ void RlKeepGround(Texture2D? ground)
 Vector3 RlMeanAlbedo(Texture2D? ground)
 {
     if (ground is null) return RefractorForge.Render.LightScene.DefaultGround;
+    if (ReferenceEquals(ground, rlMeanFor)) return rlMeanVal;
+    rlMeanVal = RlMeanAlbedoOf(ground); rlMeanFor = ground;
+    return rlMeanVal;
+}
+
+Vector3 RlMeanAlbedoOf(Texture2D ground)
+{
     static float Lin(byte v) { float c = v / 255f; return c <= 0.04045f ? c / 12.92f : MathF.Pow((c + 0.055f) / 1.055f, 2.4f); }
     double r = 0, g = 0, b = 0; int n = 0;
     var px = ground.Rgba;
@@ -12021,6 +12095,7 @@ void BakeRealisticLighting()
 
     var ground = RlGroundSource();
     RlKeepGround(ground);                        // the ground as painted, kept once, before anything goes into it
+    rlObjectsOnly = false;
     var sw = System.Diagnostics.Stopwatch.StartNew();
     // On this thread: the mesh library's cache is not thread-safe, and the scene is read-only once built.
     var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground, so, meshLib, holes: env?.IsTunnelMap == true);
@@ -12063,6 +12138,30 @@ void BakeRealisticLighting()
 }
 
 string RlV(Vector3 v) => string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:0.00}/{1:0.00}/{2:0.00}", v.X, v.Y, v.Z);
+
+// The object lightmaps alone, by the realistic solve: what Bake Object Lightmaps does when Lightmap quality is
+// Realistic. The same scene, light and fitted colours as the window's bake, without the ground stage - the ground
+// keeps whatever it has. The colours the maps were solved against are written with them, or the maps would not match.
+void BakeRealisticObjects()
+{
+    if (rlBaking || sbBaking) { Toast(Loc.T("A lighting bake is already running.")); return; }
+    var ground = RlGroundSource();
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground, so, meshLib, holes: env?.IsTunnelMap == true);
+    if (built.Scene is null) { Toast(Loc.T("Nothing to trace: this level has no terrain or objects.")); return; }
+    var day = RlModel(ground);
+    var fit = RlFitFor(day);
+    var rigSnap = RlLampSnapshot();
+    rlDay = day; rlFit = fit; rlRig = rigSnap;
+    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget());
+    Console.WriteLine($"Realistic object lightmaps: scene built in {sw.Elapsed.TotalSeconds:0.0} s; solved against diffuse {RlV(fit.Colours.Sun)}, "
+                      + $"secondary {RlV(fit.Colours.Back)}, ambient {RlV(fit.Colours.Ambient)}, LMambient {RlV(fit.Colours.LmAmbient)}.");
+    rlMaps = 0; rlMapFloor = 0; rlMapCeil = 0; rlMapErr = 0;
+    rlObjectsOnly = true;
+    BakeObjectLightmaps();
+    if (lmBaking) bakedObjects = true;
+    else if (lmPhysical is not null) FinishRealisticBake(0, 0);   // nothing on this map can carry a lightmap
+}
 
 // The ground stage's progress, and the hand-off to the object stage when it is done.
 void RealLightProgress()
@@ -12186,8 +12285,19 @@ void FinishRealisticBake(int baked, int unwrapless)
 
     double floorPct = rlMaps > 0 ? rlMapFloor / rlMaps * 100.0 : 0, ceilPct = rlMaps > 0 ? rlMapCeil / rlMaps * 100.0 : 0;
     double err = rlMaps > 0 ? rlMapErr / rlMaps : 0;
+    if (rlObjectsOnly)
+    {
+        rlSummary = string.Format(Loc.T("Baked: {0} object lightmap(s), {1} object(s) with no unwrap left to the game's own light; the ground was left as it was.\nLight colours written to the level: diffuse {2}, secondary {3}, ambient {4}, LMambient {5}.\nWhere the engine cannot follow the traced light: {6:0}% of lightmap texels are darker than its ambient floor and {7:0}% brighter than both its lights can reach; on average the result is {8:0.000} away (0 = identical, 1 = black against white)."),
+            baked, unwrapless, RlV(c.Sun), RlV(c.Back), RlV(c.Ambient), RlV(c.LmAmbient), floorPct, ceilPct, err);
+        if (lmColourNote.Length > 0) rlSummary += "\n" + lmColourNote;
+        Console.WriteLine("Realistic object lightmaps baked. " + rlSummary.Replace("\n", " "));
+        Toast(string.Format(Loc.T("Realistic object lightmaps baked: {0}. The level's light colours were set to match them. Save writes it all."), baked));
+        rlObjectsOnly = false;
+        return;
+    }
     rlSummary = string.Format(Loc.T("Baked: {0} lightmap(s), {1} object(s) with no unwrap left to the game's own light, {2:0}% of the ground in shadow.\nLight colours written to the level: diffuse {3}, secondary {4}, ambient {5}, LMambient {6}.\nWhere the engine cannot follow the traced light: {7:0}% of lightmap texels are darker than its ambient floor and {8:0}% brighter than both its lights can reach; on average the result is {9:0.000} away (0 = identical, 1 = black against white)."),
         baked, unwrapless, rlShadowShare * 100.0, RlV(c.Sun), RlV(c.Back), RlV(c.Ambient), RlV(c.LmAmbient), floorPct, ceilPct, err);
+    if (lmColourNote.Length > 0) rlSummary += "\n" + lmColourNote;
     Console.WriteLine("Realistic lighting baked. " + rlSummary.Replace("\n", " "));
     Toast(string.Format(Loc.T("Realistic lighting baked: {0} lightmap(s) and the ground. The viewport now shows the level as the game will draw it. Save writes it all."), baked));
 }
@@ -12222,7 +12332,7 @@ void RlStartPreview()
     var px = new byte[w * h * 4];
     rlPrevPx = px; rlPrevW = w; rlPrevH = h; rlPrevSeconds = 0;
     System.Threading.Volatile.Write(ref rlPrevStage, 0);
-    var view = new RefractorForge.Render.LightPreview.Camera(cam.Position, cam.Forward, Vector3.UnitY, cam.FovY * 180f / MathF.PI, w, h);
+    var view = new RefractorForge.Render.LightPreview.Camera(cam.Position, cam.Forward, Vector3.UnitY, cam.FovY * 180f / MathF.PI, w, h, cam.MirrorX);
     var rigSnap = RlLampSnapshot();
     var prep = rlPrevScene;
     rlPrevCancel = new System.Threading.CancellationTokenSource();
@@ -12257,6 +12367,173 @@ unsafe void RlUploadPreview()
     fixed (byte* p = rlPrevPx)
         gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)rlPrevW, (uint)rlPrevH, 0,
                       PixelFormat.Rgba, PixelType.UnsignedByte, p);
+}
+
+// ---- the live traced view ----------------------------------------------------------------------------------------
+
+// Is the traced view possible on this machine? Asking makes the GPU host once: it checks the card before it
+// compiles anything, and on an integrated GPU it compiles nothing at all.
+bool TraceAvailable()
+{
+    try { liveTrace ??= new RefractorForge.Viewer.LiveTraceView(gl); }
+    catch (Exception ex) { Console.WriteLine("Traced view: " + ex.Message); return false; }
+    return liveTrace.Available;
+}
+
+// What the traced scene was built from: the level's objects, terrain edits and ground.
+string TraceSig() => (hist?.UndoDepth ?? 0) + "|" + (so?.Objects.Count ?? 0) + "|" + groundAtlasVersion + "|" + (heightmap?.GetHashCode() ?? 0);
+
+// Build the level's light scene and put it on the GPU. Blocks for a few seconds on a big level, as the CPU preview's
+// build does: the mesh library it reads is not thread-safe.
+bool TraceBuildScene()
+{
+    if (heightmap is null || so is null || meshLib is null) { Toast(Loc.T("Load a level with terrain first.")); return false; }
+    if (!TraceAvailable()) { Toast(liveTrace?.Status ?? Loc.T("The traced view is not available on this graphics card.")); return false; }
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var ground0 = RlGroundSource();
+    var built = RefractorForge.Render.LightScene.Build(heightmap, cfg, ground0, so, meshLib, holes: env?.IsTunnelMap == true);
+    var packed = RefractorForge.Render.LiveTraceScene.From(built);
+    if (packed is null) { Toast(Loc.T("Nothing to trace: this level has no terrain or objects.")); return false; }
+    try { liveTrace!.SetScene(packed, ground0); }
+    catch (Exception ex) { Toast(Loc.T("The traced view could not load the level onto the GPU: ") + ex.Message); return false; }
+    traceGround = ground0; traceLevel = heightmap;
+    traceSceneSig = TraceSig(); traceStale = false;
+    if (liveTrace.SelfTestPassed is not null) liveTrace.ReleaseCpuCopy();
+    Console.WriteLine($"Traced view: {packed.TriCount:N0} triangles ({packed.TerrainTris:N0} terrain), {packed.Bytes / (1024 * 1024):N0} MB on the GPU, built in {sw.Elapsed.TotalSeconds:0.0} s.");
+    return true;
+}
+
+void SetTracedView(bool on)
+{
+    if (!on) { tracedView = false; return; }
+    if (!TraceBuildScene()) return;
+    // The first time, the GPU is held against the C# copy of its kernel; the mode is refused if they disagree.
+    if (liveTrace!.SelfTestPassed is null)
+    {
+        var fb = window.FramebufferSize;
+        liveTrace.SelfTest(TraceParams(Math.Max(16, fb.X), Math.Max(16, fb.Y)));
+        liveTrace.ReleaseCpuCopy();
+    }
+    if (liveTrace.SelfTestPassed != true)
+    {
+        Toast(Loc.T("The traced view did not pass its GPU check, so it stays off: ") + liveTrace.SelfTestReport);
+        tracedView = false;
+        return;
+    }
+    traceAutoDiv = 1; traceAutoSettle = 0; traceParamSig = 0;
+    tracedView = true;
+}
+
+// The light as the Realistic Lighting window describes it, for one frame of the traced view.
+RefractorForge.Render.LiveTraceKernel.Params TraceParams(int w, int h)
+    => RefractorForge.Render.LiveTraceKernel.Params.From(RlModel(traceGround), lightRig, cam.ViewProjection, cam.Position,
+                                                         w, h, traceGround, cfg.WorldSize, bounces: 2);
+
+// Anything that changes the picture starts it again: the camera, the light, the lamps, the resolution.
+long TraceParamSigOf(RefractorForge.Render.LiveTraceKernel.Params p)
+{
+    var hc = new HashCode();
+    hc.Add(p.InvViewProj); hc.Add(p.CamPos); hc.Add(p.Width); hc.Add(p.Height); hc.Add(p.ToSun); hc.Add(p.SunIrradiance);
+    hc.Add(p.SunTanHalf); hc.Add(p.SkyZenith); hc.Add(p.SkyHorizon); hc.Add(p.GroundRadiance); hc.Add(p.Exposure);
+    hc.Add(p.Gamma); hc.Add(p.BounceGain); hc.Add(p.Bounces);
+    foreach (var l in p.Lamps) hc.Add(l);
+    return hc.ToHashCode();
+}
+
+// Draw this frame through the traced view, if it is on. False leaves the frame to the ordinary drawing.
+bool TraceThisFrame(Silk.NET.Maths.Vector2D<int> fb)
+{
+    if (!tracedView || liveTrace is not { Available: true, Scene: not null }) return false;
+    if (!ReferenceEquals(traceLevel, heightmap)) { tracedView = false; return false; }   // another level was opened
+    if (appClock - traceStaleCheck > 0.5) { traceStaleCheck = appClock; traceStale = TraceSig() != traceSceneSig; }
+    int div = traceRes switch { 1 => 1, 2 => 2, 3 => 4, _ => traceAutoDiv };
+    int w = Math.Max(16, fb.X / div), h = Math.Max(16, fb.Y / div);
+    var p = TraceParams(w, h);
+    long sig = TraceParamSigOf(p);
+    if (sig != traceParamSig) { liveTrace.Reset(); traceParamSig = sig; }
+    try
+    {
+        liveTrace.Frame(p, cam.ViewProjection, fb.X, fb.Y, cfg.WaterLevel, TraceDrawGeometry);
+    }
+    catch (Exception ex)
+    {
+        tracedView = false;
+        Toast(Loc.T("The traced view stopped after a GPU error: ") + ex.Message);
+        Console.WriteLine("Traced view: " + ex);
+        gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        gl.Viewport(0, 0, (uint)fb.X, (uint)fb.Y);
+        gl.DepthFunc(DepthFunction.Less);
+        return false;
+    }
+    // Auto: a frame that keeps the GPU longer than about 45 ms makes the editor sluggish - trace fewer pixels.
+    if (traceRes == 0)
+    {
+        if (traceAutoSettle > 0) traceAutoSettle--;
+        else if (liveTrace.LastGpuMs > 45 && traceAutoDiv < 4) { traceAutoDiv *= 2; traceAutoSettle = 12; }
+    }
+    return true;
+}
+
+// The G-buffer's geometry: the terrain, then every object with its texture - all of them, hidden ones too, because
+// the traced scene holds all of them.
+unsafe void TraceDrawGeometry(Matrix4x4 vp)
+{
+    var lt = liveTrace!;
+    uint prog = lt.GBufferProgram;
+    int uMVP = lt.GBufferUniform("uMVP"), uModel = lt.GBufferUniform("uModel"), uKind = lt.GBufferUniform("uKind");
+    gl.UseProgram(prog);
+    var id = Matrix4x4.Identity;
+    if (terrainVao != 0 && terrainIndexCount > 0)
+    {
+        gl.Uniform1(uKind, 0);
+        gl.UniformMatrix4(uMVP, 1, false, (float*)&vp);
+        gl.UniformMatrix4(uModel, 1, false, (float*)&id);
+        gl.BindVertexArray(terrainVao);
+        gl.DrawElements(PrimitiveType.Triangles, (uint)terrainIndexCount, DrawElementsType.UnsignedInt, (void*)0);
+    }
+    if (glObjects is not null)
+    {
+        gl.Uniform1(uKind, 1);
+        bool flat = glObjects.FlatShading, lms = glObjects.ShowLightmaps;
+        var hidden = glObjects.HiddenIndices; var shares = glObjects.LightShares;
+        glObjects.FlatShading = false; glObjects.ShowLightmaps = false; glObjects.HiddenIndices = null; glObjects.LightShares = null;
+        try
+        {
+            glObjects.Draw(gl, prog, uMVP, uModel, lt.GBufferUniform("uColor"), lt.GBufferUniform("uUseTex"),
+                           lt.GBufferUniform("uAlphaTest"), -1, vp, traceNoSelection, -1, Vector3.One);
+        }
+        finally
+        {
+            glObjects.FlatShading = flat; glObjects.ShowLightmaps = lms; glObjects.HiddenIndices = hidden; glObjects.LightShares = shares;
+        }
+    }
+    gl.BindVertexArray(0);
+}
+
+// The window's controls for it.
+void TraceControls()
+{
+    ImGui.Spacing();
+    if (!TraceAvailable())
+    {
+        Theme.Muted(Loc.T("Live traced view: ") + (liveTrace?.Status ?? ""));
+        return;
+    }
+    bool on = tracedView;
+    if (ImGui.Checkbox(Loc.TL("Live traced view in the viewport (GPU)"), ref on)) SetTracedView(on);
+    Theme.Tip(Loc.T("Draws this light in the main viewport, ray-traced on the graphics card every frame: it follows the camera\nand every slider here, starts grainy and clears up while you hold still. View > Traced light turns it on too."));
+    if (liveTrace!.SelfTestPassed == false) Theme.Muted(Loc.T("GPU check: ") + liveTrace.SelfTestReport);
+    if (!tracedView) return;
+    string[] res = { Loc.T("Auto"), Loc.T("Full"), Loc.T("Half"), Loc.T("Quarter") };
+    if (Cbo(Loc.TL("Traced resolution"), ref traceRes, res, res.Length)) { traceAutoDiv = 1; traceAutoSettle = 12; }
+    Theme.Tip(Loc.T("How many pixels are traced. Auto starts at full and drops when a frame takes the GPU too long."));
+    Theme.Muted(string.Format(Loc.T("{0} x {1}, {2} sample(s) a pixel, {3:0.0} ms a frame on the GPU."),
+                              liveTrace.Width, liveTrace.Height, liveTrace.Samples, liveTrace.LastGpuMs));
+    if (traceStale)
+    {
+        Theme.Muted(Loc.T("The level has changed since the traced scene was built."));
+        if (ImGui.Button(Loc.TL("Rebuild traced scene"))) TraceBuildScene();
+    }
 }
 
 // ---- the window --------------------------------------------------------------------------------------------------
@@ -12363,6 +12640,7 @@ void RealLightWindow()
                               : stage >= 2 ? string.Format(Loc.T("Rendered in {0:0.0} s."), rlPrevSeconds) : Loc.T("Stopped."));
     }
     Theme.Muted(Loc.T("This is the light the bake aims for. The game has no ray tracer: after a bake the main viewport shows what the game will actually draw, and where the engine cannot follow, the two differ."));
+    TraceControls();
 
     // ---- 3. bake -----------------------------------------------------------------------------------------------
     ImGui.Spacing();
@@ -12965,6 +13243,7 @@ void StartLmReadyScan()
     lmReadyScripts = ts; lmReadyManifest = manifest; lmReadyMeshes = meshes;
     lmReadyExisting = CountObjectLightmaps();
     lmReadyStatus = Loc.T("Scanning the map's objects...");
+    var only = LmReadyOnly();
     float tpm = lmTexelsPerMetre; int maxPx = lmBakeMaxSize;
     int Px(float ext, int floor)
     {
@@ -12974,24 +13253,41 @@ void StartLmReadyScan()
     }
     lmReadyScan = System.Threading.Tasks.Task.Run(() =>
     {
-        var rows = RefractorForge.Render.LightmapReadyPlanner.Plan(placed, ts, manifest, meshes, Px, out int undef);
+        var rows = RefractorForge.Render.LightmapReadyPlanner.Plan(placed, ts, manifest, meshes, Px, out int undef, default, only);
         return (rows, undef);
     });
 }
 
+// How this level's lightmap-ready copies are made: on BfVietnam, lit by their lightmaps alone (measured in game on the
+// third and fourth calibration levels); Battlefield 1942 is untouched until it has been measured too.
+RefractorForge.Formats.Con.LightmapReady.LightOnly? LmReadyOnly()
+    => lmReadyLightOnly && !gameIsBf1942 ? new RefractorForge.Formats.Con.LightmapReady.LightOnly(false, true) : null;
+
+// The level's existing copies were made another way than the window is set to: applying rebuilds them.
+bool LmReadyCopiesOutdated()
+    => lmReadyManifest.Placed.Count > 0 && (lmReadyManifest.Only?.Tag ?? "") != (LmReadyOnly()?.Tag ?? "");
+
 void StartLmReadyApply(IReadOnlyCollection<string> templates)
 {
-    if (lmReadyScripts is null || lmReadyMeshes is null || lmReadyApply is not null || templates.Count == 0) return;
+    if (lmReadyScripts is null || lmReadyMeshes is null || lmReadyApply is not null) return;
+    if (templates.Count == 0 && !LmReadyCopiesOutdated()) return;
+    var only = LmReadyOnly();
     var ts = lmReadyScripts; var meshes = lmReadyMeshes; var manifest = lmReadyManifest;
     var (baseSub, levelName) = LevelIdentity();
     var chosen = templates.ToList();
+    // The sound scripts any copy might need, read here: the mesh library is not thread-safe.
+    var sounds = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+    if (meshLib is not null)
+        foreach (var p in RefractorForge.Formats.Con.LightmapReady.SoundScriptPaths(ts).Distinct(StringComparer.OrdinalIgnoreCase))
+            if (meshLib.ReadFile(p) is { } b) sounds[p] = b;
     lmReadyStatus = string.Format(Loc.T("Unwrapping the meshes of {0} object type(s)..."), chosen.Count);
     lmReadyApply = System.Threading.Tasks.Task.Run(() =>
     {
-        var patches = RefractorForge.Render.LightmapReadyPlanner.BuildPatches(chosen, ts, manifest, meshes, out var failures);
+        var patches = RefractorForge.Render.LightmapReadyPlanner.BuildPatches(chosen, ts, manifest, meshes, out var failures, default, only);
         // The copies' scripts are written whole each time, so an earlier run's types go in again with the new ones.
         var output = RefractorForge.Formats.Con.LightmapReady.Emit(ts, chosen.Concat(manifest.Placed.Keys), patches,
-                                                                  levelName, baseSub, manifest);
+                                                                  levelName, baseSub, manifest,
+                                                                  p => sounds.TryGetValue(p, out var b) ? b : null, only);
         return (output, patches, failures, chosen);
     });
 }
@@ -13170,6 +13466,13 @@ void LmReadyWindow()
         return;
     }
 
+    if (!gameIsBf1942)
+    {
+        ImGui.BeginDisabled(busy);
+        if (ImGui.Checkbox(Loc.TL("Light the copies from their lightmaps alone"), ref lmReadyLightOnly)) StartLmReadyScan();
+        ImGui.EndDisabled();
+        Theme.Tip(Loc.T("The game lights an object with its two directional lights and uses the lightmap only to dim them, so a wall\nside-on to the sun, a ceiling, or anything lit by a placed lamp cannot show what was baked.\nWith this on, a copy is drawn as texture x lightmap on every face: every level of detail goes on the 40-byte\nvertex and its shader gets selfillum 1 (measured in the game). Objects that already have a lightmap are\noffered too, because they need the same copy. Bake with the Realistic quality afterwards."));
+    }
     ImGui.Checkbox(Loc.TL("Show foliage"), ref lmReadyShowFoliage);
     Theme.Tip(Loc.T("Trees, palms, bushes, grass and rice - read from their shaders, not their names. Off by default: they are\nhundreds of placements, and a tree's leaf cards need a large map to unwrap into."));
     ImGui.SameLine();
@@ -13248,8 +13551,16 @@ void LmReadyWindow()
     if (lmReadyStatus.Length > 0) Theme.Muted(lmReadyStatus);
     ImGui.PopTextWrapPos();
 
-    ImGui.BeginDisabled(busy || chosenRows.Count == 0);
-    if (ImGui.Button(string.Format(Loc.T("Make {0} type(s) lightmap-ready"), chosenRows.Count) + "###lmrgo"))
+    bool outdated = LmReadyCopiesOutdated();
+    if (outdated)
+    {
+        ImGui.PushTextWrapPos(0f);
+        Theme.Muted(Loc.T("This level's existing copies were made the other way. Applying rebuilds all of them to match the setting above; bake the object lightmaps again afterwards."));
+        ImGui.PopTextWrapPos();
+    }
+    ImGui.BeginDisabled(busy || (chosenRows.Count == 0 && !outdated));
+    if (ImGui.Button((chosenRows.Count == 0 && outdated ? Loc.T("Rebuild the existing copies")
+                      : string.Format(Loc.T("Make {0} type(s) lightmap-ready"), chosenRows.Count)) + "###lmrgo"))
         StartLmReadyApply(chosenRows.Select(r => r.Template).ToList());
     ImGui.EndDisabled();
     ImGui.SameLine();
@@ -17785,6 +18096,11 @@ void BuildUi()
                 // ground tiles. Each heading has its own bake and its own unbake - Save writes whichever ran, with
                 // no switch to forget - and nothing under one heading touches the other's files. The combined
                 // commands sit last, named as both.
+                // The two lighting windows first: where the light is described, before the bakes that use it.
+                if (ImGui.MenuItem(Loc.TL("Night Lighting..."), null, showNightWindow)) showNightWindow = !showNightWindow;
+                Theme.Tip(Loc.T("Lamps and spots, the night look, and the bake that puts them into the game - all in one window."));
+                if (ImGui.MenuItem(Loc.TL("Realistic Lighting..."), null, showRealLight)) showRealLight = !showRealLight;
+                ImGui.Separator();
                 ImGui.TextDisabled(Loc.T("OBJECT LIGHTMAPS"));
                 if (ImGui.MenuItem(Loc.TL("Bake Object Lightmaps"), null, false, so is not null && meshLib is not null && heightmap is not null)) BakeObjectLightmaps();
                 if (ImGui.MenuItem(Loc.TL("Lightmap-Ready Objects..."), null, false, so is not null && meshLib is not null)) OpenLmReady();
@@ -17793,6 +18109,7 @@ void BuildUi()
                 // but that is not where anyone goes to start a bake.
                 if (ImGui.BeginMenu(Loc.TL("   Lightmap quality")))
                 {
+                    LightmapQualityForGame();
                     for (int q = 0; q < 4; q++)
                     {
                         string qLabel = q switch
@@ -17800,9 +18117,23 @@ void BuildUi()
                             0 => Loc.T("Draft - 1 sample, 256px max (fast)"),
                             1 => Loc.T("Good - 2x2, 512px max"),
                             2 => Loc.T("High - 3x3, 1024px max (the engine's limit)"),
-                            _ => Loc.T("Ultra - soft sun, ambient occlusion, bounce (minutes)"),
+                            _ => gameIsBf1942 ? Loc.T("Ultra - soft sun, ambient occlusion, bounce (minutes)")
+                                              : Loc.T("Realistic lighting... (sun, sky, bounce and lamps)"),
                         };
-                        if (ImGui.MenuItem(qLabel, null, lmQuality == q)) { lmQuality = q; ApplyLightmapQuality(); }
+                        // On a Battlefield Vietnam level the top entry bakes the object lightmaps with the Realistic
+                        // Lighting solve - the window's light and its quality - instead of a tier.
+                        bool real = !gameIsBf1942 && lmUseRealistic;
+                        bool sel = q == 3 && !gameIsBf1942 ? real : !real && lmQuality == q;
+                        if (ImGui.MenuItem(qLabel, null, sel))
+                        {
+                            if (q == 3 && !gameIsBf1942) lmUseRealistic = true;
+                            else { lmUseRealistic = false; lmQuality = q; ApplyLightmapQuality(); }
+                        }
+                    }
+                    if (!gameIsBf1942)
+                    {
+                        ImGui.Separator();
+                        if (ImGui.MenuItem(Loc.TL("Realistic Lighting settings..."))) showRealLight = true;
                     }
                     ImGui.EndMenu();
                 }
@@ -18040,6 +18371,13 @@ void BuildUi()
             if (ImGui.MenuItem(Loc.TL("Camera: fly"), "O", !groundCam)) SetGroundCam(false);
             if (ImGui.MenuItem(Loc.TL("Camera: top-down"), "P")) TopDownCamera();
             ImGui.Separator();
+            // The live traced view, only where the card can run it.
+            if (heightmap is not null && TraceAvailable())
+            {
+                if (ImGui.MenuItem(Loc.TL("Traced light (GPU)"), null, tracedView)) SetTracedView(!tracedView);
+                Theme.Tip(Loc.T("The Realistic Lighting window's light, ray-traced live in the viewport on the graphics card."));
+                ImGui.Separator();
+            }
             // How a level is ASSEMBLED. Both pull in content the opened .rfa doesn't itself contain, which is what
             // the game does - but while authoring it can be confusing, so both can be switched off. Reopen to apply.
             if (ImGui.BeginMenu(Loc.TL("Level assembly")))
@@ -21437,6 +21775,13 @@ void LightGizmos()
     }
 }
 
+// Ultra is a BF1942-only tier now: on a Battlefield Vietnam level the Realistic Lighting window replaces it, so a
+// level opened after a BF1942 one with Ultra chosen falls back to High.
+void LightmapQualityForGame()
+{
+    if (!gameIsBf1942 && lmQuality == 3) { lmQuality = 2; lmUseRealistic = true; ApplyLightmapQuality(); }
+}
+
 // The Lights panel. Placed lights do not exist in the engine - see LightRig - so this is about aiming a rig
 // that then gets baked.
 void LightsPanel()
@@ -21455,10 +21800,24 @@ void LightsPanel()
     Theme.Section(Loc.T("OBJECT LIGHTMAPS"));
     Theme.Tip(Loc.T("Everything that is a lightmap: the ObjectLightMaps/*.tga the game reads for each placed\nobject (sun + placed lights, as brightness). Nothing here touches the terrain - the sun\nshadow and the ground bake are the separate process below."));
     ImGui.SetNextItemWidth(150f * uiScale);
-    if (CboZ(Loc.TL("Lightmap quality"), ref lmQuality,
+    LightmapQualityForGame();
+    int lq = !gameIsBf1942 && lmUseRealistic ? 3 : lmQuality;
+    // On a Battlefield Vietnam level the top entry bakes the object lightmaps with the Realistic Lighting solve
+    // instead of the Ultra tier. Battlefield 1942 keeps Ultra until its own lighting has been measured.
+    if (CboZ(Loc.TL("Lightmap quality"), ref lq,
              Loc.T("Draft (fast)") + "\0" + Loc.T("Good") + "\0" + Loc.T("High (engine limit)") + "\0"
-             + Loc.T("Ultra (offline: soft sun, AO, bounce)") + "\0"))
-        ApplyLightmapQuality();
+             + (gameIsBf1942 ? Loc.T("Ultra (offline: soft sun, AO, bounce)") : Loc.T("Realistic lighting...")) + "\0"))
+    {
+        if (lq == 3 && !gameIsBf1942) lmUseRealistic = true;
+        else { lmUseRealistic = false; lmQuality = lq; ApplyLightmapQuality(); }
+    }
+    if (!gameIsBf1942 && lmUseRealistic)
+    {
+        ImGui.PushTextWrapPos(0f);
+        Theme.Muted(string.Format(Loc.T("Bakes with the Realistic Lighting window's light at its quality ({0}), and writes the light colours the maps were solved against. The ground keeps its current bake - the window's own bake does both."),
+                                  new[] { Loc.T("Draft - fast, coarse"), Loc.T("Good"), Loc.T("High - final") }[Math.Min(lmQuality, 2)]));
+        ImGui.PopTextWrapPos();
+    }
     Theme.Tip(Loc.T("How the object lightmaps are baked. Sub-samples per texel is what smooths a shadow edge -\none sample per texel is what makes a bake look jagged - and texels per metre is how much\ndetail a surface gets. High is the engine's ceiling; larger maps crash the game.\nThe bake runs in the background with a progress bar, so a long one is not a freeze."));
     Theme.Muted(string.Format(Loc.T("{0}x{0} samples per texel, {1:0} texels/m, up to {2}px"), lmBakeSamples, lmTexelsPerMetre, lmBakeMaxSize));
     if (lmAdvanced)

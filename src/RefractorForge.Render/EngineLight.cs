@@ -88,20 +88,33 @@ public static class EngineLight
     /// <summary>What the game multiplies a LIGHTMAPPED surface's texture by.</summary>
     /// <param name="prelight">The lightmap's value at this point, 0..1.</param>
     public static Vector3 Lightmapped(float prelight, Vector3 n, Vector3 toSun, in Colours c, in Material m)
-        => Saturate(prelight * Lights(n, toSun, c, m) + m.Ambient * c.LmAmbient + m.SelfIllum);
+        => Saturate(prelight * Lights(n, toSun, c, m) + Floor(c, m));
 
     /// <summary>The same for a lightmap that carries colour. Only a mesh drawn fixed-function
     /// (<see cref="Material.VertexLit"/>) shows it; the per-pixel shader reads the blue channel alone.</summary>
     public static Vector3 Lightmapped(Vector3 lightmap, Vector3 n, Vector3 toSun, in Colours c, in Material m)
-        => Saturate((m.VertexLit ? lightmap : new Vector3(lightmap.Z)) * Lights(n, toSun, c, m) + m.Ambient * c.LmAmbient + m.SelfIllum);
+        => Saturate((m.VertexLit ? lightmap : new Vector3(lightmap.Z)) * Lights(n, toSun, c, m) + Floor(c, m));
 
-    /// <summary>The two lights as the lightmap meets them: times the material's diffuse, and on a vertex-lit mesh
-    /// clamped to 1.</summary>
+    /// <summary>
+    /// What the lightmap multiplies. Per pixel: the two lights times the material's diffuse. On a vertex-lit mesh
+    /// it is the fixed-function vertex colour - the two lights times the diffuse PLUS the material's
+    /// self-illumination, clamped to 1. Measured on the third calibration level (2026-11-28): a palm's material as
+    /// it ships (diffuse .5, selfillum .3) under lights worth 1.04 / 1.07 showed (0.52 + 0.3) x lightmap + LMambient,
+    /// and 0.1 - the LMambient alone - at lightmap 0.
+    /// </summary>
     public static Vector3 Lights(Vector3 n, Vector3 toSun, in Colours c, in Material m)
     {
         var d = m.Diffuse * Direct(n, toSun, c);
-        return m.VertexLit ? Saturate(d) : d;
+        return m.VertexLit ? Saturate(d + m.SelfIllum) : d;
     }
+
+    /// <summary>
+    /// What a lightmapped surface shows where its lightmap is black. Per pixel: material ambient x LMambient plus
+    /// the self-illumination (read from the exe's uploads). Vertex-lit: <c>LMambientColor</c> whole - the material's
+    /// ambient does not scale it and its self-illumination is under the lightmap, not beside it (measured, as above).
+    /// </summary>
+    public static Vector3 Floor(in Colours c, in Material m)
+        => m.VertexLit ? c.LmAmbient : m.Ambient * c.LmAmbient + m.SelfIllum;
 
     /// <summary>The same with the default material.</summary>
     public static Vector3 Lightmapped(float prelight, Vector3 n, Vector3 toSun, in Colours c)
@@ -234,7 +247,7 @@ public static class EngineLight
     /// <param name="target">What should multiply the texture, in the same display units the engine's colours are in.</param>
     public static float SolvePrelight(Vector3 target, Vector3 n, Vector3 toSun, in Colours c, in Material m)
     {
-        float want = Luma(target) - Luma(m.Ambient * c.LmAmbient + m.SelfIllum);
+        float want = Luma(target) - Luma(Floor(c, m));
         if (want <= 0f) return 0f;
         float lights = Luma(Lights(n, toSun, c, m));
         return Math.Clamp(want / MathF.Max(lights, MinLights), 0f, 1f);
@@ -253,7 +266,7 @@ public static class EngineLight
     /// when it is out of reach below (the ambient alone is already brighter). 0 when a lightmap value reaches it.</summary>
     public static float OutOfReach(Vector3 target, Vector3 n, Vector3 toSun, in Colours c, in Material m)
     {
-        float floor = Luma(m.Ambient * c.LmAmbient + m.SelfIllum);
+        float floor = Luma(Floor(c, m));
         float ceil = MathF.Min(1f, floor + Luma(Lights(n, toSun, c, m)));
         float t = MathF.Min(1f, Luma(target));
         return t > ceil ? t - ceil : t < floor ? t - floor : 0f;

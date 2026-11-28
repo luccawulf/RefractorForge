@@ -333,6 +333,9 @@ public class LightCalibrationTests : IDisposable
 
     // ---- the level ------------------------------------------------------------------------------------------
 
+    /// <summary>The fake base level, for the third level's tests in another class.</summary>
+    internal string FakeLevelPath() => FakeLevel();
+
     private string FakeLevel()
     {
         const string p = "BfVietnam/levels/Foo/";

@@ -114,6 +114,10 @@ public sealed class RayScene
             return _alpha[y * Width + x] >= _threshold;
         }
 
+        /// <summary>Is texel (<paramref name="x"/>, <paramref name="y"/>) surface? What <see cref="Solid"/> reads, for
+        /// packing the mask into a GPU buffer.</summary>
+        public bool SolidTexel(int x, int y) => _alpha[y * Width + x] >= _threshold;
+
         /// <summary>The share of the mask that is surface, 0..1 - how dense a canopy this is.</summary>
         public float Coverage
         {
@@ -161,6 +165,14 @@ public sealed class RayScene
                                   IReadOnlyList<Vector3>? albedo = null,
                                   IReadOnlyList<Cutout?>? cutouts = null)
         => tris is null || tris.Count == 0 ? null : new RayScene(tris, albedo, cutouts);
+
+    /// <summary>The cut-out tests as plain data, alongside <see cref="ExportFlat"/>: for each triangle the index of
+    /// its cut-out or -1, three texture coordinates per cut-out, and the mask each one reads. Null when the scene has
+    /// none.</summary>
+    public sealed record FlatCutouts(int[] CutOf, Vector2[] Uv, AlphaMask[] Masks);
+
+    /// <summary>See <see cref="FlatCutouts"/>.</summary>
+    public FlatCutouts? ExportCutouts() => _cutOf is null ? null : new FlatCutouts(_cutOf, _cutUv!, _cutMask!);
 
     /// <summary>True when the scene alpha-tests any triangle. A GPU kernel written against <see cref="ExportFlat"/>
     /// does not carry the masks, so it must not be handed such a scene.</summary>

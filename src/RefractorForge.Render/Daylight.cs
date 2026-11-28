@@ -99,6 +99,11 @@ public sealed class DaylightModel
     public Vector3 GroundRadiance { get; }
     /// <summary>The scale that puts an open surface facing the sun at the peak on screen.</summary>
     public float Exposure { get; }
+    /// <summary>The sky's radiance straight up and at the horizon, linear - <see cref="SkyRadiance"/> blends these.</summary>
+    public Vector3 SkyZenithRadiance => _zenith * _skyScale;
+    public Vector3 SkyHorizonRadiance => _horizon * _skyScale;
+    /// <summary>The display gamma <see cref="ToDisplay"/> encodes with.</summary>
+    public float DisplayGamma => _gamma;
 
     private readonly Vector3 _horizon, _zenith;
     private readonly float _skyScale, _gamma, _invGamma;

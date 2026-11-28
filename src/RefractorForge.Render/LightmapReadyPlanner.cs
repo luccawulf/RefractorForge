@@ -36,7 +36,12 @@ public static class LightmapReadyPlanner
     public sealed record GeometryPlan(string Geometry, string File, string State, bool Widen, string? Problem,
                                       LightmapUnwrapper.UnwrapDiagnostics? Diag, int Tris, int MapPx)
     {
-        public bool Patch => Problem is null && State != "full";
+        /// <summary>The plan is for lightmap-only copies (<see cref="LightmapReady.LightOnly"/>): a mesh that
+        /// already carries an unwrap is rewritten too.</summary>
+        public bool Only { get; init; }
+        public bool Patch => Problem is null && (State != "full" || Only);
+        /// <summary>The copy needs lightmaps the level does not have yet (the mesh had no unwrap).</summary>
+        public bool NewMaps => Problem is null && State != "full";
     }
 
     /// <param name="DoneAs">Already pointed at this lightmap-ready copy.</param>
@@ -47,10 +52,11 @@ public static class LightmapReadyPlanner
         public bool Selectable => DoneAs is null && Problem is null && Geometries.Any(g => g.Patch);
         public bool DefaultOn => Selectable && Kind == Kind.Structure;
         public bool Widens => Geometries.Any(g => g.Patch && g.Widen);
-        /// <summary>New lightmaps one placement adds - one per patched LOD mesh.</summary>
-        public int MapsPerObject => Geometries.Count(g => g.Patch);
-        /// <summary>What those maps cost on disk (8-bit colour-mapped TGA: pixels + palette + header).</summary>
-        public long BytesPerObject => Geometries.Where(g => g.Patch).Sum(g => (long)g.MapPx * g.MapPx + 786);
+        /// <summary>New lightmaps one placement adds - one per patched LOD mesh that had no unwrap.</summary>
+        public int MapsPerObject => Geometries.Count(g => g.NewMaps);
+        /// <summary>What those maps cost on disk: an 8-bit colour-mapped TGA (pixels + palette + header), or a
+        /// 24-bit one for a lightmap-only copy, whose map carries colour.</summary>
+        public long BytesPerObject => Geometries.Where(g => g.NewMaps).Sum(g => g.Only ? (long)g.MapPx * g.MapPx * 3 + 18 : (long)g.MapPx * g.MapPx + 786);
     }
 
     /// <summary>The mesh files a plan over these templates will read, including an earlier run's originals.</summary>
@@ -76,7 +82,7 @@ public static class LightmapReadyPlanner
     public static List<Row> Plan(IReadOnlyList<(string Template, int Count)> placed, TemplateScripts ts,
                                  LightmapReady.Manifest manifest, IReadOnlyDictionary<string, MeshSource?> meshes,
                                  Func<float, int, int> mapSize, out int undefined,
-                                 CancellationToken cancel = default)
+                                 CancellationToken cancel = default, LightmapReady.LightOnly? only = null)
     {
         undefined = 0;
         var rows = new List<Row>();
@@ -91,9 +97,11 @@ public static class LightmapReadyPlanner
             if (def is null) { undefined += count; continue; }
 
             var geoms = LightmapReady.LodGeometries(ts, t)
-                .Select(g => geomCache.TryGetValue(g, out var gp) ? gp : geomCache[g] = PlanGeometry(ts, g, meshes, mapSize))
+                .Select(g => geomCache.TryGetValue(g, out var gp) ? gp : geomCache[g] = PlanGeometry(ts, g, meshes, mapSize, only is not null))
                 .ToList();
-            if (original is null && geoms.All(g => g.State == "full")) continue;     // already lit: nothing to offer
+            // Already lit: nothing to offer - unless the copies are to be lit by their lightmaps alone, which every
+            // mesh needs rewriting for.
+            if (original is null && only is null && geoms.All(g => g.State == "full")) continue;
 
             MeshSource? first = geoms.Count > 0 && meshes.TryGetValue(geoms[0].File, out var src) ? src : null;
             string? problem = def.ConflictingCreates ? "defined twice with different contents"
@@ -107,7 +115,7 @@ public static class LightmapReadyPlanner
     }
 
     private static GeometryPlan PlanGeometry(TemplateScripts ts, string geometry, IReadOnlyDictionary<string, MeshSource?> meshes,
-                                             Func<float, int, int> mapSize)
+                                             Func<float, int, int> mapSize, bool only = false)
     {
         string file = LightmapReady.GeometryFile(ts, geometry);
         if (!meshes.TryGetValue(file, out var src) || src is null)
@@ -127,18 +135,19 @@ public static class LightmapReadyPlanner
         }
         string state = anyReal && !anyNonReal ? "full" : anyReal ? "partial"
                      : !anySlot ? "no-slot" : !anyNoSlot ? "slot-zeroed" : "mixed";
-        if (state == "full") return new GeometryPlan(geometry, file, state, false, null, null, tris, 0);
+        if (state == "full" && !only) return new GeometryPlan(geometry, file, state, false, null, null, tris, 0);
 
         // The game client has no guard for a mesh whose shader is missing - it dies - so a copy without one is
         // never written. (The dedicated server does not read shaders, which is why only this check catches it.)
         if (src.Rs is not { Length: > 0 })
-            return new GeometryPlan(geometry, file, state, widen, "no shader (.rs) found for the mesh", null, tris, 0);
+            return new GeometryPlan(geometry, file, state, widen, "no shader (.rs) found for the mesh", null, tris, 0) { Only = only };
+        if (state == "full") return new GeometryPlan(geometry, file, state, false, null, null, tris, 0) { Only = true };
 
         var r = LightmapUnwrapper.Unwrap(sm);
         if (r.Status != LightmapUnwrapper.UnwrapStatus.Ok)
-            return new GeometryPlan(geometry, file, state, widen, $"cannot unwrap: {r.Status} ({r.Diagnostics.Reason})", null, tris, 0);
+            return new GeometryPlan(geometry, file, state, widen, $"cannot unwrap: {r.Status} ({r.Diagnostics.Reason})", null, tris, 0) { Only = only };
         int px = mapSize(Extent(sm), r.Diagnostics.MinBakeSize);
-        return new GeometryPlan(geometry, file, state, widen, null, r.Diagnostics, tris, px);
+        return new GeometryPlan(geometry, file, state, widen, null, r.Diagnostics, tris, px) { Only = only };
     }
 
     /// <summary>The mesh's largest bounding-box side over LOD0 - what the bake sizes a lightmap from.</summary>
@@ -212,7 +221,8 @@ public static class LightmapReadyPlanner
     /// </summary>
     public static Dictionary<string, LightmapReady.PatchedMesh> BuildPatches(
         IEnumerable<string> templates, TemplateScripts ts, LightmapReady.Manifest manifest,
-        IReadOnlyDictionary<string, MeshSource?> meshes, out List<string> failures, CancellationToken cancel = default)
+        IReadOnlyDictionary<string, MeshSource?> meshes, out List<string> failures, CancellationToken cancel = default,
+        LightmapReady.LightOnly? only = null)
     {
         failures = new List<string>();
         var result = new Dictionary<string, LightmapReady.PatchedMesh>(StringComparer.OrdinalIgnoreCase);
@@ -227,17 +237,25 @@ public static class LightmapReadyPlanner
                 if (!StandardMesh.TryParse(src.Sm, out var sm) || sm is null) continue;
                 bool full = sm.Lods.Count > 0 && sm.Lods[0].All(m => m.HasLightmapUv
                             && m.LightmapUvs.Any(uv => MathF.Abs(uv.U) > 1e-6f || MathF.Abs(uv.V) > 1e-6f));
-                if (full) continue;
-                var r = LightmapUnwrapper.Unwrap(sm);
-                if (r.Status != LightmapUnwrapper.UnwrapStatus.Ok || r.Lod0Plan is null) { failures.Add($"{g}: {r.Status}"); continue; }
+                if (full && only is null) continue;
+                IReadOnlyList<IReadOnlyList<StandardMeshRewriter.MaterialPlan?>>? plans = null;
+                if (!full)
+                {
+                    var r = LightmapUnwrapper.Unwrap(sm);
+                    if (r.Status != LightmapUnwrapper.UnwrapStatus.Ok || r.Lod0Plan is null) { failures.Add($"{g}: {r.Status}"); continue; }
+                    plans = LightmapUnwrapper.AllLodPlans(sm, r.Lod0Plan);
+                }
+                // Lit by the lightmap alone: every LOD on the 40-byte fixed-function vertex, a mesh that already
+                // had its unwrap included, and (for the steered form) every normal straight up.
+                if (only is not null) plans = LightmapUnwrapper.LightmapOnlyPlans(sm, plans, only.SteerUp ? (0f, 1f, 0f) : null);
                 byte[] bytes;
                 try
                 {
-                    bytes = StandardMeshRewriter.Write(src.Sm, sm, new[] { r.Lod0Plan }, new StandardMeshRewriter.Options(SetQFlag: true));
+                    bytes = StandardMeshRewriter.Write(src.Sm, sm, plans!, new StandardMeshRewriter.Options(SetQFlag: true));
                 }
                 catch (Exception ex) { failures.Add($"{g}: {ex.Message}"); continue; }
                 string clone = LightmapReady.GeometryCopyName(ts, g, manifest, taken);
-                result[g] = new LightmapReady.PatchedMesh(g, clone, bytes, src.Rs);
+                result[g] = new LightmapReady.PatchedMesh(g, clone, bytes, only is null ? src.Rs : LightmapReady.LightOnlyShader(src.Rs, only));
             }
         return result;
     }

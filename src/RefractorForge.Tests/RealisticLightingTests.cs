@@ -166,6 +166,34 @@ public class RealisticLightingTests
     }
 
     [Fact]
+    public void A_lightmap_only_copy_is_solved_per_channel_and_the_map_is_the_light()
+    {
+        // selfillum 1 on a mesh without a tangent frame: the game's vertex colour clamps at 1, so the lightmap is
+        // all the light there is - on every face - and the engine draws exactly what was traced.
+        var plain = FloorAndRoof();
+        var mesh = plain with { Parts = plain.Parts.Select(p => p with { SelfIllum = Vector3.One }).ToArray(), VertexLit = true };
+        var scene = SceneOf(mesh);
+        var day = Day(new Vector3(0.15f, 1f, 0.1f));
+        var colours = day.Fit().Colours;
+        var ph = new ObjectLightmapBaker.Physical(scene, day, colours, new LightTracer.Budget(16, 96, 2), VertexLit: true);
+        var res = ObjectLightmapBaker.BakePhysical(mesh, Matrix4x4.Identity, 96, 2, ph)!;
+        Assert.True(res.Colour, "a per-vertex mesh's map carries colour");
+        Assert.True(res.MeanError < 0.005f, $"mean distance from the traced light {res.MeanError:0.0000}");
+        Assert.True(res.AtCeiling < 0.01f, $"{res.AtCeiling:P0} out of reach above");
+
+        // By hand, in the open: map + LMambient is the traced light, whatever the two lights are.
+        var traced = LightTracer.Gather(scene, day, new Vector3(6.5f, 0.02f, 4f), Vector3.UnitY, new LightTracer.Budget(32, 512, 2), 9);
+        float want = MathF.Min(1f, EngineLight.Luma(day.ToDisplay(traced.Irradiance(day, Vector3.UnitY))));
+        float open = (float)MeanOf(res.Map, 0.32f, 0.45f);
+        Near(want, open + EngineLight.Luma(colours.LmAmbient), 0.06f);
+
+        // The same mesh under lights a tenth as strong draws the same picture: the lights no longer matter.
+        var dim = colours with { Sun = colours.Sun * 0.1f, Back = colours.Back * 0.1f };
+        var res2 = ObjectLightmapBaker.BakePhysical(mesh, Matrix4x4.Identity, 96, 2, ph with { Colours = dim })!;
+        Near(open, (float)MeanOf(res2.Map, 0.32f, 0.45f), 0.01f);
+    }
+
+    [Fact]
     public void A_mesh_with_no_unwrap_gets_no_map_and_one_value_that_knows_where_it_stands()
     {
         var blank = FloorAndRoof(emptyUvs: true);
@@ -362,6 +390,39 @@ public class RealisticLightingTests
         LightPreview.Render(prep, day, view, coarse, new LightTracer.Budget(1, 4, 0), step: 4);
         Assert.Equal(coarse[0], coarse[4]); Assert.Equal(coarse[0], coarse[48 * 4]);
         Assert.Equal(255, coarse[^1]);
+    }
+
+    [Fact]
+    public void The_preview_puts_things_on_the_same_side_of_the_picture_as_the_mirrored_viewport()
+    {
+        // The editor's viewport reflects the view left-right (Camera.MirrorX) so it matches the game; the preview
+        // must too, or it shows the scene flipped. The block sits at x 112..144, z 112..144: look at it from the
+        // south-west with it off to one side and see which half of the picture it lands in.
+        var (hm, cfg) = BlockOnPlain();
+        var built = LightScene.Build(hm, cfg, null, null, null, keepSources: true);
+        var prep = LightPreview.Prepare(built, null, null, null, cfg)!;
+        var day = Day(new Vector3(0.2f, 1f, 0.2f));
+        var editor = new RefractorForge.Render.Camera { Position = new Vector3(100f, 25f, 40f), Yaw = 0f, Pitch = -0.1f,
+                                                        Aspect = 1.5f, MirrorX = true };
+        var clip = Vector4.Transform(new Vector4(128f, 28f, 128f, 1f), editor.ViewProjection);
+        bool blockOnRight = clip.X / clip.W > 0f;
+
+        const int w = 60, h = 40;
+        var view = new LightPreview.Camera(editor.Position, editor.Forward, Vector3.UnitY, editor.FovY * 180f / MathF.PI, w, h, editor.MirrorX);
+        var px = new byte[w * h * 4];
+        LightPreview.Render(prep, day, view, px, new LightTracer.Budget(1, 0, 0));
+        // The block stands above the horizon line the plain makes; count its (non-sky) pixels in each half of a row
+        // a little above the middle, where the sky is everywhere else.
+        int row = h / 2 - 4, left = 0, right = 0;
+        var sky = (px[(row * w) * 4], px[(row * w) * 4 + 2]);
+        for (int x = 0; x < w; x++)
+        {
+            int o = (row * w + x) * 4;
+            bool notSky = Math.Abs(px[o] - px[(row * w + (x < w / 2 ? w - 1 : 0)) * 4]) + Math.Abs(px[o + 2] - px[(row * w + (x < w / 2 ? w - 1 : 0)) * 4 + 2]) > 30;
+            if (notSky) { if (x < w / 2) left++; else right++; }
+        }
+        Assert.True(left + right > 0, "the block is in the picture");
+        Assert.Equal(blockOnRight, right > left);
     }
 
     // ---- the level's settings ----------------------------------------------------------------------------------

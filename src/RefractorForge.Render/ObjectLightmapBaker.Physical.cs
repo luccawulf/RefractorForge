@@ -40,7 +40,12 @@ public static partial class ObjectLightmapBaker
     /// <param name="AtCeiling">The share whose light is more than both engine lights at full can give - drawn
     /// darker than they should be. On a face neither light reaches (a ceiling) every texel above the floor is here.</param>
     /// <param name="MeanError">Mean distance, in display luma, between what was traced and what the engine will draw.</param>
-    public sealed record PhysicalMap(Texture2D Map, float Mean, float AtFloor, float AtCeiling, float MeanError);
+    public sealed record PhysicalMap(Texture2D Map, float Mean, float AtFloor, float AtCeiling, float MeanError)
+    {
+        /// <summary>The map carries colour - it was solved per channel for a mesh the game lights per vertex - and
+        /// must be written 24-bit, not through the grey palette.</summary>
+        public bool Colour { get; init; }
+    }
 
     /// <summary>
     /// Bake one object's lightmap by tracing the light that reaches it and solving for the value that makes the game
@@ -79,6 +84,7 @@ public static partial class ObjectLightmapBaker
         var softCnt = new int[n2];                                   // how many of a texel's samples traced the soft part
         var owner = new int[n2]; Array.Fill(owner, -1);
         var texelPos = new Vector3[n2]; var texelNrm = new Vector3[n2];
+        var texelPart = new int[n2];                                 // which material part owns the texel
 
         bool lamps = rig is not null && rig.Lights.Count > 0;
         if (lamps) { lampR = new float[n2]; lampG = new float[n2]; lampB = new float[n2]; }
@@ -134,9 +140,11 @@ public static partial class ObjectLightmapBaker
             chunk.Clear();
         }
 
-        int triId = 0;
+        int triId = 0, partId = -1;
         foreach (var part in mesh.Parts)
         {
+            partId++;
+            int thisPart = partId;
             var idx = part.Indices;
             for (int t = 0; t + 2 < idx.Length; t += 3, triId++)
             {
@@ -156,7 +164,7 @@ public static partial class ObjectLightmapBaker
                     if (cancel.IsCancellationRequested) return;
                     int o = py * size + px;
                     bool first = owner[o] == -1;
-                    if (first) { owner[o] = thisTri; texelNrm[o] = fn; }
+                    if (first) { owner[o] = thisTri; texelNrm[o] = fn; texelPart[o] = thisPart; }
                     else if (owner[o] != thisTri) return;             // first triangle wins a texel
                     var wp = w0 * wa + w1 * wb + w2 * wc;
                     texelPos[o] = wp;
@@ -226,6 +234,12 @@ public static partial class ObjectLightmapBaker
         var inten = new float[n2];
         double sum = 0, err = 0; int atFloor = 0, atCeil = 0;
         var m = EngineLight.Material.Default with { VertexLit = ph.VertexLit };
+        // A mesh the game lights per vertex takes its lightmap per CHANNEL over a vertex colour that is the two
+        // lights x materialDiffuse + selfillum, clamped (measured). So each channel is solved on its own, exactly:
+        // map = (wanted - LMambient) / vertex colour. On a lightmap-only copy (selfillum 1) the vertex colour is 1
+        // and the map IS the light - on every face, whichever way it looks.
+        float[]? outG = null, outB = null;
+        if (ph.VertexLit) { outG = new float[n2]; outB = new float[n2]; }
         for (int i = 0; i < n2; i++)
         {
             if (!cover[i]) continue;
@@ -234,6 +248,21 @@ public static partial class ObjectLightmapBaker
                     + new Vector3(softR[i], softG[i], softB[i]);
             if (lamps) e += new Vector3(lampR![i], lampG![i], lampB![i]);
             var want = day.ToDisplay(e);
+            if (ph.VertexLit)
+            {
+                var part = mesh.Parts[texelPart[i]];
+                var pm = new EngineLight.Material(part.Diffuse, Vector3.One, part.SelfIllum) { VertexLit = true };
+                var v = EngineLight.Lights(nrm, day.ToSun, ph.Colours, pm);
+                var over = Vector3.Max(Vector3.Min(want, Vector3.One) - ph.Colours.LmAmbient, Vector3.Zero);
+                var map = Vector3.Clamp(over / Vector3.Max(v, new Vector3(EngineLight.MinLights)), Vector3.Zero, Vector3.One);
+                inten[i] = map.X; outG![i] = map.Y; outB![i] = map.Z;
+                sum += EngineLight.Luma(map);
+                var shown = EngineLight.Lightmapped(map, nrm, day.ToSun, ph.Colours, pm);
+                float lw = EngineLight.Luma(Vector3.Min(want, Vector3.One)), ls = EngineLight.Luma(shown);
+                if (lw < ls - 0.01f) atFloor++; else if (lw > ls + 0.01f) atCeil++;
+                err += MathF.Abs(lw - ls);
+                continue;
+            }
             float p = EngineLight.SolvePrelight(want, nrm, day.ToSun, ph.Colours, m);
             inten[i] = p; sum += p;
             float reach = EngineLight.OutOfReach(want, nrm, day.ToSun, ph.Colours, m);
@@ -241,15 +270,19 @@ public static partial class ObjectLightmapBaker
             err += MathF.Abs(MathF.Min(1f, EngineLight.Luma(want)) - EngineLight.Luma(EngineLight.Lightmapped(p, nrm, day.ToSun, ph.Colours, m)));
         }
 
+        if (outG is not null) { Dilate(outG, (bool[])cover.Clone(), size); Dilate(outB!, (bool[])cover.Clone(), size); }
         Dilate(inten, cover, size);
         var rgba = new byte[n2 * 4];
         for (int i = 0; i < n2; i++)
         {
             byte v = (byte)Math.Clamp((int)(inten[i] * 255f + 0.5f), 0, 255);
-            rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
+            rgba[i * 4] = v;
+            rgba[i * 4 + 1] = outG is null ? v : (byte)Math.Clamp((int)(outG[i] * 255f + 0.5f), 0, 255);
+            rgba[i * 4 + 2] = outB is null ? v : (byte)Math.Clamp((int)(outB![i] * 255f + 0.5f), 0, 255);
+            rgba[i * 4 + 3] = 255;
         }
         return new PhysicalMap(new Texture2D(size, size, rgba), (float)(sum / covered),
-                               atFloor / (float)covered, atCeil / (float)covered, (float)(err / covered));
+                               atFloor / (float)covered, atCeil / (float)covered, (float)(err / covered)) { Colour = outG is not null };
     }
 
     /// <summary>

@@ -69,6 +69,87 @@ public class LightmapUnwrapTests
         return ms.ToArray();
     }
 
+    // A box with face normals, written as several LODs - each a little smaller than the one before, as a real
+    // lower LOD is a reduction of the first.
+    private static byte[] MultiLodBox(int lods)
+    {
+        using var ms = new MemoryStream();
+        var w = new BinaryWriter(ms);
+        w.Write((uint)10); w.Write(new byte[4]);
+        w.Write(-1f); w.Write(-1.5f); w.Write(-2f); w.Write(1f); w.Write(1.5f); w.Write(2f);
+        w.Write((byte)0);
+        w.Write((uint)0);
+        w.Write((uint)lods);
+        for (int l = 0; l < lods; l++)
+        {
+            float k = 1f - 0.02f * l, x = 1f * k, y = 1.5f * k, z = 2f * k;
+            var p = new List<Vector3>(); var nrm = new List<Vector3>(); var idx = new List<ushort>();
+            void Face(Vector3 n, Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+            {
+                int b0 = p.Count;
+                p.Add(a); p.Add(b); p.Add(c); p.Add(d);
+                for (int i = 0; i < 4; i++) nrm.Add(n);
+                foreach (var t in new[] { (0, 1, 2), (0, 2, 3) })
+                { idx.Add((ushort)(b0 + t.Item3)); idx.Add((ushort)(b0 + t.Item2)); idx.Add((ushort)(b0 + t.Item1)); }
+            }
+            Face(-Vector3.UnitZ, new(-x, -y, -z), new(x, -y, -z), new(x, y, -z), new(-x, y, -z));
+            Face(Vector3.UnitZ, new(x, -y, z), new(-x, -y, z), new(-x, y, z), new(x, y, z));
+            Face(-Vector3.UnitX, new(-x, -y, z), new(-x, -y, -z), new(-x, y, -z), new(-x, y, z));
+            Face(Vector3.UnitX, new(x, -y, -z), new(x, -y, z), new(x, y, z), new(x, y, -z));
+            Face(Vector3.UnitY, new(-x, y, -z), new(x, y, -z), new(x, y, z), new(-x, y, z));
+            Face(-Vector3.UnitY, new(-x, -y, z), new(x, -y, z), new(x, -y, -z), new(-x, -y, -z));
+            w.Write((uint)1);
+            var nm = Encoding.Latin1.GetBytes("box_Material0");
+            w.Write((uint)nm.Length); w.Write(nm); w.Write(new byte[12]);
+            w.Write(4u); w.Write(1041u); w.Write(32u);
+            w.Write((uint)p.Count); w.Write((uint)idx.Count); w.Write((uint)0);
+            for (int i = 0; i < p.Count; i++)
+            {
+                w.Write(p[i].X); w.Write(p[i].Y); w.Write(p[i].Z);
+                w.Write(nrm[i].X); w.Write(nrm[i].Y); w.Write(nrm[i].Z);
+                w.Write(0f); w.Write(0f);
+            }
+            foreach (var i in idx) w.Write(i);
+        }
+        w.Write((uint)0); w.Write((uint)0);
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    [Fact]
+    public void Every_lod_of_a_lightmap_ready_mesh_gets_the_lightmap_channel_pointing_where_lod0s_does()
+    {
+        // No retail BfVietnam mesh mixes vertex layouts between its LODs, and a copy with a wide LOD0 over 32-byte
+        // lower LODs crashed the game client while it loaded the level.
+        var bytes = MultiLodBox(3);
+        var sm = Parse(bytes);
+        var r = LightmapUnwrapper.Unwrap(sm);
+        Assert.Equal(LightmapUnwrapper.UnwrapStatus.Ok, r.Status);
+        var plans = LightmapUnwrapper.AllLodPlans(sm, r.Lod0Plan!);
+        Assert.Equal(3, plans.Count);
+        var outSm = Parse(StandardMeshRewriter.Write(bytes, sm, plans, new StandardMeshRewriter.Options(SetQFlag: true)));
+        Assert.Equal(3, outSm.NumLods);
+        foreach (var lod in outSm.Lods)
+            foreach (var m in lod)
+            {
+                Assert.Equal(40u, m.VertexByteSize);
+                Assert.Equal(9233u, m.VertexFormat);
+                Assert.True(m.HasLightmapUv);
+            }
+        // Each lower-LOD vertex points at the lightmap texel of the same corner of the same face in LOD0.
+        var lod0 = outSm.Lods[0][0];
+        for (int l = 1; l < 3; l++)
+        {
+            var m = outSm.Lods[l][0];
+            Assert.Equal(sm.Lods[l][0].NumVertices, m.NumVertices);   // nothing split: a renumbering would be wrong here
+            for (int v = 0; v < m.NumVertices; v++) Assert.Equal(lod0.LightmapUvs[v], m.LightmapUvs[v]);
+        }
+        // A one-LOD mesh is left exactly as the LOD0 plan says.
+        var one = Parse(Box());
+        var r1 = LightmapUnwrapper.Unwrap(one);
+        Assert.Single(LightmapUnwrapper.AllLodPlans(one, r1.Lod0Plan!));
+    }
+
     private static StandardMesh Parse(byte[] b)
     {
         Assert.True(StandardMesh.TryParse(b, out var sm));

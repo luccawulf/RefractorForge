@@ -221,6 +221,35 @@ public class LightmapReadyTests
     }
 
     [Fact]
+    public void A_copy_takes_the_sound_script_its_original_loads_from_beside_its_own_script()
+    {
+        // Operation_Flaming_Dart, 2026-11-27: o_NVARadio_M1 loads "Sounds/radio.ssc" from its own folder. Copied into
+        // the level verbatim, the line named a file that is not there, and the game client crashed loading the level.
+        var ts = TemplateScripts.Parse(new[] { ("objects/Objects_NVA/o_NVARadio_M1/Objects.con",
+            "ObjectTemplate.create SimpleObject o_NVARadio_M1\r\nObjectTemplate.geometry o_NVARadio_M1\r\n" +
+            "ObjectTemplate.autoPlaySound 1\r\nObjectTemplate.loadSoundScript Sounds/radio.ssc\r\n") });
+        Assert.Equal("objects/Objects_NVA/o_NVARadio_M1/Sounds/radio.ssc",
+                     LightmapReady.ResolveFromScript(@"objects\Objects_NVA\o_NVARadio_M1\Objects.con", "Sounds/radio.ssc"));
+        Assert.Equal("objects/Common/Sounds/x.ssc", LightmapReady.ResolveFromScript("objects/Objects_NVA/a/Objects.con", "../../Common/Sounds/x.ssc"));
+        Assert.Null(LightmapReady.ResolveFromScript("objects/a/Objects.con", "@ROOT/Sound/x.wav"));
+        Assert.Equal(new[] { "objects/Objects_NVA/o_NVARadio_M1/Sounds/radio.ssc" }, LightmapReady.SoundScriptPaths(ts).ToArray());
+
+        var patches = new Dictionary<string, LightmapReady.PatchedMesh> { ["o_NVARadio_M1"] = Patch("o_NVARadio_M1", "o_NVARadio_lm_M1") };
+        var ssc = System.Text.Encoding.Latin1.GetBytes("newPatch\r\nstream @ROOT/Sound/@RTD/NVA_radio.wav\r\n");
+        var o = LightmapReady.Emit(ts, new[] { "o_NVARadio_M1" }, patches, "L", "BfVietnam", null,
+                                   p => p == "objects/Objects_NVA/o_NVARadio_M1/Sounds/radio.ssc" ? ssc : null);
+        var objs = Text(o, "RF_LightmapReady/Objects.con");
+        Assert.Contains("ObjectTemplate.loadSoundScript Sounds/o_NVARadio_M1/radio.ssc", objs);
+        Assert.Contains(o.Files, f => f.RelPath == "Objects/RF_LightmapReady/Sounds/o_NVARadio_M1/radio.ssc" && f.Bytes.SequenceEqual(ssc));
+
+        // Not found: the line must not survive pointing at nothing.
+        var o2 = LightmapReady.Emit(ts, new[] { "o_NVARadio_M1" }, patches, "L", "BfVietnam", null, _ => null);
+        var objs2 = Text(o2, "RF_LightmapReady/Objects.con");
+        Assert.DoesNotContain("loadSoundScript", objs2.Split('\n').Where(l => !l.StartsWith("rem")).Aggregate("", (x, y) => x + y));
+        Assert.Contains(o2.Skipped, sk => sk.Contains("without its sound"));
+    }
+
+    [Fact]
     public void A_template_that_cannot_be_copied_faithfully_is_skipped_with_the_reason()
     {
         var ts = TemplateScripts.Parse(new[] { ("o.con",

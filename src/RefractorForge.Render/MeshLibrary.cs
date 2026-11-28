@@ -60,7 +60,14 @@ public sealed class MeshLibrary
     /// <param name="Unlit">Full bright (<c>lighting false</c>).</param>
     /// <param name="Additive">Added onto what is behind it (<c>blendDest one</c>): a glow.</param>
     public sealed record MaterialPart(int[] Indices, Vector3 Color, Texture2D? Texture, bool AlphaTest, bool Blend = false, string? TextureName = null, float? AlphaRef = null, bool Foliage = false, float? Opacity = null, bool DepthWrite = true,
-                                      bool TwoSided = false, bool Unlit = false, bool Additive = false);
+                                      bool TwoSided = false, bool Unlit = false, bool Additive = false)
+    {
+        /// <summary>The shader's <c>materialDiffuse</c> (1 when unstated) - what scales the two lights.</summary>
+        public Vector3 Diffuse { get; init; } = Vector3.One;
+        /// <summary>The shader's <c>selfillum</c>. At 1 on a mesh without a tangent frame the game draws the part as
+        /// texture x (lightmap + LMambient) - a lightmap-only copy.</summary>
+        public Vector3 SelfIllum { get; init; }
+    }
 
     /// <summary>A flattened, render-ready mesh: engine-space positions, per-vertex UVs, and per-material parts.</summary>
     public sealed record Mesh(Vector3[] Positions, System.Numerics.Vector2[] Uvs, MaterialPart[] Parts)
@@ -125,6 +132,20 @@ public sealed class MeshLibrary
             _cache.Remove(t.Name);
         }
         foreach (var kv in ParseGeometryFiles(text)) _geomFile![kv.Key] = kv.Value;
+    }
+
+    /// <summary>A file by its path inside the archives (forward or back slashes, any case), the last archive opened
+    /// winning as the engine's mount order does; null when none has it. Not thread-safe, like the rest.</summary>
+    public byte[]? ReadFile(string path)
+    {
+        string want = path.Replace('\\', '/').TrimStart('/');
+        for (int a = _archives.Count - 1; a >= 0; a--)
+            foreach (var e in _archives[a].Entries)
+                if (string.Equals(e.Name.Replace('\\', '/'), want, StringComparison.OrdinalIgnoreCase))
+                {
+                    try { return _archives[a].Read(e); } catch { return null; }
+                }
+        return null;
     }
 
     /// <summary>Every <c>.con</c> script the library can see, archives first in the order they were opened, then
@@ -1912,7 +1933,8 @@ public sealed class MeshLibrary
                                        // objects unsorted, so a pane that wrote depth erased whatever came after it.
                                        Opacity: blend ? sh?.Opacity : null,
                                        DepthWrite: sh?.DepthWrite != false,
-                                       TwoSided: sh?.TwoSided == true, Unlit: sh?.Unlit == true, Additive: sh?.Additive == true));
+                                       TwoSided: sh?.TwoSided == true, Unlit: sh?.Unlit == true, Additive: sh?.Additive == true)
+                      { Diffuse = sh?.Diffuse ?? Vector3.One, SelfIllum = sh?.SelfIllum ?? Vector3.Zero });
         }
         if (parts.Count == 0) return null;
         return new Mesh(pos.ToArray(), uvs.ToArray(), parts.ToArray())

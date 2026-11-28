@@ -37,6 +37,101 @@ public static class LightmapReady
     /// <summary>One patched mesh: the original geometry template, the copy's name, and its files.</summary>
     public sealed record PatchedMesh(string Geometry, string Copy, byte[] Sm, string Rs);
 
+    /// <summary>
+    /// Make the copies take ALL of their light from their lightmap, so the game draws
+    /// <c>texture x (lightmap + LMambient)</c> on every face whichever way it looks - which is the only way a wall
+    /// square to the sun's compass bearing, a ceiling, or anything a placed lamp lights can show what was baked.
+    ///
+    /// <para>Measured on the third calibration level (2026-11-28). The engine draws a mesh WITHOUT a tangent frame
+    /// through the fixed-function pipeline: the vertex colour is the two lights times <c>materialDiffuse</c> plus
+    /// <c>selfillum</c>, from the vertex's STORED normal, clamped to 1, and the lightmap multiplies that per colour
+    /// channel. So every LOD of a copy goes on the 40-byte vertex (a 64-byte one gives up its tangent frame and
+    /// keeps its unwrap), and then one of two things makes that vertex colour 1 everywhere:</para>
+    /// <list type="bullet">
+    /// <item><see cref="SteerUp"/>: every normal straight up - the second light is the sun mirrored in azimuth, so
+    /// "up" is the one direction both reach equally whatever the object's yaw - with <c>materialDiffuse 1</c>, on a
+    /// level whose two lights add up to 1 on that normal. Proven in game: a bunker and a bush read exactly
+    /// lightmap + LMambient on every pixel from three sides.</item>
+    /// <item><see cref="SelfIllum"/>: <c>selfillum 1 1 1</c> in the copy's shader, which is inside the same clamp
+    /// (a palm's .3 showed as (lights + .3) x lightmap) and so needs neither the normals nor the lights.</item>
+    /// </list>
+    /// </summary>
+    public sealed record LightOnly(bool SteerUp, bool SelfIllum)
+    {
+        /// <summary>What the copies' manifest records. The number is the shader recipe's version: copies made by an
+        /// older one are offered for rebuilding (2 = specular and normal map off).</summary>
+        public string Tag => (SteerUp ? "steer" : "") + (SteerUp && SelfIllum ? "+" : "") + (SelfIllum ? "selfillum-v2" : "");
+        public static LightOnly? FromTag(string? tag)
+        {
+            if (string.IsNullOrWhiteSpace(tag)) return null;
+            bool steer = tag.Contains("steer", StringComparison.OrdinalIgnoreCase);
+            bool glow = tag.Contains("selfillum", StringComparison.OrdinalIgnoreCase);
+            return steer || glow ? new LightOnly(steer, glow) : null;
+        }
+    }
+
+    /// <summary>
+    /// A copy's shader for <paramref name="mode"/>: every lit subshader gets <c>materialDiffuse 1 1 1</c> (so the
+    /// two lights reach the clamp on an up normal as the level's colours were set to) and, for
+    /// <see cref="LightOnly.SelfIllum"/>, <c>selfillum 1 1 1</c>. A subshader that says <c>lighting false</c> - a
+    /// glow, a glass pane - is left exactly as it is. Everything else in the file is kept byte for byte.
+    /// </summary>
+    public static string LightOnlyShader(string rs, LightOnly mode)
+    {
+        var sb = new StringBuilder();
+        int at = 0;
+        while (true)
+        {
+            int sub = rs.IndexOf("subshader", at, StringComparison.OrdinalIgnoreCase);
+            int open = sub < 0 ? -1 : rs.IndexOf('{', sub), close = open < 0 ? -1 : rs.IndexOf('}', open);
+            if (close < 0) { sb.Append(rs, at, rs.Length - at); break; }
+            sb.Append(rs, at, open + 1 - at);
+            string body = rs[(open + 1)..close];
+            if (!System.Text.RegularExpressions.Regex.IsMatch(body, @"(?im)^[ \t]*lighting\s+false\b"))
+            {
+                body = SetStatement(body, "materialDiffuse", "1 1 1");
+                if (mode.SelfIllum)
+                {
+                    body = SetStatement(body, "selfillum", "1 1 1");
+                    // Specular off and no normal map. With them on, the game drew every copy NEAR the camera at full
+                    // white and only the distant ones from their lightmaps (Operation_Flaming_Dart, 2026-11-28): close
+                    // up it takes a path where the self-illumination is added after the lightmap instead of under
+                    // it. The fourth calibration level's bunker, whose shader had neither, read its lightmap from
+                    // twelve metres as it did from fifty.
+                    body = SetStatement(body, "lightingSpecular", "false");
+                    body = DropStatement(body, "normalmap");
+                    body = DropStatement(body, "highEndPerPixel");
+                }
+            }
+            sb.Append(body);
+            at = close;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Comment a statement out wherever it stands in a subshader's body.</summary>
+    private static string DropStatement(string body, string key)
+        => new System.Text.RegularExpressions.Regex(@"(?im)^([ \t]*)(" + key + @"\b[^\r\n]*)").Replace(body, "$1// $2");
+
+    /// <summary>Set one statement in a subshader's body: its first uncommented occurrence is rewritten (and any
+    /// later one dropped), or the statement is added as the body's first line.</summary>
+    private static string SetStatement(string body, string key, string value)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(@"(?im)^([ \t]*)" + key + @"\b[^;\r\n]*;?");
+        bool done = false;
+        string res = rx.Replace(body, m =>
+        {
+            if (done) return m.Groups[1].Value + "// " + m.Value.TrimStart();
+            done = true;
+            return m.Groups[1].Value + key + " " + value + ";";
+        });
+        if (done) return res;
+        string nl = body.Contains("\r\n") ? "\r\n" : "\n";
+        int firstBreak = body.IndexOf('\n');
+        string line = "\t" + key + " " + value + ";";
+        return firstBreak < 0 ? nl + line + nl + body.TrimStart() : body[..(firstBreak + 1)] + line + nl + body[(firstBreak + 1)..];
+    }
+
     public sealed record Output(
         List<(string RelPath, byte[] Bytes)> Files,
         IReadOnlyDictionary<string, string> Placed,          // placed template -> the copy to point it at
@@ -57,6 +152,9 @@ public static class LightmapReady
         public bool IsOurs(string template)
             => Copies.Values.Contains(template, StringComparer.OrdinalIgnoreCase)
                || Geometries.Values.Contains(template, StringComparer.OrdinalIgnoreCase);
+        /// <summary>How the copies were made to take their light from the lightmap alone, or null for copies that
+        /// only gained an unwrap.</summary>
+        public LightOnly? Only { get; init; }
     }
 
     /// <summary>The manifest lines at the top of the copies' <c>Objects.con</c>. Missing or foreign text reads as empty.</summary>
@@ -65,18 +163,21 @@ public static class LightmapReady
         var placed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var copies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var geoms = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        LightOnly? only = null;
         foreach (var raw in (objectsCon ?? "").Split('\n'))
         {
             var line = raw.Trim();
             if (!line.StartsWith(Tag, StringComparison.OrdinalIgnoreCase)) continue;
             var t = line[Tag.Length..].Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             if (t.Length != 3) continue;
-            if (t[0].Equals("placed", StringComparison.OrdinalIgnoreCase)) placed[t[1]] = t[2];
+            if (t[0].Equals("option", StringComparison.OrdinalIgnoreCase) && t[1].Equals("lightonly", StringComparison.OrdinalIgnoreCase))
+                only = LightOnly.FromTag(t[2]);
+            else if (t[0].Equals("placed", StringComparison.OrdinalIgnoreCase)) placed[t[1]] = t[2];
             else if (t[0].Equals("copy", StringComparison.OrdinalIgnoreCase)) copies[t[1]] = t[2];
             else if (t[0].Equals("geometry", StringComparison.OrdinalIgnoreCase)) geoms[t[1]] = t[2];
         }
         foreach (var kv in placed) copies.TryAdd(kv.Key, kv.Value);
-        return new Manifest(placed, copies, geoms);
+        return new Manifest(placed, copies, geoms) { Only = only };
     }
 
     /// <summary>The name a patched copy of <paramref name="geometry"/> gets: the earlier run's name if there was one,
@@ -175,10 +276,49 @@ public static class LightmapReady
     /// </summary>
     /// <param name="patches">Patched meshes, keyed by the ORIGINAL geometry template name.</param>
     /// <param name="previous">An earlier run's manifest, so copies keep their names across runs.</param>
+    /// <summary>
+    /// The archive path a script's relative file argument names: <paramref name="arg"/> taken from the folder of
+    /// <paramref name="source"/> (the .con the line came from), with <c>..</c> resolved and forward slashes. Null for
+    /// an argument that is not relative to its script (<c>@ROOT/...</c>, a drive path).
+    /// </summary>
+    public static string? ResolveFromScript(string? source, string arg)
+    {
+        if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(arg)) return null;
+        arg = arg.Trim().Trim('"').Replace('\\', '/');
+        if (arg.StartsWith("@") || arg.Contains(':')) return null;
+        var parts = new List<string>(source.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries));
+        if (parts.Count > 0) parts.RemoveAt(parts.Count - 1);            // the script's own file name
+        foreach (var seg in arg.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (seg == ".") continue;
+            if (seg == "..") { if (parts.Count == 0) return null; parts.RemoveAt(parts.Count - 1); }
+            else parts.Add(seg);
+        }
+        return string.Join("/", parts);
+    }
+
+    /// <summary>The sound scripts the given definitions load, as archive paths (see <see cref="ResolveFromScript"/>),
+    /// so a caller can read them on the thread that owns the archives before <see cref="Emit"/> runs elsewhere.</summary>
+    public static IEnumerable<string> SoundScriptPaths(TemplateScripts ts)
+    {
+        foreach (var d in ts.All)
+            foreach (var l in d.Lines)
+            {
+                var (cmd, arg) = TemplateScripts.Command(l);
+                if (cmd.Equals("loadSoundScript", StringComparison.OrdinalIgnoreCase)
+                    && ResolveFromScript(d.Source, TemplateScripts.FirstToken(arg)) is { } p) yield return p;
+            }
+    }
+
+    /// <param name="readFile">Reads an archive path (see <see cref="ResolveFromScript"/>), or returns null. A copy
+    /// lives in the level's own folder, so a file its original loads relative to ITS folder - a sound script - is
+    /// copied in beside the copy; without this the game client finds an empty sound in the object's list and dies
+    /// while the level loads (the dedicated server loads no sounds and never notices).</param>
     public static Output Emit(TemplateScripts ts, IEnumerable<string> placedTemplates,
                               IReadOnlyDictionary<string, PatchedMesh> patches, string levelName, string baseSub,
-                              Manifest? previous = null)
+                              Manifest? previous = null, Func<string, byte[]?>? readFile = null, LightOnly? only = null)
     {
+        var extraFiles = new List<(string, byte[])>();
         previous ??= Manifest.Empty;
         var patch = new Dictionary<string, PatchedMesh>(patches, StringComparer.OrdinalIgnoreCase);
         var skipped = new List<string>();
@@ -242,6 +382,7 @@ public static class LightmapReady
         var objs = new StringBuilder();
         objs.Append("rem RefractorForge: lightmap-ready copies of objects whose meshes had no lightmap unwrap.").Append(crlf);
         objs.Append("rem Each is its original definition line for line; only the names of patched meshes and copied children differ.").Append(crlf);
+        if (only is not null) objs.Append($"{Tag} option lightonly {only.Tag}").Append(crlf);
         foreach (var kv in placed.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
             objs.Append($"{Tag} placed {kv.Key} {kv.Value}").Append(crlf);
         foreach (var t in order.Where(t => !placed.ContainsKey(t)).OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
@@ -268,6 +409,27 @@ public static class LightmapReady
                     line = $"{prefix}.geometry {pm.Copy}";
                 else if (copyChild.Contains(i))
                     line = $"{prefix}.addTemplate {CopyName(TemplateScripts.FirstToken(arg))}";
+                else if (cmd.Equals("loadSoundScript", StringComparison.OrdinalIgnoreCase)
+                         && ResolveFromScript(d.Source, TemplateScripts.FirstToken(arg)) is { } snd)
+                {
+                    // The original loads this from beside ITS script; the copy's script is in the level, so the file
+                    // goes there too, in a folder of its own so two originals' same-named scripts cannot collide.
+                    var bytes = readFile?.Invoke(snd);
+                    string leaf = snd[(snd.LastIndexOf('/') + 1)..];
+                    if (bytes is not null)
+                    {
+                        string rel = $"Sounds/{t}/{leaf}";
+                        if (!extraFiles.Any(f => f.Item1.Equals($"Objects/{Folder}/{rel}", StringComparison.OrdinalIgnoreCase)))
+                            extraFiles.Add(($"Objects/{Folder}/{rel}", bytes));
+                        line = $"{prefix}.loadSoundScript {rel}";
+                    }
+                    else
+                    {
+                        // Left pointing at a file that is not there, the game client crashes loading the level.
+                        line = $"rem RefractorForge: the original's sound script {snd} was not found, so this copy has no sound";
+                        skipped.Add($"{t}: copied without its sound - {snd} was not found");
+                    }
+                }
                 objs.Append(line).Append(crlf);
             }
             objs.Append(crlf);
@@ -297,6 +459,7 @@ public static class LightmapReady
         files.Add(($"Objects/{Folder}/{Folder}.con", enc.GetBytes($"run Geometries{crlf}run Objects{crlf}")));
         files.Add(($"Objects/{Folder}/Geometries.con", enc.GetBytes(geo.ToString())));
         files.Add(($"Objects/{Folder}/Objects.con", enc.GetBytes(objs.ToString())));
+        files.AddRange(extraFiles);
         return new Output(files, placed, skipped);
     }
 

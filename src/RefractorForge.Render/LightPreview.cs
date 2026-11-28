@@ -21,7 +21,9 @@ public static class LightPreview
 {
     /// <summary>Where the picture is taken from.</summary>
     /// <param name="FovYDeg">Vertical field of view, degrees.</param>
-    public sealed record Camera(Vector3 Position, Vector3 Forward, Vector3 Up, float FovYDeg, int Width, int Height);
+    /// <param name="MirrorX">Reflect the picture left-right, as the editor's viewport does (Camera.MirrorX), so the
+    /// preview shows the view the way the viewport and the game do.</param>
+    public sealed record Camera(Vector3 Position, Vector3 Forward, Vector3 Up, float FovYDeg, int Width, int Height, bool MirrorX = false);
 
     /// <summary>
     /// Everything a render reads, resolved up front. Build it on the thread that owns the mesh library - its cache
@@ -79,6 +81,7 @@ public static class LightPreview
         var fwd = Vector3.Normalize(cam.Forward);
         var right = Vector3.Normalize(Vector3.Cross(fwd, cam.Up));
         var up = Vector3.Cross(right, fwd);
+        if (cam.MirrorX) right = -right;
         float tanFov = MathF.Tan(cam.FovYDeg * MathF.PI / 360f), aspect = w / (float)h;
         int rows = (h + step - 1) / step;
         try

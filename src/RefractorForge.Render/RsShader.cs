@@ -33,7 +33,12 @@ public sealed class RsShaderSet
     public sealed record MaterialShader(string Name, string? Texture, Vector3 Diffuse, bool TextureFade,
                                         bool Transparent = false, float? AlphaTestRef = null,
                                         bool GlossInAlpha = false, float? Opacity = null, bool DepthWrite = true,
-                                        bool TwoSided = false, bool Unlit = false, bool Additive = false);
+                                        bool TwoSided = false, bool Unlit = false, bool Additive = false)
+    {
+        /// <summary><c>selfillum r g b</c>: light the surface carries of its own. On a mesh without a tangent frame
+        /// it joins the two lights in the vertex colour, under the lightmap (measured - see EngineLight.Lights).</summary>
+        public Vector3 SelfIllum { get; init; }
+    }
 
     private readonly Dictionary<string, MaterialShader> _byName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -90,6 +95,7 @@ public sealed class RsShaderSet
         Vector3 diffuse = Vector3.One; bool fade = false; bool transp = false; bool inBlock = false;
         float? alphaRef = null; bool gloss = false; float? opacity = null; bool depthWrite = true;
         bool twoSided = false, unlit = false, additive = false;
+        Vector3 selfIllum = Vector3.Zero;
 
         foreach (var line in Statements(text))
         {
@@ -100,14 +106,14 @@ public sealed class RsShaderSet
                 curName = q.Count > 0 ? q[0] : null;
                 curTex = null; diffuse = Vector3.One; fade = false; transp = false; alphaRef = null;
                 gloss = false; opacity = null; depthWrite = true;
-                twoSided = false; unlit = false; additive = false;
+                twoSided = false; unlit = false; additive = false; selfIllum = Vector3.Zero;
             }
             else if (line.StartsWith("{")) inBlock = true;
             else if (line.StartsWith("}"))
             {
                 if (curName is not null)
                     set._byName[curName] = new MaterialShader(curName, curTex, diffuse, fade, transp, alphaRef,
-                                                             gloss, opacity, depthWrite, twoSided, unlit, additive);
+                                                             gloss, opacity, depthWrite, twoSided, unlit, additive) { SelfIllum = selfIllum };
                 inBlock = false; curName = null;
             }
             else if (inBlock && curName is not null)
@@ -125,6 +131,15 @@ public sealed class RsShaderSet
                         float.TryParse(p[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var g) &&
                         float.TryParse(p[3].TrimEnd(';'), NumberStyles.Float, CultureInfo.InvariantCulture, out var b))
                         diffuse = new Vector3(r, g, b);
+                }
+                else if (Keyword(line).TrimEnd(';').Equals("selfillum", StringComparison.OrdinalIgnoreCase))
+                {
+                    var p = line.Split("//")[0].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                    if (p.Length >= 4 &&
+                        float.TryParse(p[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var sr) &&
+                        float.TryParse(p[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var sg) &&
+                        float.TryParse(p[3].TrimEnd(';'), NumberStyles.Float, CultureInfo.InvariantCulture, out var sbl))
+                        selfIllum = new Vector3(sr, sg, sbl);
                 }
                 else if (line.StartsWith("textureFade", StringComparison.OrdinalIgnoreCase))
                     fade = line.Contains("true", StringComparison.OrdinalIgnoreCase);

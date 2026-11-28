@@ -34,7 +34,11 @@ public static class StandardMeshRewriter
     /// </summary>
     public sealed record StridePromotion(uint NewVertexFormat, uint NewVertexByteSize)
     {
-        /// <summary>The only promotion there is: 32-byte pos/normal/uv to 40-byte + lightmap UV.</summary>
+        /// <summary>To the 40-byte pos/normal/uv + lightmap UV vertex. From 32 bytes it adds the channel; from the
+        /// 64-byte planar form it DROPS the tangent frame and keeps the lightmap UV the mesh already has (or takes
+        /// the plan's), which moves the mesh from the per-pixel shaders to the fixed-function ones - the path where
+        /// the lightmap is applied per colour channel and the light comes from the stored normal alone. Dropping a
+        /// tangent frame is safe in a way inventing one is not: nothing is synthesised.</summary>
         public static readonly StridePromotion To40 = new(9233u, 40u);
     }
 
@@ -49,11 +53,16 @@ public static class StandardMeshRewriter
     /// it is correct for a triangle STRIP as well as a list.</param>
     /// <param name="Promote">Widen this material's vertex before writing, or null to keep its stride. Required
     /// for any 32-byte material: without it the lightmap UVs have nowhere to go.</param>
+    /// <param name="Normal">Write THIS normal on every vertex of the material instead of its own. The engine's
+    /// fixed-function path lights a vertex from its stored normal and nothing else (measured: the calibration boards'
+    /// triangles all faced one way while their normals pointed round the sphere), so a mesh whose normals all point
+    /// along the two lights' bisector is lit evenly on every face and its lightmap carries all of the shading.</param>
     public sealed record MaterialPlan(
         (float U, float V)[] Uv2,
         int[] CloneSources,
         ushort[]? Indices = null,
-        StridePromotion? Promote = null);
+        StridePromotion? Promote = null,
+        (float X, float Y, float Z)? Normal = null);
 
     /// <param name="SetQFlag">Write the version-10 qflag. Measured across both retail corpora, qflag 1 means "this
     /// mesh has a real unwrap" (371 of 371 unwrapped meshes), so a rewrite that fills the channel should set it.
@@ -157,9 +166,9 @@ public static class StandardMeshRewriter
         int outStride = (int)(plan.Promote?.NewVertexByteSize ?? mat.VertexByteSize);
         if (plan.Promote is { } pr)
         {
-            if (mat.VertexByteSize != 32 || pr.NewVertexByteSize != 40 || pr.NewVertexFormat != 9233)
+            if ((mat.VertexByteSize != 32 && mat.VertexByteSize != 64) || pr.NewVertexByteSize != 40 || pr.NewVertexFormat != 9233)
                 throw new InvalidDataException(
-                    $"Material '{mat.Name}': the only supported promotion is 32-byte/1041 to 40-byte/9233, not " +
+                    $"Material '{mat.Name}': the only supported change is 32-byte/1041 or 64-byte planar to 40-byte/9233, not " +
                     $"{mat.VertexByteSize}/{mat.VertexFormat} to {pr.NewVertexByteSize}/{pr.NewVertexFormat}. " +
                     "The 64-byte planar form carries an undecoded tangent frame and must never be synthesised.");
         }
@@ -204,8 +213,34 @@ public static class StandardMeshRewriter
         int origin = mat.VertexDataOffset;
         var uv2 = plan?.Uv2 ?? Array.Empty<(float U, float V)>();
         bool writeUv = uv2.Length > 0 && extra >= 8;
+        var normal = plan?.Normal;
 
         int Source(int v) => v < nvIn ? v : plan!.CloneSources[v - nvIn];
+        void PutNormal(byte[] rec)
+        {
+            if (normal is not { } n) return;
+            BinaryPrimitives.WriteSingleLittleEndian(rec.AsSpan(12, 4), n.X);
+            BinaryPrimitives.WriteSingleLittleEndian(rec.AsSpan(16, 4), n.Y);
+            BinaryPrimitives.WriteSingleLittleEndian(rec.AsSpan(20, 4), n.Z);
+        }
+
+        if (planar && outStride == 40)
+        {
+            // Planar 64 to interleaved 40: each vertex's pos/normal/uv record, then the lightmap UV - the first
+            // eight bytes of its record in the extras block - and the tangent frame is left behind.
+            int extras = origin + nvIn * 32;
+            var rec40 = new byte[40];
+            for (int v = 0; v < nvOut; v++)
+            {
+                int sv = Source(v);
+                Buffer.BlockCopy(original, origin + sv * 32, rec40, 0, 32);
+                Buffer.BlockCopy(original, extras + sv * 32, rec40, 32, 8);
+                PutNormal(rec40);
+                if (writeUv && v < uv2.Length) PutUv(rec40, 32, uv2[v]);
+                w.Write(rec40);
+            }
+            return;
+        }
 
         if (!planar)
         {
@@ -217,6 +252,7 @@ public static class StandardMeshRewriter
             {
                 Array.Clear(rec);
                 Buffer.BlockCopy(original, origin + Source(v) * srcStride, rec, 0, copy);
+                PutNormal(rec);
                 if (writeUv && v < uv2.Length) PutUv(rec, 32, uv2[v]);
                 w.Write(rec);
             }
@@ -228,6 +264,7 @@ public static class StandardMeshRewriter
         for (int v = 0; v < nvOut; v++)
         {
             Buffer.BlockCopy(original, origin + Source(v) * 32, pos, 0, 32);
+            PutNormal(pos);
             w.Write(pos);
         }
         int extraBase = origin + nvIn * 32;

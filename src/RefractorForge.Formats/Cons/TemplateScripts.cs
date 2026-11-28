@@ -54,6 +54,9 @@ public sealed class TemplateScripts
         => _defs.TryGetValue((family, name), out var d) ? d : null;
 
     public Def? Object(string name) => Find("ObjectTemplate", name);
+
+    /// <summary>Every definition read.</summary>
+    public IEnumerable<Def> All => _defs.Values;
     public Def? Geometry(string name) => Find("GeometryTemplate", name);
 
     public bool Knows(string family, string name) => _defs.ContainsKey((family, name));

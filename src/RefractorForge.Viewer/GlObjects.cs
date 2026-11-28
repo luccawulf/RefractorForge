@@ -14,7 +14,8 @@ namespace RefractorForge.Viewer;
 /// </summary>
 public sealed class GlObjects
 {
-    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; public float? Opacity; public bool DepthWrite; }
+    private struct Part { public int Offset; public int Count; public Vector3 Color; public uint Tex; public bool AlphaTest; public bool Blend; public float? AlphaRef; public bool Foliage; public float? Opacity; public bool DepthWrite;
+                          public Vector3 MatDif; public Vector3 SelfIllum; }
 
     /// <summary>The shader's uAlphaTest mode for a part, plus its alpha-test threshold. Mode picks OUTPUT and
     /// LIGHTING; the threshold is independent and applies in every mode, because a blended material can carry an
@@ -378,6 +379,7 @@ public sealed class GlObjects
         int uLm = gl.GetUniformLocation(prog, "uLightmap");
         int uVertexLit = gl.GetUniformLocation(prog, "uVertexLit");
         int uLightCut = gl.GetUniformLocation(prog, "uLightCut");
+        int uMatDif = gl.GetUniformLocation(prog, "uMatDif"), uSelfIllum = gl.GetUniformLocation(prog, "uSelfIllum");
         if (uLm >= 0) gl.Uniform1(uLm, 1);
         bool lmOn = ShowLightmaps && _haveLightmaps && uHasLm >= 0;
         foreach (var (tmpl, world, objIndex) in Placements)
@@ -412,6 +414,8 @@ public sealed class GlObjects
             gl.BindVertexArray(t.Vao);
             foreach (var part in t.Parts)
             {
+                if (uMatDif >= 0) gl.Uniform3(uMatDif, part.MatDif.X, part.MatDif.Y, part.MatDif.Z);
+                if (uSelfIllum >= 0) gl.Uniform3(uSelfIllum, part.SelfIllum.X, part.SelfIllum.Y, part.SelfIllum.Z);
                 if (part.Tex != 0 && !FlatShading)
                 {
                     gl.BindTexture(TextureTarget.Texture2D, part.Tex);
@@ -427,6 +431,9 @@ public sealed class GlObjects
                 gl.DrawElements(PrimitiveType.Triangles, (uint)part.Count, DrawElementsType.UnsignedInt, (void*)((nint)part.Offset * sizeof(uint)));
             }
         }
+            // Everything else that shares this program (growth, the model viewer, markers) is an ordinary material.
+            if (uMatDif >= 0) gl.Uniform3(uMatDif, 1f, 1f, 1f);
+            if (uSelfIllum >= 0) gl.Uniform3(uSelfIllum, 0f, 0f, 0f);
             if (uVertexLit >= 0) gl.Uniform1(uVertexLit, 0);   // growth, the model viewer and markers share this program
             if (uLightCut >= 0) gl.Uniform1(uLightCut, 0f);
             gl.DepthMask(true);   // a depthWrite-false material must not leak out of this pass
@@ -567,7 +574,7 @@ public sealed class GlObjects
             int off = allIdx.Count;
             foreach (var ix in part.Indices) allIdx.Add((uint)ix);
             uint tex = part.Texture is { } bmp ? GlTextureFor(gl, bmp, part.AlphaTest) : 0u;
-            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage, Opacity = part.Opacity, DepthWrite = part.DepthWrite });
+            parts.Add(new Part { Offset = off, Count = part.Indices.Length, Color = part.Color, Tex = tex, AlphaTest = part.AlphaTest, Blend = part.Blend, AlphaRef = part.AlphaRef, Foliage = part.Foliage, Opacity = part.Opacity, DepthWrite = part.DepthWrite, MatDif = part.Diffuse, SelfIllum = part.SelfIllum });
         }
         // Blended parts go LAST, whatever order the mesh listed them in. The assault Huey puts its canopy FIRST,
         // so the glass was composited against the sky and the opaque fuselage then drew straight over it - and,

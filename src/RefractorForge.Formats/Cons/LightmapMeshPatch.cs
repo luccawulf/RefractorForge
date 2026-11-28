@@ -75,7 +75,7 @@ public static class LightmapMeshPatch
         {
             // qflag 1 says "this mesh carries a real unwrap" - measured true of 371 of 371 unwrapped retail
             // meshes, and the rewriter refuses to set it on a mesh whose vertices could not hold one.
-            patched = StandardMeshRewriter.Write(originalSm, sm, new[] { result.Lod0Plan },
+            patched = StandardMeshRewriter.Write(originalSm, sm, LightmapUnwrapper.AllLodPlans(sm, result.Lod0Plan),
                                                  new StandardMeshRewriter.Options(SetQFlag: true));
         }
         catch (Exception) { status = LightmapUnwrapper.UnwrapStatus.IndexCeiling; return null; }

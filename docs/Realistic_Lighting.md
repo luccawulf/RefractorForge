@@ -306,3 +306,34 @@ ramps, and the distance from the editor's model (`LightCalibration.Predict`). `s
 - A lamp's colour is on the ground only.
 - Dynamic objects are lit by the two lights, unshadowed by lamps.
 - Per-object lightmaps top out at 1024 px (2048 crashes); terrain tiles are DXT1 with mipmaps.
+
+## Lightmap-only copies (measured 2026-11-28, calibration levels 3 and 4)
+
+The engine lights an object with its two directional lights and lets the lightmap only scale them, so a wall side-on
+to the sun's bearing, a ceiling, or anything a placed lamp lights cannot show what a bake traced. Two screenshots
+settled how to get past that with data alone:
+
+- A mesh WITHOUT a tangent frame (32/40-byte vertex) is drawn fixed-function. Its vertex colour is
+  `sat(materialDiffuse x (sun x sat(N.L) + back x sat(N.B)) + selfillum)`, from the stored normal, and the game draws
+  `texture x sat(lightmap.rgb x vertexColour + LMambientColor)`. `materialAmbient` does nothing there.
+- So `selfillum 1 1 1` makes the vertex colour 1 and the object shows `texture x (lightmap + LMambient)` on every
+  face, with any normals and any light colours (board A of level 4: 26 / 90 / 154 / 217 / 255 under lights of 0.3 and
+  0.1; a coloured 24-bit map comes through per channel). Steering every normal straight up under lights that clamp
+  does the same (level 3) but needs the level's lights raised; it is not used.
+- `lighting false` ignores the lightmap and draws full white. A 64-byte (tangent-frame) mesh with `selfillum 1`
+  follows the lightmap only at a distance and is white up close, so a copy must be on the 40-byte vertex.
+
+Tools > Lighting > Lightmap-Ready Objects, "Light the copies from their lightmaps alone" (BfVietnam, on by default)
+makes such copies: every LOD rewritten to 40 bytes (a 64-byte mesh keeps its unwrap and drops its tangent frame),
+`materialDiffuse 1 1 1` and `selfillum 1 1 1` in every lit subshader. The Realistic bake then solves a per-vertex
+mesh per channel - map = (traced light - LMambient) / vertex colour - and writes it as a 24-bit TGA. 1,931 of 1,990
+retail meshes convert (`lightcal onlyscan`); the rest (19 that will not unwrap, 6 triangle strips) stay as they are.
+
+Two things found on the first full level (Operation Flaming Dart):
+
+- With `lightingSpecular true` and a `normalmap` left in a copy's shader, every copy NEAR the camera drew full white and
+  only distant ones showed their lightmaps. Copies now get `lightingSpecular false` and lose `normalmap` and
+  `highEndPerPixel`.
+- 864 MB of 24-bit lightmaps (288 at 1024 px) ran the client out of memory while loading (null effect from
+  `effects/particles.fx` at 2 GB). The bake holds 24-bit maps to 500 MB (`LightmapBudget`): colourless maps go back to
+  8-bit, the largest of the rest are halved. 500 MB is a working value, not a measured ceiling.

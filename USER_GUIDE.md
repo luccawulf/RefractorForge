@@ -397,6 +397,12 @@ what you see is where the game plants every tree and tuft.
     there it is brightness only) and a denoiser that stops at edges. **Sun size** 0.53° is the real sun; larger
     reads as haze, and around 1-1.5° is a good start for interiors lit through a window. Ultra takes minutes per
     object on the CPU - **Bake selected only (preview)** bakes just the selected object and keeps every other map.
+  - **On a Battlefield Vietnam level the top entry is Realistic** instead of Ultra (also in **Tools ▸ Lighting ▸
+    Lightmap quality**). With it chosen, **Bake Object Lightmaps** bakes every object by the Realistic Lighting
+    solve - the window's sun, sky, bounce and lamps at the window's quality - and sets the level's four light colours
+    to the ones the maps were solved against, since the maps are only right with those. The ground is left as it
+    is; the window's own **Bake realistic lighting** does the ground too. **Realistic Lighting settings...** opens
+    the window. BF1942 keeps Ultra.
   - **Bake on the GPU** runs Ultra's rays on a dedicated graphics card (OpenGL 4.3). It is off until **Test GPU**
     has baked a small scene on the card and on the CPU and found them to agree; the result line shows the card,
     the speed-up and how far apart they were. It only runs on a *dedicated* card: on a machine with two GPUs,
@@ -418,6 +424,23 @@ what you see is where the game plants every tree and tuft.
       healing - with only the mesh names changed, down through every LOD mesh; parts placed at an offset are left
       alone, as the bake leaves them;
     - every placement of that type is pointed at the copy (one undo step). Then **Bake Object Lightmaps** as usual.
+  - **Light the copies from their lightmaps alone** (BfVietnam only, on by default). The game lights an object with
+    its two directional lights and uses the lightmap only to dim them, so a wall side-on to the sun, a ceiling, or
+    anything lit by a placed lamp cannot show what was baked. With this on, a copy is drawn as
+    **texture x lightmap** on every face - measured in the game:
+    - every level of detail goes on the 40-byte vertex (a 64-byte mesh keeps its unwrap and gives up its tangent
+      frame), and the shader gets `selfillum 1 1 1` with specular and the normal map switched off;
+    - objects that already have a lightmap are listed too, because they need the same copy. Tick **Show foliage**
+      and **Tick all shown** to convert every object on the map;
+    - bake afterwards with the **Realistic** quality: such a copy's lightmap is solved per colour channel and
+      written as a 24-bit file, so a lamp's colour and the light inside a hangar reach the game;
+    - a 24-bit lightmap costs the game about four times the memory of an 8-bit one, and a level with too many
+      does not load. The bake keeps them within 500 MB: a map with no colour in it is written 8-bit, and the
+      largest of the rest are halved until they fit. The bake summary says how many were reduced;
+    - a level whose copies were made the older way shows **Rebuild the existing copies**;
+    - what it costs: the copies lose their specular highlight and normal map, and about 3 in 100 retail meshes
+      (ones that will not unwrap, and triangle strips) cannot be converted and stay as they were;
+    - Battlefield 1942 is not covered yet: its copies are made as before.
     
     Everything goes into this level's archive (`Objects/RF_LightmapReady/`, `StandardMesh/<mesh>_lm_m1.sm`);
     nothing outside the map changes, and **Point all back at the originals** undoes it for every type. Foliage and
@@ -494,6 +517,24 @@ draw that light, and writes all of it.
 **2. Preview** — **Render preview** ray-traces what the camera sees now, with this light, in a few seconds. Nothing
 is baked or changed; it is there to tune the light by looking. It shows the light the bake *aims for*, not what the
 game will draw — the game has no ray tracer.
+
+**Live traced view (GPU)** — tick **Live traced view in the viewport (GPU)** under the preview, or use
+**View ▸ Traced light (GPU)**, and the main viewport itself shows this light, ray-traced on the graphics card every
+frame: the sun and its soft shadows, the sky, two bounces, your lamps, and leaves and fences casting the shadow of
+their texture. It follows the camera and every slider in this window; each change starts the picture again, grainy
+for a moment, and it clears up while you hold still (it stops adding samples at 2048). Markers and gizmos stay on top,
+so you can keep selecting things.
+
+- Only offered on a **dedicated graphics card** (NVIDIA, AMD Radeon RX, Intel Arc). On a laptop with two GPUs set
+  RefractorForge.exe to *High performance* in Windows Settings ▸ System ▸ Display ▸ Graphics. The window says why
+  when it is not offered.
+- The first time it is turned on, the editor checks the card's answer against its own on a small view and refuses
+  the mode if they disagree; the window then shows the numbers.
+- **Traced resolution**: *Auto* starts at full and drops to a half or a quarter when a frame keeps the GPU too long;
+  *Full*, *Half* and *Quarter* fix it. The window shows the size, the samples so far and the GPU time a frame.
+- It traces the level as it was when the mode was turned on. After you move objects, sculpt or paint, the window
+  says so — press **Rebuild traced scene**.
+- It is a picture of the light, like the preview: what the game draws comes from the bake.
 
 **3. Bake** — **Bake realistic lighting** writes:
 
