@@ -30,7 +30,13 @@ public static partial class ObjectLightmapBaker
     /// <param name="VertexLit">The mesh has no tangent frame, so the game clamps the two lights' sum to 1 before the
     /// lightmap scales it (<see cref="EngineLight.Material.VertexLit"/>); the map is solved against that.</param>
     public sealed record Physical(RayScene Scene, DaylightModel Day, EngineLight.Colours Colours, LightTracer.Budget Budget,
-                                  int DenoiseIterations = 2, float SurfaceOffset = 0.01f, int SoftStride = 2, bool VertexLit = false);
+                                  int DenoiseIterations = 2, float SurfaceOffset = 0.01f, int SoftStride = 2, bool VertexLit = false)
+    {
+        /// <summary>Solve for BATTLEFIELD 1942. That game draws a lightmapped object as texture x 2 x lightmap, per
+        /// channel, and adds no light of its own (<see cref="EngineLight.Bf1942"/>, measured), so the map is simply
+        /// half of what the screen should show, in colour. <see cref="Colours"/> plays no part.</summary>
+        public bool Bf1942 { get; init; }
+    }
 
     /// <summary>A traced lightmap and how well the engine can show what was traced.</summary>
     /// <param name="Map">The lightmap: the same value in every channel, as the grey palette wants it.</param>
@@ -239,7 +245,7 @@ public static partial class ObjectLightmapBaker
         // map = (wanted - LMambient) / vertex colour. On a lightmap-only copy (selfillum 1) the vertex colour is 1
         // and the map IS the light - on every face, whichever way it looks.
         float[]? outG = null, outB = null;
-        if (ph.VertexLit) { outG = new float[n2]; outB = new float[n2]; }
+        if (ph.VertexLit || ph.Bf1942) { outG = new float[n2]; outB = new float[n2]; }
         for (int i = 0; i < n2; i++)
         {
             if (!cover[i]) continue;
@@ -248,6 +254,17 @@ public static partial class ObjectLightmapBaker
                     + new Vector3(softR[i], softG[i], softB[i]);
             if (lamps) e += new Vector3(lampR![i], lampG![i], lampB![i]);
             var want = day.ToDisplay(e);
+            if (ph.Bf1942)
+            {
+                // The map IS the light, halved: nothing to invert, no floor, and only one way to miss - a texel
+                // brighter than the texture at full, which the game clips.
+                var map = EngineLight.Bf1942.SolveLightmap(want);
+                inten[i] = map.X; outG![i] = map.Y; outB![i] = map.Z;
+                sum += EngineLight.Luma(map);
+                if (MathF.Max(want.X, MathF.Max(want.Y, want.Z)) > 1.01f) atCeil++;
+                err += MathF.Abs(MathF.Min(1f, EngineLight.Luma(want)) - EngineLight.Luma(EngineLight.Bf1942.Lightmapped(map)));
+                continue;
+            }
             if (ph.VertexLit)
             {
                 var part = mesh.Parts[texelPart[i]];

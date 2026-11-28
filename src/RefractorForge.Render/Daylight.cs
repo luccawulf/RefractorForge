@@ -358,6 +358,45 @@ public sealed class DaylightModel
         return new Fitted(new EngineLight.Colours(keyV, backV, ambV, lm), Math.Clamp(1f - ratio, 0f, 0.9f), ratio);
     }
 
+    /// <summary>
+    /// The same question for BATTLEFIELD 1942, which has one directional light and a constant
+    /// (<see cref="EngineLight.Bf1942"/>). Its lightmapped objects take neither, so these two colours are only for
+    /// what has no lightmap - props without an unwrap, soldiers, vehicles - and are simply the pair that sits closest
+    /// to the open daylight over every facing from straight up to a little below level. Both come back AS WRITTEN in
+    /// Init.con, that is at half of what the screen shows; <c>Ambient</c> is the sum the level's
+    /// <c>ambientColor</c> and <c>globalAmbientColor</c> should make.
+    /// </summary>
+    public (Vector3 Diffuse, Vector3 Ambient) FitBf1942()
+    {
+        var sun = ToSun;
+        var facing = new System.Collections.Generic.List<(float A, float Want)>();
+        for (int i = 0; i < Sphere.Length; i += 4)
+        {
+            var n = Sphere[i];
+            if (n.Y < -0.1f) continue;
+            facing.Add((MathF.Max(0f, Vector3.Dot(n, sun)), MathF.Min(EngineLight.Luma(OpenDisplay(n)), 1f)));
+        }
+        float bk = 0f, ba = 0.04f, best = float.MaxValue;
+        for (float a0 = 0.02f; a0 <= 0.8f + 1e-4f; a0 += 0.01f)
+            for (float k = 0f; k <= 1.2f + 1e-4f; k += 0.01f)
+            {
+                double cost = 0;
+                foreach (var (a, want) in facing)
+                {
+                    float d = MathF.Min(1f, k * a + a0) - want;
+                    cost += (double)d * d;
+                }
+                if (cost < best) { best = (float)cost; bk = k; ba = a0; }
+            }
+        // The constant takes the colour of open shade on a wall turned from the sun; the light, of what the sun
+        // adds on a face turned toward it.
+        float cosElev = MathF.Sqrt(MathF.Max(0f, sun.X * sun.X + sun.Z * sun.Z));
+        var away = cosElev > 1e-3f ? Vector3.Normalize(new Vector3(-sun.X, 0f, -sun.Z)) : Vector3.UnitZ;
+        var amb = Capped(Hue(OpenDisplay(away)) * ba, 0.9f);
+        var key = Capped(Hue(Vector3.Max(OpenDisplay(sun) - amb, Vector3.Zero)) * bk, 1.2f);
+        return (key * 0.5f, amb * 0.5f);
+    }
+
     /// <summary>The most <c>renderer.diffuseColor</c> can usefully be. The engine halves it on the way to the shader,
     /// whose constants stop at 1, so 2 is the hard limit.</summary>
     public const float SunLimit = 1.5f;

@@ -70,7 +70,22 @@ if (cmd == "build")
     bool fog = args.Contains("--fog");
     bool steer = args.Contains("--steer") || glow || fog;
     LC.Options opts;
-    if (glow)
+    if (args.Contains("--bf1942"))
+    {
+        // Battlefield 1942: the sun red, ambientColor green, globalAmbientColor blue, each low enough that nothing
+        // clips even if the game doubles its lights as BfVietnam does.
+        opts = new LC.Options(baseRfa, name, outDir, Full: false, LC.Site.ElAlamein)
+        {
+            Bf1942 = true, BaseSub = "bf1942",
+            Sun = new Vector3(0.5f, 0f, 0f), Back = Vector3.Zero, LmAmbient = Vector3.Zero,
+            Ambient = new Vector3(0f, 0.25f, 0f), GlobalAmbient = new Vector3(0f, 0f, 0.25f),
+        };
+        // --trees: three stock swaying trees with different lightmap files, under plain grey light so a tree that
+        // took its lightmap (black, or red) stands out from one that did not.
+        if (args.Contains("--trees"))
+            opts = opts with { Trees = true, Sun = new Vector3(0.4f), Ambient = new Vector3(0.15f), GlobalAmbient = new Vector3(0.15f) };
+    }
+    else if (glow)
     {
         // The fourth level: shader levers under WEAK lights (a night's worth), ordinary normals everywhere.
         string archives = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(baseRfa))!, "..", ".."));
@@ -819,6 +834,127 @@ if (cmd == "lsbtex")
 }
 
 LC.Manifest LoadManifest(string path) => JsonSerializer.Deserialize<LC.Manifest>(File.ReadAllText(path))!;
+
+if (cmd == "variant")
+{
+    // variant <src.rfa> <newName> <destDir> [--drop <substring>]... [--take <entry suffix>=<other.rfa>]...
+    // A renamed copy of a level for bisecting a load failure: entries whose path contains a --drop substring are left
+    // out, and a --take entry is replaced by the one of that name from another archive of the SAME level (its paths
+    // re-pointed to the new name). The source is never written to.
+    string srcRfa = args[1], newName = args[2], destDir = args[3];
+    Directory.CreateDirectory(destDir);
+    var drops = new List<string>(); var takes = new List<(string Suffix, string From)>(); var strips = new List<(string Suffix, string Rx)>(); var prepends = new List<(string Suffix, string Line)>();   // --strip <entry suffix>=<regex>: leave out the lines that match
+    for (int i = 4; i + 1 < args.Length; i += 2)
+    {
+        if (args[i] == "--drop") drops.Add(args[i + 1]);
+        else if (args[i] == "--prepend") { int eq = args[i + 1].IndexOf('='); prepends.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
+        else if (args[i] == "--strip") { int eq = args[i + 1].IndexOf('='); strips.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
+        else if (args[i] == "--take") { int eq = args[i + 1].IndexOf('='); takes.Add((args[i + 1][..eq], args[i + 1][(eq + 1)..])); }
+    }
+    var res = RefractorForge.Formats.LevelCopy.CopyArchive(srcRfa, newName, destDir);
+    var arc = new RefractorFlatArchive(res.Destination);
+    var repl = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+    foreach (var (suffix, from) in takes)
+    {
+        var other = new RefractorFlatArchive(from);
+        var oe = other.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        repl[Fwd(mine.Name)] = RefractorForge.Formats.LevelCopy.Retarget(other.Read(oe), new[] { res.OldName }, newName).Bytes;
+    }
+    foreach (var (suffix, rxs) in strips)
+    {
+        var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        var rx = new System.Text.RegularExpressions.Regex(rxs, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var lines = Encoding.Latin1.GetString(arc.Read(mine)).Split((char)10);
+        int before = lines.Length;
+        lines = lines.Where(l => !rx.IsMatch(l)).ToArray();
+        Console.WriteLine($"  {suffix}: {before - lines.Length} line(s) stripped");
+        repl[Fwd(mine.Name)] = Encoding.Latin1.GetBytes(string.Join((char)10, lines));
+    }
+    foreach (var (suffix, line) in prepends)
+    {
+        var mine = arc.Entries.First(e => Fwd(e.Name).EndsWith("/" + suffix, StringComparison.OrdinalIgnoreCase));
+        var cur = repl.TryGetValue(Fwd(mine.Name), out var had) ? had : arc.Read(mine);
+        repl[Fwd(mine.Name)] = Encoding.Latin1.GetBytes(line + "\r\n").Concat(cur).ToArray();
+    }
+    int dropped = 0;
+    string tmp = res.Destination + ".tmp";
+    File.Copy(res.Destination, tmp, true);
+    var tmpArc = new RefractorFlatArchive(tmp);
+    RefractorFlatArchive.RepackToFile(res.Destination, tmpArc, repl,
+        n => { bool d = drops.Any(x => Fwd(n).Contains(x, StringComparison.OrdinalIgnoreCase)); if (d) dropped++; return d; });
+    File.Delete(tmp);
+    Console.WriteLine($"{newName}: {new RefractorFlatArchive(res.Destination).Entries.Count} entries ({dropped} dropped, {repl.Count} taken from elsewhere) -> {res.Destination}");
+    return;
+}
+
+if (cmd == "bake42")
+{
+    // bake42 <ArchivesDir> <levelName> <outDir> [maxMaps] : the Battlefield 1942 traced bake on a real level, without
+    // the editor. Bakes the first lightmap-carrying objects, writes each map as the game will SHOW it (x 2) beside
+    // the retail map for the same object read the same way, and prints the colours the level would be given.
+    string arcDir = args[1], lvl = args[2], outD = args[3];
+    int max = args.Length > 4 ? int.Parse(args[4]) : 6;
+    Directory.CreateDirectory(outD);
+    bool Is(string f, string stem) { var n = Path.GetFileNameWithoutExtension(f); return n.Equals(stem, StringComparison.OrdinalIgnoreCase) || (n.StartsWith(stem + "_", StringComparison.OrdinalIgnoreCase) && n[(stem.Length + 1)..].All(char.IsDigit)); }
+    var levelRfas = Directory.GetFiles(Path.Combine(arcDir, "bf1942", "levels"), "*.rfa").Where(f => Is(f, lvl)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+    var top = Directory.GetFiles(arcDir, "*.rfa").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+    var meshA = top.Where(f => Is(f, "standardMesh") || Is(f, "Objects") || Is(f, "treeMesh")).Concat(levelRfas).ToArray();
+    var texA = top.Where(f => Is(f, "texture")).Concat(levelRfas).ToArray();
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var loaded = LevelArchive.FromRfa(levelRfas);
+    var lib = MeshLibrary.Open(meshA);
+    lib.AttachTextures(TextureLibrary.Open(texA));
+    var envS = loaded.Environment;
+    var toSun = envS is null ? Vector3.Normalize(new Vector3(-0.5f, 0.8f, -0.35f)) : Vector3.Normalize(new Vector3(envS.SunDirection.X, envS.SunDirection.Y, envS.SunDirection.Z));
+    var day = new Daylight { ToSun = toSun }.Build();
+    var built = LightScene.Build(loaded.Heightmap, loaded.Config, null, loaded.StaticObjects, lib);
+    Console.WriteLine($"{lvl}: {levelRfas.Length} archive(s), {loaded.StaticObjects.Objects.Count} static object(s); scene of {built.Stats.TerrainTriangles:N0} terrain + {built.Stats.ObjectTriangles:N0} object triangle(s) in {sw.Elapsed.TotalSeconds:0.0} s; sun toward {toSun.X:0.00}/{toSun.Y:0.00}/{toSun.Z:0.00}");
+    var (fd, fa) = day.FitBf1942();
+    Console.WriteLine($"for objects with no lightmap: diffuse {fd.X:0.00}/{fd.Y:0.00}/{fd.Z:0.00}, ambient + global ambient {fa.X:0.00}/{fa.Y:0.00}/{fa.Z:0.00}"
+                      + (envS is null ? "" : $"   (the level ships diffuse {envS.DiffuseColor.X:0.00}/{envS.DiffuseColor.Y:0.00}/{envS.DiffuseColor.Z:0.00}, ambient {envS.AmbientColor.X:0.00}/{envS.AmbientColor.Y:0.00}/{envS.AmbientColor.Z:0.00} + global {envS.GlobalAmbientColor.X:0.00}/{envS.GlobalAmbientColor.Y:0.00}/{envS.GlobalAmbientColor.Z:0.00})"));
+    var retail = ObjectLightmaps.FromRfaPaths(levelRfas, throughLevelPalette: true);
+    var ph = new ObjectLightmapBaker.Physical(built.Scene!, day, default, new LightTracer.Budget(8, 32, 2)) { Bf1942 = true };
+    int withUv = 0, without = 0, done = 0;
+    static (double R, double G, double B) Shown(Texture2D t)
+    {
+        double r = 0, g = 0, b = 0; int n = t.Width * t.Height;
+        for (int i = 0; i < n; i++) { r += Math.Min(255, 2 * t.Rgba[i * 4]); g += Math.Min(255, 2 * t.Rgba[i * 4 + 1]); b += Math.Min(255, 2 * t.Rgba[i * 4 + 2]); }
+        return (r / n, g / n, b / n);
+    }
+    static byte[] Doubled(Texture2D t)
+    {
+        var o = (byte[])t.Rgba.Clone();
+        for (int i = 0; i < o.Length; i++) if (i % 4 != 3) o[i] = (byte)Math.Min(255, 2 * o[i]);
+        return o;
+    }
+    foreach (var o in loaded.StaticObjects.Objects)
+    {
+        MeshLibrary.Mesh? mesh = null; string? meshName = null;
+        foreach (var mn in lib.LodGeometryNames(o.Template))
+            if (lib.TryGet(mn, out var m) && m.LightmapUvs is not null) { mesh = m; meshName = mn; break; }
+        if (mesh is null) { without++; continue; }
+        withUv++;
+        if (done >= max) continue;
+        sw.Restart();
+        var pm = ObjectLightmapBaker.BakePhysical(mesh, LevelScene.MeshWorld(o), 128, 2, ph);
+        if (pm is null) { Console.WriteLine($"  {meshName}: no unwrap in its lightmap channel"); continue; }
+        string stem = $"{ObjectLightmaps.FileBase(meshName!)}_{(int)o.Position.X}-{(int)o.Position.Y}-{(int)o.Position.Z}";
+        SavePng(Path.Combine(outD, stem + "_traced_x2.png"), Doubled(pm.Map), pm.Map.Width, pm.Map.Height);
+        var s2 = Shown(pm.Map);
+        string line = $"  {stem}: traced shows {s2.R:0}/{s2.G:0}/{s2.B:0} mean, {pm.AtCeiling:P0} clipped, {sw.Elapsed.TotalSeconds:0.0} s";
+        if (retail.Match(o.Template, o.Position.X, o.Position.Y, o.Position.Z) is { } rt)
+        {
+            SavePng(Path.Combine(outD, stem + "_retail_x2.png"), Doubled(rt), rt.Width, rt.Height);
+            var r2 = Shown(rt);
+            line += $"; retail shows {r2.R:0}/{r2.G:0}/{r2.B:0}";
+        }
+        Console.WriteLine(line);
+        done++;
+    }
+    Console.WriteLine($"{withUv} object(s) carry a lightmap unwrap, {without} do not (those are lit by the level's sun and ambient).");
+    return;
+}
 
 if (cmd == "synth")
 {

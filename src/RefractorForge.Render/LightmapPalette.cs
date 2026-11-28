@@ -130,6 +130,40 @@ public sealed class LightmapPalette
     // and the game's own bilinear filter blends them back. Without it a soft shadow edge is 32 hard bands.
     private static readonly byte[] Bayer = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 
+    // The same table from the palette's colours AS WRITTEN, for a game that keeps all eight bits of them.
+    private (byte Value, byte Index)[]? _exact;
+    private (byte Value, byte Index)[] ExactLevels
+    {
+        get
+        {
+            if (_exact is not null) return _exact;
+            var best = new Dictionary<byte, (int Index, int Tint)>();
+            for (int i = 0; i < 256; i++)
+            {
+                var (r, g, b) = this[i];
+                int tint = Math.Abs(r - b) + Math.Abs(g - b);
+                if (!best.TryGetValue(b, out var have) || tint < have.Tint) best[b] = (i, tint);
+            }
+            return _exact = best.OrderBy(kv => kv.Key).Select(kv => (kv.Key, (byte)kv.Value.Index)).ToArray();
+        }
+    }
+
+    /// <summary>
+    /// The index whose colour, as written in the palette, is nearest <paramref name="value"/> - no 5:6:5 step and
+    /// no dither. Battlefield 1942 shows a palette entry at its full eight bits (its calibration level read
+    /// 2 x 86 = 172 off an entry of 86, where 5:6:5 would have given 164 or 180), so there is nothing for a dither
+    /// to hide - and a dither written for it shows: a grid of dots a level of 8 apart, doubled by the game.
+    /// </summary>
+    public byte ExactIndexFor(byte value)
+    {
+        var lv = ExactLevels;
+        if (value <= lv[0].Value) return lv[0].Index;
+        if (value >= lv[^1].Value) return lv[^1].Index;
+        int lo = 0, hi = lv.Length - 1;
+        while (hi - lo > 1) { int mid = (lo + hi) / 2; if (lv[mid].Value <= value) lo = mid; else hi = mid; }
+        return value - lv[lo].Value <= lv[hi].Value - value ? lv[lo].Index : lv[hi].Index;
+    }
+
     /// <summary>The index to write at texel (x, y) so the game shows <paramref name="value"/> (0..255) there.</summary>
     public byte IndexFor(byte value, int x, int y)
     {
@@ -149,7 +183,9 @@ public sealed class LightmapPalette
     /// map is this palette too - the game ignores it, but anything else that opens the file then sees what the
     /// game will.
     /// </summary>
-    public byte[] Encode(Texture2D t)
+    /// <param name="exact">Battlefield 1942: nearest palette colour as written, undithered
+    /// (<see cref="ExactIndexFor"/>). BfVietnam's 5:6:5 levels with the dither otherwise.</param>
+    public byte[] Encode(Texture2D t, bool exact = false)
     {
         int w = t.Width, h = t.Height;
         var buf = new byte[18 + 256 * 3 + w * h];
@@ -164,7 +200,8 @@ public sealed class LightmapPalette
         for (int y = 0; y < h; y++)                   // file row 0 is the picture's bottom row
         {
             int row = h - 1 - y;
-            for (int x = 0; x < w; x++) buf[p++] = IndexFor(px[(row * w + x) * 4], x, row);
+            for (int x = 0; x < w; x++)
+                buf[p++] = exact ? ExactIndexFor(px[(row * w + x) * 4]) : IndexFor(px[(row * w + x) * 4], x, row);
         }
         return buf;
     }

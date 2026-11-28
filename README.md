@@ -38,13 +38,17 @@ runtime, with a dark, Battlecraft-style Dear ImGui interface.
   mesh and which do not.
 - **Free models** — search Poly Haven and Poly Pizza from inside the editor and import a model straight into the
   map (native glTF reader, no Blender needed); the credit each licence asks for is written into the map.
-- **Realistic lighting** (BfVietnam) — describe the light as a sun, a sky and your placed lamps; the editor
+- **Realistic lighting** (BfVietnam and Battlefield 1942) — describe the light as a sun, a sky and your placed lamps; the editor
   ray-traces it with bounces and solves it into what the game draws with: the ground tiles in colour, every object's
   lightmap, and the level's four light colours, fitted to the engine's own formula (read from its shaders and exe —
   `docs/Realistic_Lighting.md`). A ray-traced preview of the camera view tunes the light before baking, and the
   viewport can draw the level exactly as the game will. **Lightmap-only objects** make the game draw a converted
   object as texture x lightmap on every face, so lamp colour, interiors and ceilings come through; a **live traced
-  view** (GPU compute, discrete cards) shows the traced light in the viewport. BfVietnam only for now.
+  view** (GPU compute, discrete cards) shows the traced light in the viewport. **Light volumes** (BfVietnam) add
+  shaped fog, darkness and lamp shafts as a lattice of nearly transparent planes. **Battlefield 1942** is solved
+  against its own measurements: a lightmapped object there is texture x 2 x lightmap and nothing else, so the bake
+  writes the traced light itself into 24-bit colour lightmaps. Picking a preset or moving a slider lights the
+  viewport with that sun and sky at once.
 - **Lighting** — real-time sun control + shadow mapping, plus **bake-to-game**: terrain sun shadows
   (`LightmapShadowBits.lsb`, byte-exact), per-object lightmaps, and minimap generation.
 - **Environment** — water colour/level/textures, sun azimuth/elevation, fog, skybox import, animated

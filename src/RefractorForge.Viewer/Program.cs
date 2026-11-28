@@ -526,6 +526,10 @@ uniform vec3 uAmbLight; uniform vec3 uDifLight;         // the level's ambient/d
 // with B the sun mirrored to the opposite compass bearing, the lightmap taken as 1 where there is none, and the
 // ambient LMambientColor for a lightmapped surface, ambientColor otherwise.
 uniform int uGame; uniform vec3 uGSun; uniform vec3 uGBack; uniform vec3 uGAmb;
+// 1 = the level is Battlefield 1942, whose rules are its own (EngineLight.Bf1942, measured): a lightmapped object is
+// texture x 2 x lightmap and nothing else; one without is texture x 2 x (matDiffuse x sun x N.L + the two ambients).
+// uGAmb then carries ambientColor + globalAmbientColor.
+uniform int uBf42;
 uniform int uVertexLit;                                   // the mesh has no tangent frame: the game draws it fixed-function
 uniform vec3 uMatDif; uniform vec3 uSelfIllum;            // the part's materialDiffuse and selfillum (1 / 0 for an ordinary material)
 uniform float uLightCut;                                  // how much of the two lights an unlightmapped object LOSES in terrain shadow (0 = none)
@@ -624,6 +628,7 @@ void main(){
         vec4 lmt = texture(uLightmap, vLmUv);
         // BF1942 keeps a lamp's COLOUR in a 24-bit map (GC_Bespin_Night ships them); BfVietnam's shader reads .b only.
         vec3 lmc = (uLmColour == 1) ? lmt.rgb : vec3(lmt.b);
+        if (uBf42 == 1) lmc = min(2.0 * lmc, vec3(1.0));
         vec3 lmv = max(lmc, placedLights(vWorld, ln));
         float ndl = abs(dot(ln, normalize(uLightDir)));
         vec3 d = lmv * uDifLight * ndl + min(2.0 * uLmAmbient, vec3(0.6));
@@ -641,6 +646,7 @@ void main(){
             // lightmap - so selfillum 1 leaves texture x (lightmap + LMambient) on every face (measured).
             if (uVertexLit == 1) { two = min(uMatDif * two + uSelfIllum, vec3(1.0)); lmg = lmt.rgb; }
             c = base * uTint * min(lmg * two + uLmAmbient, vec3(1.0));
+            if (uBf42 == 1) c = base * uTint * min(2.0 * lmt.rgb, vec3(1.0));
         }
     } else {
         vec3 n = normalize(vN);
@@ -664,6 +670,7 @@ void main(){
             two *= 1.0 - uLightCut;
             if (uAlphaTest==1) two = (uGSun + uGBack) * 0.3 * (1.0 - uLightCut) + vec3(0.35);
             c = base * uTint * min(two + uGAmb, vec3(1.0));
+            if (uBf42 == 1) c = base * uTint * min(2.0 * (uMatDif * uGSun * max(dot(gn, sunL), 0.0) + uGAmb), vec3(1.0));
         }
     }
     if (uFogEnable==1) {
@@ -1627,6 +1634,9 @@ RefractorForge.Render.GroundLightBake.Result? rlGround = null;
 Texture2D? rlLitGround = null;
 RefractorForge.Render.DaylightModel? rlDay = null;
 RefractorForge.Render.DaylightModel.Fitted? rlFit = null;
+bool rlShow = false;                       // the viewport is lit by the Realistic Lighting window's light, not the level's
+long rlShowSig = 0; (Vector3 Amb, Vector3 Dif) rlShowLight;
+(Vector3 Diffuse, Vector3 Ambient)? rlFit42 = null;   // Battlefield 1942: its sun and its ambient sum, as Init.con writes them
 string rlSummary = "";
 object rlStatLock = new();
 int rlMaps = 0; double rlMapFloor = 0, rlMapCeil = 0, rlMapErr = 0;      // how far the engine fell short of the trace
@@ -9004,7 +9014,7 @@ void BakeObjectLightmaps()
     if (so is null || meshLib is null || heightmap is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
     if (lmBaking) { Toast(Loc.T("A lightmap bake is already running.")); return; }
     // Realistic chosen as the quality: set up the traced solve and come back through here with it in place.
-    if (lmUseRealistic && !gameIsBf1942 && lmPhysical is null) { BakeRealisticObjects(); return; }
+    if (lmUseRealistic && lmPhysical is null) { BakeRealisticObjects(); return; }
     var es = EffectiveSun(); var sunV = new Vec3(es.X, es.Y, es.Z);
     // One job per LOD MESH of each placed object, because that is how the game files lightmaps: O_HueHouse_B's is
     // O_HueHouse_B_M1_<pos>.tga (and _M2_ for the far LOD), never O_HueHouse_B_<pos>.tga - a file named after the
@@ -9056,7 +9066,7 @@ void BakeObjectLightmaps()
     var advRef = LightmapAdvanced();
     // The GPU only takes the Ultra tier's terms; anything else it hands straight back to the CPU itself.
     RefractorForge.Render.ILightmapShader? gpuRef = gpuLm is { Enabled: true, Available: true } && advRef is not null ? gpuLm : null;
-    if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null; lmLampSamples = NightLampSamples(); lmMoonLevel = 1f; }
+    if (nbStage != 2) { lmColour = gameIsBf1942 && nightColourLightmaps && rigRef is not null && lmPhysical is null; lmLampSamples = NightLampSamples(); lmMoonLevel = 1f; }   // a traced bake carries its own colour and goes through the 24-bit budget
     var nightRef = rigRef is not null ? lmNightScene : null; bool colourRef = lmColour; int lampRef = lmLampSamples; float moonRef = lmMoonLevel;
     bool uniformRef = nightUniformUnwrapless && nbStage == 2;
     var fallbackRgb = new Vector3?[jobs.Count]; lmFallbackRgb = fallbackRgb;
@@ -9136,7 +9146,13 @@ void FinishObjectLightmapBake()
     // means - Battlecraft's tinted one stops at about 0.73 - gets the plain ramp too, but only on a whole-level
     // bake, which rewrites every map that was written against the old one.
     var lmPalette = LightmapPalette.Linear; bool lmPaletteReplaced;
-    if (gameIsBf1942) lmPaletteReplaced = !LevelHasLightmapPalette();
+    // Battlefield 1942 reads an 8-bit map through the level's palette as well, then doubles it (measured). The
+    // classic bake is left as it was - index = sun visibility, which a retail palette turns into its own shade and
+    // sunlit colours. A traced map is a light VALUE: a whole-level bake writes the plain ramp so every value means
+    // itself; a bake of the selection keeps the level's palette, because the other maps were written against it.
+    if (gameIsBf1942 && lmPhysical is null) lmPaletteReplaced = !LevelHasLightmapPalette();
+    else if (gameIsBf1942 && !lmSelectedOnly) lmPaletteReplaced = true;
+    else if (gameIsBf1942) { if (LevelLightmapPalette() is { } pal42) { lmPalette = pal42; lmPaletteReplaced = false; } else lmPaletteReplaced = true; }
     else if (LevelLightmapPalette() is { } levelPal && (levelPal.Usable || lmSelectedOnly)) { lmPalette = levelPal; lmPaletteReplaced = false; }
     else lmPaletteReplaced = true;
     int baked = 0, noUnwrap = 0, lodMaps = 0, uniform = 0;
@@ -9179,7 +9195,7 @@ void FinishObjectLightmapBake()
         // A traced map for a mesh the game lights per vertex is solved per channel: 24-bit too (BfVietnam reads a
         // 24-bit map exactly as written - measured).
         bool rgbMap = lmColour || (lmJobColour is { } jc && i < jc.Length && jc[i]);
-        if (rgbMap && !lmColour && !gameIsBf1942) { tracedColour.Add(($"{fileBase}_{x}-{y}-{z}.tga", tex)); continue; }
+        if (rgbMap && !lmColour && (!gameIsBf1942 || lmPhysical is not null)) { tracedColour.Add(($"{fileBase}_{x}-{y}-{z}.tga", tex)); continue; }
         bakedObjectLightmaps[$"{fileBase}_{x}-{y}-{z}.tga"] = rgbMap ? TgaTexture.EncodeRgb24(tex) : EncodeGreyLightmap(tex, lmPalette);
     }
     lmJobColour = null;
@@ -9326,8 +9342,9 @@ LightmapPalette? LevelLightmapPalette()
 }
 
 // A grey lightmap as the file the game reads. BfVietnam: every index chosen so the level's palette SHOWS the value
-// meant (LightmapPalette). Battlefield 1942 is left exactly as it was - index = value - until it is measured too.
-byte[] EncodeGreyLightmap(Texture2D tex, LightmapPalette pal) => gameIsBf1942 ? TgaTexture.EncodeGrayColormapped(tex) : pal.Encode(tex);
+// meant (LightmapPalette). Battlefield 1942: the same for a traced map; its classic bake stays index = value.
+// Battlefield 1942 keeps a palette entry's full eight bits, so its maps are written undithered (a dither shows as dots).
+byte[] EncodeGreyLightmap(Texture2D tex, LightmapPalette pal) => gameIsBf1942 && lmPhysical is null ? TgaTexture.EncodeGrayColormapped(tex) : pal.Encode(tex, exact: gameIsBf1942);
 
 bool LevelHasLightmapPalette()
 {
@@ -9369,10 +9386,10 @@ void EnsureObjectLightmaps()
 {
     if (objectLightmapsLoaded || glObjects is null || so is null) return;
     objectLightmapsLoaded = true;
-    // BfVietnam looks an 8-bit map's indices up in the level's Palette.pal, not in the file's own colour map
-    // (measured in the game), so that is how they are read here too.
-    objectLightmaps = rfaList.Length > 0 ? ObjectLightmaps.FromRfaPaths(rfaList, throughLevelPalette: !gameIsBf1942)
-                    : (levelDir is not null && Directory.Exists(levelDir) ? ObjectLightmaps.FromFolder(levelDir, throughLevelPalette: !gameIsBf1942) : null);
+    // Both games look an 8-bit map's indices up in the level's Palette.pal, not in the file's own colour map
+    // (measured in each - BF1942 on rf_calib42, 2026-11-28), so that is how they are read here too.
+    objectLightmaps = rfaList.Length > 0 ? ObjectLightmaps.FromRfaPaths(rfaList, throughLevelPalette: true)
+                    : (levelDir is not null && Directory.Exists(levelDir) ? ObjectLightmaps.FromFolder(levelDir, throughLevelPalette: true) : null);
     glObjects.SetObjectLightmaps(gl, objectLightmaps, so, meshLib);
     if (glObjects.LightmapInstanceCount > 0)
         Console.WriteLine($"Object lightmaps: {objectLightmaps?.Count ?? 0} baked tga(s), {glObjects.LightmapInstanceCount} object(s) lit.");
@@ -9570,7 +9587,7 @@ void OnRender(double dt)
             // Wireframe object view: line polygons for every object drawn in this pass (statics, vehicle spawners,
             // flags, spawn markers). Flat shading comes with it so the lines are the material colour, not texture.
             if (objectView == 3) gl.PolygonMode(GLEnum.FrontAndBack, GLEnum.Line);
-            bool wantLm = showObjectLightmaps && !sunOverride;
+            bool wantLm = showObjectLightmaps && !sunOverride && !rlShow;
             if (wantLm) EnsureObjectLightmaps();   // lazy: only decode the lightmaps when they're actually about to be shown
             glObjects.ShowLightmaps = wantLm;
             glObjects.FlatShading = objectView is 1 or 3;   // Battlecraft View as Detail Mesh (and wireframe)
@@ -12104,7 +12121,6 @@ int? RlTileSize()
 void BakeRealisticLighting()
 {
     if (heightmap is null || so is null || meshLib is null) { Toast(Loc.T("Load a level with terrain first.")); return; }
-    if (gameIsBf1942) { Toast(Loc.T("Realistic lighting is solved against Battlefield Vietnam's own shaders. It is not available for a Battlefield 1942 level yet.")); return; }
     if (rlBaking || lmBaking || sbBaking) { Toast(Loc.T("A lighting bake is already running.")); return; }
 
     var ground = RlGroundSource();
@@ -12118,10 +12134,15 @@ void BakeRealisticLighting()
     var fit = RlFitFor(day);
     var rigSnap = RlLampSnapshot();
     rlDay = day; rlFit = fit; rlRig = rigSnap;
-    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget());
+    rlFit42 = gameIsBf1942 ? day.FitBf1942() : null;
+    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget()) { Bf1942 = gameIsBf1942 };
     Console.WriteLine($"Realistic lighting: scene of {built.Stats.TerrainTriangles:N0} terrain + {built.Stats.ObjectTriangles:N0} object triangle(s), "
                       + $"{built.Stats.CutoutTriangles:N0} cut-out over {built.Stats.Masks} texture(s), built in {sw.Elapsed.TotalSeconds:0.0} s; "
                       + $"{rigSnap?.Lights.Count ?? 0} lamp(s).");
+    if (rlFit42 is { } f42)
+        Console.WriteLine($"   Battlefield 1942: the lightmaps hold the light itself (texture x 2 x lightmap). For what has no lightmap: "
+                          + $"diffuse {RlV(f42.Diffuse)}, ambient + global ambient {RlV(f42.Ambient)}; open shade {fit.OpenShade:0.00} of sunlit.");
+    else
     Console.WriteLine($"   Light colours it is solved against: diffuse {RlV(fit.Colours.Sun)}, secondary {RlV(fit.Colours.Back)}, "
                       + $"ambient {RlV(fit.Colours.Ambient)}, LMambient {RlV(fit.Colours.LmAmbient)}; open shade {fit.OpenShade:0.00} of sunlit.");
 
@@ -12130,7 +12151,7 @@ void BakeRealisticLighting()
     int size = Math.Clamp(atlasCpu?.Width ?? 2048, 1024, 4096);
     var target = ground is null ? null : new Texture2D(ground.Width, ground.Height, new byte[ground.Rgba.Length]);
     var budget = lmQuality == 0 ? new RefractorForge.Render.LightTracer.Budget(4, 24, 1) : new RefractorForge.Render.LightTracer.Budget(8, 48, 2);
-    var scene = built.Scene; var floor = fit.Colours.LmAmbient;
+    var scene = built.Scene; var floor = gameIsBf1942 ? Vector3.Zero : fit.Colours.LmAmbient;   // BF1942 has no floor under its lightmaps
     rlDone = 0; rlTotal = 1; rlBaking = true; rlStarted = appClock;
     rlCancel = new System.Threading.CancellationTokenSource();
     var token = rlCancel.Token;
@@ -12167,7 +12188,12 @@ void BakeRealisticObjects()
     var fit = RlFitFor(day);
     var rigSnap = RlLampSnapshot();
     rlDay = day; rlFit = fit; rlRig = rigSnap;
-    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget());
+    rlFit42 = gameIsBf1942 ? day.FitBf1942() : null;
+    lmPhysical = new ObjectLightmapBaker.Physical(built.Scene, day, fit.Colours, RlObjectBudget()) { Bf1942 = gameIsBf1942 };
+    if (rlFit42 is { } f42)
+        Console.WriteLine($"Realistic object lightmaps (Battlefield 1942): scene built in {sw.Elapsed.TotalSeconds:0.0} s; the maps hold the light itself. "
+                          + $"For what has no lightmap: diffuse {RlV(f42.Diffuse)}, ambient + global ambient {RlV(f42.Ambient)}.");
+    else
     Console.WriteLine($"Realistic object lightmaps: scene built in {sw.Elapsed.TotalSeconds:0.0} s; solved against diffuse {RlV(fit.Colours.Sun)}, "
                       + $"secondary {RlV(fit.Colours.Back)}, ambient {RlV(fit.Colours.Ambient)}, LMambient {RlV(fit.Colours.LmAmbient)}.");
     rlMaps = 0; rlMapFloor = 0; rlMapCeil = 0; rlMapErr = 0;
@@ -12183,8 +12209,8 @@ void RealLightProgress()
     // A level that was baked this way opens showing what the game shows; any other opens in the editor's own light.
     if (rlLevelSeen != levelDir)
     {
-        rlLevelSeen = levelDir;
-        gameLighting = !gameIsBf1942 && lightRig.Daylight?.Baked == true;
+        rlLevelSeen = levelDir; rlShow = false;
+        gameLighting = lightRig.Daylight?.Baked == true;
         if (gameLighting) showObjectLightmaps = true;   // the game's picture includes the lightmaps: load and show them
         rlSummary = ""; rlPrevScene = null; rlPrevSceneSig = "";
     }
@@ -12283,6 +12309,7 @@ void FinishRealisticBake(int baked, int unwrapless)
 {
     lmPhysical = null; rlRig = null;
     if (rlFit is not { } fit) return;
+    if (gameIsBf1942) { FinishRealisticBake42(baked, unwrapless); return; }
     var c = fit.Colours;
     lightDiffuse = c.Sun; lightAmb = c.Ambient;
     if (env is not null)
@@ -12294,7 +12321,7 @@ void FinishRealisticBake(int baked, int unwrapless)
     }
     lightingDirty = true;                          // Init.con is patched on the next save
     BroadcastLight();
-    gameLighting = true; lightPreview = true;
+    gameLighting = true; lightPreview = true; rlShow = false;
     RlSettings().Baked = true;
 
     double floorPct = rlMaps > 0 ? rlMapFloor / rlMaps * 100.0 : 0, ceilPct = rlMaps > 0 ? rlMapCeil / rlMaps * 100.0 : 0;
@@ -12314,6 +12341,40 @@ void FinishRealisticBake(int baked, int unwrapless)
     if (lmColourNote.Length > 0) rlSummary += "\n" + lmColourNote;
     Console.WriteLine("Realistic lighting baked. " + rlSummary.Replace("\n", " "));
     Toast(string.Format(Loc.T("Realistic lighting baked: {0} lightmap(s) and the ground. The viewport now shows the level as the game will draw it. Save writes it all."), baked));
+}
+
+// The same for Battlefield 1942. Its lightmaps need no colours to go with them; the level's sun and ambient are set
+// for what has none - props without an unwrap, soldiers, vehicles. The ambient is shared between ambientColor and
+// globalAmbientColor in the proportion the level already had: the game adds the two, and nothing measured tells
+// them apart.
+void FinishRealisticBake42(int baked, int unwrapless)
+{
+    var (dif, amb) = rlFit42 ?? (lightDiffuse, lightAmb + lightGlobalAmb);
+    float la = RefractorForge.Render.EngineLight.Luma(lightAmb), lg = RefractorForge.Render.EngineLight.Luma(lightGlobalAmb);
+    float share = la + lg > 1e-4f ? la / (la + lg) : 0.5f;
+    lightDiffuse = dif; lightAmb = amb * share; lightGlobalAmb = amb * (1f - share);
+    lightingDirty = true;                          // Init.con is patched on the next save
+    BroadcastLight();
+    gameLighting = true; lightPreview = true;
+    RlSettings().Baked = true;
+    double ceilPct = rlMaps > 0 ? rlMapCeil / rlMaps * 100.0 : 0;
+    rlShow = false;
+    if (rlObjectsOnly)
+    {
+        rlSummary = string.Format(Loc.T("Baked: {0} object lightmap(s), {1} object(s) with no lightmap unwrap left to the game's own light; the ground was left as it was.\nBattlefield 1942 draws a lightmapped object as its texture x 2 x the lightmap and adds no light of its own, so the maps hold the traced light itself, in colour; {2:0}% of their texels are brighter than the game can show.\nFor everything without a lightmap the level's colours were set to: diffuse {3}, ambient {4}, global ambient {5}."),
+            baked, unwrapless, ceilPct, RlV(lightDiffuse), RlV(lightAmb), RlV(lightGlobalAmb));
+        if (lmColourNote.Length > 0) rlSummary += "\n" + lmColourNote;
+        Console.WriteLine("Realistic object lightmaps baked (Battlefield 1942). " + rlSummary.Replace("\n", " "));
+        Toast(string.Format(Loc.T("Realistic object lightmaps baked: {0}. The level's light colours were set to match them. Save writes it all."), baked));
+        rlObjectsOnly = false;
+        return;
+    }
+    rlSummary = string.Format(Loc.T("Baked: {0} lightmap(s), {1} object(s) with no lightmap unwrap left to the game's own light, {2:0}% of the ground in shadow.\nBattlefield 1942 draws a lightmapped object as its texture x 2 x the lightmap and adds no light of its own, so the maps hold the traced light itself, in colour; {3:0}% of their texels are brighter than the game can show.\nFor everything without a lightmap the level's colours were set to: diffuse {4}, ambient {5}, global ambient {6}."),
+        baked, unwrapless, rlShadowShare * 100.0, ceilPct, RlV(lightDiffuse), RlV(lightAmb), RlV(lightGlobalAmb));
+    if (lmColourNote.Length > 0) rlSummary += "\n" + lmColourNote;
+    Console.WriteLine("Realistic lighting baked (Battlefield 1942). " + rlSummary.Replace("\n", " "));
+    Toast(string.Format(Loc.T("Realistic lighting baked: {0} lightmap(s) and the ground. The viewport now shows the level as the game will draw it. Save writes it all."), baked));
+    rlObjectsOnly = false;
 }
 
 // ---- the ray-traced preview of the current view ------------------------------------------------------------------
@@ -12550,6 +12611,35 @@ void TraceControls()
     }
 }
 
+// ---- the window's light in the viewport ----------------------------------------------------------------------------
+
+// The light the window describes, as the editor's ordinary shading can show it: a constant and one sun. The constant
+// is what open, level ground shows out of the sun - the sky alone; the sun is what it adds on a face turned to it.
+// Unlike the level's own colours these are NOT normalised, so a dim light looks dim. It is a stand-in to tune by:
+// no bounce, no soft shade, nothing traced - the preview picture and the traced view are the real thing.
+(Vector3 Amb, Vector3 Dif) RlViewportLight()
+{
+    var st = RlSettings();
+    var sun = EffectiveSun();
+    var hc = new HashCode();
+    hc.Add(sun); hc.Add(st.SunR); hc.Add(st.SunG); hc.Add(st.SunB); hc.Add(st.ZenithR); hc.Add(st.ZenithG); hc.Add(st.ZenithB);
+    hc.Add(st.HorizonR); hc.Add(st.HorizonG); hc.Add(st.HorizonB); hc.Add(st.SkyStrength); hc.Add(st.Brightness); hc.Add(st.Bounce);
+    long sig = hc.ToHashCode() | (1L << 40);
+    if (sig == rlShowSig) return rlShowLight;
+    var day = RlModel(null);
+    var amb = day.ToDisplay(day.SkyIrradianceUp);
+    var dif = Vector3.Max(day.OpenDisplay(sun) - amb, Vector3.Zero);
+    rlShowSig = sig; rlShowLight = (amb, dif);
+    return rlShowLight;
+}
+
+// Something in the window changed the light: show it. The baked picture (the game's lighting, the lightmaps) no
+// longer says what this light looks like, so the viewport leaves it until the next bake or until it is ticked again.
+void RlShowInViewport()
+{
+    rlShow = true; lightPreview = true; gameLighting = false;
+}
+
 // ---- the window --------------------------------------------------------------------------------------------------
 
 void RlPreset(float sr, float sg, float sb, float zr, float zg, float zb, float hr, float hg, float hb, float sky, float bright)
@@ -12559,11 +12649,12 @@ void RlPreset(float sr, float sg, float sb, float zr, float zg, float zb, float 
     st.ZenithR = zr; st.ZenithG = zg; st.ZenithB = zb;
     st.HorizonR = hr; st.HorizonG = hg; st.HorizonB = hb;
     st.SkyStrength = sky; st.Brightness = bright;
+    RlShowInViewport();
 }
 
 void RealLightWindow()
 {
-    if (!showRealLight) return;
+    if (!showRealLight) { rlShow = false; return; }
     ImGui.SetNextWindowSize(new Vector2(580f * uiScale, 800f * uiScale), ImGuiCond.FirstUseEver);
     ImGui.SetNextWindowSizeConstraints(new Vector2(440f * uiScale, 360f * uiScale), new Vector2(float.MaxValue, float.MaxValue));
     if (!ImGui.Begin(Loc.TL("Realistic Lighting") + "###reallight", ref showRealLight)) { ImGui.End(); return; }
@@ -12572,7 +12663,7 @@ void RealLightWindow()
     bool busy = rlBaking || lmBaking || sbBaking;
 
     if (gameIsBf1942)
-        ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), Loc.T("This level is Battlefield 1942. The bake is solved against Battlefield Vietnam's shaders, so only the preview works here for now."));
+        Theme.Muted(Loc.T("This level is Battlefield 1942. Its lightmaps hold the whole traced light, in colour: an object with a lightmap is drawn as its texture x 2 x the lightmap. Objects with no lightmap unwrap, soldiers and vehicles are lit by the level's sun and ambient colours, which the bake also sets."));
 
     // ---- 1. the light ------------------------------------------------------------------------------------------
     Theme.Section(Loc.T("1. THE LIGHT"));
@@ -12587,6 +12678,9 @@ void RealLightWindow()
     ImGui.SameLine();
     if (ImGui.SmallButton(Loc.TL("Moonlit night##rl"))) RlPreset(0.72f, 0.84f, 1f, 0.30f, 0.42f, 0.75f, 0.40f, 0.50f, 0.78f, 0.5f, 0.30f);
     Theme.Tip(Loc.T("Starting points. They set the colours, the sky's strength and the brightness - not where the sun is."));
+    ImGui.Checkbox(Loc.TL("Show this light in the viewport"), ref rlShow);
+    if (rlShow) { lightPreview = true; gameLighting = false; }
+    Theme.Tip(Loc.T("Lights the viewport with the sun and sky set here instead of the level's own colours, so a preset or a slider\nshows at once. It turns on by itself when you change the light. It is a quick stand-in - one sun and the sky's\nfill, no bounce - and it hides the baked lightmaps while it is on; the preview picture below is the real thing."));
 
     {
         var es = EffectiveSun();
@@ -12596,22 +12690,22 @@ void RealLightWindow()
         if (SldF(Loc.TL("Sun bearing"), ref az, -180f, 180f, "%.0f deg")) moved = true;
         if (SldF(Loc.TL("Sun height"), ref el, 2f, 89f, "%.0f deg")) moved = true;
         Theme.Tip(Loc.T("Where the sun (or the moon) stands. Low is long shadows and warm walls; high is short shadows and bright ground.\nOn a level lit by lamps, 35-45 degrees lets walls and ground both carry lamp light.\nMoving it is an edit to the level: save writes it to SkyAndSun.con."));
-        if (moved) { sunOverride = true; sunAzimuthDeg = az; sunElevationDeg = el; shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); }
+        if (moved) { sunOverride = true; sunAzimuthDeg = az; sunElevationDeg = el; shadowMapDirty = true; MarkSunEdited(); BroadcastLight(); RlShowInViewport(); }
     }
 
     var sunC = new Vector3(st.SunR, st.SunG, st.SunB);
-    if (Col3(Loc.TL("Sun colour"), ref sunC)) { st.SunR = sunC.X; st.SunG = sunC.Y; st.SunB = sunC.Z; }
+    if (Col3(Loc.TL("Sun colour"), ref sunC)) { st.SunR = sunC.X; st.SunG = sunC.Y; st.SunB = sunC.Z; RlShowInViewport(); }
     var zen = new Vector3(st.ZenithR, st.ZenithG, st.ZenithB);
-    if (Col3(Loc.TL("Sky colour, overhead"), ref zen)) { st.ZenithR = zen.X; st.ZenithG = zen.Y; st.ZenithB = zen.Z; }
+    if (Col3(Loc.TL("Sky colour, overhead"), ref zen)) { st.ZenithR = zen.X; st.ZenithG = zen.Y; st.ZenithB = zen.Z; RlShowInViewport(); }
     var hor = new Vector3(st.HorizonR, st.HorizonG, st.HorizonB);
-    if (Col3(Loc.TL("Sky colour, horizon"), ref hor)) { st.HorizonR = hor.X; st.HorizonG = hor.Y; st.HorizonB = hor.Z; }
+    if (Col3(Loc.TL("Sky colour, horizon"), ref hor)) { st.HorizonR = hor.X; st.HorizonG = hor.Y; st.HorizonB = hor.Z; RlShowInViewport(); }
     Theme.Tip(Loc.T("The sky's colour is the colour of shade: everything the sun does not reach is lit by it."));
 
     float sky = st.SkyStrength;
-    if (SldF(Loc.TL("Sky strength"), ref sky, 0.05f, 2f, "%.2f")) st.SkyStrength = sky;
+    if (SldF(Loc.TL("Sky strength"), ref sky, 0.05f, 2f, "%.2f")) { st.SkyStrength = sky; RlShowInViewport(); }
     Theme.Tip(Loc.T("How much light the open sky gives, against the sun. About 0.2 is a clear day with dark, crisp shadows;\n0.45 is haze; above 1 is overcast, where shadows almost vanish."));
     float bright = st.Brightness;
-    if (SldF(Loc.TL("Brightness"), ref bright, 0.1f, 1.3f, "%.2f")) st.Brightness = bright;
+    if (SldF(Loc.TL("Brightness"), ref bright, 0.1f, 1.3f, "%.2f")) { st.Brightness = bright; RlShowInViewport(); }
     Theme.Tip(Loc.T("How bright a surface facing the sun is drawn: 1 is its texture at full brightness.\nAbout 1.05 by day. A night level wants 0.25-0.35, so the moon is dim and the lamps are what you see."));
     float bounce = st.Bounce;
     if (SldF(Loc.TL("Bounced light"), ref bounce, 0f, 1.5f, "%.2f")) st.Bounce = bounce;
@@ -12665,17 +12759,16 @@ void RealLightWindow()
         if (Cbo(Loc.TL("Quality"), ref q, names, names.Length)) { lmQuality = q; ApplyLightmapQuality(); }
         Theme.Tip(Loc.T("Lightmap size and rays per texel. Draft is for checking the light on the whole map quickly;\nHigh is the final bake and takes far longer."));
     }
-    ImGui.BeginDisabled(busy || gameIsBf1942);
+    ImGui.BeginDisabled(busy);
     if (ImGui.Button(Loc.TL("Bake realistic lighting"), new Vector2(260f * uiScale, 0f))) BakeRealisticLighting();
     ImGui.EndDisabled();
     Theme.Tip(Loc.T("Traces the light and writes all of it: the ground tiles in colour, every object's lightmap,\nthe shadow bits, and the level's four light colours in Init.con.\nIt replaces what earlier lighting bakes put in the ground. Save writes it to the level."));
     if (busy) Theme.Muted(Loc.T("A bake is running."));
 
-    if (!gameIsBf1942)
-    {
-        ImGui.Checkbox(Loc.TL("Viewport shows the game's lighting"), ref gameLighting);
-        Theme.Tip(Loc.T("Draw the level with the game's own formula: its sun, its second light from the opposite side,\nits ambient, the lightmaps and the ground exactly as baked. Off is the editor's always-readable light."));
-    }
+    if (ImGui.Checkbox(Loc.TL("Viewport shows the game's lighting"), ref gameLighting) && gameLighting) rlShow = false;
+    Theme.Tip(gameIsBf1942
+        ? Loc.T("Draw the level with the game's own formula: a lightmapped object as its texture x 2 x the lightmap,\neverything else by the level's sun and its two ambients, the ground exactly as baked.\nOff is the editor's always-readable light.")
+        : Loc.T("Draw the level with the game's own formula: its sun, its second light from the opposite side,\nits ambient, the lightmaps and the ground exactly as baked. Off is the editor's always-readable light."));
     if (rlSummary.Length > 0) { ImGui.Spacing(); Theme.Muted(rlSummary); }
 
     ImGui.PopTextWrapPos();
@@ -14753,6 +14846,7 @@ List<(string RelPath, byte[] Bytes)> SkyCubemapPieces()
 // ambient against a full-strength sun would otherwise put every shadowed face near black.
 (Vector3 Amb, Vector3 Dif) SceneLight()
 {
+    if (rlShow) return RlViewportLight();
     if (!lightPreview) return (new Vector3(0.4f), new Vector3(0.6f));
     static float Lum(Vector3 c) => 0.299f * c.X + 0.587f * c.Y + 0.114f * c.Z;
 
@@ -14859,15 +14953,22 @@ void UploadPlacedLights(uint prog)
             else gl.Uniform4(gl.GetUniformLocation(prog, $"uPlSpot[{i}]"), 0f, -1f, 0f, -2f);
         }
     }
-    { int lc = gl.GetUniformLocation(prog, "uLmColour"); if (lc >= 0) gl.Uniform1(lc, gameIsBf1942 && nightColourLightmaps ? 1 : 0); }
-    if (loc[4] >= 0) gl.Uniform1(loc[4], lightRig.NightAmount);
+    // Battlefield 1942 reads a lightmap per channel always - a 24-bit one as written, an 8-bit one through the
+    // level's palette - so its maps are always shown in colour.
+    { int lc = gl.GetUniformLocation(prog, "uLmColour"); if (lc >= 0) gl.Uniform1(lc, gameIsBf1942 ? 1 : 0); }
+    { int b42 = gl.GetUniformLocation(prog, "uBf42"); if (b42 >= 0) gl.Uniform1(b42, gameIsBf1942 ? 1 : 0); }
+    if (loc[4] >= 0) gl.Uniform1(loc[4], rlShow ? 0f : lightRig.NightAmount);   // the window's light is already as dim as it should be
     if (loc[5] >= 0) { var na = NightSceneLight(); gl.Uniform3(loc[5], na.X, na.Y, na.Z); }
     if (loc[6] >= 0) { var la = env?.LMAmbientColor ?? new Vec3(0.25f, 0.25f, 0.25f); gl.Uniform3(loc[6], la.X, la.Y, la.Z); }
     // The game's own lighting (see the object shader): the level's four light colours exactly as Init.con has them.
-    if (loc[7] >= 0) gl.Uniform1(loc[7], gameLighting && !gameIsBf1942 ? 1 : 0);
+    if (loc[7] >= 0) gl.Uniform1(loc[7], gameLighting ? 1 : 0);
     if (loc[8] >= 0) gl.Uniform3(loc[8], lightDiffuse.X, lightDiffuse.Y, lightDiffuse.Z);
     if (loc[9] >= 0) { var sb = env?.SecondaryDiffuseColor ?? new Vec3(0f, 0f, 0f); gl.Uniform3(loc[9], sb.X, sb.Y, sb.Z); }
-    if (loc[10] >= 0) gl.Uniform3(loc[10], lightAmb.X, lightAmb.Y, lightAmb.Z);
+    if (loc[10] >= 0)
+    {
+        var ga = gameIsBf1942 ? lightAmb + lightGlobalAmb : lightAmb;   // BF1942 adds its two ambients (measured)
+        gl.Uniform3(loc[10], ga.X, ga.Y, ga.Z);
+    }
 }
 
 // Copy the edited lighting back onto the EnvironmentSettings, flagging each key as declared so the patcher writes it.
@@ -18462,24 +18563,20 @@ void BuildUi()
                             0 => Loc.T("Draft - 1 sample, 256px max (fast)"),
                             1 => Loc.T("Good - 2x2, 512px max"),
                             2 => Loc.T("High - 3x3, 1024px max (the engine's limit)"),
-                            _ => gameIsBf1942 ? Loc.T("Ultra - soft sun, ambient occlusion, bounce (minutes)")
-                                              : Loc.T("Realistic lighting... (sun, sky, bounce and lamps)"),
+                            _ => Loc.T("Realistic lighting... (sun, sky, bounce and lamps)"),
                         };
-                        // On a Battlefield Vietnam level the top entry bakes the object lightmaps with the Realistic
-                        // Lighting solve - the window's light and its quality - instead of a tier.
-                        bool real = !gameIsBf1942 && lmUseRealistic;
-                        bool sel = q == 3 && !gameIsBf1942 ? real : !real && lmQuality == q;
+                        // The top entry bakes the object lightmaps with the Realistic Lighting solve - the window's
+                        // light and its quality - instead of a tier. Both games: each has its own measured formula.
+                        bool real = lmUseRealistic;
+                        bool sel = q == 3 ? real : !real && lmQuality == q;
                         if (ImGui.MenuItem(qLabel, null, sel))
                         {
-                            if (q == 3 && !gameIsBf1942) lmUseRealistic = true;
+                            if (q == 3) lmUseRealistic = true;
                             else { lmUseRealistic = false; lmQuality = q; ApplyLightmapQuality(); }
                         }
                     }
-                    if (!gameIsBf1942)
-                    {
-                        ImGui.Separator();
-                        if (ImGui.MenuItem(Loc.TL("Realistic Lighting settings..."))) showRealLight = true;
-                    }
+                    ImGui.Separator();
+                    if (ImGui.MenuItem(Loc.TL("Realistic Lighting settings..."))) showRealLight = true;
                     ImGui.EndMenu();
                 }
                 // Measured across every retail Battlefield Vietnam level: 4,152 object lightmaps, 68% of them
@@ -22121,11 +22218,11 @@ void LightGizmos()
     }
 }
 
-// Ultra is a BF1942-only tier now: on a Battlefield Vietnam level the Realistic Lighting window replaces it, so a
-// level opened after a BF1942 one with Ultra chosen falls back to High.
+// The Ultra tier is gone from the menus: the Realistic Lighting solve replaces it on both games, so a session that
+// still has Ultra chosen moves to Realistic at High.
 void LightmapQualityForGame()
 {
-    if (!gameIsBf1942 && lmQuality == 3) { lmQuality = 2; lmUseRealistic = true; ApplyLightmapQuality(); }
+    if (lmQuality == 3) { lmQuality = 2; lmUseRealistic = true; ApplyLightmapQuality(); }
 }
 
 // The Lights panel. Placed lights do not exist in the engine - see LightRig - so this is about aiming a rig
@@ -22147,17 +22244,16 @@ void LightsPanel()
     Theme.Tip(Loc.T("Everything that is a lightmap: the ObjectLightMaps/*.tga the game reads for each placed\nobject (sun + placed lights, as brightness). Nothing here touches the terrain - the sun\nshadow and the ground bake are the separate process below."));
     ImGui.SetNextItemWidth(150f * uiScale);
     LightmapQualityForGame();
-    int lq = !gameIsBf1942 && lmUseRealistic ? 3 : lmQuality;
-    // On a Battlefield Vietnam level the top entry bakes the object lightmaps with the Realistic Lighting solve
-    // instead of the Ultra tier. Battlefield 1942 keeps Ultra until its own lighting has been measured.
+    int lq = lmUseRealistic ? 3 : lmQuality;
+    // The top entry bakes the object lightmaps with the Realistic Lighting solve, on both games.
     if (CboZ(Loc.TL("Lightmap quality"), ref lq,
              Loc.T("Draft (fast)") + "\0" + Loc.T("Good") + "\0" + Loc.T("High (engine limit)") + "\0"
-             + (gameIsBf1942 ? Loc.T("Ultra (offline: soft sun, AO, bounce)") : Loc.T("Realistic lighting...")) + "\0"))
+             + Loc.T("Realistic lighting...") + "\0"))
     {
-        if (lq == 3 && !gameIsBf1942) lmUseRealistic = true;
+        if (lq == 3) lmUseRealistic = true;
         else { lmUseRealistic = false; lmQuality = lq; ApplyLightmapQuality(); }
     }
-    if (!gameIsBf1942 && lmUseRealistic)
+    if (lmUseRealistic)
     {
         ImGui.PushTextWrapPos(0f);
         Theme.Muted(string.Format(Loc.T("Bakes with the Realistic Lighting window's light at its quality ({0}), and writes the light colours the maps were solved against. The ground keeps its current bake - the window's own bake does both."),

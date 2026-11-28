@@ -499,4 +499,63 @@ public class RealisticLightingTests
         // A sidecar from before this existed opens with none.
         Assert.Null(LightRig.FromJson("{\"Lights\":[]}").Daylight);
     }
+
+    // ---- Battlefield 1942 --------------------------------------------------------------------------------------
+
+    [Fact]
+    public void Bf1942_formulas_give_what_its_calibration_level_showed()
+    {
+        // rf_calib42: a 24-bit lightmap of level 64 tinted (1, .5, .75) came out 129 / 64 / 97, and 128 at 253 / 129 / 192.
+        var a = EngineLight.Bf1942.Lightmapped(new Vector3(1f, 0.5f, 0.75f) * (64f / 255f)) * 255f;
+        Assert.InRange(a.X, 126f, 131f); Assert.InRange(a.Y, 62f, 66f); Assert.InRange(a.Z, 94f, 99f);
+        Assert.Equal(Vector3.One, EngineLight.Bf1942.Lightmapped(new Vector3(0.75f)));
+        // A mesh with no lightmap channel under a red sun of 0.5 and ambients of 0.25 green + 0.25 blue: 255 / 127 / 127
+        // facing the sun, 0 / 127 / 127 facing away, and half the red with materialDiffuse 0.5.
+        var sun = Vector3.Normalize(new Vector3(-0.75f, 0.46f, 0.46f));
+        var dif = new Vector3(0.5f, 0f, 0f); var amb = new Vector3(0f, 0.25f, 0.25f);
+        Assert.True((new Vector3(1f, 0.5f, 0.5f) - EngineLight.Bf1942.Dynamic(sun, sun, dif, amb, Vector3.One)).Length() < 1e-4f);
+        Assert.Equal(new Vector3(0f, 0.5f, 0.5f), EngineLight.Bf1942.Dynamic(-sun, sun, dif, amb, Vector3.One));
+        Assert.Equal(0.5f, EngineLight.Bf1942.Dynamic(sun, sun, dif, amb, new Vector3(0.5f)).X, 3);
+        // The solve is its inverse, and never writes more than the game can show.
+        var t = new Vector3(0.3f, 0.6f, 1.4f);
+        Assert.Equal(Vector3.Min(t, Vector3.One), EngineLight.Bf1942.Lightmapped(EngineLight.Bf1942.SolveLightmap(t)));
+    }
+
+    [Fact]
+    public void A_bf1942_lightmap_is_half_the_traced_light()
+    {
+        var mesh = FloorAndRoof();
+        var scene = SceneOf(mesh);
+        var day = Day(new Vector3(0.15f, 1f, 0.1f));
+        var ph = new ObjectLightmapBaker.Physical(scene, day, default, new LightTracer.Budget(16, 96, 2)) { Bf1942 = true };
+        var res = ObjectLightmapBaker.BakePhysical(mesh, Matrix4x4.Identity, 96, 2, ph)!;
+
+        Assert.True(res.Colour, "a Battlefield 1942 map is written in colour");
+        double under = MeanOf(res.Map, 0.05f, 0.20f), open = MeanOf(res.Map, 0.32f, 0.45f), roofTop = MeanOf(res.Map, 0.58f, 0.92f);
+        Assert.True(under < open * 0.6, $"under the roof {under:0.00} against open floor {open:0.00}");
+        Assert.True(under > 0.005, "shade holds the sky and the bounce, not black");
+        // The roof's top sees the whole sky and the sun: the map there is half of what the open daylight shows.
+        float want = MathF.Min(1f, day.OpenDisplay(Vector3.UnitY).X) * 0.5f;
+        Assert.InRange(roofTop, want - 0.04, want + 0.04);
+        // Nothing above 0.5 (128): the game doubles it, and more would only clip.
+        for (int i = 0; i < res.Map.Rgba.Length; i += 4)
+            Assert.True(res.Map.Rgba[i] <= 128 && res.Map.Rgba[i + 1] <= 128 && res.Map.Rgba[i + 2] <= 128);
+        Assert.True(res.MeanError < 0.03f, $"mean distance from the traced light {res.MeanError:0.000}");
+    }
+
+    [Fact]
+    public void The_bf1942_fit_puts_unlightmapped_objects_near_the_daylight()
+    {
+        var day = Day(Vector3.Normalize(new Vector3(-0.75f, 0.46f, 0.46f)));
+        var (dif, amb) = day.FitBf1942();
+        Assert.True(EngineLight.Luma(amb) > 0.01f && EngineLight.Luma(dif) > 0.05f);
+        Assert.True(MathF.Max(dif.X, MathF.Max(dif.Y, dif.Z)) <= 0.61f, "written at half of what the screen shows");
+        // Ground in the open and a wall turned from the sun both land near what the daylight says.
+        foreach (var n in new[] { Vector3.UnitY, Vector3.Normalize(new Vector3(0.75f, 0f, -0.46f)), day.ToSun })
+        {
+            float got = EngineLight.Luma(EngineLight.Bf1942.Dynamic(n, day.ToSun, dif, amb, Vector3.One));
+            float want = MathF.Min(1f, EngineLight.Luma(day.OpenDisplay(n)));
+            Assert.InRange(got, want - 0.2f, want + 0.2f);
+        }
+    }
 }

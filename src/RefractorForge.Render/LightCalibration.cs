@@ -395,6 +395,8 @@ public static class LightCalibration
         public static readonly Site Hue = new(376, 536, 512);
         /// <summary>The same ground, ten metres further back, for the six-column second level.</summary>
         public static readonly Site HueUnlit = new(376, 536, 502);
+        /// <summary>BF1942's El Alamein: the dead-level ground (39.0 m) of the village in the north-west corner.</summary>
+        public static readonly Site ElAlamein = new(280, 1912, 1878);
     }
 
     /// <param name="BaseRfa">The retail level to copy (its numbered patches beside it are merged in).</param>
@@ -409,6 +411,23 @@ public static class LightCalibration
         public Vector3 Ambient { get; init; } = new(0f, 0f, 0.5f);
         public Vector3 LmAmbient { get; init; } = new(0f, 0f, 0.25f);
         public string BaseSub { get; init; } = "BfVietnam";
+        /// <summary>Build for BATTLEFIELD 1942 instead. Nothing measured on BfVietnam is assumed: that game has no
+        /// back light and no lightmap ambient to set - its Init.con carries <c>diffuseColor</c>, <c>ambientColor</c>
+        /// and <c>globalAmbientColor</c> - and its meshes have no tangent-frame layout. One row of six boards: the
+        /// 40-byte mesh with a grey 8-bit lightmap, with none, with a coloured 8-bit one and with a 24-bit one; the
+        /// 32-byte mesh with a stray flat lightmap; and the 40-byte mesh with <c>selfillum 1</c>. The sun
+        /// (<see cref="Sun"/>) is red, <see cref="Ambient"/> green and <see cref="GlobalAmbient"/> blue, so a
+        /// screenshot says which of the three reaches which kind of object, and how a lightmap combines with them.</summary>
+        public bool Bf1942 { get; init; }
+        /// <summary>Battlefield 1942: also stand three of the game's own swaying trees (<see cref="TreeTemplate"/>, a
+        /// TreeMesh, not a StandardMesh) in front of the boards, each with a different lightmap file under the name a
+        /// StandardMesh at that spot would use: none, flat black, flat red. If the game reads lightmaps for tree
+        /// meshes the three differ; if it does not they look alike.</summary>
+        public bool Trees { get; init; }
+        /// <summary>The stock tree used by <see cref="Trees"/>.</summary>
+        public string TreeTemplate { get; init; } = "EU_Spruce_large_M1";
+        /// <summary>BF1942's <c>renderer.globalAmbientColor</c>.</summary>
+        public Vector3 GlobalAmbient { get; init; }
         /// <summary>Build the SECOND level instead: what the terrain shadow map does to an object with no lightmap.
         /// Six columns - four such boards over ground painted black, dark grey, mid grey and white, a mesh with a
         /// stray lightmap file, and a lightmapped control - in two rows: the front row stands where the shadow
@@ -576,6 +595,10 @@ public static class LightCalibration
         public float[] Back { get; init; } = Array.Empty<float>();
         public float[] Ambient { get; init; } = Array.Empty<float>();
         public float[] LmAmbient { get; init; } = Array.Empty<float>();
+        /// <summary>"BfVietnam" or "bf1942".</summary>
+        public string Game { get; init; } = "BfVietnam";
+        /// <summary>BF1942 only: <c>renderer.globalAmbientColor</c>.</summary>
+        public float[] GlobalAmbient { get; init; } = Array.Empty<float>();
         public float[] Detail { get; init; } = Array.Empty<float>();
         /// <summary>The five lightmap levels as the game holds them when they come from an 8-bit map: looked up in
         /// the level's own Palette.pal and kept in a 5:6:5 texture (<see cref="LightmapPalette"/>). Fifteen numbers,
@@ -649,7 +672,7 @@ public static class LightCalibration
         // ---- the site must be what the layout assumes: dry, in bounds and near enough level ----
         var site = o.Site;
         const int boardPitch = 8;
-        int[] boardX = o.Unlit || o.Steer
+        int[] boardX = o.Unlit || o.Steer || o.Bf1942
             ? new[] { site.CentreX - 20, site.CentreX - 12, site.CentreX - 4, site.CentreX + 4, site.CentreX + 12, site.CentreX + 20 }
             : new[] { site.CentreX - 12, site.CentreX - 4, site.CentreX + 4, site.CentreX + 12 };
         int backZ = site.BoardsZ + (o.Unlit ? 5 : 0);         // the second level's upper row stands five metres behind
@@ -764,6 +787,17 @@ public static class LightCalibration
                                      boardX[i], bottomY, site.BoardsZ, steered[i].What) { Steered = true, Style = steered[i].Style.ToString() });
             boards.Add(new Board("F", "rfcal_pv_m1", "40-byte, no tangent frame", nameof(LightmapKind.Grey24), true, boardX[5], bottomY, site.BoardsZ,
                                  "ordinary normals, the board turned half round: do its normals turn with it?") { Yaw = 180 });
+        }
+        else if (o.Bf1942)
+        {
+            boards.Clear();
+            meshes.Add(("rfcal_g1_m1", StandardMeshWriter.LitLayout.Lightmap40, true, false, false, ShaderStyle.Glow));
+            boards.Add(new("A", "rfcal_pv_m1", "40-byte", nameof(LightmapKind.Grey), true, boardX[0], bottomY, site.BoardsZ, "a grey 8-bit lightmap, as retail ships them"));
+            boards.Add(new("B", "rfcal_pv_m1", "40-byte", nameof(LightmapKind.None), true, boardX[1], bottomY, site.BoardsZ, "the same mesh with no lightmap file"));
+            boards.Add(new("C", "rfcal_pv_m1", "40-byte", nameof(LightmapKind.ColourPalette), true, boardX[2], bottomY, site.BoardsZ, "an 8-bit lightmap with a coloured palette of its own: the file's palette or the level's?"));
+            boards.Add(new("D", "rfcal_pv_m1", "40-byte", nameof(LightmapKind.Rgb24), true, boardX[3], bottomY, site.BoardsZ, "a coloured 24-bit lightmap: read per channel?"));
+            boards.Add(new("E", "rfcal_p32_m1", "32-byte, no lightmap channel", nameof(LightmapKind.Uniform), false, boardX[4], bottomY, site.BoardsZ, "no unwrap, one flat lightmap value (128)"));
+            boards.Add(new("F", "rfcal_g1_m1", "40-byte", nameof(LightmapKind.Grey24), true, boardX[5], bottomY, site.BoardsZ, "selfillum 1, grey 24-bit lightmap: the lightmap alone on every patch?") { Style = nameof(ShaderStyle.Glow) });
         }
         else if (o.Full)
         {
@@ -939,6 +973,28 @@ public static class LightCalibration
         }
         foreach (var v in volumes)
             so.Objects.Add(new StaticObject(v.Mesh) { Position = new Vec3(v.X, v.Y, v.Z), Rotation = new Vec3(0, 0, 0) });
+        if (o.Trees)
+        {
+            // Left to right from the spawn: no file, black, red. 24-bit, 64 px, one value in every texel, so it does
+            // not matter where a tree's vertices would sample it.
+            var trees = new (int Dx, byte[]? Rgb, string What)[]
+            {
+                (-12, null, "no lightmap file"), (0, new byte[] { 0, 0, 0 }, "a flat BLACK lightmap"), (12, new byte[] { 255, 0, 0 }, "a flat RED lightmap"),
+            };
+            int tz = site.BoardsZ - 12;
+            foreach (var (dx, rgb, what) in trees)
+            {
+                int tx = site.CentreX + dx;
+                so.Objects.Add(new StaticObject(o.TreeTemplate) { Position = new Vec3(tx, groundY, tz), Rotation = new Vec3(0, 0, 0) });
+                if (rgb is not null)
+                {
+                    var px = new byte[64 * 64 * 4];
+                    for (int i = 0; i < px.Length; i += 4) { px[i] = rgb[0]; px[i + 1] = rgb[1]; px[i + 2] = rgb[2]; px[i + 3] = 255; }
+                    Put($"{lmFolder}/{ObjectLightmaps.FileBase(o.TreeTemplate)}_{tx}-{groundY}-{tz}.tga", TgaTexture.EncodeRgb24(new Texture2D(64, 64, px)));
+                }
+                notes.Add($"Tree {o.TreeTemplate} at {tx}/{groundY}/{tz}: {what}.");
+            }
+        }
         Put("StaticObjects.con", LevelSaver.SerializeStaticObjects(so));
         notes.Add("Every retail static object was taken out so nothing stands between the spawn and the boards.");
 
@@ -946,11 +1002,22 @@ public static class LightCalibration
         var init = Lines("Init.con").ToList();
         SetCon(init, "renderer.diffuseColor", Triple(o.Sun));
         SetCon(init, "renderer.ambientColor", Triple(o.Ambient));
-        SetCon(init, "renderer.SecondaryDiffuseColor", Triple(o.Back));
-        SetCon(init, "renderer.LMambientColor", Triple(o.LmAmbient));
-        float view = env.ViewDistance > 60f ? env.ViewDistance : 300f;
-        SetCon(init, "renderer.fogstart", (view - 15f).ToString("0.###", CultureInfo.InvariantCulture));
-        SetCon(init, "renderer.fogend", view.ToString("0.###", CultureInfo.InvariantCulture));
+        if (o.Bf1942)
+        {
+            // BF1942 knows neither a back light nor a lightmap ambient (its exe has no such commands). Specular and
+            // the vertex fog are switched off so neither tints a patch.
+            SetCon(init, "renderer.globalAmbientColor", Triple(o.GlobalAmbient));
+            SetCon(init, "renderer.specularColor", "0/0/0");
+            SetCon(init, "renderer.vertexFogEnable", "0");
+        }
+        else
+        {
+            SetCon(init, "renderer.SecondaryDiffuseColor", Triple(o.Back));
+            SetCon(init, "renderer.LMambientColor", Triple(o.LmAmbient));
+            float view = env.ViewDistance > 60f ? env.ViewDistance : 300f;
+            SetCon(init, "renderer.fogstart", (view - 15f).ToString("0.###", CultureInfo.InvariantCulture));
+            SetCon(init, "renderer.fogend", view.ToString("0.###", CultureInfo.InvariantCulture));
+        }
         var initText = DecalObject.PatchInitCon(string.Join("\r\n", init), o.Name, o.BaseSub);
         Put("Init.con", latin.GetBytes(initText));
 
@@ -1106,6 +1173,7 @@ public static class LightCalibration
             BaseLevel = Path.GetFileNameWithoutExtension(o.BaseRfa),
             ToSun = new[] { toSun.X, toSun.Y, toSun.Z },
             Sun = A(o.Sun), Back = A(o.Back), Ambient = A(o.Ambient), LmAmbient = A(o.LmAmbient),
+            Game = o.Bf1942 ? "bf1942" : "BfVietnam", GlobalAmbient = A(o.GlobalAmbient),
             Detail = A(detailRgb),
             LevelsShown = levelsShown,
             Boards = boards,

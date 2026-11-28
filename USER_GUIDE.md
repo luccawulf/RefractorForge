@@ -586,7 +586,20 @@ light a wall moon-blue.
 - Objects with **no lightmap channel at all** stay lit by the two lights, unshadowed. *Lightmap-ready objects…*
   gives them one.
 
-A Battlefield 1942 level can use the preview; the bake itself is solved against BfVietnam's shaders.
+**Battlefield 1942** follows its own rules, measured in the game on a calibration level of its own. An object with a
+lightmap is drawn as its texture x 2 x the lightmap and takes no other light, so the bake writes the traced light
+itself into the maps, in colour (24-bit) - none of the limits above apply to it: ceilings, deep interiors and a
+lamp's colour all come out as traced. Everything without a lightmap unwrap - most props on a retail level, soldiers,
+vehicles - is lit by the level's sun and its two ambients, unshadowed; the bake sets those to the pair closest to
+the daylight. The ground is baked the same way as on BfVietnam.
+
+**Seeing the light while you set it.** Picking a preset or moving a slider in the window lights the viewport
+with that sun and sky at once (*Show this light in the viewport*). It is a quick stand-in - one sun and the sky's
+fill, no bounce - and it hides the baked lightmaps while it is on. A finished bake, or ticking *Viewport shows the
+game's lighting*, returns the viewport to the baked picture.
+
+**Bake Object Lightmaps** offers *Realistic lighting* as its top quality on both games: the object lightmaps alone,
+by this window's light, with the ground left as it is.
 
 ---
 

@@ -232,7 +232,7 @@ Not done:
 - `renderer.diffuseColor` above 1 (the fit goes to 1.25 for a low sun) is outside what retail levels use. The engine
   halves it before the shader, whose constants stop at 1, so 2 is the arithmetic limit; overgrowth, lit by the same
   light through fixed-function, will be brighter on its sun side.
-- Battlefield 1942: its statics are fixed-function and its lightmaps may be RGB. The bake is not offered there.
+- Battlefield 1942 has its own rules and its own section below; nothing above is assumed for it.
 
 ## Checking it in the game: the calibration level
 
@@ -337,3 +337,37 @@ Two things found on the first full level (Operation Flaming Dart):
 - 864 MB of 24-bit lightmaps (288 at 1024 px) ran the client out of memory while loading (null effect from
   `effects/particles.fx` at 2 GB). The bake holds 24-bit maps to 500 MB (`LightmapBudget`): colourless maps go back to
   8-bit, the largest of the rest are halved. 500 MB is a working value, not a measured ceiling.
+
+## Battlefield 1942 (measured 2026-11-28, calibration levels rf_calib42 and rf_calib42t)
+
+Nothing measured on BfVietnam was assumed. `lightcal build <El_Alamein.rfa> <out> <name> --bf1942` builds a copy of
+El Alamein with six boards, the sun (`diffuseColor`) red, `ambientColor` green and `globalAmbientColor` blue; the
+game's screenshot was read back with `lightcal read`. BF1942's exe has no `SecondaryDiffuseColor` and no
+`LMambientColor`.
+
+| What | Result in the game |
+|---|---|
+| 40-byte mesh, 24-bit lightmap | texture x 2 x lightmap per channel, clipped. Level 64 tinted (1, .5, .75) read 129 / 64 / 97. No light is added: the sun's direction, the three colours and `materialDiffuse` change nothing; lightmap 0 is black. |
+| 40-byte mesh, 8-bit lightmap | the same, through the LEVEL's `ObjectLightmaps/Palette.pal` at its full eight bits (entries 34 / 86 / 137 read 68 / 172 / 253). The file's own colour map is ignored. |
+| 40-byte mesh, `selfillum 1` | no different: texture x 2 x lightmap. |
+| 32-byte mesh (no lightmap channel) | a lightmap file is ignored. texture x 2 x (materialDiffuse x diffuseColor x N.L + ambientColor + globalAmbientColor); the sun fitted 0.1 degrees from `sunLightDirectionVec` as written; no second light; `materialDiffuse` does not scale the ambients. |
+| 40-byte mesh with NO lightmap file | one flat colour (154 / 145 / 148) on every face. Origin unknown; not modelled. |
+| Terrain | takes none of the three colours (the ground chart read as painted x detail x 2). |
+| TreeMesh (swaying trees) | ignores a lightmap file: trees with no file, a black one and a red one looked alike. |
+
+What follows from it (`EngineLight.Bf1942`, `ObjectLightmapBaker.Physical.Bf1942`, `DaylightModel.FitBf1942`):
+
+- The lightmap is half of what the screen should show, per channel, written 24-bit; there is nothing to fit and no
+  floor, so ceilings, interiors and a lamp's colour come out as traced. A map with no colour in it goes to 8-bit
+  through a plain-ramp palette the whole-level bake writes, UNDITHERED: BfVietnam keeps the palette 5:6:5 and a
+  dither hides its steps, but BF1942 keeps all eight bits and showed the dither as a grid of dots.
+- `diffuseColor`, `ambientColor` and `globalAmbientColor` matter only to what has no lightmap - props without an
+  unwrap, soldiers, vehicles, trees. The bake sets the pair closest to the open daylight (written at half of what the
+  screen shows) and shares the ambient between the two keys in the level's existing proportion.
+- The same 500 MB budget holds the 24-bit maps; BF1942's own ceiling has not been measured.
+
+Not yet known: whether the game darkens the terrain at draw time from `LightmapShadowBits.lsb` (the calibration
+levels had it cleared). Known fault: a lightmap-ready COPY of an object that adds child templates (`stebarbwire_m1`
+with `e_Barbwire`, `mediclocker` with `mediclockerRepairpoint`) is refused by the dedicated server with "template not
+found"; copies of objects without children load. `tools/lightcal/ded-load-check-bf1942.ps1` loads a level on the
+headless server and reads its error box.

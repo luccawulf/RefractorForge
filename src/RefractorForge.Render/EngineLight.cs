@@ -273,4 +273,40 @@ public static class EngineLight
     }
 
     private static Vector3 Saturate(Vector3 v) => Vector3.Clamp(v, Vector3.Zero, Vector3.One);
+
+    /// <summary>
+    /// Battlefield 1942's object light. None of the above is assumed for it: this is what its own calibration level
+    /// (<c>rf_calib42</c>, El Alamein, 2026-11-28) showed in the game, with the sun red, <c>ambientColor</c> green and
+    /// <c>globalAmbientColor</c> blue.
+    /// <list type="bullet">
+    /// <item>An object WITH a lightmap (a 40-byte mesh and its file) is <c>texture x 2 x lightmap</c>, per channel,
+    /// clipped - and nothing else. The sun's direction, the three light colours and the material's diffuse change
+    /// nothing; lightmap 0 is black and 128 the texture at full. A 24-bit map is read in colour; an 8-bit one
+    /// through the LEVEL's <c>Palette.pal</c> (the file's own colour map is ignored), then doubled the same way.
+    /// <c>selfillum 1</c> changes nothing either.</item>
+    /// <item>A mesh with no lightmap channel (32-byte vertices) ignores a lightmap file and is lit per vertex:
+    /// <c>texture x 2 x (materialDiffuse x diffuseColor x N.L + ambientColor + globalAmbientColor)</c>, the sun from
+    /// <c>sunLightDirectionVec</c> as written. There is no second light, and the material's diffuse does not scale
+    /// the two ambients.</item>
+    /// <item>The terrain takes none of the three colours.</item>
+    /// </list>
+    /// A 40-byte mesh with NO lightmap file showed one flat colour on every face, of unknown origin; it is not
+    /// modelled, and a bake does not leave such an object behind.
+    /// </summary>
+    public static class Bf1942
+    {
+        /// <summary>What the game multiplies a lightmapped surface's texture by.</summary>
+        public static Vector3 Lightmapped(Vector3 lightmap) => Saturate(2f * lightmap);
+
+        /// <summary>The lightmap that makes the game draw <paramref name="target"/>: half of it. A target above 1
+        /// cannot be shown and is written as 1, so a bilinear tap across it does not carry the excess into its
+        /// neighbours.</summary>
+        public static Vector3 SolveLightmap(Vector3 target) => Saturate(target) * 0.5f;
+
+        /// <summary>What the game multiplies the texture of a surface with no lightmap channel by.</summary>
+        /// <param name="diffuse"><c>renderer.diffuseColor</c>, as written in Init.con.</param>
+        /// <param name="ambient"><c>renderer.ambientColor + renderer.globalAmbientColor</c>, as written.</param>
+        public static Vector3 Dynamic(Vector3 n, Vector3 toSun, Vector3 diffuse, Vector3 ambient, Vector3 materialDiffuse)
+            => Saturate(2f * (materialDiffuse * diffuse * MathF.Max(0f, Vector3.Dot(n, toSun)) + ambient));
+    }
 }

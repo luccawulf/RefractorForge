@@ -293,4 +293,18 @@ public class LightmapPaletteTests : IDisposable
         Near(239f, Rgb(EngineLight.Lightmapped(lm, Sun, Sun, Cal, EngineLight.Material.Default)).X, 1f);   // G: 239
         Near(191f, Rgb(EngineLight.Lightmapped(lm, back, Sun, Cal, EngineLight.Material.Default)).Y, 1f);  // G: 191
     }
+
+    [Fact]
+    public void An_exact_encode_is_undithered_and_index_equals_value_on_the_plain_ramp()
+    {
+        // Battlefield 1942 shows a palette entry at its full eight bits: a flat value must come out as ONE index.
+        var px = new byte[16 * 16 * 4];
+        for (int i = 0; i < px.Length; i += 4) { px[i] = px[i + 1] = px[i + 2] = 13; px[i + 3] = 255; }
+        var file = LightmapPalette.Linear.Encode(new Texture2D(16, 16, px), exact: true);
+        var indices = file.AsSpan(18 + 768).ToArray();
+        Assert.All(indices, b => Assert.Equal(13, b));
+        // The dithered form of the same map mixes two indices - which is what showed as dots in that game.
+        var dithered = LightmapPalette.Linear.Encode(new Texture2D(16, 16, px)).AsSpan(18 + 768).ToArray();
+        Assert.True(dithered.Distinct().Count() > 1);
+    }
 }
